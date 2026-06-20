@@ -13,6 +13,7 @@ export interface Conversation {
   lastMessageTime: number;
   tags: string[];
   profilePicUrl?: string;
+  chatUrl?: string;
   archived: boolean;
   createdAt: number;
   updatedAt: number;

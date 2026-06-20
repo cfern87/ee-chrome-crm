@@ -130,27 +130,58 @@ function saveStore(store: Store): Promise<void> {
   });
 }
 
+// Build the canonical chat URL for a thread. Prefer the live href from a
+// sidebar link so we get the exact URL Facebook uses (some threads use numeric
+// ids, others use usernames). Fall back to constructing from the current page.
+function buildChatUrl(threadId: string, link?: HTMLAnchorElement): string {
+  if (link?.href) {
+    // Strip any trailing query/hash but keep the path
+    try {
+      const u = new URL(link.href);
+      return u.origin + u.pathname;
+    } catch { /* fall through */ }
+  }
+  // If we're currently on this thread's page, use window.location
+  if (window.location.pathname.includes(`/t/${threadId}`)) {
+    return `${window.location.origin}${window.location.pathname}`;
+  }
+  return `https://www.facebook.com/messages/t/${threadId}/`;
+}
+
 async function ensureConversation(threadId: string, link?: HTMLAnchorElement): Promise<Conversation> {
   const store = await getStore();
+  const chatUrl = buildChatUrl(threadId, link);
+  let dirty = false;
+
   if (!store.conversations[threadId]) {
     const name = link ? getNameFromLink(link) : getActiveThreadName();
     const now = Date.now();
     store.conversations[threadId] = {
       id: threadId, participantName: name, participantId: threadId,
       lastMessage: '', lastMessageTime: now, tags: [],
-      archived: false, createdAt: now, updatedAt: now
+      archived: false, createdAt: now, updatedAt: now,
+      chatUrl
     };
-    await saveStore(store);
+    dirty = true;
   } else {
+    const conv = store.conversations[threadId];
     // Refresh name if we got a better one from the sidebar link
     if (link) {
       const name = getNameFromLink(link);
-      if (name !== 'Unknown' && store.conversations[threadId].participantName !== name) {
-        store.conversations[threadId].participantName = name;
-        await saveStore(store);
+      if (name !== 'Unknown' && conv.participantName !== name) {
+        conv.participantName = name;
+        dirty = true;
       }
     }
+    // Always update chatUrl when we have a real link href or are on the page
+    const betterUrl = buildChatUrl(threadId, link);
+    if (betterUrl !== conv.chatUrl) {
+      conv.chatUrl = betterUrl;
+      dirty = true;
+    }
   }
+
+  if (dirty) await saveStore(store);
   return store.conversations[threadId];
 }
 

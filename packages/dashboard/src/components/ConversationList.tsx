@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Conversation, Tag } from '../../types';
-import { X, Plus, Trash2, Archive } from 'lucide-react';
+import { X, Plus, Trash2, Archive, ExternalLink } from 'lucide-react';
 
 interface ConversationListProps {
   conversations: Conversation[];
@@ -58,7 +58,21 @@ export default function ConversationList({
                   selectedConvId === conv.id ? 'bg-blue-600' : 'bg-slate-800'
                 }`}
               >
-                <div className="font-semibold text-white">{conv.participantName}</div>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-semibold text-white truncate">{conv.participantName}</div>
+                  {conv.chatUrl && (
+                    <a
+                      href={conv.chatUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={e => e.stopPropagation()}
+                      className="flex-shrink-0 text-slate-400 hover:text-blue-400 transition-colors"
+                      title="Open chat"
+                    >
+                      <ExternalLink size={14} />
+                    </a>
+                  )}
+                </div>
                 <div className="text-sm text-slate-300 truncate mt-1">{conv.lastMessage}</div>
                 <div className="flex gap-1 mt-2 flex-wrap">
                   {conv.tags.slice(0, 2).map((tagId) => {
@@ -82,7 +96,21 @@ export default function ConversationList({
         {selectedConversation ? (
           <>
             <div className="mb-6">
-              <h2 className="text-3xl font-bold text-white mb-2">{selectedConversation.participantName}</h2>
+              <div className="flex items-center gap-3 mb-2">
+                {selectedConversation.chatUrl ? (
+                  <a
+                    href={selectedConversation.chatUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-3xl font-bold text-white hover:text-blue-400 transition-colors flex items-center gap-2 group"
+                  >
+                    {selectedConversation.participantName}
+                    <ExternalLink size={20} className="opacity-0 group-hover:opacity-100 transition-opacity text-blue-400" />
+                  </a>
+                ) : (
+                  <h2 className="text-3xl font-bold text-white">{selectedConversation.participantName}</h2>
+                )}
+              </div>
               <p className="text-slate-400">
                 Last message: {new Date(selectedConversation.lastMessageTime).toLocaleDateString()}
               </p>
@@ -148,6 +176,17 @@ export default function ConversationList({
 
             {/* Actions */}
             <div className="flex gap-2">
+              {selectedConversation.chatUrl && (
+                <a
+                  href={selectedConversation.chatUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex-1 py-2 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium flex items-center justify-center gap-2 transition-colors"
+                >
+                  <ExternalLink size={16} />
+                  Open Chat
+                </a>
+              )}
               <button
                 onClick={() => {
                   onUpdate(selectedConversation.id, { archived: !selectedConversation.archived });
