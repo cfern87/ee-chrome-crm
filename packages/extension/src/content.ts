@@ -326,17 +326,19 @@ function startSidebarObserver() {
 }
 
 // Re-inject whenever storage changes (tag added/removed from panel or popup)
-// Wrapped in try-catch for context invalidation
-try {
-  chrome.storage.onChanged.addListener(changes => {
-    if (changes[STORAGE_KEY]) {
-      storeCache = null;
-      scheduleSidebarInject();
-      if (panelEl && panelEl.style.display !== 'none') renderPanel();
-    }
-  });
-} catch (e) {
-  console.warn('Failed to register storage listener:', e);
+// Only register if the extension context is alive
+if (isExtensionAlive()) {
+  try {
+    chrome.storage.onChanged.addListener(changes => {
+      if (changes[STORAGE_KEY]) {
+        storeCache = null;
+        scheduleSidebarInject();
+        if (panelEl && panelEl.style.display !== 'none') renderPanel();
+      }
+    });
+  } catch (e) {
+    console.warn('[CRM] Failed to register storage listener:', e);
+  }
 }
 
 // ---- Pick mode ----
