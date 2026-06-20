@@ -39,16 +39,55 @@ function extractThreadId(href: string): string | null { const m = href.match(THR
 function getActiveThreadId(): string | null { return extractThreadId(window.location.pathname); }
 
 function getActiveThreadName(): string {
+  // Try multiple sources in order of reliability:
+
+  // 1. Active/current sidebar link for this thread
+  const threadId = getActiveThreadId();
+  if (threadId) {
+    const activeLink = document.querySelector<HTMLAnchorElement>(
+      `a[href*="/t/${threadId}"]`
+    );
+    if (activeLink) {
+      const name = getNameFromLink(activeLink);
+      if (name && name !== 'Unknown') return name;
+    }
+  }
+
+  // 2. Conversation header — usually the first prominent heading in [role="main"]
   const main = document.querySelector('[role="main"]');
   if (main) {
-    const h = main.querySelector('h1, h2, [role="heading"]');
-    const t = h?.textContent?.trim();
-    if (t && t.length > 0 && t.length < 100) return t;
+    // Look for visible text in headings or high-level elements
+    const candidates = main.querySelectorAll('h1, h2, h3, [role="heading"]');
+    for (const el of candidates) {
+      const text = el.textContent?.trim();
+      if (text && text.length > 1 && text.length < 100 && !/^\d+$/.test(text)) {
+        return text.split(/[\n•]/)[0].trim();
+      }
+    }
+
+    // Fallback: find the first substantial text node in the header area
+    // (usually a div or section at the top)
+    const headerLike = main.querySelector('div:first-child, section:first-child');
+    if (headerLike) {
+      const text = headerLike.textContent?.trim();
+      if (text && text.length > 1 && text.length < 200) {
+        // Extract first line or first "word group"
+        const firstLine = text.split(/[\n•]/)[0].trim();
+        if (firstLine.length > 1 && firstLine.length < 100) {
+          return firstLine;
+        }
+      }
+    }
   }
+
+  // 3. Page title (least reliable, but fallback)
   const title = document.title
     .replace(/\s*[|·-]\s*(Messenger|Facebook).*$/i, '')
     .replace(/^\(\d+\)\s*/, '').trim();
-  if (title && !/^(messenger|facebook)$/i.test(title)) return title;
+  if (title && !/^(messenger|facebook)$/i.test(title) && title.length < 100) {
+    return title;
+  }
+
   return 'Unknown';
 }
 
@@ -252,6 +291,7 @@ function exitPickMode() {
 let panelEl: HTMLElement | null = null;
 let currentPanelThreadId: string | null = null;
 let lastRenderedThread: string | null = null;
+let editingName: string | null = null;
 
 function buildLauncher() {
   if (document.getElementById('fb-crm-launcher')) return;
@@ -312,7 +352,10 @@ async function renderPanel() {
       <button class="fb-crm-close">✕</button>
     </div>
     <div class="fb-crm-body">
-      <div class="fb-crm-name">${escapeHtml(conv.participantName)}</div>
+      <div class="fb-crm-name-row">
+        <div class="fb-crm-name">${escapeHtml(conv.participantName)}</div>
+        <button class="fb-crm-name-edit" title="Edit name">✎</button>
+      </div>
       <button class="fb-crm-pick-btn">🎯 Select different conversation</button>
 
       <div class="fb-crm-section-title">Tags on this conversation</div>
@@ -398,6 +441,28 @@ function wirePanelActions(threadId: string) {
   // Allow Enter key in the tag name input to create the tag
   panelEl.querySelector<HTMLInputElement>('#fb-crm-new-name')?.addEventListener('keydown', e => {
     if (e.key === 'Enter') panelEl?.querySelector<HTMLButtonElement>('#fb-crm-create')?.click();
+  });
+
+  // Name edit button
+  panelEl.querySelector('.fb-crm-name-edit')?.addEventListener('click', async () => {
+    const nameEl = panelEl?.querySelector('.fb-crm-name');
+    if (!nameEl) return;
+
+    editingName = (panelEl?.querySelector('.fb-crm-name') as HTMLElement)?.textContent || '';
+
+    const newName = prompt('Enter conversation name:', editingName);
+    if (newName !== null && newName.trim()) {
+      const store = await getStore();
+      const conv = store.conversations[threadId];
+      if (conv) {
+        conv.participantName = newName.trim();
+        conv.updatedAt = Date.now();
+        await saveStore(store);
+        editingName = null;
+        await renderPanel();
+        await injectSidebarTags();
+      }
+    }
   });
 }
 
