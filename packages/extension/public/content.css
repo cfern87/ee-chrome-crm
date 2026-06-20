@@ -1,80 +1,169 @@
-.facebook-crm-tags {
-  display: flex;
-  gap: 4px;
-  margin-top: 4px;
-  flex-wrap: wrap;
-}
+/* Facebook Messenger CRM — floating UI */
 
-.facebook-crm-add-tag-btn {
-  padding: 4px 8px;
-  background: #e4e6eb;
+#fb-crm-launcher {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 2147483646;
+  padding: 10px 16px;
+  background: linear-gradient(135deg, #065fd4 0%, #0a7ef5 100%);
+  color: #fff;
   border: none;
-  border-radius: 4px;
+  border-radius: 24px;
+  font-size: 14px;
+  font-weight: 600;
   cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+#fb-crm-launcher:hover {
+  filter: brightness(1.05);
+}
+
+#fb-crm-panel {
+  position: fixed;
+  bottom: 72px;
+  right: 20px;
+  z-index: 2147483647;
+  width: 320px;
+  max-height: 70vh;
+  overflow: hidden;
+  background: #fff;
+  color: #1c1e21;
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  display: flex;
+  flex-direction: column;
+}
+
+.fb-crm-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: linear-gradient(135deg, #065fd4 0%, #0a7ef5 100%);
+  color: #fff;
+  font-weight: 600;
+  font-size: 15px;
+}
+
+.fb-crm-close {
+  background: transparent;
+  border: none;
+  color: #fff;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px;
+}
+
+.fb-crm-body {
+  padding: 14px 16px;
+  overflow-y: auto;
+}
+
+.fb-crm-empty {
+  padding: 24px 16px;
+  text-align: center;
+  color: #65676b;
+  font-size: 13px;
+}
+
+.fb-crm-name {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.fb-crm-section-title {
   font-size: 12px;
-  color: #065fd4;
-  font-weight: 500;
-  transition: background 0.2s;
+  font-weight: 600;
+  color: #65676b;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin: 14px 0 6px;
 }
 
-.facebook-crm-add-tag-btn:hover {
-  background: #d0d2d7;
+.fb-crm-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
-.facebook-crm-tag {
+.fb-crm-muted {
+  color: #8a8d91;
+  font-size: 13px;
+}
+
+.fb-crm-chip {
   display: inline-flex;
   align-items: center;
   gap: 4px;
   padding: 4px 8px;
-  border-radius: 4px;
+  border-radius: 12px;
   font-size: 12px;
-  font-weight: 500;
-  color: white;
-  background-color: #065fd4;
-}
-
-.facebook-crm-tag-dropdown {
-  position: fixed;
-  background: white;
-  border: 1px solid #ccc;
-  border-radius: 8px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-  z-index: 10000;
-  padding: 8px;
-  min-width: 200px;
-}
-
-.facebook-crm-tag-dropdown input {
-  width: 100%;
-  padding: 8px;
-  border: 1px solid #e0e0e0;
-  border-radius: 4px;
-  margin-bottom: 8px;
-  font-size: 12px;
-}
-
-.facebook-crm-tag-dropdown button {
-  width: 100%;
-  padding: 8px;
+  font-weight: 600;
+  color: #fff;
   border: none;
-  border-radius: 4px;
+}
+
+.fb-crm-chip-add {
   cursor: pointer;
-  margin-bottom: 8px;
-  font-size: 12px;
-  font-weight: 500;
-  transition: background 0.2s;
 }
 
-.facebook-crm-tag-dropdown button:first-of-type {
+.fb-crm-chip-x {
+  background: rgba(255, 255, 255, 0.3);
+  border: none;
+  color: #fff;
+  border-radius: 50%;
+  width: 16px;
+  height: 16px;
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.fb-crm-new {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.fb-crm-new input[type='text'] {
+  flex: 1;
+  padding: 8px;
+  border: 1px solid #ccd0d5;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.fb-crm-new input[type='color'] {
+  width: 36px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid #ccd0d5;
+  border-radius: 6px;
+  cursor: pointer;
+  background: #fff;
+}
+
+.fb-crm-new button {
+  padding: 8px 12px;
   background: #065fd4;
-  color: white;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
 }
 
-.facebook-crm-tag-dropdown button:first-of-type:hover {
+.fb-crm-new button:hover {
   background: #0a5bcc;
-}
-
-.facebook-crm-tag-dropdown button:not(:first-of-type) {
-  color: white;
-  text-align: left;
 }

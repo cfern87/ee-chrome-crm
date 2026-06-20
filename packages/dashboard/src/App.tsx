@@ -4,7 +4,7 @@ import ConversationList from './components/ConversationList';
 import TagManager from './components/TagManager';
 import Dashboard from './components/Dashboard';
 import { Conversation, Tag, CRMStore } from '../types';
-import { Users, Tags, BarChart3, Settings } from 'lucide-react';
+import { Users, Tags, BarChart3, Settings as SettingsIcon } from 'lucide-react';
 
 type TabType = 'conversations' | 'tags' | 'dashboard' | 'settings';
 
@@ -27,7 +27,18 @@ export default function App() {
     const saved = localStorage.getItem('facebook_crm_store');
     if (saved) {
       try {
-        setStore(JSON.parse(saved));
+        const parsed = JSON.parse(saved);
+        setStore({
+          conversations: parsed.conversations || {},
+          tags: parsed.tags || {},
+          notes: parsed.notes || {},
+          settings: {
+            autoTagging: true,
+            notificationEnabled: true,
+            theme: 'light',
+            ...(parsed.settings || {})
+          }
+        });
       } catch (error) {
         console.error('Failed to load store:', error);
       }
@@ -194,7 +205,7 @@ export default function App() {
                 : 'text-slate-300 hover:text-white'
             }`}
           >
-            <Settings size={18} />
+            <SettingsIcon size={18} />
             Settings
           </button>
         </nav>
@@ -229,7 +240,7 @@ export default function App() {
           )}
 
           {activeTab === 'settings' && (
-            <Settings
+            <SettingsPanel
               store={store}
               onSave={saveStore}
             />
@@ -240,7 +251,7 @@ export default function App() {
   );
 }
 
-function Settings({ store, onSave }: { store: CRMStore; onSave: (store: CRMStore) => void }) {
+function SettingsPanel({ store, onSave }: { store: CRMStore; onSave: (store: CRMStore) => void }) {
   return (
     <div className="p-8">
       <div className="max-w-2xl mx-auto bg-slate-700 rounded-lg p-6">

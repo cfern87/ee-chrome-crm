@@ -132,11 +132,19 @@ npm run dev
 ### Chrome Extension
 
 1. **Open Facebook Messenger** at `https://www.facebook.com/messages/`
-2. **Look for the "+ Tag" button** in each conversation
-3. **Click to add tags**:
-   - Select existing tags
-   - Or create new tags on the fly
-4. **View your tags** in the extension popup
+2. **Open any conversation** (the URL becomes `.../messages/t/<id>/`)
+3. **Click the floating "🏷️ CRM" button** in the bottom-right corner
+4. **In the panel you can**:
+   - See the tags already on the open conversation
+   - Add any existing tag with one click
+   - Create a new tag (name + color) and apply it instantly
+   - Remove tags with the ✕ on each chip
+5. **View everything** across all conversations in the extension popup and the dashboard
+
+> The panel keys off the thread id in the URL rather than Facebook's
+> (frequently-changing, obfuscated) CSS class names, so it keeps working as
+> Facebook updates its markup. When you switch conversations, the open panel
+> updates automatically.
 
 ### Management Dashboard
 
