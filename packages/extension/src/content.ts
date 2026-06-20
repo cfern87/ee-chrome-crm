@@ -11,24 +11,15 @@
 // Pick mode: lets the user click any sidebar item to register it as the
 //   "current" conversation for the panel when the URL-based detection fails.
 
-const STORAGE_KEY = 'facebook_crm_store';
+import {
+  STORAGE_KEY,
+  loadStore as _loadStore,
+  saveStore as _saveStore,
+} from './storage';
+import type { Store, Tag, Conversation } from './storage';
+
 const THREAD_RE = /\/t\/([^/?#]+)/;
 const COLORS = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E2'];
-
-// ---- Types ----
-
-interface Tag { id: string; name: string; color: string; createdAt: number; }
-interface Conversation {
-  id: string; participantName: string; participantId: string;
-  lastMessage: string; lastMessageTime: number; tags: string[];
-  archived: boolean; createdAt: number; updatedAt: number;
-}
-interface Store {
-  conversations: Record<string, Conversation>;
-  tags: Record<string, Tag>;
-  notes: Record<string, unknown>;
-  settings: Record<string, unknown>;
-}
 
 // ---- Helpers ----
 
@@ -104,20 +95,24 @@ function getNameFromLink(link: HTMLAnchorElement): string {
   return link.textContent?.trim().split('\n')[0] || 'Unknown';
 }
 
-// ---- Storage (localStorage primary, chrome.storage.local secondary) ----
-//
-// localStorage is the primary source — it's always available even when the
-// extension context is invalidated. chrome.storage.local is written to as a
-// secondary target (for the popup), but we never block on it and always
-// guard the call with a liveness check.
-//
-// "Extension context invalidated" happens when the extension is reloaded or
-// updated while the content script is still alive. chrome.runtime.id becomes
-// undefined at that point, and ANY chrome.* call will throw synchronously.
-// The fix: check liveness before every chrome API call, never rely on
-// .catch() alone since the throw is synchronous (not a rejected promise).
+// ---- Storage ----
+// Delegates to shared storage module (chrome.storage.local + IndexedDB mirror).
+// In-memory cache keeps repeated reads fast without hitting async storage on
+// every sidebar render cycle.
 
 let storeCache: Store | null = null;
+
+async function getStore(): Promise<Store> {
+  if (storeCache) return storeCache;
+  const store = await _loadStore();
+  storeCache = store;
+  return store;
+}
+
+async function saveStore(store: Store): Promise<void> {
+  storeCache = store;
+  await _saveStore(store);
+}
 
 function isExtensionAlive(): boolean {
   try {
@@ -125,87 +120,6 @@ function isExtensionAlive(): boolean {
   } catch {
     return false;
   }
-}
-
-function readLocalStorage(): Store {
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    const s = raw ? JSON.parse(raw) : {};
-    return {
-      conversations: s.conversations || {},
-      tags: s.tags || {},
-      notes: s.notes || {},
-      settings: s.settings || {}
-    };
-  } catch {
-    return { conversations: {}, tags: {}, notes: {}, settings: {} };
-  }
-}
-
-function writeLocalStorage(store: Store): void {
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-  } catch (e) {
-    console.warn('[CRM] localStorage write failed:', e);
-  }
-}
-
-function getStore(): Promise<Store> {
-  // If extension context is gone, fall straight to localStorage
-  if (!isExtensionAlive()) {
-    const store = readLocalStorage();
-    storeCache = store;
-    return Promise.resolve(store);
-  }
-
-  return new Promise(resolve => {
-    try {
-      chrome.storage.local.get(STORAGE_KEY, (result: Record<string, any>) => {
-        // Check again inside the callback — context can die while waiting
-        if (!isExtensionAlive() || chrome.runtime.lastError) {
-          const store = readLocalStorage();
-          storeCache = store;
-          resolve(store);
-          return;
-        }
-        const s: Store = result[STORAGE_KEY] || {};
-        const store: Store = {
-          conversations: s.conversations || {},
-          tags: s.tags || {},
-          notes: s.notes || {},
-          settings: s.settings || {}
-        };
-        // Keep localStorage in sync (so dashboard always has fresh data)
-        writeLocalStorage(store);
-        storeCache = store;
-        resolve(store);
-      });
-    } catch (e) {
-      // chrome.storage.local.get threw synchronously — context is gone
-      const store = readLocalStorage();
-      storeCache = store;
-      resolve(store);
-    }
-  });
-}
-
-function saveStore(store: Store): Promise<void> {
-  storeCache = store;
-  // Always write to localStorage first (dashboard reads this)
-  writeLocalStorage(store);
-
-  // Best-effort write to chrome.storage for the popup
-  if (!isExtensionAlive()) return Promise.resolve();
-  return new Promise(resolve => {
-    try {
-      chrome.storage.local.set({ [STORAGE_KEY]: store }, () => {
-        // Ignore lastError — context may have died between the check and here
-        resolve();
-      });
-    } catch {
-      resolve();
-    }
-  });
 }
 
 // Build the canonical chat URL for a thread. Prefer the live href from a

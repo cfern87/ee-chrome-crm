@@ -1,46 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Store, Conversation, Tag } from './types';
-
-const STORAGE_KEY = 'facebook_crm_store';
-
-const EMPTY_STORE: Store = {
-  conversations: {},
-  tags: {},
-  notes: {},
-  settings: {},
-};
-
-function getChrome(): typeof chrome | null {
-  try {
-    if (typeof chrome !== 'undefined' && chrome.storage) return chrome;
-  } catch {}
-  return null;
-}
-
-function loadStoreFromChrome(): Promise<Store> {
-  return new Promise((resolve) => {
-    const c = getChrome();
-    if (!c) { resolve(EMPTY_STORE); return; }
-    c.storage.local.get(STORAGE_KEY, (result) => {
-      if (c.runtime.lastError) { resolve(EMPTY_STORE); return; }
-      const s = result[STORAGE_KEY] || {};
-      resolve({
-        conversations: s.conversations || {},
-        tags: s.tags || {},
-        notes: s.notes || {},
-        settings: s.settings || {},
-      });
-    });
-  });
-}
-
-function saveStoreToChrome(store: Store): Promise<void> {
-  return new Promise((resolve) => {
-    const c = getChrome();
-    if (!c) { resolve(); return; }
-    c.storage.local.set({ [STORAGE_KEY]: store }, () => resolve());
-  });
-}
+import { Store, Conversation, Tag, loadStore, saveStore, EMPTY_STORE } from '../storage';
 
 function formatRelativeTime(ts: number): string {
   const diff = Date.now() - ts;
@@ -69,7 +28,7 @@ export default function DashboardApp() {
   const [filterTag, setFilterTag] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    const s = await loadStoreFromChrome();
+    const s = await loadStore();
     setStore(s);
     setLoading(false);
   }, []);
@@ -77,21 +36,22 @@ export default function DashboardApp() {
   useEffect(() => {
     refresh();
 
-    const c = getChrome();
-    if (c) {
-      const handler = () => refresh();
-      c.storage.onChanged.addListener(handler);
-      return () => c.storage.onChanged.removeListener(handler);
-    }
+    try {
+      if (typeof chrome !== 'undefined' && chrome.storage) {
+        const handler = () => refresh();
+        chrome.storage.onChanged.addListener(handler);
+        return () => chrome.storage.onChanged.removeListener(handler);
+      }
+    } catch {}
 
-    // Fallback polling if no chrome.storage events
+    // Fallback polling when chrome.storage events are unavailable
     const interval = setInterval(refresh, 3000);
     return () => clearInterval(interval);
   }, [refresh]);
 
   const updateStore = async (next: Store) => {
     setStore(next);
-    await saveStoreToChrome(next);
+    await saveStore(next);
   };
 
   // --- Conversations ---
