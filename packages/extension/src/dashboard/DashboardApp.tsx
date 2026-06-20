@@ -14,6 +14,7 @@ function formatRelativeTime(ts: number): string {
 }
 
 type Tab = 'conversations' | 'tags' | 'settings';
+type DateFilter = 'all' | 'today' | 'week' | 'month';
 
 export default function DashboardApp() {
   const [store, setStore] = useState<Store>(EMPTY_STORE);
@@ -26,6 +27,9 @@ export default function DashboardApp() {
   const [newTagColor, setNewTagColor] = useState('#FF6B6B');
   const [loading, setLoading] = useState(true);
   const [filterTag, setFilterTag] = useState<string | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
+  const [dateFilter, setDateFilter] = useState<DateFilter>('all');
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   const refresh = useCallback(async () => {
     const s = await loadStore();
@@ -56,17 +60,61 @@ export default function DashboardApp() {
 
   // --- Conversations ---
   const conversations = Object.values(store.conversations);
+  const now = Date.now();
+  const DAY = 24 * 60 * 60 * 1000;
+
   const filtered = conversations.filter((c) => {
+    // Search filter
     const matchesSearch =
       !search ||
       c.participantName.toLowerCase().includes(search.toLowerCase()) ||
       c.lastMessage.toLowerCase().includes(search.toLowerCase());
+
+    // Tag filter
     const matchesTag = !filterTag || c.tags.includes(filterTag);
-    return matchesSearch && matchesTag && !c.archived;
+
+    // Archive filter
+    const matchesArchived = showArchived === c.archived;
+
+    // Date filter
+    let matchesDate = true;
+    if (dateFilter !== 'all') {
+      const daysAgo = (now - (c.updatedAt || 0)) / DAY;
+      if (dateFilter === 'today') matchesDate = daysAgo < 1;
+      else if (dateFilter === 'week') matchesDate = daysAgo < 7;
+      else if (dateFilter === 'month') matchesDate = daysAgo < 30;
+    }
+
+    return matchesSearch && matchesTag && matchesArchived && matchesDate;
   });
   filtered.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
   const archived = conversations.filter((c) => c.archived);
+
+  // Bulk actions
+  const handleSelectAll = () => {
+    if (selectedIds.size === filtered.length) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(filtered.map((c) => c.id)));
+    }
+  };
+
+  const handleToggleSelect = (id: string) => {
+    const next = new Set(selectedIds);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setSelectedIds(next);
+  };
+
+  const handleOpenAll = () => {
+    const convsToOpen = filtered.filter((c) => selectedIds.has(c.id));
+    convsToOpen.forEach((c) => {
+      if (c.chatUrl) {
+        window.open(c.chatUrl, '_blank');
+      }
+    });
+  };
 
   const deleteConversation = async (id: string) => {
     const next = { ...store, conversations: { ...store.conversations } };
@@ -204,9 +252,9 @@ export default function DashboardApp() {
         {activeTab === 'conversations' && (
           <div style={{ display: 'flex', gap: 16 }}>
             {/* Left: list */}
-            <div style={{ flex: '0 0 340px' }}>
-              {/* Search + filter */}
-              <div style={{ marginBottom: 10 }}>
+            <div style={{ flex: '0 0 360px' }}>
+              {/* Search */}
+              <div style={{ marginBottom: 12 }}>
                 <input
                   type="text"
                   placeholder="Search conversations..."
@@ -216,14 +264,35 @@ export default function DashboardApp() {
                 />
               </div>
 
+              {/* Advanced filters */}
+              <div style={{ display: 'flex', gap: 8, marginBottom: 12, fontSize: 12 }}>
+                {/* Archive toggle */}
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', padding: '6px 10px', background: '#f0f0f0', borderRadius: 6, fontWeight: 500 }}>
+                  <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} style={{ cursor: 'pointer' }} />
+                  Archived
+                </label>
+
+                {/* Date filter */}
+                <select
+                  value={dateFilter}
+                  onChange={(e) => setDateFilter(e.target.value as DateFilter)}
+                  style={{ padding: '6px 8px', border: '1px solid #d0d0d0', borderRadius: 6, fontSize: 12, cursor: 'pointer', background: '#fff' }}
+                >
+                  <option value="all">Any time</option>
+                  <option value="today">Last 24h</option>
+                  <option value="week">Last 7 days</option>
+                  <option value="month">Last 30 days</option>
+                </select>
+              </div>
+
               {/* Tag filter chips */}
               {tags.length > 0 && (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
                   <button
                     onClick={() => setFilterTag(null)}
-                    style={{ padding: '4px 10px', borderRadius: 12, border: '1px solid #ccc', background: filterTag === null ? '#065fd4' : '#fff', color: filterTag === null ? '#fff' : '#666', fontSize: 12, cursor: 'pointer' }}
+                    style={{ padding: '4px 10px', borderRadius: 12, border: '1px solid #ccc', background: filterTag === null ? '#065fd4' : '#fff', color: filterTag === null ? '#fff' : '#666', fontSize: 12, cursor: 'pointer', fontWeight: 500 }}
                   >
-                    All
+                    All Tags
                   </button>
                   {tags.map((tag) => (
                     <button
@@ -242,6 +311,45 @@ export default function DashboardApp() {
                 </div>
               )}
 
+              {/* Bulk actions bar */}
+              {selectedIds.size > 0 && (
+                <div style={{ background: '#e8f0fe', border: '1px solid #b3d9f2', borderRadius: 8, padding: '10px 12px', marginBottom: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: '#065fd4' }}>
+                    {selectedIds.size} selected
+                  </span>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button
+                      onClick={handleOpenAll}
+                      style={{ background: '#065fd4', color: '#fff', border: 'none', padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                    >
+                      Open All
+                    </button>
+                    <button
+                      onClick={() => setSelectedIds(new Set())}
+                      style={{ background: '#fff', color: '#666', border: '1px solid #d0d0d0', padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Select all header */}
+              {filtered.length > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', background: '#fafafa', borderRadius: 6, marginBottom: 6, fontSize: 12 }}>
+                  <input
+                    type="checkbox"
+                    checked={filtered.length > 0 && selectedIds.size === filtered.length}
+                    indeterminate={selectedIds.size > 0 && selectedIds.size < filtered.length}
+                    onChange={handleSelectAll}
+                    style={{ cursor: 'pointer' }}
+                  />
+                  <label style={{ flex: 1, cursor: 'pointer', fontWeight: 500, color: '#666' }} onClick={handleSelectAll}>
+                    {selectedIds.size > 0 ? `${selectedIds.size} selected` : 'Select all'}
+                  </label>
+                </div>
+              )}
+
               {/* List */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {filtered.length === 0 && (
@@ -252,46 +360,61 @@ export default function DashboardApp() {
                   </div>
                 )}
                 {filtered.map((conv) => {
-                  const isSelected = selectedConv?.id === conv.id;
+                  const isDetailSelected = selectedConv?.id === conv.id;
+                  const isBulkSelected = selectedIds.has(conv.id);
                   return (
                     <div
                       key={conv.id}
-                      onClick={() => setSelectedConv(isSelected ? null : conv)}
                       style={{
-                        background: isSelected ? '#e8f0fe' : '#fff',
-                        border: `1px solid ${isSelected ? '#065fd4' : '#e8e8e8'}`,
+                        background: isDetailSelected ? '#e8f0fe' : '#fff',
+                        border: `1px solid ${isDetailSelected ? '#065fd4' : '#e8e8e8'}`,
                         borderRadius: 8,
-                        padding: '10px 12px',
+                        padding: '10px 10px',
                         cursor: 'pointer',
                         transition: 'background 0.15s',
+                        display: 'flex',
+                        gap: 8,
+                        alignItems: 'flex-start',
                       }}
                     >
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                        <div style={{ fontWeight: 600, fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {conv.participantName || 'Unknown'}
+                      <input
+                        type="checkbox"
+                        checked={isBulkSelected}
+                        onChange={() => handleToggleSelect(conv.id)}
+                        onClick={(e) => e.stopPropagation()}
+                        style={{ cursor: 'pointer', marginTop: 3, flexShrink: 0 }}
+                      />
+                      <div
+                        onClick={() => setSelectedConv(isDetailSelected ? null : conv)}
+                        style={{ flex: 1, minWidth: 0 }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                          <div style={{ fontWeight: 600, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                            {conv.participantName || 'Unknown'}
+                          </div>
+                          <div style={{ fontSize: 11, color: '#aaa', flexShrink: 0, marginLeft: 8 }}>
+                            {conv.updatedAt ? formatRelativeTime(conv.updatedAt) : ''}
+                          </div>
                         </div>
-                        <div style={{ fontSize: 11, color: '#aaa', flexShrink: 0, marginLeft: 8 }}>
-                          {conv.updatedAt ? formatRelativeTime(conv.updatedAt) : ''}
+                        <div style={{ fontSize: 12, color: '#888', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 3 }}>
+                          {conv.lastMessage || ''}
                         </div>
+                        {conv.tags.length > 0 && (
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}>
+                            {conv.tags.map((tagId) => {
+                              const tag = store.tags[tagId];
+                              return tag ? (
+                                <span
+                                  key={tagId}
+                                  style={{ background: tag.color, color: '#fff', fontSize: 10, padding: '2px 7px', borderRadius: 10, fontWeight: 600 }}
+                                >
+                                  {tag.name}
+                                </span>
+                              ) : null;
+                            })}
+                          </div>
+                        )}
                       </div>
-                      <div style={{ fontSize: 12, color: '#888', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 3 }}>
-                        {conv.lastMessage || ''}
-                      </div>
-                      {conv.tags.length > 0 && (
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}>
-                          {conv.tags.map((tagId) => {
-                            const tag = store.tags[tagId];
-                            return tag ? (
-                              <span
-                                key={tagId}
-                                style={{ background: tag.color, color: '#fff', fontSize: 10, padding: '2px 7px', borderRadius: 10, fontWeight: 600 }}
-                              >
-                                {tag.name}
-                              </span>
-                            ) : null;
-                          })}
-                        </div>
-                      )}
                     </div>
                   );
                 })}
