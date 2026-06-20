@@ -1,4 +1,6 @@
-/* Facebook Messenger CRM — floating UI */
+/* Facebook Messenger CRM — injected UI */
+
+/* ---- Floating launcher ---- */
 
 #fb-crm-launcher {
   position: fixed;
@@ -15,11 +17,12 @@
   cursor: pointer;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  letter-spacing: 0.01em;
 }
 
-#fb-crm-launcher:hover {
-  filter: brightness(1.05);
-}
+#fb-crm-launcher:hover { filter: brightness(1.08); }
+
+/* ---- Floating panel ---- */
 
 #fb-crm-panel {
   position: fixed;
@@ -27,134 +30,165 @@
   right: 20px;
   z-index: 2147483647;
   width: 320px;
-  max-height: 70vh;
-  overflow: hidden;
+  max-height: 72vh;
   background: #fff;
   color: #1c1e21;
   border-radius: 12px;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .fb-crm-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 16px;
+  padding: 12px 14px;
   background: linear-gradient(135deg, #065fd4 0%, #0a7ef5 100%);
   color: #fff;
-  font-weight: 600;
+  font-weight: 700;
   font-size: 15px;
+  flex-shrink: 0;
 }
 
 .fb-crm-close {
-  background: transparent;
+  background: rgba(255,255,255,0.2);
   border: none;
   color: #fff;
   cursor: pointer;
-  font-size: 14px;
-  line-height: 1;
-  padding: 4px;
+  font-size: 13px;
+  border-radius: 50%;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
 }
+.fb-crm-close:hover { background: rgba(255,255,255,0.35); }
 
 .fb-crm-body {
-  padding: 14px 16px;
+  padding: 14px 14px 16px;
   overflow-y: auto;
+  flex: 1;
 }
 
 .fb-crm-empty {
-  padding: 24px 16px;
-  text-align: center;
   color: #65676b;
   font-size: 13px;
+  margin-bottom: 12px;
 }
 
 .fb-crm-name {
   font-size: 16px;
   font-weight: 700;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
+  line-height: 1.3;
 }
 
-.fb-crm-section-title {
+.fb-crm-pick-btn {
+  display: block;
+  width: 100%;
+  padding: 7px 12px;
+  background: #f0f2f5;
+  color: #050505;
+  border: 1px solid #ddd;
+  border-radius: 6px;
   font-size: 12px;
   font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  margin-bottom: 2px;
+}
+.fb-crm-pick-btn:hover { background: #e4e6eb; }
+
+.fb-crm-section-title {
+  font-size: 11px;
+  font-weight: 700;
   color: #65676b;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
-  margin: 14px 0 6px;
+  letter-spacing: 0.05em;
+  margin: 13px 0 6px;
 }
 
 .fb-crm-chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 5px;
+  align-items: center;
 }
 
-.fb-crm-muted {
-  color: #8a8d91;
-  font-size: 13px;
-}
+.fb-crm-muted { color: #8a8d91; font-size: 12px; }
 
 .fb-crm-chip {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
   padding: 4px 8px;
   border-radius: 12px;
   font-size: 12px;
   font-weight: 600;
   color: #fff;
   border: none;
+  white-space: nowrap;
 }
 
 .fb-crm-chip-add {
   cursor: pointer;
+  opacity: 0.85;
 }
+.fb-crm-chip-add:hover { opacity: 1; }
 
 .fb-crm-chip-x {
-  background: rgba(255, 255, 255, 0.3);
+  background: rgba(255,255,255,0.3);
   border: none;
   color: #fff;
   border-radius: 50%;
-  width: 16px;
-  height: 16px;
-  font-size: 10px;
-  line-height: 1;
+  width: 15px;
+  height: 15px;
+  font-size: 9px;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
+  flex-shrink: 0;
 }
+.fb-crm-chip-x:hover { background: rgba(255,255,255,0.5); }
 
 .fb-crm-new {
   display: flex;
-  gap: 6px;
+  gap: 5px;
   align-items: center;
+  margin-top: 2px;
 }
 
 .fb-crm-new input[type='text'] {
   flex: 1;
-  padding: 8px;
+  min-width: 0;
+  padding: 7px 9px;
   border: 1px solid #ccd0d5;
   border-radius: 6px;
   font-size: 13px;
+  outline: none;
 }
+.fb-crm-new input[type='text']:focus { border-color: #065fd4; }
 
 .fb-crm-new input[type='color'] {
-  width: 36px;
-  height: 34px;
-  padding: 0;
+  width: 34px;
+  height: 32px;
+  padding: 1px;
   border: 1px solid #ccd0d5;
   border-radius: 6px;
   cursor: pointer;
   background: #fff;
+  flex-shrink: 0;
 }
 
 .fb-crm-new button {
-  padding: 8px 12px;
+  padding: 7px 11px;
   background: #065fd4;
   color: #fff;
   border: none;
@@ -162,8 +196,72 @@
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
+  flex-shrink: 0;
+}
+.fb-crm-new button:hover { background: #0a5bcc; }
+
+/* ---- Sidebar chip injection ---- */
+
+[data-crm-chips] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding: 3px 0 1px;
+  pointer-events: none; /* clicks fall through to the link itself */
 }
 
-.fb-crm-new button:hover {
-  background: #0a5bcc;
+.fb-crm-sidebar-chip {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  line-height: 1.4;
+  white-space: nowrap;
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
 }
+
+/* ---- Pick mode ---- */
+
+/* Subtle blue ring on every detectable sidebar link while in pick mode */
+[data-crm-pick] {
+  outline: 2px solid #065fd4 !important;
+  outline-offset: -2px;
+  cursor: crosshair !important;
+}
+
+#fb-crm-pick-banner {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  background: #065fd4;
+  color: #fff;
+  padding: 10px 18px;
+  border-radius: 24px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  white-space: nowrap;
+}
+
+#fb-crm-pick-cancel {
+  background: rgba(255,255,255,0.25);
+  border: none;
+  color: #fff;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+#fb-crm-pick-cancel:hover { background: rgba(255,255,255,0.4); }
