@@ -18,36 +18,80 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<TabType>('dashboard');
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Load store from localStorage on mount
+  // Load store from localStorage/chrome.storage on mount
+  // Also listen for real-time updates
   useEffect(() => {
     loadStore();
+
+    // Listen for storage changes from the extension/popup
+    const handleStorageChange = (changes: any) => {
+      if (changes.facebook_crm_store) {
+        loadStore();
+      }
+    };
+
+    if (typeof chrome !== 'undefined' && chrome.storage) {
+      try {
+        chrome.storage.onChanged.addListener(handleStorageChange);
+        return () => {
+          chrome.storage.onChanged.removeListener(handleStorageChange);
+        };
+      } catch (e) {
+        console.warn('Failed to register storage listener:', e);
+      }
+    }
   }, []);
 
   const loadStore = () => {
-    const saved = localStorage.getItem('facebook_crm_store');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        setStore({
-          conversations: parsed.conversations || {},
-          tags: parsed.tags || {},
-          notes: parsed.notes || {},
-          settings: {
-            autoTagging: true,
-            notificationEnabled: true,
-            theme: 'light',
-            ...(parsed.settings || {})
-          }
-        });
-      } catch (error) {
-        console.error('Failed to load store:', error);
+    // Try to use chrome.storage if available (when running as extension page)
+    if (typeof chrome !== 'undefined' && chrome.storage) {
+      chrome.storage.local.get('facebook_crm_store', (result: any) => {
+        const stored = result.facebook_crm_store;
+        if (stored) {
+          setStore({
+            conversations: stored.conversations || {},
+            tags: stored.tags || {},
+            notes: stored.notes || {},
+            settings: {
+              autoTagging: true,
+              notificationEnabled: true,
+              theme: 'light',
+              ...(stored.settings || {})
+            }
+          });
+        }
+      });
+    } else {
+      // Fallback to localStorage (for localhost development)
+      const saved = localStorage.getItem('facebook_crm_store');
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          setStore({
+            conversations: parsed.conversations || {},
+            tags: parsed.tags || {},
+            notes: parsed.notes || {},
+            settings: {
+              autoTagging: true,
+              notificationEnabled: true,
+              theme: 'light',
+              ...(parsed.settings || {})
+            }
+          });
+        } catch (error) {
+          console.error('Failed to load store:', error);
+        }
       }
     }
   };
 
   const saveStore = (newStore: CRMStore) => {
     setStore(newStore);
-    localStorage.setItem('facebook_crm_store', JSON.stringify(newStore));
+    if (typeof chrome !== 'undefined' && chrome.storage) {
+      chrome.storage.local.set({ facebook_crm_store: newStore });
+    } else {
+      localStorage.setItem('facebook_crm_store', JSON.stringify(newStore));
+    }
   };
 
   const addConversation = (conversation: Conversation) => {
