@@ -104,14 +104,53 @@ function getNameFromLink(link: HTMLAnchorElement): string {
   return link.textContent?.trim().split('\n')[0] || 'Unknown';
 }
 
-// ---- Storage ----
+// ---- Storage (chrome.storage.local + localStorage bridge) ----
+// The extension saves to chrome.storage.local (private, extension-only).
+// To sync with the dashboard (which uses localStorage), we also write to
+// window.localStorage. The dashboard can then read that directly.
+// This bridges the two storage systems without a backend.
 
 let storeCache: Store | null = null;
 
+function safeChromeCall<T>(fn: () => Promise<T>): Promise<T | null> {
+  return fn().catch(err => {
+    // Extension context invalidated (service worker reloaded, extension updated, etc.)
+    // Fall back to localStorage only
+    if (err.message?.includes('context') || err.message?.includes('invalid')) {
+      console.warn('Extension context lost, using localStorage only');
+      return null;
+    }
+    throw err;
+  });
+}
+
 function getStore(): Promise<Store> {
-  return new Promise(resolve => {
-    chrome.storage.local.get(STORAGE_KEY, result => {
-      const s: Store = result[STORAGE_KEY] || {};
+  return new Promise(async resolve => {
+    // Try chrome.storage first
+    const chromeResult = await safeChromeCall(() =>
+      new Promise<Store | null>(res => {
+        chrome.storage.local.get(STORAGE_KEY, (result: Record<string, any>) => {
+          const s: Store = result[STORAGE_KEY] || {};
+          res({
+            conversations: s.conversations || {},
+            tags: s.tags || {},
+            notes: s.notes || {},
+            settings: s.settings || {}
+          });
+        });
+      })
+    );
+
+    if (chromeResult) {
+      storeCache = chromeResult;
+      resolve(chromeResult);
+      return;
+    }
+
+    // Fallback: read from localStorage (dashboard or context-invalidated scenario)
+    try {
+      const stored = window.localStorage.getItem(STORAGE_KEY);
+      const s = stored ? JSON.parse(stored) : {};
       storeCache = {
         conversations: s.conversations || {},
         tags: s.tags || {},
@@ -119,15 +158,38 @@ function getStore(): Promise<Store> {
         settings: s.settings || {}
       };
       resolve(storeCache);
-    });
+    } catch (e) {
+      resolve({
+        conversations: {},
+        tags: {},
+        notes: {},
+        settings: {}
+      });
+    }
   });
 }
 
 function saveStore(store: Store): Promise<void> {
   storeCache = store;
-  return new Promise(resolve => {
-    chrome.storage.local.set({ [STORAGE_KEY]: store }, resolve);
+  // Write to both chrome.storage and localStorage for dashboard sync
+  const writeToLocal = new Promise<void>(resolve => {
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+      resolve();
+    } catch (e) {
+      console.warn('localStorage write failed:', e);
+      resolve();
+    }
   });
+
+  const writeToChrome = safeChromeCall(
+    () =>
+      new Promise<void>(resolve => {
+        chrome.storage.local.set({ [STORAGE_KEY]: store }, () => resolve());
+      })
+  ).then(() => {});
+
+  return Promise.all([writeToLocal, writeToChrome]).then(() => {});
 }
 
 // Build the canonical chat URL for a thread. Prefer the live href from a
@@ -248,13 +310,18 @@ function startSidebarObserver() {
 }
 
 // Re-inject whenever storage changes (tag added/removed from panel or popup)
-chrome.storage.onChanged.addListener(changes => {
-  if (changes[STORAGE_KEY]) {
-    storeCache = null;
-    scheduleSidebarInject();
-    if (panelEl && panelEl.style.display !== 'none') renderPanel();
-  }
-});
+// Wrapped in try-catch for context invalidation
+try {
+  chrome.storage.onChanged.addListener(changes => {
+    if (changes[STORAGE_KEY]) {
+      storeCache = null;
+      scheduleSidebarInject();
+      if (panelEl && panelEl.style.display !== 'none') renderPanel();
+    }
+  });
+} catch (e) {
+  console.warn('Failed to register storage listener:', e);
+}
 
 // ---- Pick mode ----
 
@@ -284,25 +351,33 @@ function enterPickMode() {
     let el: Element | null = target;
     let threadId: string | null = null;
     let foundLink: HTMLAnchorElement | null = null;
-    for (let i = 0; i < 20 && el; i++) {
-      if (el.tagName === 'A') {
+    for (let i = 0; i < 25 && el; i++) {
+      if (el.tagName === 'A' && el.hasAttribute('href')) {
         const href = (el as HTMLAnchorElement).href;
         const id = extractThreadId(href);
-        if (id) { threadId = id; foundLink = el as HTMLAnchorElement; break; }
+        if (id) {
+          threadId = id;
+          foundLink = el as HTMLAnchorElement;
+          break;
+        }
       }
       el = el.parentElement;
     }
 
-    if (threadId) {
+    if (threadId && foundLink) {
       e.preventDefault();
       e.stopPropagation();
       exitPickMode();
 
-      await ensureConversation(threadId, foundLink || undefined);
-      currentPanelThreadId = threadId;
-      if (panelEl) {
-        panelEl.style.display = 'block';
-        await renderPanel();
+      try {
+        await ensureConversation(threadId, foundLink);
+        currentPanelThreadId = threadId;
+        if (panelEl) {
+          panelEl.style.display = 'block';
+          await renderPanel();
+        }
+      } catch (err) {
+        console.error('Failed to select conversation:', err);
       }
     }
   };
