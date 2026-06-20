@@ -1,0 +1,23 @@
+{
+  "name": "facebook-crm",
+  "version": "1.0.0",
+  "description": "Facebook Messenger CRM with tagging and dashboard",
+  "private": true,
+  "workspaces": [
+    "packages/extension",
+    "packages/dashboard"
+  ],
+  "scripts": {
+    "install-all": "npm install",
+    "dev": "npm run dev --workspaces",
+    "build": "npm run build --workspaces",
+    "start": "npm start --workspaces"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.260",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "Facebook Messenger CRM",
+  "version": "1.0.0",
+  "description": "Manage conversations and tags directly in Facebook Messenger",
+  "permissions": [
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://www.facebook.com/*",
+    "https://www.messenger.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Facebook CRM"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.facebook.com/messages/*",
+        "https://www.messenger.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["content.css"]
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": ["https://www.facebook.com/*", "https://www.messenger.com/*"]
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

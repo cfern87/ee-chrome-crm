@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Facebook CRM</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 400px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+      background: #fff;
+      color: #333;
+    }
+
+    .header {
+      background: linear-gradient(135deg, #065fd4 0%, #0a7ef5 100%);
+      color: white;
+      padding: 16px;
+      text-align: center;
+    }
+
+    .header h1 {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .header p {
+      font-size: 12px;
+      opacity: 0.9;
+    }
+
+    .nav-tabs {
+      display: flex;
+      border-bottom: 1px solid #e0e0e0;
+      background: #f8f8f8;
+    }
+
+    .nav-tab {
+      flex: 1;
+      padding: 12px;
+      border: none;
+      background: none;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      color: #666;
+      border-bottom: 3px solid transparent;
+      transition: all 0.3s;
+    }
+
+    .nav-tab.active {
+      color: #065fd4;
+      border-bottom-color: #065fd4;
+      background: white;
+    }
+
+    .content {
+      padding: 16px;
+      max-height: 500px;
+      overflow-y: auto;
+    }
+
+    .tab-content {
+      display: none;
+    }
+
+    .tab-content.active {
+      display: block;
+    }
+
+    .conversation-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .conversation-item {
+      background: #f8f8f8;
+      padding: 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .conversation-item:hover {
+      background: #efefef;
+    }
+
+    .conversation-name {
+      font-weight: 600;
+      font-size: 13px;
+      margin-bottom: 4px;
+    }
+
+    .conversation-message {
+      font-size: 12px;
+      color: #666;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .tags-container {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .tag-item {
+      background: #f8f8f8;
+      padding: 12px;
+      border-radius: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .tag-color {
+      width: 20px;
+      height: 20px;
+      border-radius: 4px;
+      margin-right: 8px;
+    }
+
+    .tag-name {
+      flex: 1;
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .btn-delete {
+      background: #ff6b6b;
+      color: white;
+      border: none;
+      padding: 6px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .btn-delete:hover {
+      background: #ff5252;
+    }
+
+    .btn-primary {
+      background: #065fd4;
+      color: white;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      width: 100%;
+      margin-top: 8px;
+    }
+
+    .btn-primary:hover {
+      background: #0a5bcc;
+    }
+
+    .input-group {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .input-group input {
+      flex: 1;
+      padding: 8px 12px;
+      border: 1px solid #e0e0e0;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 24px 16px;
+      color: #999;
+      font-size: 13px;
+    }
+
+    .settings-group {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .setting-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px;
+      background: #f8f8f8;
+      border-radius: 6px;
+    }
+
+    .setting-label {
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .toggle {
+      position: relative;
+      width: 44px;
+      height: 24px;
+    }
+
+    .toggle input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .toggle-slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #ccc;
+      transition: 0.4s;
+      border-radius: 24px;
+    }
+
+    .toggle-slider:before {
+      position: absolute;
+      content: "";
+      height: 18px;
+      width: 18px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      transition: 0.4s;
+      border-radius: 50%;
+    }
+
+    input:checked + .toggle-slider {
+      background-color: #065fd4;
+    }
+
+    input:checked + .toggle-slider:before {
+      transform: translateX(20px);
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>📱 Messenger CRM</h1>
+    <p>Manage conversations & tags</p>
+  </div>
+
+  <div class="nav-tabs">
+    <button class="nav-tab active" data-tab="conversations">Conversations</button>
+    <button class="nav-tab" data-tab="tags">Tags</button>
+    <button class="nav-tab" data-tab="settings">Settings</button>
+  </div>
+
+  <div class="content">
+    <div class="tab-content active" id="conversations">
+      <div class="conversation-list" id="conversationList">
+        <div class="empty-state">No conversations yet. Open Messenger to load them.</div>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tags">
+      <div class="input-group">
+        <input type="text" id="newTagName" placeholder="Tag name..." />
+        <input type="color" id="newTagColor" value="#FF6B6B" style="flex: 0 0 50px; cursor: pointer;" />
+      </div>
+      <button class="btn-primary" id="addTagBtn">Add Tag</button>
+
+      <div class="tags-container" id="tagsList" style="margin-top: 16px;">
+        <div class="empty-state">No tags yet. Create one to get started.</div>
+      </div>
+    </div>
+
+    <div class="tab-content" id="settings">
+      <div class="settings-group">
+        <div class="setting-item">
+          <span class="setting-label">Auto-tagging</span>
+          <label class="toggle">
+            <input type="checkbox" id="autoTagging" />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="setting-item">
+          <span class="setting-label">Notifications</span>
+          <label class="toggle">
+            <input type="checkbox" id="notifications" />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <button class="btn-primary" id="exportBtn">📥 Export Data</button>
+        <button class="btn-primary" style="background: #4ECDC4;" id="importBtn">📤 Import Data</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
