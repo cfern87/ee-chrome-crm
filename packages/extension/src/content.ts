@@ -104,92 +104,108 @@ function getNameFromLink(link: HTMLAnchorElement): string {
   return link.textContent?.trim().split('\n')[0] || 'Unknown';
 }
 
-// ---- Storage (chrome.storage.local + localStorage bridge) ----
-// The extension saves to chrome.storage.local (private, extension-only).
-// To sync with the dashboard (which uses localStorage), we also write to
-// window.localStorage. The dashboard can then read that directly.
-// This bridges the two storage systems without a backend.
+// ---- Storage (localStorage primary, chrome.storage.local secondary) ----
+//
+// localStorage is the primary source — it's always available even when the
+// extension context is invalidated. chrome.storage.local is written to as a
+// secondary target (for the popup), but we never block on it and always
+// guard the call with a liveness check.
+//
+// "Extension context invalidated" happens when the extension is reloaded or
+// updated while the content script is still alive. chrome.runtime.id becomes
+// undefined at that point, and ANY chrome.* call will throw synchronously.
+// The fix: check liveness before every chrome API call, never rely on
+// .catch() alone since the throw is synchronous (not a rejected promise).
 
 let storeCache: Store | null = null;
 
-function safeChromeCall<T>(fn: () => Promise<T>): Promise<T | null> {
-  return fn().catch(err => {
-    // Extension context invalidated (service worker reloaded, extension updated, etc.)
-    // Fall back to localStorage only
-    if (err.message?.includes('context') || err.message?.includes('invalid')) {
-      console.warn('Extension context lost, using localStorage only');
-      return null;
-    }
-    throw err;
-  });
+function isExtensionAlive(): boolean {
+  try {
+    return typeof chrome !== 'undefined' && typeof chrome.runtime !== 'undefined' && !!chrome.runtime.id;
+  } catch {
+    return false;
+  }
+}
+
+function readLocalStorage(): Store {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const s = raw ? JSON.parse(raw) : {};
+    return {
+      conversations: s.conversations || {},
+      tags: s.tags || {},
+      notes: s.notes || {},
+      settings: s.settings || {}
+    };
+  } catch {
+    return { conversations: {}, tags: {}, notes: {}, settings: {} };
+  }
+}
+
+function writeLocalStorage(store: Store): void {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+  } catch (e) {
+    console.warn('[CRM] localStorage write failed:', e);
+  }
 }
 
 function getStore(): Promise<Store> {
-  return new Promise(async resolve => {
-    // Try chrome.storage first
-    const chromeResult = await safeChromeCall(() =>
-      new Promise<Store | null>(res => {
-        chrome.storage.local.get(STORAGE_KEY, (result: Record<string, any>) => {
-          const s: Store = result[STORAGE_KEY] || {};
-          res({
-            conversations: s.conversations || {},
-            tags: s.tags || {},
-            notes: s.notes || {},
-            settings: s.settings || {}
-          });
-        });
-      })
-    );
+  // If extension context is gone, fall straight to localStorage
+  if (!isExtensionAlive()) {
+    const store = readLocalStorage();
+    storeCache = store;
+    return Promise.resolve(store);
+  }
 
-    if (chromeResult) {
-      storeCache = chromeResult;
-      resolve(chromeResult);
-      return;
-    }
-
-    // Fallback: read from localStorage (dashboard or context-invalidated scenario)
+  return new Promise(resolve => {
     try {
-      const stored = window.localStorage.getItem(STORAGE_KEY);
-      const s = stored ? JSON.parse(stored) : {};
-      storeCache = {
-        conversations: s.conversations || {},
-        tags: s.tags || {},
-        notes: s.notes || {},
-        settings: s.settings || {}
-      };
-      resolve(storeCache);
-    } catch (e) {
-      resolve({
-        conversations: {},
-        tags: {},
-        notes: {},
-        settings: {}
+      chrome.storage.local.get(STORAGE_KEY, (result: Record<string, any>) => {
+        // Check again inside the callback — context can die while waiting
+        if (!isExtensionAlive() || chrome.runtime.lastError) {
+          const store = readLocalStorage();
+          storeCache = store;
+          resolve(store);
+          return;
+        }
+        const s: Store = result[STORAGE_KEY] || {};
+        const store: Store = {
+          conversations: s.conversations || {},
+          tags: s.tags || {},
+          notes: s.notes || {},
+          settings: s.settings || {}
+        };
+        // Keep localStorage in sync (so dashboard always has fresh data)
+        writeLocalStorage(store);
+        storeCache = store;
+        resolve(store);
       });
+    } catch (e) {
+      // chrome.storage.local.get threw synchronously — context is gone
+      const store = readLocalStorage();
+      storeCache = store;
+      resolve(store);
     }
   });
 }
 
 function saveStore(store: Store): Promise<void> {
   storeCache = store;
-  // Write to both chrome.storage and localStorage for dashboard sync
-  const writeToLocal = new Promise<void>(resolve => {
+  // Always write to localStorage first (dashboard reads this)
+  writeLocalStorage(store);
+
+  // Best-effort write to chrome.storage for the popup
+  if (!isExtensionAlive()) return Promise.resolve();
+  return new Promise(resolve => {
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-      resolve();
-    } catch (e) {
-      console.warn('localStorage write failed:', e);
+      chrome.storage.local.set({ [STORAGE_KEY]: store }, () => {
+        // Ignore lastError — context may have died between the check and here
+        resolve();
+      });
+    } catch {
       resolve();
     }
   });
-
-  const writeToChrome = safeChromeCall(
-    () =>
-      new Promise<void>(resolve => {
-        chrome.storage.local.set({ [STORAGE_KEY]: store }, () => resolve());
-      })
-  ).then(() => {});
-
-  return Promise.all([writeToLocal, writeToChrome]).then(() => {});
 }
 
 // Build the canonical chat URL for a thread. Prefer the live href from a
