@@ -29,6 +29,7 @@ export interface Conversation {
   archived: boolean;
   createdAt: number;
   updatedAt: number;
+  lastOpenedAt?: number;
 }
 
 export interface Store {

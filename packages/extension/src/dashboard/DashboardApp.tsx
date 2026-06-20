@@ -15,6 +15,7 @@ function formatRelativeTime(ts: number): string {
 
 type Tab = 'conversations' | 'tags' | 'settings';
 type DateFilter = 'all' | 'today' | 'week' | 'month';
+type SortBy = 'recent' | 'lastOpened' | 'dateAdded' | 'tagCount' | 'name';
 
 export default function DashboardApp() {
   const [store, setStore] = useState<Store>(EMPTY_STORE);
@@ -29,7 +30,11 @@ export default function DashboardApp() {
   const [filterTag, setFilterTag] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
   const [dateFilter, setDateFilter] = useState<DateFilter>('all');
+  const [sortBy, setSortBy] = useState<SortBy>('recent');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkTagMenu, setBulkTagMenu] = useState<'assign' | 'remove' | null>(null);
+  const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
 
   const refresh = useCallback(async () => {
     const s = await loadStore();
@@ -87,11 +92,40 @@ export default function DashboardApp() {
 
     return matchesSearch && matchesTag && matchesArchived && matchesDate;
   });
-  filtered.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+  // Sort
+  const dir = sortDir === 'asc' ? 1 : -1;
+  filtered.sort((a, b) => {
+    switch (sortBy) {
+      case 'lastOpened':
+        return dir * ((a.lastOpenedAt || 0) - (b.lastOpenedAt || 0));
+      case 'dateAdded':
+        return dir * ((a.createdAt || 0) - (b.createdAt || 0));
+      case 'tagCount':
+        return dir * (a.tags.length - b.tags.length);
+      case 'name':
+        return dir * (a.participantName || '').localeCompare(b.participantName || '');
+      case 'recent':
+      default:
+        return dir * ((a.updatedAt || 0) - (b.updatedAt || 0));
+    }
+  });
 
   const archived = conversations.filter((c) => c.archived);
 
+  // Mark conversations as opened (tracks lastOpenedAt for sort-by-last-opened)
+  const markOpened = async (ids: string[]) => {
+    const ts = Date.now();
+    const nextConvs = { ...store.conversations };
+    for (const id of ids) {
+      if (nextConvs[id]) nextConvs[id] = { ...nextConvs[id], lastOpenedAt: ts };
+    }
+    await updateStore({ ...store, conversations: nextConvs });
+  };
+
   // Bulk actions
+  const selectedConvs = filtered.filter((c) => selectedIds.has(c.id));
+
   const handleSelectAll = () => {
     if (selectedIds.size === filtered.length) {
       setSelectedIds(new Set());
@@ -108,12 +142,44 @@ export default function DashboardApp() {
   };
 
   const handleOpenAll = () => {
-    const convsToOpen = filtered.filter((c) => selectedIds.has(c.id));
-    convsToOpen.forEach((c) => {
-      if (c.chatUrl) {
-        window.open(c.chatUrl, '_blank');
+    const toOpen = selectedConvs.filter((c) => c.chatUrl);
+    toOpen.forEach((c) => window.open(c.chatUrl, '_blank'));
+    if (toOpen.length > 0) markOpened(toOpen.map((c) => c.id));
+  };
+
+  const handleBulkAssignTag = async (tagId: string) => {
+    const nextConvs = { ...store.conversations };
+    const ts = Date.now();
+    for (const id of selectedIds) {
+      const c = nextConvs[id];
+      if (c && !c.tags.includes(tagId)) {
+        nextConvs[id] = { ...c, tags: [...c.tags, tagId], updatedAt: ts };
       }
-    });
+    }
+    await updateStore({ ...store, conversations: nextConvs });
+    setBulkTagMenu(null);
+  };
+
+  const handleBulkRemoveTag = async (tagId: string) => {
+    const nextConvs = { ...store.conversations };
+    const ts = Date.now();
+    for (const id of selectedIds) {
+      const c = nextConvs[id];
+      if (c && c.tags.includes(tagId)) {
+        nextConvs[id] = { ...c, tags: c.tags.filter((t) => t !== tagId), updatedAt: ts };
+      }
+    }
+    await updateStore({ ...store, conversations: nextConvs });
+    setBulkTagMenu(null);
+  };
+
+  const handleBulkDelete = async () => {
+    const nextConvs = { ...store.conversations };
+    for (const id of selectedIds) delete nextConvs[id];
+    await updateStore({ ...store, conversations: nextConvs });
+    if (selectedConv && selectedIds.has(selectedConv.id)) setSelectedConv(null);
+    setSelectedIds(new Set());
+    setBulkDeleteConfirm(false);
   };
 
   const deleteConversation = async (id: string) => {
@@ -265,7 +331,7 @@ export default function DashboardApp() {
               </div>
 
               {/* Advanced filters */}
-              <div style={{ display: 'flex', gap: 8, marginBottom: 12, fontSize: 12 }}>
+              <div style={{ display: 'flex', gap: 8, marginBottom: 12, fontSize: 12, flexWrap: 'wrap' }}>
                 {/* Archive toggle */}
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', padding: '6px 10px', background: '#f0f0f0', borderRadius: 6, fontWeight: 500 }}>
                   <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} style={{ cursor: 'pointer' }} />
@@ -283,6 +349,31 @@ export default function DashboardApp() {
                   <option value="week">Last 7 days</option>
                   <option value="month">Last 30 days</option>
                 </select>
+              </div>
+
+              {/* Sort controls */}
+              <div style={{ display: 'flex', gap: 6, marginBottom: 12, fontSize: 12, alignItems: 'center' }}>
+                <span style={{ color: '#888', fontWeight: 500 }}>Sort:</span>
+                <select
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value as SortBy)}
+                  style={{ flex: 1, padding: '6px 8px', border: '1px solid #d0d0d0', borderRadius: 6, fontSize: 12, cursor: 'pointer', background: '#fff' }}
+                >
+                  <option value="recent">Recent activity</option>
+                  <option value="lastOpened">Last opened</option>
+                  <option value="dateAdded">Date added</option>
+                  <option value="tagCount">Number of tags</option>
+                  <option value="name">Name</option>
+                </select>
+                <button
+                  onClick={() => setSortDir(sortDir === 'asc' ? 'desc' : 'asc')}
+                  title={sortDir === 'asc' ? 'Ascending' : 'Descending'}
+                  style={{ padding: '6px 10px', border: '1px solid #d0d0d0', borderRadius: 6, fontSize: 13, cursor: 'pointer', background: '#fff', fontWeight: 600, color: '#555' }}
+                >
+                  {sortBy === 'name'
+                    ? (sortDir === 'asc' ? 'A→Z' : 'Z→A')
+                    : (sortDir === 'asc' ? '↑' : '↓')}
+                </button>
               </div>
 
               {/* Tag filter chips */}
@@ -313,24 +404,92 @@ export default function DashboardApp() {
 
               {/* Bulk actions bar */}
               {selectedIds.size > 0 && (
-                <div style={{ background: '#e8f0fe', border: '1px solid #b3d9f2', borderRadius: 8, padding: '10px 12px', marginBottom: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ fontSize: 13, fontWeight: 600, color: '#065fd4' }}>
-                    {selectedIds.size} selected
-                  </span>
-                  <div style={{ display: 'flex', gap: 8 }}>
+                <div style={{ background: '#e8f0fe', border: '1px solid #b3d9f2', borderRadius: 8, padding: '10px 12px', marginBottom: 12 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: '#065fd4' }}>
+                      {selectedIds.size} selected
+                    </span>
                     <button
-                      onClick={handleOpenAll}
-                      style={{ background: '#065fd4', color: '#fff', border: 'none', padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
-                    >
-                      Open All
-                    </button>
-                    <button
-                      onClick={() => setSelectedIds(new Set())}
-                      style={{ background: '#fff', color: '#666', border: '1px solid #d0d0d0', padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                      onClick={() => { setSelectedIds(new Set()); setBulkTagMenu(null); setBulkDeleteConfirm(false); }}
+                      style={{ background: 'none', color: '#666', border: 'none', fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}
                     >
                       Clear
                     </button>
                   </div>
+
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    <button
+                      onClick={handleOpenAll}
+                      style={{ background: '#065fd4', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                    >
+                      Open All
+                    </button>
+                    <button
+                      onClick={() => { setBulkTagMenu(bulkTagMenu === 'assign' ? null : 'assign'); setBulkDeleteConfirm(false); }}
+                      style={{ background: bulkTagMenu === 'assign' ? '#065fd4' : '#fff', color: bulkTagMenu === 'assign' ? '#fff' : '#065fd4', border: '1px solid #065fd4', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                    >
+                      Assign Tag
+                    </button>
+                    <button
+                      onClick={() => { setBulkTagMenu(bulkTagMenu === 'remove' ? null : 'remove'); setBulkDeleteConfirm(false); }}
+                      style={{ background: bulkTagMenu === 'remove' ? '#065fd4' : '#fff', color: bulkTagMenu === 'remove' ? '#fff' : '#065fd4', border: '1px solid #065fd4', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                    >
+                      Remove Tag
+                    </button>
+                    <button
+                      onClick={() => { setBulkDeleteConfirm(true); setBulkTagMenu(null); }}
+                      style={{ background: '#fff0f0', color: '#e53e3e', border: '1px solid #fecaca', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                    >
+                      Delete
+                    </button>
+                  </div>
+
+                  {/* Tag picker for assign/remove */}
+                  {bulkTagMenu && (
+                    <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid #cfe2f5' }}>
+                      <div style={{ fontSize: 11, color: '#666', marginBottom: 6, fontWeight: 600 }}>
+                        {bulkTagMenu === 'assign' ? 'Add tag to selected:' : 'Remove tag from selected:'}
+                      </div>
+                      {tags.length === 0 ? (
+                        <div style={{ fontSize: 12, color: '#999' }}>No tags exist yet.</div>
+                      ) : (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                          {tags.map((tag) => (
+                            <button
+                              key={tag.id}
+                              onClick={() => bulkTagMenu === 'assign' ? handleBulkAssignTag(tag.id) : handleBulkRemoveTag(tag.id)}
+                              style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: tag.color, color: '#fff', border: 'none', padding: '4px 10px', borderRadius: 12, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                            >
+                              {bulkTagMenu === 'assign' ? '+' : '−'} {tag.name}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Delete confirmation */}
+                  {bulkDeleteConfirm && (
+                    <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid #cfe2f5' }}>
+                      <div style={{ fontSize: 13, color: '#e53e3e', fontWeight: 600, marginBottom: 8 }}>
+                        Delete {selectedIds.size} conversation{selectedIds.size !== 1 ? 's' : ''}? This cannot be undone.
+                      </div>
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <button
+                          onClick={handleBulkDelete}
+                          style={{ background: '#e53e3e', color: '#fff', border: 'none', padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                        >
+                          Yes, Delete {selectedIds.size}
+                        </button>
+                        <button
+                          onClick={() => setBulkDeleteConfirm(false)}
+                          style={{ background: '#fff', color: '#666', border: '1px solid #d0d0d0', padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -339,8 +498,10 @@ export default function DashboardApp() {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', background: '#fafafa', borderRadius: 6, marginBottom: 6, fontSize: 12 }}>
                   <input
                     type="checkbox"
+                    ref={(el) => {
+                      if (el) el.indeterminate = selectedIds.size > 0 && selectedIds.size < filtered.length;
+                    }}
                     checked={filtered.length > 0 && selectedIds.size === filtered.length}
-                    indeterminate={selectedIds.size > 0 && selectedIds.size < filtered.length}
                     onChange={handleSelectAll}
                     style={{ cursor: 'pointer' }}
                   />
@@ -433,6 +594,7 @@ export default function DashboardApp() {
                   onClose={() => setSelectedConv(null)}
                   onDelete={() => deleteConversation(selectedConv.id)}
                   onArchive={() => toggleArchive(selectedConv)}
+                  onOpen={() => markOpened([selectedConv.id])}
                   onRemoveTag={(tagId) => removeTagFromConv(selectedConv, tagId)}
                   onAddTag={(tagId) => addTagToConv(selectedConv, tagId)}
                   onStartDelete={() => { setDeleteConfirm(selectedConv.id); setDeleteConfirm2(false); }}
@@ -526,6 +688,7 @@ interface ConvDetailProps {
   onClose: () => void;
   onDelete: () => void;
   onArchive: () => void;
+  onOpen: () => void;
   onRemoveTag: (tagId: string) => void;
   onAddTag: (tagId: string) => void;
   onStartDelete: () => void;
@@ -533,7 +696,7 @@ interface ConvDetailProps {
   onCancelDelete: () => void;
 }
 
-function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose, onDelete, onArchive, onRemoveTag, onAddTag, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
+function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
   const availableTags = tags.filter((t) => !conv.tags.includes(t.id));
   const [addingTag, setAddingTag] = useState(false);
 
@@ -545,6 +708,7 @@ function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose,
           <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>{conv.participantName || 'Unknown'}</h2>
           <div style={{ fontSize: 12, color: '#aaa', marginTop: 4 }}>
             Last activity: {conv.updatedAt ? formatRelativeTime(conv.updatedAt) : 'unknown'}
+            {conv.lastOpenedAt ? ` · Last opened: ${formatRelativeTime(conv.lastOpenedAt)}` : ''}
           </div>
         </div>
         <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 20, color: '#aaa', lineHeight: 1 }}>×</button>
@@ -557,6 +721,7 @@ function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose,
             href={conv.chatUrl}
             target="_blank"
             rel="noreferrer"
+            onClick={onOpen}
             style={{ background: '#065fd4', color: '#fff', padding: '8px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 6 }}
           >
             Open Chat ↗
