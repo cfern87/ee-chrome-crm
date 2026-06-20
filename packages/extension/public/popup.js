@@ -2,6 +2,11 @@
 
 let currentStore = {};
 
+// Open dashboard in a new tab
+document.getElementById('openDashboardBtn').addEventListener('click', () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL('dashboard.html') });
+});
+
 // Tab navigation
 document.querySelectorAll('.nav-tab').forEach(tab => {
   tab.addEventListener('click', (e) => {

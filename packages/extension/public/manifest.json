@@ -15,6 +15,7 @@
     "default_popup": "popup.html",
     "default_title": "Facebook CRM"
   },
+  "options_page": "dashboard.html",
   "background": {
     "service_worker": "background.js"
   },
