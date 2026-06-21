@@ -180,11 +180,19 @@ async function ensureConversation(threadId: string, link?: HTMLAnchorElement): P
 // ---- Sidebar tag injection ----
 
 let sidebarDebounce: number | null = null;
+let lastInjectAt = 0;
+let lastLoggedLinkCount = -1;
 
 async function injectSidebarTags() {
+  lastInjectAt = Date.now();
   const store = await getStore();
   const links = document.querySelectorAll<HTMLAnchorElement>('a[href*="/t/"]');
-  console.log(`[CRM] Sidebar injection: found ${links.length} conversation links`);
+  // Only log when the link count changes, to avoid spamming the console
+  // (this now runs on a periodic safety interval as well).
+  if (links.length !== lastLoggedLinkCount) {
+    lastLoggedLinkCount = links.length;
+    console.log(`[CRM] Sidebar injection: found ${links.length} conversation links`);
+  }
 
   links.forEach(link => {
     const threadId = extractThreadId(link.href);
@@ -218,9 +226,20 @@ async function injectSidebarTags() {
   });
 }
 
+// Throttle (not a pure debounce). Facebook mutates the DOM constantly —
+// presence dots, typing indicators, virtualized scrolling — so a debounce
+// that resets on every mutation can be starved indefinitely and never fire.
+// This guarantees injection runs at least once every MIN_GAP ms while
+// mutations keep coming, while still coalescing bursts.
 function scheduleSidebarInject() {
+  const MIN_GAP = 500;
   if (sidebarDebounce !== null) clearTimeout(sidebarDebounce);
-  sidebarDebounce = window.setTimeout(injectSidebarTags, 350);
+  const sinceLast = Date.now() - lastInjectAt;
+  if (sinceLast >= MIN_GAP) {
+    injectSidebarTags();
+  } else {
+    sidebarDebounce = window.setTimeout(injectSidebarTags, MIN_GAP - sinceLast);
+  }
 }
 
 // ---- MutationObserver ----
@@ -527,8 +546,30 @@ function init() {
   buildLauncher();
   startSidebarObserver();
   watchNavigation();
-  // Give the page a moment to render the sidebar before our first injection
+
+  // First injection once the sidebar has had a moment to render.
   setTimeout(injectSidebarTags, 1500);
+
+  // Safety net: re-run injection periodically. Facebook lazy-loads
+  // conversations via AJAX as you scroll, and the MutationObserver can miss
+  // bursts on a constantly-mutating page. Injection is idempotent and cheap
+  // (it reuses existing chip containers), so polling every 2s is safe.
+  setInterval(injectSidebarTags, 2000);
+
+  // Re-inject on scroll too, so freshly lazy-loaded rows get chips immediately
+  // rather than waiting for the next interval tick. Capture phase catches
+  // scrolls inside Facebook's inner scroll containers.
+  let scrollThrottle = 0;
+  document.addEventListener(
+    'scroll',
+    () => {
+      const now = Date.now();
+      if (now - scrollThrottle < 300) return;
+      scrollThrottle = now;
+      scheduleSidebarInject();
+    },
+    true
+  );
 }
 
 if (document.readyState === 'loading') {
