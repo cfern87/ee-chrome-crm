@@ -4,7 +4,7 @@
   "description": "Chrome extension for Facebook Messenger CRM",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "node build.mjs",
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
