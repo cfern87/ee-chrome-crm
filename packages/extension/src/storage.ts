@@ -30,6 +30,7 @@ export interface Conversation {
   createdAt: number;
   updatedAt: number;
   lastOpenedAt?: number;
+  lastContactedAt?: number;
 }
 
 export interface Store {

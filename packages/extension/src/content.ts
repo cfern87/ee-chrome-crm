@@ -27,6 +27,18 @@ function genId(): string { return Date.now().toString(36) + Math.random().toStri
 function randomColor(): string { return COLORS[Math.floor(Math.random() * COLORS.length)]; }
 function escapeHtml(s: string): string { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function extractThreadId(href: string): string | null { const m = href.match(THREAD_RE); return m ? m[1] : null; }
+function formatRelative(ts?: number): string {
+  if (!ts) return 'never';
+  const diff = Date.now() - ts;
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}d ago`;
+  return new Date(ts).toLocaleDateString();
+}
 function getActiveThreadId(): string | null { return extractThreadId(window.location.pathname); }
 
 function getActiveThreadName(): string {
@@ -439,6 +451,7 @@ async function renderPanel() {
         <div class="fb-crm-name">${escapeHtml(conv.participantName)}</div>
         <button class="fb-crm-name-edit" title="Edit name">✎</button>
       </div>
+      <div class="fb-crm-meta">📨 Last contacted: <strong>${formatRelative(conv.lastContactedAt)}</strong></div>
       <button class="fb-crm-pick-btn">🎯 Select different conversation</button>
 
       <div class="fb-crm-section-title">Tags on this conversation</div>
@@ -549,6 +562,124 @@ function wirePanelActions(threadId: string) {
   });
 }
 
+// ---- Last-contacted tracking ----
+//
+// We record `lastContactedAt` when the user SENDS a message to a contact that
+// is already saved in the CRM. We detect the send *action* (Enter on the
+// composer, or a click on the Send button) rather than trying to parse message
+// bubbles out of Facebook's obfuscated DOM — that makes it reliable.
+//
+// Safety gates (so we never record garbage):
+//   1. The target must be the message composer (a contenteditable textbox),
+//      which excludes the search <input>.
+//   2. The composer must contain actual text at send time.
+//   3. We must resolve the thread id with confidence (URL on /messages pages,
+//      or an unambiguous single-thread popup container on regular FB pages).
+//   4. The thread must already exist as a saved conversation — we never
+//      auto-create a contact just because a message was sent.
+
+// Is this element the Messenger message composer (not the search box)?
+function isMessageComposer(el: Element | null): el is HTMLElement {
+  if (!el) return false;
+  const node = el as HTMLElement;
+  // The composer is a contenteditable div with role="textbox". The sidebar
+  // search is a plain <input>, which is never contentEditable, so this check
+  // cleanly excludes it.
+  if (!node.isContentEditable) return false;
+  const role = node.getAttribute('role');
+  if (role && role !== 'textbox') return false;
+  return true;
+}
+
+// Resolve which saved thread a composer belongs to, with confidence.
+// Returns null when we can't be sure (so the caller does nothing).
+function resolveSendThreadId(composer: Element): string | null {
+  // Primary: the open conversation from the URL. On /messages/t/<id> the
+  // composer you type in *is* this conversation. Fully reliable.
+  const urlId = getActiveThreadId();
+  if (urlId) return urlId;
+
+  // Popup case (regular FB page, chat bubble): no thread id in the URL.
+  // Walk up from the composer looking for a self-contained container that
+  // references EXACTLY ONE thread id. If a subtree references many distinct
+  // ids (e.g. we've climbed up to the whole-page sidebar), it's ambiguous —
+  // bail rather than guess.
+  let el: Element | null = composer;
+  for (let i = 0; i < 15 && el; i++) {
+    const links = el.querySelectorAll<HTMLAnchorElement>('a[href*="/t/"]');
+    if (links.length > 0) {
+      const ids = new Set<string>();
+      links.forEach(l => { const id = extractThreadId(l.href); if (id) ids.add(id); });
+      if (ids.size === 1) return [...ids][0]; // unambiguous → confident
+      if (ids.size > 1) return null;          // too broad → bail
+    }
+    el = el.parentElement;
+  }
+  return null;
+}
+
+// Stamp lastContactedAt — but only for an already-saved contact.
+async function markContacted(threadId: string): Promise<void> {
+  const store = await getStore();
+  const conv = store.conversations[threadId];
+  if (!conv) return; // saved contacts only — never auto-create on send
+  const now = Date.now();
+  // Coalesce rapid repeat sends so we don't write on every keystroke-send burst
+  if (conv.lastContactedAt && now - conv.lastContactedAt < 1500) return;
+  conv.lastContactedAt = now;
+  conv.updatedAt = now;
+  await saveStore(store);
+  console.log('[CRM] Recorded lastContacted for', conv.participantName || threadId);
+  if (panelEl && panelEl.style.display !== 'none') renderPanel();
+}
+
+// Given a send originating from `composer`, record contact if everything checks
+// out. Guards: composer is the real composer, it has text, and the thread is a
+// confidently-resolved saved contact.
+function handleSendFrom(composer: Element | null): void {
+  if (!isMessageComposer(composer)) return;
+  const text = (composer as HTMLElement).textContent?.trim() || '';
+  if (text.length === 0) return; // empty composer doesn't send a message
+  const threadId = resolveSendThreadId(composer);
+  if (!threadId) return;
+  markContacted(threadId).catch(() => { /* storage hiccup — ignore */ });
+}
+
+function watchOutgoingMessages() {
+  // Enter (without Shift) in the composer sends the message. Capture phase so
+  // we see it before Facebook's own handlers clear the composer.
+  document.addEventListener(
+    'keydown',
+    (e: KeyboardEvent) => {
+      if (e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
+      handleSendFrom(e.target as Element);
+    },
+    true
+  );
+
+  // Send button click (covers cases where the user clicks the paper-plane
+  // instead of pressing Enter). The button lives next to the composer; find the
+  // composer within the same conversation form/container.
+  document.addEventListener(
+    'click',
+    (e: MouseEvent) => {
+      const target = e.target as Element;
+      const btn = target.closest?.('[aria-label]');
+      if (!btn) return;
+      const label = btn.getAttribute('aria-label') || '';
+      if (!/send/i.test(label)) return;
+      // Find the composer nearest this send button.
+      let container: Element | null = btn;
+      for (let i = 0; i < 12 && container; i++) {
+        const composer = container.querySelector<HTMLElement>('[contenteditable="true"][role="textbox"], [contenteditable="true"]');
+        if (composer && isMessageComposer(composer)) { handleSendFrom(composer); return; }
+        container = container.parentElement;
+      }
+    },
+    true
+  );
+}
+
 // ---- Page detection ----
 
 // The content script now loads on ALL of facebook.com (so it survives SPA
@@ -608,6 +739,7 @@ function init() {
 
   startSidebarObserver();
   watchNavigation();
+  watchOutgoingMessages();
 
   if (isMessagesPage()) {
     console.log('[CRM] On Messenger page, building launcher...');

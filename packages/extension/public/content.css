@@ -119,6 +119,13 @@
   color: #065fd4;
 }
 
+.fb-crm-meta {
+  font-size: 12px;
+  color: #65676b;
+  margin: 0 0 10px;
+}
+.fb-crm-meta strong { color: #1c1e21; font-weight: 600; }
+
 .fb-crm-pick-btn {
   display: block;
   width: 100%;

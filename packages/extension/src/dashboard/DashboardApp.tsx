@@ -15,7 +15,7 @@ function formatRelativeTime(ts: number): string {
 
 type Tab = 'conversations' | 'tags' | 'settings';
 type DateFilter = 'all' | 'today' | 'week' | 'month';
-type SortBy = 'recent' | 'lastOpened' | 'dateAdded' | 'tagCount' | 'name';
+type SortBy = 'recent' | 'lastContacted' | 'lastOpened' | 'dateAdded' | 'tagCount' | 'name';
 
 export default function DashboardApp() {
   const [store, setStore] = useState<Store>(EMPTY_STORE);
@@ -97,6 +97,8 @@ export default function DashboardApp() {
   const dir = sortDir === 'asc' ? 1 : -1;
   filtered.sort((a, b) => {
     switch (sortBy) {
+      case 'lastContacted':
+        return dir * ((a.lastContactedAt || 0) - (b.lastContactedAt || 0));
       case 'lastOpened':
         return dir * ((a.lastOpenedAt || 0) - (b.lastOpenedAt || 0));
       case 'dateAdded':
@@ -360,6 +362,7 @@ export default function DashboardApp() {
                   style={{ flex: 1, padding: '6px 8px', border: '1px solid #d0d0d0', borderRadius: 6, fontSize: 12, cursor: 'pointer', background: '#fff' }}
                 >
                   <option value="recent">Recent activity</option>
+                  <option value="lastContacted">Last contacted</option>
                   <option value="lastOpened">Last opened</option>
                   <option value="dateAdded">Date added</option>
                   <option value="tagCount">Number of tags</option>
@@ -708,6 +711,7 @@ function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose,
           <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>{conv.participantName || 'Unknown'}</h2>
           <div style={{ fontSize: 12, color: '#aaa', marginTop: 4 }}>
             Last activity: {conv.updatedAt ? formatRelativeTime(conv.updatedAt) : 'unknown'}
+            {conv.lastContactedAt ? ` · 📨 Last contacted: ${formatRelativeTime(conv.lastContactedAt)}` : ''}
             {conv.lastOpenedAt ? ` · Last opened: ${formatRelativeTime(conv.lastOpenedAt)}` : ''}
           </div>
         </div>
