@@ -356,3 +356,40 @@ export async function saveStore(store: Store): Promise<void> {
   await syncWriteDelta(store);
   await Promise.all([chromeLocalSet(store), idbSet(store)]);
 }
+
+export interface SyncUsage {
+  available: boolean;     // is chrome.storage.sync usable
+  bytesInUse: number;     // bytes currently used
+  quotaBytes: number;     // total byte quota (≈102400)
+  itemCount: number;      // number of synced items (shards)
+  maxItems: number;       // item quota (≈512)
+}
+
+const SYNC_QUOTA_BYTES = 102400; // chrome.storage.sync.QUOTA_BYTES
+const SYNC_MAX_ITEMS = 512;      // chrome.storage.sync.MAX_ITEMS
+
+/**
+ * Report how much of the chrome.storage.sync quota is in use, for a usage
+ * meter in the dashboard. Counts only our CRM shard items/bytes.
+ */
+export async function getSyncUsage(): Promise<SyncUsage> {
+  const quotaBytes = (chrome?.storage?.sync as { QUOTA_BYTES?: number })?.QUOTA_BYTES || SYNC_QUOTA_BYTES;
+  const maxItems = (chrome?.storage?.sync as { MAX_ITEMS?: number })?.MAX_ITEMS || SYNC_MAX_ITEMS;
+  const base: SyncUsage = { available: false, bytesInUse: 0, quotaBytes, itemCount: 0, maxItems };
+  if (!syncAvailable()) return base;
+
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.sync.get(null, (items) => {
+        if (!isExtensionAlive() || chrome.runtime.lastError || !items) { resolve(base); return; }
+        const crmKeys = Object.keys(items).filter(isCrmSyncKey);
+        chrome.storage.sync.getBytesInUse(crmKeys, (bytes) => {
+          if (chrome.runtime.lastError) { resolve({ ...base, available: true, itemCount: crmKeys.length }); return; }
+          resolve({ available: true, bytesInUse: bytes || 0, quotaBytes, itemCount: crmKeys.length, maxItems });
+        });
+      });
+    } catch {
+      resolve(base);
+    }
+  });
+}
