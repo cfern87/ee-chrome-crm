@@ -354,20 +354,43 @@ let lastRenderedThread: string | null = null;
 let editingName: string | null = null;
 
 function buildLauncher() {
-  if (document.getElementById('fb-crm-launcher')) return;
+  const existing = document.getElementById('fb-crm-launcher');
+  if (existing) {
+    console.log('[CRM] buildLauncher: launcher already exists, skipping');
+    return;
+  }
 
-  const btn = document.createElement('button');
-  btn.id = 'fb-crm-launcher';
-  btn.textContent = '🏷️ CRM';
-  btn.title = 'Messenger CRM';
-  btn.addEventListener('click', togglePanel);
-  document.body.appendChild(btn);
+  console.log('[CRM] buildLauncher: creating launcher button...');
+  try {
+    const btn = document.createElement('button');
+    btn.id = 'fb-crm-launcher';
+    btn.textContent = '🏷️ CRM';
+    btn.title = 'Messenger CRM';
+    btn.addEventListener('click', togglePanel);
 
-  const panel = document.createElement('div');
-  panel.id = 'fb-crm-panel';
-  panel.style.display = 'none';
-  document.body.appendChild(panel);
-  panelEl = panel;
+    console.log('[CRM] Appending button to document.body (body exists?', !!document.body, ')');
+    document.body.appendChild(btn);
+
+    const verifyBtn = document.getElementById('fb-crm-launcher');
+    console.log('[CRM] Button created and appended, verification:', !!verifyBtn);
+    if (!verifyBtn) {
+      console.error('[CRM] Button exists in memory but not in DOM!');
+    }
+
+    const panel = document.createElement('div');
+    panel.id = 'fb-crm-panel';
+    panel.style.display = 'none';
+    console.log('[CRM] Appending panel to document.body');
+    document.body.appendChild(panel);
+
+    const verifyPanel = document.getElementById('fb-crm-panel');
+    console.log('[CRM] Panel created and appended, verification:', !!verifyPanel);
+
+    panelEl = panel;
+    console.log('[CRM] buildLauncher complete, panelEl set');
+  } catch (e) {
+    console.error('[CRM] buildLauncher error:', e);
+  }
 }
 
 async function togglePanel() {
@@ -532,8 +555,11 @@ function wirePanelActions(threadId: string) {
 // navigation from the homepage into Messenger, which would otherwise never
 // inject the script). We only show the CRM UI on the Messenger pages.
 function isMessagesPage(): boolean {
-  if (window.location.hostname.includes('messenger.com')) return true;
-  return /^\/messages(\/|$)/.test(window.location.pathname);
+  const isMessengerDomain = window.location.hostname.includes('messenger.com');
+  const isMessagesPath = /^\/messages(\/|$)/.test(window.location.pathname);
+  const result = isMessengerDomain || isMessagesPath;
+  console.log('[CRM] isMessagesPage() -> hostname includes messenger.com?', isMessengerDomain, ', pathname matches /messages/?', isMessagesPath, ', result:', result);
+  return result;
 }
 
 function removeLauncher() {
@@ -546,20 +572,25 @@ function removeLauncher() {
 
 function watchNavigation() {
   let lastPath = window.location.pathname;
+  console.log('[CRM] watchNavigation started, initial path:', lastPath);
   setInterval(() => {
     const path = window.location.pathname;
     if (path !== lastPath) {
+      console.log('[CRM] Navigation detected: ', lastPath, ' -> ', path);
       lastPath = path;
       // Entering Messenger from elsewhere in the SPA: build the UI.
       // Leaving Messenger: tear it down so it doesn't linger on other pages.
       if (isMessagesPage()) {
+        console.log('[CRM] Navigated to Messenger page, building launcher');
         buildLauncher();
         scheduleSidebarInject();
       } else {
+        console.log('[CRM] Navigated away from Messenger page, removing launcher');
         removeLauncher();
       }
       const newThreadId = getActiveThreadId();
       if (newThreadId && panelEl && panelEl.style.display !== 'none') {
+        console.log('[CRM] Active thread changed to:', newThreadId, ', re-rendering panel');
         currentPanelThreadId = newThreadId;
         renderPanel();
       }
@@ -570,13 +601,22 @@ function watchNavigation() {
 // ---- Init ----
 
 function init() {
+  console.log('[CRM] Script initializing...');
+  console.log('[CRM] document.readyState:', document.readyState);
+  console.log('[CRM] Current URL:', window.location.href);
+  console.log('[CRM] isMessagesPage():', isMessagesPage());
+
   startSidebarObserver();
   watchNavigation();
 
   if (isMessagesPage()) {
+    console.log('[CRM] On Messenger page, building launcher...');
     buildLauncher();
+    console.log('[CRM] Launcher button element:', document.getElementById('fb-crm-launcher'));
     // First injection once the sidebar has had a moment to render.
     setTimeout(injectSidebarTags, 1500);
+  } else {
+    console.log('[CRM] NOT on Messenger page, skipping launcher');
   }
 
   // Safety net: every 2s, if we're on a Messenger page, make sure the launcher
@@ -585,9 +625,17 @@ function init() {
   // MutationObserver can miss bursts on a constantly-mutating page. Both
   // operations are idempotent and cheap.
   setInterval(() => {
-    if (!isMessagesPage()) return;
+    const isMsg = isMessagesPage();
+    if (!isMsg) return;
+    console.log('[CRM] Safety interval: checking launcher... exists?', !!document.getElementById('fb-crm-launcher'));
     buildLauncher();        // no-op if it already exists; self-heals if removed
-    injectSidebarTags();
+    const exists = document.getElementById('fb-crm-launcher');
+    if (exists) {
+      console.log('[CRM] Launcher exists, injecting tags...');
+      injectSidebarTags();
+    } else {
+      console.warn('[CRM] Launcher button not found after buildLauncher() call!');
+    }
   }, 2000);
 
   // Re-inject on scroll too, so freshly lazy-loaded rows get chips immediately
@@ -607,8 +655,11 @@ function init() {
   );
 }
 
+console.log('[CRM] Content script loaded, document.readyState:', document.readyState);
 if (document.readyState === 'loading') {
+  console.log('[CRM] Waiting for DOMContentLoaded...');
   document.addEventListener('DOMContentLoaded', init);
 } else {
+  console.log('[CRM] Document already loaded, running init immediately');
   init();
 }
