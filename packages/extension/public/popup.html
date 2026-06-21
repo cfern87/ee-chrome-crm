@@ -269,6 +269,10 @@
 
   <div class="content">
     <div class="tab-content active" id="conversations">
+      <input type="text" id="convSearch" placeholder="Search conversations..."
+        style="width:100%;padding:8px 12px;border:1px solid #e0e0e0;border-radius:6px;font-size:13px;margin-bottom:10px;box-sizing:border-box;" />
+      <div id="convTagFilters" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;"></div>
+      <div style="font-size:11px;color:#999;margin-bottom:8px;" id="convHint">Click a conversation to open their chat in a new tab.</div>
       <div class="conversation-list" id="conversationList">
         <div class="empty-state">No conversations yet. Open Messenger to load them.</div>
       </div>

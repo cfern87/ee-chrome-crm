@@ -246,6 +246,8 @@ function scheduleSidebarInject() {
 
 function startSidebarObserver() {
   const obs = new MutationObserver(mutations => {
+    // Script now runs on all of facebook.com; only do work on Messenger pages.
+    if (!isMessagesPage()) return;
     // Only react to mutations that don't originate from our own injections
     const ours = mutations.every(m =>
       m.addedNodes.length > 0 &&
@@ -524,37 +526,69 @@ function wirePanelActions(threadId: string) {
   });
 }
 
+// ---- Page detection ----
+
+// The content script now loads on ALL of facebook.com (so it survives SPA
+// navigation from the homepage into Messenger, which would otherwise never
+// inject the script). We only show the CRM UI on the Messenger pages.
+function isMessagesPage(): boolean {
+  if (window.location.hostname.includes('messenger.com')) return true;
+  return /^\/messages(\/|$)/.test(window.location.pathname);
+}
+
+function removeLauncher() {
+  document.getElementById('fb-crm-launcher')?.remove();
+  document.getElementById('fb-crm-panel')?.remove();
+  panelEl = null;
+}
+
 // ---- Navigation watcher (SPA) ----
 
 function watchNavigation() {
   let lastPath = window.location.pathname;
   setInterval(() => {
     const path = window.location.pathname;
-    if (path === lastPath) return;
-    lastPath = path;
-    const newThreadId = getActiveThreadId();
-    if (newThreadId && panelEl && panelEl.style.display !== 'none') {
-      currentPanelThreadId = newThreadId;
-      renderPanel();
+    if (path !== lastPath) {
+      lastPath = path;
+      // Entering Messenger from elsewhere in the SPA: build the UI.
+      // Leaving Messenger: tear it down so it doesn't linger on other pages.
+      if (isMessagesPage()) {
+        buildLauncher();
+        scheduleSidebarInject();
+      } else {
+        removeLauncher();
+      }
+      const newThreadId = getActiveThreadId();
+      if (newThreadId && panelEl && panelEl.style.display !== 'none') {
+        currentPanelThreadId = newThreadId;
+        renderPanel();
+      }
     }
-  }, 1000);
+  }, 800);
 }
 
 // ---- Init ----
 
 function init() {
-  buildLauncher();
   startSidebarObserver();
   watchNavigation();
 
-  // First injection once the sidebar has had a moment to render.
-  setTimeout(injectSidebarTags, 1500);
+  if (isMessagesPage()) {
+    buildLauncher();
+    // First injection once the sidebar has had a moment to render.
+    setTimeout(injectSidebarTags, 1500);
+  }
 
-  // Safety net: re-run injection periodically. Facebook lazy-loads
-  // conversations via AJAX as you scroll, and the MutationObserver can miss
-  // bursts on a constantly-mutating page. Injection is idempotent and cheap
-  // (it reuses existing chip containers), so polling every 2s is safe.
-  setInterval(injectSidebarTags, 2000);
+  // Safety net: every 2s, if we're on a Messenger page, make sure the launcher
+  // still exists (Facebook's React re-renders can remove our nodes) and re-run
+  // injection. Facebook lazy-loads conversations via AJAX as you scroll and the
+  // MutationObserver can miss bursts on a constantly-mutating page. Both
+  // operations are idempotent and cheap.
+  setInterval(() => {
+    if (!isMessagesPage()) return;
+    buildLauncher();        // no-op if it already exists; self-heals if removed
+    injectSidebarTags();
+  }, 2000);
 
   // Re-inject on scroll too, so freshly lazy-loaded rows get chips immediately
   // rather than waiting for the next interval tick. Capture phase catches
@@ -563,6 +597,7 @@ function init() {
   document.addEventListener(
     'scroll',
     () => {
+      if (!isMessagesPage()) return;
       const now = Date.now();
       if (now - scrollThrottle < 300) return;
       scrollThrottle = now;

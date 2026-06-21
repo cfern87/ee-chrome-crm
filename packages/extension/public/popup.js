@@ -21,34 +21,99 @@ document.querySelectorAll('.nav-tab').forEach(tab => {
   });
 });
 
+// Conversation filter state
+let convSearch = '';
+let convFilterTag = null;
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+
 // Load conversations
 function loadConversations() {
   chrome.runtime.sendMessage({ type: 'GET_STORE' }, (store) => {
     currentStore = store;
-    const conversationList = document.getElementById('conversationList');
-    const conversations = Object.values(store.conversations || {});
+    renderConversations();
+    renderConvTagFilters();
+  });
+}
 
-    if (conversations.length === 0) {
-      conversationList.innerHTML = '<div class="empty-state">No conversations yet. Open Messenger to load them.</div>';
-      return;
-    }
+function renderConvTagFilters() {
+  const container = document.getElementById('convTagFilters');
+  if (!container) return;
+  const tags = Object.values(currentStore.tags || {});
+  if (tags.length === 0) { container.innerHTML = ''; return; }
 
-    conversationList.innerHTML = conversations.map(conv => {
-      const tags = conv.tags.map(tagId => {
-        const tag = store.tags[tagId];
-        return tag ? `<span style="background: ${tag.color}; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px;">${tag.name}</span>` : '';
-      }).join('');
+  const chip = (label, active, color, tagVal) =>
+    `<button class="conv-tag-filter" data-tag="${tagVal}"
+      style="padding:4px 10px;border-radius:12px;border:${color ? 'none' : '1px solid #ccc'};
+      background:${active ? (color || '#065fd4') : (color ? color + '33' : '#fff')};
+      color:${active ? '#fff' : (color || '#666')};font-size:12px;cursor:pointer;font-weight:600;">${escapeHtml(label)}</button>`;
 
-      return `
-        <div class="conversation-item">
-          <div class="conversation-name">${conv.participantName}</div>
-          <div class="conversation-message">${conv.lastMessage}</div>
-          <div style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 4px;">
-            ${tags}
-          </div>
-        </div>
-      `;
+  container.innerHTML =
+    chip('All', convFilterTag === null, null, '__all__') +
+    tags.map(t => chip(t.name, convFilterTag === t.id, t.color, t.id)).join('');
+
+  container.querySelectorAll('.conv-tag-filter').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tag = btn.getAttribute('data-tag');
+      convFilterTag = tag === '__all__' ? null : (convFilterTag === tag ? null : tag);
+      renderConversations();
+      renderConvTagFilters();
+    });
+  });
+}
+
+function renderConversations() {
+  const store = currentStore;
+  const conversationList = document.getElementById('conversationList');
+  let conversations = Object.values(store.conversations || {});
+
+  // Apply filters
+  const q = convSearch.trim().toLowerCase();
+  conversations = conversations.filter(conv => {
+    const matchesSearch = !q ||
+      (conv.participantName || '').toLowerCase().includes(q) ||
+      (conv.lastMessage || '').toLowerCase().includes(q);
+    const matchesTag = !convFilterTag || (conv.tags || []).includes(convFilterTag);
+    return matchesSearch && matchesTag && !conv.archived;
+  });
+  conversations.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+  if (conversations.length === 0) {
+    conversationList.innerHTML = '<div class="empty-state">No conversations match your filters.</div>';
+    return;
+  }
+
+  conversationList.innerHTML = conversations.map(conv => {
+    const tags = (conv.tags || []).map(tagId => {
+      const tag = store.tags[tagId];
+      return tag ? `<span style="background: ${tag.color}; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px;">${escapeHtml(tag.name)}</span>` : '';
     }).join('');
+
+    const hasUrl = !!conv.chatUrl;
+    return `
+      <div class="conversation-item" data-conv-id="${escapeHtml(conv.id)}" title="${hasUrl ? 'Open chat in new tab' : 'No saved chat URL for this contact'}" style="${hasUrl ? '' : 'opacity:0.7;'}">
+        <div class="conversation-name">${escapeHtml(conv.participantName)} ${hasUrl ? '<span style="font-size:11px;color:#065fd4;">↗</span>' : ''}</div>
+        <div class="conversation-message">${escapeHtml(conv.lastMessage)}</div>
+        <div style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 4px;">
+          ${tags}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  // Click to open chat in a new tab
+  conversationList.querySelectorAll('[data-conv-id]').forEach(item => {
+    item.addEventListener('click', () => {
+      const id = item.getAttribute('data-conv-id');
+      const conv = store.conversations[id];
+      if (conv && conv.chatUrl) {
+        chrome.tabs.create({ url: conv.chatUrl });
+      }
+    });
   });
 }
 
@@ -173,12 +238,21 @@ function loadSettings() {
   });
 }
 
+// Search box
+const convSearchInput = document.getElementById('convSearch');
+if (convSearchInput) {
+  convSearchInput.addEventListener('input', (e) => {
+    convSearch = e.target.value;
+    renderConversations();
+  });
+}
+
 // Initialize
 loadConversations();
 loadTags();
 loadSettings();
 
-// Refresh every 5 seconds
+// Refresh every 5 seconds (re-render preserves current filters)
 setInterval(() => {
   loadConversations();
 }, 5000);
