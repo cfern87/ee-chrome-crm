@@ -935,7 +935,7 @@ function SettingsPanel({ store, updateStore, conversations, tags }: SettingsPane
           </button>
         </div>
         <div style={{ marginTop: 12, fontSize: 12, color: '#aaa' }}>
-          {conversations.length} conversations, {tags.length} tags stored in chrome.storage.local
+          {conversations.length} conversations, {tags.length} tags · synced across your devices via chrome.storage.sync
         </div>
       </div>
     </div>

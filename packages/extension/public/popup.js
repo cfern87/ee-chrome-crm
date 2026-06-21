@@ -174,21 +174,23 @@ document.getElementById('addTagBtn').addEventListener('click', () => {
   });
 });
 
-// Settings
-document.getElementById('autoTagging').addEventListener('change', (e) => {
-  chrome.storage.local.get('facebook_crm_store', (result) => {
-    const store = result.facebook_crm_store || { conversations: {}, tags: {}, notes: {}, settings: {} };
-    store.settings.autoTagging = e.target.checked;
-    chrome.storage.local.set({ facebook_crm_store: store });
+// Settings — route writes through the background so they shard into
+// chrome.storage.sync (cross-machine) like everything else.
+function updateSetting(key, value) {
+  chrome.runtime.sendMessage({ type: 'GET_STORE' }, (store) => {
+    const next = store || { conversations: {}, tags: {}, notes: {}, settings: {} };
+    next.settings = next.settings || {};
+    next.settings[key] = value;
+    chrome.runtime.sendMessage({ type: 'SET_STORE', payload: next });
   });
+}
+
+document.getElementById('autoTagging').addEventListener('change', (e) => {
+  updateSetting('autoTagging', e.target.checked);
 });
 
 document.getElementById('notifications').addEventListener('change', (e) => {
-  chrome.storage.local.get('facebook_crm_store', (result) => {
-    const store = result.facebook_crm_store || { conversations: {}, tags: {}, notes: {}, settings: {} };
-    store.settings.notificationEnabled = e.target.checked;
-    chrome.storage.local.set({ facebook_crm_store: store });
-  });
+  updateSetting('notificationEnabled', e.target.checked);
 });
 
 // Export data
@@ -216,7 +218,8 @@ document.getElementById('importBtn').addEventListener('click', () => {
     reader.onload = (event) => {
       try {
         const data = JSON.parse(event.target.result);
-        chrome.storage.local.set({ facebook_crm_store: data }, () => {
+        // Route through background so the import shards into chrome.storage.sync.
+        chrome.runtime.sendMessage({ type: 'SET_STORE', payload: data }, () => {
           alert('Data imported successfully!');
           loadConversations();
           loadTags();

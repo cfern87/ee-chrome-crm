@@ -1,84 +1,82 @@
-// Service Worker for Facebook CRM Extension
+// Service Worker for Facebook CRM Extension.
+//
+// All reads/writes go through the shared storage module so that popup-driven
+// changes are sharded into chrome.storage.sync (cross-machine) just like the
+// content script and dashboard.
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.type === 'GET_CONVERSATIONS') {
-    handleGetConversations(sendResponse);
-  } else if (request.type === 'ADD_CONVERSATION') {
-    handleAddConversation(request.payload, sendResponse);
-  } else if (request.type === 'UPDATE_CONVERSATION') {
-    handleUpdateConversation(request.payload, sendResponse);
-  } else if (request.type === 'ADD_TAG') {
-    handleAddTag(request.payload, sendResponse);
-  } else if (request.type === 'DELETE_TAG') {
-    handleDeleteTag(request.payload, sendResponse);
-  } else if (request.type === 'GET_STORE') {
-    handleGetStore(sendResponse);
-  }
+import { loadStore, saveStore } from './storage';
+import type { Store } from './storage';
+
+chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  (async () => {
+    try {
+      switch (request.type) {
+        case 'GET_CONVERSATIONS': {
+          const store = await loadStore();
+          sendResponse({ conversations: Object.values(store.conversations) });
+          break;
+        }
+        case 'ADD_CONVERSATION': {
+          const store = await loadStore();
+          store.conversations[request.payload.id] = request.payload;
+          await saveStore(store);
+          sendResponse({ success: true });
+          break;
+        }
+        case 'UPDATE_CONVERSATION': {
+          const store = await loadStore();
+          const existing = store.conversations[request.payload.id];
+          if (existing) {
+            store.conversations[request.payload.id] = {
+              ...existing,
+              ...request.payload.updates,
+              updatedAt: Date.now(),
+            };
+            await saveStore(store);
+            sendResponse({ success: true });
+          } else {
+            sendResponse({ success: false, error: 'Conversation not found' });
+          }
+          break;
+        }
+        case 'ADD_TAG': {
+          const store = await loadStore();
+          store.tags[request.payload.id] = request.payload;
+          await saveStore(store);
+          sendResponse({ success: true });
+          break;
+        }
+        case 'DELETE_TAG': {
+          const store = await loadStore();
+          delete store.tags[request.payload.tagId];
+          for (const convId of Object.keys(store.conversations)) {
+            store.conversations[convId].tags =
+              store.conversations[convId].tags.filter((t) => t !== request.payload.tagId);
+          }
+          await saveStore(store);
+          sendResponse({ success: true });
+          break;
+        }
+        case 'GET_STORE': {
+          const store = await loadStore();
+          sendResponse(store);
+          break;
+        }
+        case 'SET_STORE': {
+          // Full-store write (used by popup settings + import).
+          await saveStore(request.payload as Store);
+          sendResponse({ success: true });
+          break;
+        }
+        default:
+          sendResponse({ success: false, error: 'Unknown message type' });
+      }
+    } catch (e) {
+      console.warn('[CRM] background handler error:', e);
+      try { sendResponse({ success: false, error: String(e) }); } catch { /* channel closed */ }
+    }
+  })();
+
+  // Keep the message channel open for the async response.
   return true;
 });
-
-function handleGetConversations(sendResponse: Function) {
-  chrome.storage.local.get('facebook_crm_store', (result) => {
-    const store = result.facebook_crm_store || { conversations: {} };
-    sendResponse({ conversations: Object.values(store.conversations) });
-  });
-}
-
-function handleAddConversation(payload: any, sendResponse: Function) {
-  chrome.storage.local.get('facebook_crm_store', (result) => {
-    const store = result.facebook_crm_store || { conversations: {}, tags: {}, notes: {}, settings: {} };
-    store.conversations[payload.id] = payload;
-    chrome.storage.local.set({ facebook_crm_store: store }, () => {
-      sendResponse({ success: true });
-    });
-  });
-}
-
-function handleUpdateConversation(payload: any, sendResponse: Function) {
-  chrome.storage.local.get('facebook_crm_store', (result) => {
-    const store = result.facebook_crm_store || { conversations: {}, tags: {}, notes: {}, settings: {} };
-    if (store.conversations[payload.id]) {
-      store.conversations[payload.id] = {
-        ...store.conversations[payload.id],
-        ...payload.updates,
-        updatedAt: Date.now()
-      };
-      chrome.storage.local.set({ facebook_crm_store: store }, () => {
-        sendResponse({ success: true });
-      });
-    } else {
-      sendResponse({ success: false, error: 'Conversation not found' });
-    }
-  });
-}
-
-function handleAddTag(payload: any, sendResponse: Function) {
-  chrome.storage.local.get('facebook_crm_store', (result) => {
-    const store = result.facebook_crm_store || { conversations: {}, tags: {}, notes: {}, settings: {} };
-    store.tags[payload.id] = payload;
-    chrome.storage.local.set({ facebook_crm_store: store }, () => {
-      sendResponse({ success: true });
-    });
-  });
-}
-
-function handleDeleteTag(payload: any, sendResponse: Function) {
-  chrome.storage.local.get('facebook_crm_store', (result) => {
-    const store = result.facebook_crm_store || { conversations: {}, tags: {}, notes: {}, settings: {} };
-    delete store.tags[payload.tagId];
-    // Remove from all conversations
-    Object.keys(store.conversations).forEach((convId) => {
-      store.conversations[convId].tags = store.conversations[convId].tags.filter((t: string) => t !== payload.tagId);
-    });
-    chrome.storage.local.set({ facebook_crm_store: store }, () => {
-      sendResponse({ success: true });
-    });
-  });
-}
-
-function handleGetStore(sendResponse: Function) {
-  chrome.storage.local.get('facebook_crm_store', (result) => {
-    const store = result.facebook_crm_store || { conversations: {}, tags: {}, notes: {}, settings: {} };
-    sendResponse(store);
-  });
-}
