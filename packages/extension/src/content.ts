@@ -184,6 +184,7 @@ let sidebarDebounce: number | null = null;
 async function injectSidebarTags() {
   const store = await getStore();
   const links = document.querySelectorAll<HTMLAnchorElement>('a[href*="/t/"]');
+  console.log(`[CRM] Sidebar injection: found ${links.length} conversation links`);
 
   links.forEach(link => {
     const threadId = extractThreadId(link.href);
