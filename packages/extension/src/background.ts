@@ -181,7 +181,7 @@ async function ensureSenderTab(chatUrl: string, log: string[]): Promise<number |
 
 interface SendResult { ok: boolean; error?: string; log: string[] }
 
-async function sendToRecipient(r: Campaign['recipients'][number]): Promise<SendResult> {
+async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolean): Promise<SendResult> {
   const log: string[] = [];
   if (!r.chatUrl) {
     return { ok: false, error: 'No saved chat URL for this contact', log: ['missing chatUrl — cannot navigate'] };
@@ -195,7 +195,7 @@ async function sendToRecipient(r: Campaign['recipients'][number]): Promise<SendR
 
   const res = await sendToTab<SendResult>(tabId, {
     type: 'CRM_SEND_MESSAGE',
-    payload: { threadId: r.threadId, message: r.renderedMessage },
+    payload: { threadId: r.threadId, message: r.renderedMessage, dryRun },
   });
   if (!res) return { ok: false, error: 'No response from content script (tab closed?)', log: [...log, 'tabs.sendMessage returned null'] };
   return { ok: res.ok, error: res.error, log: [...log, ...(res.log || [])] };
@@ -262,7 +262,7 @@ async function processTick(): Promise<void> {
     await upsertCampaign(camp);
 
     // Perform the actual send (navigates a tab, types, validates).
-    const result = await sendToRecipient(r);
+    const result = await sendToRecipient(r, camp.dryRun);
 
     // Reload — the user may have paused/cancelled while we were sending.
     const after = await getCampaign(camp.id);

@@ -890,11 +890,12 @@ interface SendResult { ok: boolean; error?: string; log: string[] }
 
 // Core send + validate routine. Returns ok only after CONFIRMING the message
 // text appears as a new bubble in the thread and the composer has cleared.
-async function performAutomatedSend(threadId: string, message: string): Promise<SendResult> {
+async function performAutomatedSend(threadId: string, message: string, dryRun = false): Promise<SendResult> {
   const log: string[] = [];
   const stamp = (m: string) => log.push(`[${new Date().toISOString()}] ${m}`);
   const target = normalizeText(message);
 
+  stamp(`mode=${dryRun ? 'DRY RUN (type, do not send)' : 'live send'}`);
   stamp(`url=${window.location.href}`);
   stamp(`requestedThread=${threadId} activeThread=${getActiveThreadId() || '(none)'}`);
   stamp(`messageLength=${message.length} normalizedLength=${target.length}`);
@@ -961,6 +962,15 @@ async function performAutomatedSend(threadId: string, message: string): Promise<
     stamp(`WARN composer text does not match target. composer="${typed.slice(0, 120)}"`);
   }
 
+  // Dry run: stop here — message is sitting in the composer, nothing sent.
+  if (dryRun) {
+    if (!typed.includes(target)) {
+      return { ok: false, error: 'Dry run: typed text did not match the template', log };
+    }
+    stamp('DRY RUN OK — message typed into composer but NOT sent (no Enter, no Send click)');
+    return { ok: true, log };
+  }
+
   // 5. Send.
   pressEnter(composer);
   stamp('pressed Enter');
@@ -1015,8 +1025,8 @@ if (isExtensionAlive()) {
       }
 
       if (request.type === 'CRM_SEND_MESSAGE') {
-        const { threadId, message } = request.payload || {};
-        performAutomatedSend(String(threadId), String(message))
+        const { threadId, message, dryRun } = request.payload || {};
+        performAutomatedSend(String(threadId), String(message), !!dryRun)
           .then((res) => sendResponse(res))
           .catch((e) => sendResponse({ ok: false, error: 'Exception: ' + String(e), log: [String(e)] }));
         return true; // async response

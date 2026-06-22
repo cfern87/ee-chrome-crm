@@ -66,6 +66,7 @@ export interface Campaign {
   id: string;
   name: string;                 // user-facing label (e.g. first line of template)
   template: string;
+  dryRun: boolean;              // type the message but never actually send
   createdAt: number;
   startedAt?: number;
   completedAt?: number;
@@ -130,6 +131,7 @@ export interface NewCampaignInput {
   recipients: Array<{ threadId: string; participantName: string; chatUrl?: string }>;
   config?: Partial<CampaignConfig>;
   name?: string;
+  dryRun?: boolean;
 }
 
 export function createCampaign(input: NewCampaignInput): Campaign {
@@ -139,6 +141,7 @@ export function createCampaign(input: NewCampaignInput): Campaign {
     id: 'camp_' + now.toString(36) + Math.random().toString(36).slice(2, 7),
     name: (input.name && input.name.trim()) || shortName(input.template),
     template: input.template,
+    dryRun: !!input.dryRun,
     createdAt: now,
     status: 'running',
     recipients: input.recipients.map((r) => ({

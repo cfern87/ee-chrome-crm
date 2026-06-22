@@ -165,9 +165,13 @@ npm run dev
 4. *(Optional)* Expand **Sending pace** to tune the delay between messages, how
    often it pauses, and how long the pause lasts. Defaults: 2–4 min apart, pause
    ~20 messages for 30–45 min.
-5. **Start campaign.** The extension drives a browser tab to each contact, types
+5. **Test first (recommended):** tick **Dry run — type but don't send** and run
+   it on a single contact. The extension navigates to that chat, types your
+   message into the composer, and stops *before* sending so you can eyeball it
+   with zero risk. Untick it to send for real.
+6. **Start campaign.** The extension drives a browser tab to each contact, types
    the message, sends it, and **verifies delivery** before marking it sent.
-6. **Watch progress** on the Messaging tab (live counts + countdown) and review
+7. **Watch progress** on the Messaging tab (live counts + countdown) and review
    everything later in the **History** tab — template, recipients, per-recipient
    status/timestamps, batch timings, and full diagnostic logs for any errors.
 

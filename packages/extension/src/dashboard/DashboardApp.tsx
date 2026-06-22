@@ -1106,6 +1106,14 @@ function StatusBadge({ status }: { status: Campaign['status'] }) {
   );
 }
 
+function DryRunChip() {
+  return (
+    <span style={{ background: '#fff6e5', color: '#b9770e', padding: '3px 9px', borderRadius: 12, fontSize: 11, fontWeight: 700, border: '1px solid #f0d28a' }}>
+      🧪 Dry run
+    </span>
+  );
+}
+
 interface MessagingPanelProps {
   conversations: Conversation[];
   tags: Tag[];
@@ -1130,6 +1138,7 @@ function MessagingPanel({ conversations, tags, store, campaigns, preselected, on
   const [pauseMax, setPauseMax] = useState(DEFAULTS.pauseMaxMs / 60000);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [dryRun, setDryRun] = useState(false);
 
   // Adopt contacts pre-selected from the Conversations tab "Message" button.
   useEffect(() => {
@@ -1184,6 +1193,7 @@ function MessagingPanel({ conversations, tags, store, campaigns, preselected, on
       payload: {
         template,
         recipients,
+        dryRun,
         config: {
           minDelayMs: Math.round(minDelay * 60000),
           maxDelayMs: Math.round(maxDelay * 60000),
@@ -1293,16 +1303,24 @@ function MessagingPanel({ conversations, tags, store, campaigns, preselected, on
               A campaign is currently {active.status}. Pause or cancel it before starting another.
             </div>
           )}
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '10px 12px', background: dryRun ? '#fff6e5' : '#f8f8f8', borderRadius: 7, marginBottom: 10, cursor: 'pointer', border: dryRun ? '1px solid #f0d28a' : '1px solid transparent' }}>
+            <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} style={{ marginTop: 2, cursor: 'pointer' }} />
+            <span style={{ fontSize: 12, color: '#555', lineHeight: 1.4 }}>
+              <strong>Dry run</strong> — type the message into each chat but <strong>don't send it</strong>. Great for testing on one contact first. Marked "sent" once the text is confirmed in the composer.
+            </span>
+          </label>
           <button
             onClick={start}
             disabled={starting || !!active}
             style={{
-              width: '100%', background: starting || active ? '#9ec7b3' : '#0a7c4a', color: '#fff', border: 'none',
+              width: '100%', background: starting || active ? '#9ec7b3' : dryRun ? '#b9770e' : '#0a7c4a', color: '#fff', border: 'none',
               padding: '12px 16px', borderRadius: 8, fontWeight: 700, fontSize: 14,
               cursor: starting || active ? 'not-allowed' : 'pointer',
             }}
           >
-            {starting ? 'Starting…' : `Start campaign → ${selectedWithUrl.length} recipient${selectedWithUrl.length !== 1 ? 's' : ''}`}
+            {starting
+              ? 'Starting…'
+              : `${dryRun ? 'Start dry run' : 'Start campaign'} → ${selectedWithUrl.length} recipient${selectedWithUrl.length !== 1 ? 's' : ''}`}
           </button>
         </div>
       </div>
@@ -1394,7 +1412,7 @@ function ActiveCampaignCard({ campaign, onChanged }: { campaign: Campaign; onCha
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{campaign.name}</div>
-          <div style={{ marginTop: 4 }}><StatusBadge status={campaign.status} /></div>
+          <div style={{ marginTop: 4, display: 'flex', gap: 6 }}><StatusBadge status={campaign.status} />{campaign.dryRun && <DryRunChip />}</div>
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
           {campaign.status === 'running' && (
@@ -1474,6 +1492,7 @@ function CampaignHistoryCard({ campaign, onChanged }: { campaign: Campaign; onCh
           <span style={{ color: '#e53e3e', fontWeight: 600 }}>{sum.errors}✕</span>
           <span style={{ color: '#999' }}>{sum.pending}⏳</span>
           <span>/ {sum.total}</span>
+          {campaign.dryRun && <DryRunChip />}
           <StatusBadge status={campaign.status} />
         </div>
       </div>
