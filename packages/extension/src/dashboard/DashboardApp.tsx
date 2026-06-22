@@ -1,9 +1,39 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Store, Conversation, Tag, loadStore, saveStore, EMPTY_STORE, getSyncUsage, SyncUsage } from '../storage';
+import { Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS } from '../campaigns';
+
+// Promise wrapper around the background message channel (campaign control).
+// Always settles: a timeout guards against a service worker that failed to
+// register its handler (e.g. before a full extension reload), so the UI can
+// never hang waiting for a response that will never come.
+function sendBg<T = any>(message: unknown, timeoutMs = 15000): Promise<T | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v: T | null) => { if (!settled) { settled = true; resolve(v); } };
+    const timer = setTimeout(() => done(null), timeoutMs);
+    try {
+      if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) { clearTimeout(timer); done(null); return; }
+      chrome.runtime.sendMessage(message, (res) => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) { done(null); return; }
+        done(res as T);
+      });
+    } catch { clearTimeout(timer); done(null); }
+  });
+}
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   return `${(n / 1024).toFixed(1)} KB`;
+}
+
+function formatDateTime(ts?: number): string {
+  if (!ts) return '—';
+  return new Date(ts).toLocaleString();
+}
+
+function minutes(ms: number): string {
+  return `${Math.round(ms / 60000)}m`;
 }
 
 function formatRelativeTime(ts: number): string {
@@ -18,7 +48,7 @@ function formatRelativeTime(ts: number): string {
   return new Date(ts).toLocaleDateString();
 }
 
-type Tab = 'conversations' | 'tags' | 'settings';
+type Tab = 'conversations' | 'messaging' | 'history' | 'tags' | 'settings';
 type DateFilter = 'all' | 'today' | 'week' | 'month';
 type SortBy = 'recent' | 'lastContacted' | 'lastOpened' | 'dateAdded' | 'tagCount' | 'name';
 
@@ -42,6 +72,21 @@ export default function DashboardApp() {
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
 
   const [syncUsage, setSyncUsage] = useState<SyncUsage | null>(null);
+
+  // Bulk messaging
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [preselectedRecipients, setPreselectedRecipients] = useState<string[]>([]);
+
+  const refreshCampaigns = useCallback(async () => {
+    const res = await sendBg<{ campaigns: Campaign[] }>({ type: 'GET_CAMPAIGNS' });
+    if (res?.campaigns) setCampaigns(res.campaigns);
+  }, []);
+
+  useEffect(() => {
+    refreshCampaigns();
+    const interval = setInterval(refreshCampaigns, 3000);
+    return () => clearInterval(interval);
+  }, [refreshCampaigns]);
 
   const refresh = useCallback(async () => {
     const s = await loadStore();
@@ -281,7 +326,7 @@ export default function DashboardApp() {
 
       {/* Tabs */}
       <div style={{ display: 'flex', background: '#fff', borderBottom: '1px solid #e0e0e0' }}>
-        {(['conversations', 'tags', 'settings'] as Tab[]).map((tab) => (
+        {(['conversations', 'messaging', 'history', 'tags', 'settings'] as Tab[]).map((tab) => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
@@ -299,7 +344,15 @@ export default function DashboardApp() {
               transition: 'color 0.2s',
             }}
           >
-            {tab === 'conversations' ? `Conversations (${filtered.length})` : tab === 'tags' ? `Tags (${totalTags})` : 'Settings'}
+            {tab === 'conversations'
+              ? `Conversations (${filtered.length})`
+              : tab === 'messaging'
+              ? 'Messaging'
+              : tab === 'history'
+              ? `History (${campaigns.length})`
+              : tab === 'tags'
+              ? `Tags (${totalTags})`
+              : 'Settings'}
           </button>
         ))}
       </div>
@@ -434,6 +487,12 @@ export default function DashboardApp() {
                       style={{ background: '#065fd4', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
                     >
                       Open All
+                    </button>
+                    <button
+                      onClick={() => { setPreselectedRecipients(Array.from(selectedIds)); setActiveTab('messaging'); }}
+                      style={{ background: '#0a7c4a', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                    >
+                      💬 Message ({selectedIds.size})
                     </button>
                     <button
                       onClick={() => { setBulkTagMenu(bulkTagMenu === 'assign' ? null : 'assign'); setBulkDeleteConfirm(false); }}
@@ -686,6 +745,25 @@ export default function DashboardApp() {
               })}
             </div>
           </div>
+        )}
+
+        {/* Messaging tab */}
+        {activeTab === 'messaging' && (
+          <MessagingPanel
+            conversations={conversations}
+            tags={tags}
+            store={store}
+            campaigns={campaigns}
+            preselected={preselectedRecipients}
+            onConsumePreselected={() => setPreselectedRecipients([])}
+            onChanged={refreshCampaigns}
+            onViewHistory={() => setActiveTab('history')}
+          />
+        )}
+
+        {/* History tab */}
+        {activeTab === 'history' && (
+          <HistoryPanel campaigns={campaigns} onChanged={refreshCampaigns} />
         )}
 
         {/* Settings tab */}
@@ -993,6 +1071,509 @@ function SyncMeter({ usage, convCount, tagCount }: { usage: SyncUsage | null; co
         <div style={{ marginTop: 8, fontSize: 11, color: '#b9770e', background: '#fff6e5', padding: '6px 8px', borderRadius: 6 }}>
           ⚠️ Approaching the chrome.storage.sync limit. New changes still save to your local backup, but may stop syncing to other devices once full. Consider exporting/archiving older contacts.
         </div>
+      )}
+    </div>
+  );
+}
+
+// =====================================================================
+//  Bulk messaging
+// =====================================================================
+
+function statusColor(s: RecipientStatus): string {
+  switch (s) {
+    case 'sent': return '#0a7c4a';
+    case 'error': return '#e53e3e';
+    case 'sending': return '#b9770e';
+    default: return '#999';
+  }
+}
+
+function statusLabel(s: RecipientStatus): string {
+  switch (s) {
+    case 'sent': return 'Sent';
+    case 'error': return 'Error';
+    case 'sending': return 'Sending…';
+    default: return 'Pending';
+  }
+}
+
+function StatusBadge({ status }: { status: Campaign['status'] }) {
+  const map: Record<Campaign['status'], { bg: string; fg: string; label: string }> = {
+    running: { bg: '#e8f5ee', fg: '#0a7c4a', label: '● Running' },
+    paused: { bg: '#fff6e5', fg: '#b9770e', label: '❚❚ Paused' },
+    completed: { bg: '#eef2f7', fg: '#555', label: '✓ Completed' },
+    cancelled: { bg: '#fdecec', fg: '#e53e3e', label: '✕ Cancelled' },
+  };
+  const s = map[status];
+  return (
+    <span style={{ background: s.bg, color: s.fg, padding: '3px 10px', borderRadius: 12, fontSize: 11, fontWeight: 700 }}>
+      {s.label}
+    </span>
+  );
+}
+
+function DryRunChip() {
+  return (
+    <span style={{ background: '#fff6e5', color: '#b9770e', padding: '3px 9px', borderRadius: 12, fontSize: 11, fontWeight: 700, border: '1px solid #f0d28a' }}>
+      🧪 Dry run
+    </span>
+  );
+}
+
+interface MessagingPanelProps {
+  conversations: Conversation[];
+  tags: Tag[];
+  store: Store;
+  campaigns: Campaign[];
+  preselected: string[];
+  onConsumePreselected: () => void;
+  onChanged: () => void;
+  onViewHistory: () => void;
+}
+
+function MessagingPanel({ conversations, tags, store, campaigns, preselected, onConsumePreselected, onChanged, onViewHistory }: MessagingPanelProps) {
+  const [template, setTemplate] = useState('');
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [search, setSearch] = useState('');
+  const [filterTag, setFilterTag] = useState<string | null>(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [minDelay, setMinDelay] = useState(DEFAULTS.minDelayMs / 60000);
+  const [maxDelay, setMaxDelay] = useState(DEFAULTS.maxDelayMs / 60000);
+  const [batchSize, setBatchSize] = useState(DEFAULTS.batchSize);
+  const [pauseMin, setPauseMin] = useState(DEFAULTS.pauseMinMs / 60000);
+  const [pauseMax, setPauseMax] = useState(DEFAULTS.pauseMaxMs / 60000);
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [dryRun, setDryRun] = useState(false);
+
+  // Adopt contacts pre-selected from the Conversations tab "Message" button.
+  useEffect(() => {
+    if (preselected.length > 0) {
+      setSelected(new Set(preselected));
+      onConsumePreselected();
+    }
+  }, [preselected, onConsumePreselected]);
+
+  const active = campaigns.find((c) => c.status === 'running' || c.status === 'paused') || null;
+
+  const sendable = conversations.filter((c) => !c.archived);
+  const filtered = sendable.filter((c) => {
+    const matchesSearch = !search || (c.participantName || '').toLowerCase().includes(search.toLowerCase());
+    const matchesTag = !filterTag || c.tags.includes(filterTag);
+    return matchesSearch && matchesTag;
+  });
+
+  const selectedConvs = conversations.filter((c) => selected.has(c.id));
+  const selectedWithUrl = selectedConvs.filter((c) => c.chatUrl);
+  const selectedWithoutUrl = selectedConvs.filter((c) => !c.chatUrl);
+
+  const toggle = (id: string) => {
+    const next = new Set(selected);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    setSelected(next);
+  };
+
+  const selectAllFiltered = () => {
+    const ids = filtered.filter((c) => c.chatUrl).map((c) => c.id);
+    const allSelected = ids.every((id) => selected.has(id));
+    const next = new Set(selected);
+    if (allSelected) ids.forEach((id) => next.delete(id));
+    else ids.forEach((id) => next.add(id));
+    setSelected(next);
+  };
+
+  const previewName = selectedConvs[0]?.participantName || 'Jane Doe';
+  const preview = template ? renderTemplate(template, previewName) : '';
+
+  const start = async () => {
+    setError(null);
+    if (!template.trim()) { setError('Please type a message template.'); return; }
+    if (selectedWithUrl.length === 0) { setError('Select at least one recipient with a saved chat URL.'); return; }
+    if (minDelay > maxDelay) { setError('Min delay cannot be greater than max delay.'); return; }
+    if (pauseMin > pauseMax) { setError('Min pause cannot be greater than max pause.'); return; }
+
+    setStarting(true);
+    const recipients = selectedWithUrl.map((c) => ({ threadId: c.id, participantName: c.participantName, chatUrl: c.chatUrl }));
+    const res = await sendBg<{ success: boolean; error?: string }>({
+      type: 'START_CAMPAIGN',
+      payload: {
+        template,
+        recipients,
+        dryRun,
+        config: {
+          minDelayMs: Math.round(minDelay * 60000),
+          maxDelayMs: Math.round(maxDelay * 60000),
+          batchSize: Math.round(batchSize),
+          pauseMinMs: Math.round(pauseMin * 60000),
+          pauseMaxMs: Math.round(pauseMax * 60000),
+        },
+      },
+    });
+    setStarting(false);
+    if (res?.success) {
+      setSelected(new Set());
+      setTemplate('');
+      onChanged();
+      onViewHistory();
+    } else if (res === null) {
+      setError('No response from the extension background. Fully reload the extension at chrome://extensions (Developer mode → ⟳ on this extension), then refresh this page — the messaging feature needs the new "alarms" permission.');
+    } else {
+      setError(res.error || 'Failed to start campaign.');
+    }
+  };
+
+  const inputStyle: React.CSSProperties = { width: '100%', padding: '9px 12px', border: '1px solid #e0e0e0', borderRadius: 7, fontSize: 13, boxSizing: 'border-box', outline: 'none' };
+  const numStyle: React.CSSProperties = { width: 64, padding: '6px 8px', border: '1px solid #d0d0d0', borderRadius: 6, fontSize: 13 };
+
+  return (
+    <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+      {/* Left: composer + config */}
+      <div style={{ flex: '1 1 420px', minWidth: 360 }}>
+        {active && (
+          <div style={{ marginBottom: 14 }}>
+            <ActiveCampaignCard campaign={active} onChanged={onChanged} />
+          </div>
+        )}
+
+        <div style={{ background: '#fff', borderRadius: 10, padding: 18, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
+          <h3 style={{ margin: '0 0 6px', fontSize: 15, fontWeight: 700 }}>Compose template</h3>
+          <p style={{ margin: '0 0 12px', fontSize: 12, color: '#888' }}>
+            Use <code style={{ background: '#f0f0f0', padding: '1px 5px', borderRadius: 4 }}>{'{{name}}'}</code> or{' '}
+            <code style={{ background: '#f0f0f0', padding: '1px 5px', borderRadius: 4 }}>{'{{firstName}}'}</code> to personalize each message.
+          </p>
+          <textarea
+            value={template}
+            onChange={(e) => setTemplate(e.target.value)}
+            placeholder="Hi {{firstName}}, just wanted to reach out…"
+            rows={6}
+            style={{ ...inputStyle, resize: 'vertical', fontFamily: 'inherit', lineHeight: 1.5 }}
+          />
+          {preview && (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: '#888', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>
+                Preview ({previewName})
+              </div>
+              <div style={{ background: '#f8f8f8', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#444', whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>
+                {preview}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Pacing config */}
+        <div style={{ background: '#fff', borderRadius: 10, padding: 18, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
+          <button
+            onClick={() => setShowAdvanced(!showAdvanced)}
+            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14, fontWeight: 700, color: '#333', padding: 0, display: 'flex', alignItems: 'center', gap: 6 }}
+          >
+            {showAdvanced ? '▾' : '▸'} Sending pace
+          </button>
+          <div style={{ fontSize: 12, color: '#888', marginTop: 6 }}>
+            {minDelay}–{maxDelay} min between messages · pause ~{batchSize} messages for {pauseMin}–{pauseMax} min
+          </div>
+          {showAdvanced && (
+            <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, flexWrap: 'wrap' }}>
+                <span style={{ width: 150, color: '#555' }}>Delay between (min):</span>
+                <input type="number" min={0} step={0.5} value={minDelay} onChange={(e) => setMinDelay(Number(e.target.value))} style={numStyle} />
+                <span>to</span>
+                <input type="number" min={0} step={0.5} value={maxDelay} onChange={(e) => setMaxDelay(Number(e.target.value))} style={numStyle} />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, flexWrap: 'wrap' }}>
+                <span style={{ width: 150, color: '#555' }}>Pause every (msgs):</span>
+                <input type="number" min={1} step={1} value={batchSize} onChange={(e) => setBatchSize(Number(e.target.value))} style={numStyle} />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, flexWrap: 'wrap' }}>
+                <span style={{ width: 150, color: '#555' }}>Pause length (min):</span>
+                <input type="number" min={0} step={1} value={pauseMin} onChange={(e) => setPauseMin(Number(e.target.value))} style={numStyle} />
+                <span>to</span>
+                <input type="number" min={0} step={1} value={pauseMax} onChange={(e) => setPauseMax(Number(e.target.value))} style={numStyle} />
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Start */}
+        <div style={{ background: '#fff', borderRadius: 10, padding: 18, boxShadow: '0 1px 3px rgba(0,0,0,0.08)' }}>
+          <div style={{ fontSize: 13, color: '#555', marginBottom: 10 }}>
+            <strong>{selectedWithUrl.length}</strong> recipient{selectedWithUrl.length !== 1 ? 's' : ''} ready
+            {selectedWithoutUrl.length > 0 && (
+              <span style={{ color: '#b9770e' }}> · {selectedWithoutUrl.length} skipped (no chat URL)</span>
+            )}
+          </div>
+          {error && (
+            <div style={{ background: '#fdecec', color: '#e53e3e', borderRadius: 6, padding: '8px 12px', fontSize: 12, marginBottom: 10 }}>
+              {error}
+            </div>
+          )}
+          {active && (
+            <div style={{ background: '#fff6e5', color: '#b9770e', borderRadius: 6, padding: '8px 12px', fontSize: 12, marginBottom: 10 }}>
+              A campaign is currently {active.status}. Pause or cancel it before starting another.
+            </div>
+          )}
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '10px 12px', background: dryRun ? '#fff6e5' : '#f8f8f8', borderRadius: 7, marginBottom: 10, cursor: 'pointer', border: dryRun ? '1px solid #f0d28a' : '1px solid transparent' }}>
+            <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} style={{ marginTop: 2, cursor: 'pointer' }} />
+            <span style={{ fontSize: 12, color: '#555', lineHeight: 1.4 }}>
+              <strong>Dry run</strong> — type the message into each chat but <strong>don't send it</strong>. Great for testing on one contact first. Marked "sent" once the text is confirmed in the composer.
+            </span>
+          </label>
+          <button
+            onClick={start}
+            disabled={starting || !!active}
+            style={{
+              width: '100%', background: starting || active ? '#9ec7b3' : dryRun ? '#b9770e' : '#0a7c4a', color: '#fff', border: 'none',
+              padding: '12px 16px', borderRadius: 8, fontWeight: 700, fontSize: 14,
+              cursor: starting || active ? 'not-allowed' : 'pointer',
+            }}
+          >
+            {starting
+              ? 'Starting…'
+              : `${dryRun ? 'Start dry run' : 'Start campaign'} → ${selectedWithUrl.length} recipient${selectedWithUrl.length !== 1 ? 's' : ''}`}
+          </button>
+        </div>
+      </div>
+
+      {/* Right: recipient picker */}
+      <div style={{ flex: '1 1 320px', minWidth: 300 }}>
+        <div style={{ background: '#fff', borderRadius: 10, padding: 16, boxShadow: '0 1px 3px rgba(0,0,0,0.08)' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700 }}>Recipients</h3>
+            <button onClick={selectAllFiltered} style={{ background: 'none', border: 'none', color: '#065fd4', fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}>
+              Toggle all shown
+            </button>
+          </div>
+          <input
+            type="text"
+            placeholder="Search contacts…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={{ ...inputStyle, marginBottom: 10 }}
+          />
+          {tags.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+              <button onClick={() => setFilterTag(null)} style={{ padding: '3px 9px', borderRadius: 12, border: '1px solid #ccc', background: filterTag === null ? '#065fd4' : '#fff', color: filterTag === null ? '#fff' : '#666', fontSize: 11, cursor: 'pointer', fontWeight: 600 }}>
+                All
+              </button>
+              {tags.map((t) => (
+                <button key={t.id} onClick={() => setFilterTag(filterTag === t.id ? null : t.id)} style={{ padding: '3px 9px', borderRadius: 12, border: 'none', background: filterTag === t.id ? t.color : t.color + '33', color: filterTag === t.id ? '#fff' : t.color, fontSize: 11, cursor: 'pointer', fontWeight: 600 }}>
+                  {t.name}
+                </button>
+              ))}
+            </div>
+          )}
+          <div style={{ maxHeight: 460, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {filtered.length === 0 && (
+              <div style={{ textAlign: 'center', padding: '24px 12px', color: '#aaa', fontSize: 12 }}>No contacts match.</div>
+            )}
+            {filtered.map((c) => {
+              const noUrl = !c.chatUrl;
+              return (
+                <label
+                  key={c.id}
+                  title={noUrl ? 'No saved chat URL — open this chat once in Messenger to capture it' : ''}
+                  style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 9px', borderRadius: 6, background: selected.has(c.id) ? '#e8f5ee' : '#fafafa', cursor: noUrl ? 'not-allowed' : 'pointer', opacity: noUrl ? 0.55 : 1 }}
+                >
+                  <input type="checkbox" disabled={noUrl} checked={selected.has(c.id)} onChange={() => toggle(c.id)} style={{ cursor: noUrl ? 'not-allowed' : 'pointer' }} />
+                  <span style={{ flex: 1, fontSize: 13, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {c.participantName || 'Unknown'}
+                  </span>
+                  {noUrl && <span style={{ fontSize: 10, color: '#b9770e' }}>no URL</span>}
+                  {c.tags.slice(0, 2).map((tid) => {
+                    const tag = store.tags[tid];
+                    return tag ? <span key={tid} style={{ background: tag.color, color: '#fff', fontSize: 9, padding: '1px 5px', borderRadius: 7 }}>{tag.name}</span> : null;
+                  })}
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Countdown({ to }: { to?: number }) {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const i = setInterval(() => force((n) => n + 1), 1000);
+    return () => clearInterval(i);
+  }, []);
+  if (!to) return null;
+  const ms = to - Date.now();
+  if (ms <= 0) return <span>any moment…</span>;
+  const m = Math.floor(ms / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  return <span>{m > 0 ? `${m}m ` : ''}{s}s</span>;
+}
+
+function ActiveCampaignCard({ campaign, onChanged }: { campaign: Campaign; onChanged: () => void }) {
+  const sum = summarize(campaign);
+  const pausing = !!(campaign.pausedForBatchUntil && campaign.pausedForBatchUntil > Date.now());
+
+  const control = async (type: string) => {
+    await sendBg({ type, payload: { campaignId: campaign.id } });
+    onChanged();
+  };
+
+  return (
+    <div style={{ background: '#fff', borderRadius: 10, padding: 16, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', border: '1px solid #d7eadf' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{campaign.name}</div>
+          <div style={{ marginTop: 4, display: 'flex', gap: 6 }}><StatusBadge status={campaign.status} />{campaign.dryRun && <DryRunChip />}</div>
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {campaign.status === 'running' && (
+            <button onClick={() => control('PAUSE_CAMPAIGN')} style={{ background: '#fff', color: '#b9770e', border: '1px solid #f0d28a', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Pause</button>
+          )}
+          {campaign.status === 'paused' && (
+            <button onClick={() => control('RESUME_CAMPAIGN')} style={{ background: '#0a7c4a', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Resume</button>
+          )}
+          <button onClick={() => control('CANCEL_CAMPAIGN')} style={{ background: '#fff0f0', color: '#e53e3e', border: '1px solid #fecaca', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Cancel</button>
+        </div>
+      </div>
+
+      {/* Progress bar */}
+      <div style={{ marginTop: 12, height: 8, background: '#eee', borderRadius: 5, overflow: 'hidden', display: 'flex' }}>
+        <div style={{ width: `${(sum.sent / sum.total) * 100}%`, background: '#0a7c4a' }} />
+        <div style={{ width: `${(sum.errors / sum.total) * 100}%`, background: '#e53e3e' }} />
+      </div>
+      <div style={{ marginTop: 8, fontSize: 12, color: '#666', display: 'flex', gap: 14, flexWrap: 'wrap' }}>
+        <span>✅ {sum.sent} sent</span>
+        <span>❌ {sum.errors} errors</span>
+        <span>⏳ {sum.pending} pending</span>
+        <span style={{ marginLeft: 'auto' }}>
+          {campaign.status === 'running' && (pausing
+            ? <>Batch pause · resumes in <Countdown to={campaign.pausedForBatchUntil} /></>
+            : <>Next send in <Countdown to={campaign.nextSendAt} /></>)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// =====================================================================
+//  Campaign history
+// =====================================================================
+
+function HistoryPanel({ campaigns, onChanged }: { campaigns: Campaign[]; onChanged: () => void }) {
+  const sorted = campaigns.slice().sort((a, b) => b.createdAt - a.createdAt);
+  if (sorted.length === 0) {
+    return (
+      <div style={{ background: '#fff', borderRadius: 10, padding: '48px 24px', textAlign: 'center', color: '#aaa', fontSize: 14, boxShadow: '0 1px 3px rgba(0,0,0,0.08)' }}>
+        No bulk messages yet. Compose one in the Messaging tab.
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {sorted.map((c) => <CampaignHistoryCard key={c.id} campaign={c} onChanged={onChanged} />)}
+    </div>
+  );
+}
+
+function CampaignHistoryCard({ campaign, onChanged }: { campaign: Campaign; onChanged: () => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const sum = summarize(campaign);
+
+  const control = async (type: string) => {
+    await sendBg({ type, payload: { campaignId: campaign.id } });
+    onChanged();
+  };
+
+  return (
+    <div style={{ background: '#fff', borderRadius: 10, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', overflow: 'hidden' }}>
+      <div
+        onClick={() => setExpanded(!expanded)}
+        style={{ padding: '14px 18px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 12 }}
+      >
+        <span style={{ color: '#999', fontSize: 13 }}>{expanded ? '▾' : '▸'}</span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{campaign.name}</div>
+          <div style={{ fontSize: 12, color: '#999', marginTop: 2 }}>
+            Started {formatDateTime(campaign.startedAt || campaign.createdAt)}
+            {campaign.completedAt ? ` · finished ${formatDateTime(campaign.completedAt)}` : ''}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 12, color: '#666' }}>
+          <span style={{ color: '#0a7c4a', fontWeight: 600 }}>{sum.sent}✓</span>
+          <span style={{ color: '#e53e3e', fontWeight: 600 }}>{sum.errors}✕</span>
+          <span style={{ color: '#999' }}>{sum.pending}⏳</span>
+          <span>/ {sum.total}</span>
+          {campaign.dryRun && <DryRunChip />}
+          <StatusBadge status={campaign.status} />
+        </div>
+      </div>
+
+      {expanded && (
+        <div style={{ borderTop: '1px solid #eee', padding: '14px 18px' }}>
+          {/* Controls for an in-flight campaign */}
+          {(campaign.status === 'running' || campaign.status === 'paused') && (
+            <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+              {campaign.status === 'running' && <button onClick={() => control('PAUSE_CAMPAIGN')} style={{ background: '#fff', color: '#b9770e', border: '1px solid #f0d28a', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Pause</button>}
+              {campaign.status === 'paused' && <button onClick={() => control('RESUME_CAMPAIGN')} style={{ background: '#0a7c4a', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Resume</button>}
+              <button onClick={() => control('CANCEL_CAMPAIGN')} style={{ background: '#fff0f0', color: '#e53e3e', border: '1px solid #fecaca', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Cancel</button>
+            </div>
+          )}
+
+          {/* Template */}
+          <div style={{ fontSize: 11, fontWeight: 600, color: '#888', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Template</div>
+          <div style={{ background: '#f8f8f8', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#444', whiteSpace: 'pre-wrap', marginBottom: 14, lineHeight: 1.5 }}>{campaign.template}</div>
+
+          {/* Config summary */}
+          <div style={{ fontSize: 12, color: '#777', marginBottom: 14 }}>
+            Pace: {minutes(campaign.config.minDelayMs)}–{minutes(campaign.config.maxDelayMs)} between messages · pause ~{campaign.config.batchSize} for {minutes(campaign.config.pauseMinMs)}–{minutes(campaign.config.pauseMaxMs)}
+          </div>
+
+          {/* Batches */}
+          {campaign.batches.length > 0 && (
+            <>
+              <div style={{ fontSize: 11, fontWeight: 600, color: '#888', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>Batches</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 14 }}>
+                {campaign.batches.map((b) => (
+                  <div key={b.index} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: '#666', background: '#fafafa', padding: '6px 10px', borderRadius: 6 }}>
+                    <span>Batch {b.index + 1} · {b.count} message{b.count !== 1 ? 's' : ''}</span>
+                    <span>{formatDateTime(b.startedAt)}{b.endedAt ? ` → ${new Date(b.endedAt).toLocaleTimeString()}` : ' → …'}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          {/* Recipients */}
+          <div style={{ fontSize: 11, fontWeight: 600, color: '#888', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>Recipients</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {campaign.recipients.map((r, i) => <RecipientRow key={r.threadId + i} r={r} />)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RecipientRow({ r }: { r: CampaignRecipient }) {
+  const [open, setOpen] = useState(false);
+  const hasLog = !!(r.log && r.log.length);
+  return (
+    <div style={{ background: '#fafafa', borderRadius: 6, padding: '8px 10px' }}>
+      <div
+        onClick={() => hasLog && setOpen(!open)}
+        style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: hasLog ? 'pointer' : 'default' }}
+      >
+        <span style={{ width: 8, height: 8, borderRadius: '50%', background: statusColor(r.status), flexShrink: 0 }} />
+        <span style={{ flex: 1, fontSize: 13, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.participantName || r.threadId}</span>
+        <span style={{ fontSize: 11, color: statusColor(r.status), fontWeight: 600 }}>{statusLabel(r.status)}</span>
+        {r.sentAt && <span style={{ fontSize: 11, color: '#aaa' }}>{new Date(r.sentAt).toLocaleTimeString()}</span>}
+        {hasLog && <span style={{ fontSize: 11, color: '#065fd4' }}>{open ? 'hide log' : 'log'}</span>}
+      </div>
+      {r.error && (
+        <div style={{ marginTop: 6, marginLeft: 18, fontSize: 12, color: '#e53e3e' }}>⚠️ {r.error}</div>
+      )}
+      {open && hasLog && (
+        <pre style={{ marginTop: 8, marginLeft: 18, background: '#1e1e1e', color: '#d4d4d4', padding: '10px 12px', borderRadius: 6, fontSize: 11, lineHeight: 1.5, overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+          {r.log!.join('\n')}
+        </pre>
       )}
     </div>
   );

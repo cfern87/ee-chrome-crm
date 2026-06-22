@@ -10,6 +10,14 @@ A powerful CRM system for managing Facebook Messenger conversations with advance
 - **Tag Management**: Create, edit, and delete tags with ease
 - **Usage Analytics**: See how many conversations each tag is used in
 
+### 💬 Bulk Messaging (Automated)
+- **Template messages**: Compose once with `{{name}}` / `{{firstName}}` personalization
+- **Pick recipients**: Select any set of saved contacts (or push a selection straight from the Conversations tab)
+- **Human-like pacing**: A random 2–4 minute gap between every message, and a 30–45 minute pause after roughly every 20 messages (all configurable)
+- **Send validation**: Each message is only marked *Sent* after the extension confirms the text actually appears as a new outgoing bubble in the thread — otherwise it's marked *Error*
+- **Diagnostic logs**: Failed sends capture a timestamped log (URL, thread match, composer detection, delivery checks) so you can see exactly what went wrong
+- **Bulk message history**: Review every campaign — the template used, who it went to, per-recipient status, and when each batch was sent
+
 ### 📊 Management Dashboard
 - **Real-time Analytics**: View statistics on conversations, tags, and activity
 - **Conversation Management**: Browse, search, and organize all your conversations
@@ -145,6 +153,40 @@ npm run dev
 > (frequently-changing, obfuscated) CSS class names, so it keeps working as
 > Facebook updates its markup. When you switch conversations, the open panel
 > updates automatically.
+
+### Bulk Messaging
+
+1. **Open the dashboard** and go to the **Messaging** tab (or select contacts in
+   the **Conversations** tab and click **💬 Message**).
+2. **Type your template** in the composer. Use `{{name}}` or `{{firstName}}` and
+   each recipient gets a personalized copy (a live preview is shown).
+3. **Pick recipients** on the right. Contacts without a saved chat URL are
+   disabled — open that chat once in Messenger to capture its URL first.
+4. *(Optional)* Expand **Sending pace** to tune the delay between messages, how
+   often it pauses, and how long the pause lasts. Defaults: 2–4 min apart, pause
+   ~20 messages for 30–45 min.
+5. **Test first (recommended):** tick **Dry run — type but don't send** and run
+   it on a single contact. The extension navigates to that chat, types your
+   message into the composer, and stops *before* sending so you can eyeball it
+   with zero risk. Untick it to send for real.
+6. **Start campaign.** The extension drives a browser tab to each contact, types
+   the message, sends it, and **verifies delivery** before marking it sent.
+7. **Watch progress** on the Messaging tab (live counts + countdown) and review
+   everything later in the **History** tab — template, recipients, per-recipient
+   status/timestamps, batch timings, and full diagnostic logs for any errors.
+
+> **How it works:** the background service worker owns the queue and pacing via
+> `chrome.alarms` (so it survives the worker being suspended between sends). For
+> each recipient it focuses a reusable "sender" tab — foreground, because
+> Facebook throttles timers in background tabs, which would break delivery
+> validation. Delivery is confirmed by checking that the composer clears **and**
+> a new bubble containing the exact message text appears in the thread. Campaign
+> history is stored per-machine in `chrome.storage.local` (logs are too verbose
+> for the synced store).
+>
+> ⚠️ Keep the sender tab/window open while a campaign runs. Automating Messenger
+> may be against Facebook's Terms of Service — use responsibly and at your own
+> risk; aggressive pacing can get an account flagged.
 
 ### Management Dashboard
 
