@@ -389,9 +389,22 @@ export async function forcePullFromSync(): Promise<Store | null> {
  * as changed and write all of them. Also mirrors to local backups.
  */
 export async function forcePushToSync(store: Store): Promise<void> {
+  if (!syncAvailable()) {
+    throw new Error('chrome.storage.sync is not available in this context.');
+  }
   lastSyncSnapshot = clone(EMPTY_STORE); // forces full delta
   await syncWriteDelta(store);
   await Promise.all([chromeLocalSet(store), idbSet(store)]);
+
+  // Verify the write actually landed: read sync back and confirm it now holds
+  // data when the store we pushed had some. Catches silently-dropped writes
+  // (quota errors, sync disabled) that syncSet swallows.
+  if (hasData(store)) {
+    const readback = await syncGetAll();
+    if (!hasData(readback)) {
+      throw new Error('Push did not land in Chrome sync (the write was rejected or sync is disabled). Use Export/Import as a fallback.');
+    }
+  }
 }
 
 /**
