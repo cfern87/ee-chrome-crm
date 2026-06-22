@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Store, Conversation, Tag, loadStore, saveStore, EMPTY_STORE, getSyncUsage, SyncUsage } from '../storage';
+import { Store, Conversation, Tag, loadStore, saveStore, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync } from '../storage';
 import { Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS } from '../campaigns';
 
 // Promise wrapper around the background message channel (campaign control).
@@ -768,7 +768,7 @@ export default function DashboardApp() {
 
         {/* Settings tab */}
         {activeTab === 'settings' && (
-          <SettingsPanel store={store} updateStore={updateStore} conversations={conversations} tags={tags} syncUsage={syncUsage} />
+          <SettingsPanel store={store} updateStore={updateStore} conversations={conversations} tags={tags} syncUsage={syncUsage} onStoreReplaced={async (s) => { setStore(s); getSyncUsage().then(setSyncUsage).catch(() => {}); }} />
         )}
       </div>
     </div>
@@ -942,10 +942,41 @@ interface SettingsPanelProps {
   conversations: Conversation[];
   tags: Tag[];
   syncUsage: SyncUsage | null;
+  onStoreReplaced: (s: Store) => Promise<void>;
 }
 
-function SettingsPanel({ store, updateStore, conversations, tags, syncUsage }: SettingsPanelProps) {
+function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onStoreReplaced }: SettingsPanelProps) {
   const settings = store.settings as Record<string, unknown>;
+  const [syncStatus, setSyncStatus] = useState<{ type: 'success' | 'error' | 'info'; msg: string } | null>(null);
+  const [pushConfirm, setPushConfirm] = useState(false);
+
+  const handlePull = async () => {
+    setSyncStatus({ type: 'info', msg: 'Pulling from Chrome sync…' });
+    try {
+      const pulled = await forcePullFromSync();
+      if (!pulled) {
+        setSyncStatus({ type: 'error', msg: 'Nothing found in Chrome sync. Make sure you are signed into Chrome with the same account on both machines and that the extension has been active long enough to sync (development-mode extensions may not sync).' });
+        return;
+      }
+      await onStoreReplaced(pulled);
+      const convCount = Object.keys(pulled.conversations).length;
+      const tagCount = Object.keys(pulled.tags).length;
+      setSyncStatus({ type: 'success', msg: `Pulled ${convCount} contacts and ${tagCount} tags from Chrome sync.` });
+    } catch (e) {
+      setSyncStatus({ type: 'error', msg: `Pull failed: ${String(e)}` });
+    }
+  };
+
+  const handlePush = async () => {
+    setPushConfirm(false);
+    setSyncStatus({ type: 'info', msg: 'Pushing to Chrome sync…' });
+    try {
+      await forcePushToSync(store);
+      setSyncStatus({ type: 'success', msg: 'Local data pushed to Chrome sync successfully.' });
+    } catch (e) {
+      setSyncStatus({ type: 'error', msg: `Push failed: ${String(e)}` });
+    }
+  };
 
   const toggleSetting = async (key: string, val: boolean) => {
     await updateStore({ ...store, settings: { ...settings, [key]: val } });
@@ -1020,6 +1051,48 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage }: S
       </div>
 
       <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
+        <h3 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>Chrome Sync</h3>
+        <p style={{ margin: '0 0 14px', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
+          Pull loads data from Chrome's sync storage into this machine. Push uploads this machine's data to Chrome sync so other machines pick it up.
+          {' '}<strong>Note:</strong> Chrome may not sync data for extensions installed in developer mode — if contacts are missing after pulling, try the Export/Import buttons below as a fallback.
+        </p>
+        <div style={{ display: 'flex', gap: 10, marginBottom: syncStatus ? 10 : 0 }}>
+          <button
+            onClick={handlePull}
+            style={{ flex: 1, background: '#4ECDC4', color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}
+          >
+            Pull from Sync
+          </button>
+          {!pushConfirm ? (
+            <button
+              onClick={() => setPushConfirm(true)}
+              style={{ flex: 1, background: '#f0a500', color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}
+            >
+              Push to Sync
+            </button>
+          ) : (
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span style={{ fontSize: 11, color: '#c0392b', fontWeight: 600 }}>This overwrites Chrome sync with local data. Other machines will pick up these changes on their next load.</span>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button onClick={handlePush} style={{ flex: 1, background: '#c0392b', color: '#fff', border: 'none', padding: '7px 10px', borderRadius: 6, fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>Confirm Push</button>
+                <button onClick={() => setPushConfirm(false)} style={{ flex: 1, background: '#eee', color: '#333', border: 'none', padding: '7px 10px', borderRadius: 6, fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>Cancel</button>
+              </div>
+            </div>
+          )}
+        </div>
+        {syncStatus && (
+          <div style={{
+            fontSize: 12, padding: '8px 10px', borderRadius: 6, lineHeight: 1.5,
+            background: syncStatus.type === 'success' ? '#e8f5e9' : syncStatus.type === 'error' ? '#fdecea' : '#e3f2fd',
+            color: syncStatus.type === 'success' ? '#2e7d32' : syncStatus.type === 'error' ? '#c62828' : '#1565c0',
+          }}>
+            {syncStatus.msg}
+          </div>
+        )}
+        <SyncMeter usage={syncUsage} convCount={conversations.length} tagCount={tags.length} />
+      </div>
+
+      <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
         <h3 style={{ margin: '0 0 16px', fontSize: 15, fontWeight: 600 }}>Data</h3>
         <div style={{ display: 'flex', gap: 10 }}>
           <button onClick={exportData} style={{ flex: 1, background: '#065fd4', color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
@@ -1029,7 +1102,6 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage }: S
             Import Data
           </button>
         </div>
-        <SyncMeter usage={syncUsage} convCount={conversations.length} tagCount={tags.length} />
       </div>
     </div>
   );

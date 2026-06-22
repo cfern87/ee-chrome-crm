@@ -369,6 +369,32 @@ const SYNC_QUOTA_BYTES = 102400; // chrome.storage.sync.QUOTA_BYTES
 const SYNC_MAX_ITEMS = 512;      // chrome.storage.sync.MAX_ITEMS
 
 /**
+ * Force a fresh pull from chrome.storage.sync, bypassing the in-memory
+ * snapshot. Updates local backups and resets the snapshot so subsequent
+ * saves only write real deltas. Returns the pulled store, or null if sync
+ * has no CRM data (so the caller can decide whether to keep local data).
+ */
+export async function forcePullFromSync(): Promise<Store | null> {
+  const fromSync = await syncGetAll();
+  if (!fromSync) return null;
+  lastSyncSnapshot = clone(fromSync);
+  chromeLocalSet(fromSync);
+  idbSet(fromSync);
+  return fromSync;
+}
+
+/**
+ * Force a full push of the given store to chrome.storage.sync by clearing
+ * the in-memory snapshot first, which makes syncWriteDelta treat every shard
+ * as changed and write all of them. Also mirrors to local backups.
+ */
+export async function forcePushToSync(store: Store): Promise<void> {
+  lastSyncSnapshot = clone(EMPTY_STORE); // forces full delta
+  await syncWriteDelta(store);
+  await Promise.all([chromeLocalSet(store), idbSet(store)]);
+}
+
+/**
  * Report how much of the chrome.storage.sync quota is in use, for a usage
  * meter in the dashboard. Counts only our CRM shard items/bytes.
  */
