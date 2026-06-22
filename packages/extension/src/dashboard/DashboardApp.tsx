@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Store, Conversation, Tag, loadStore, saveStore, EMPTY_STORE } from '../storage';
+import { Store, Conversation, Tag, loadStore, saveStore, EMPTY_STORE, getSyncUsage, SyncUsage } from '../storage';
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  return `${(n / 1024).toFixed(1)} KB`;
+}
 
 function formatRelativeTime(ts: number): string {
   const diff = Date.now() - ts;
@@ -36,10 +41,13 @@ export default function DashboardApp() {
   const [bulkTagMenu, setBulkTagMenu] = useState<'assign' | 'remove' | null>(null);
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
 
+  const [syncUsage, setSyncUsage] = useState<SyncUsage | null>(null);
+
   const refresh = useCallback(async () => {
     const s = await loadStore();
     setStore(s);
     setLoading(false);
+    getSyncUsage().then(setSyncUsage).catch(() => setSyncUsage(null));
   }, []);
 
   useEffect(() => {
@@ -674,7 +682,7 @@ export default function DashboardApp() {
 
         {/* Settings tab */}
         {activeTab === 'settings' && (
-          <SettingsPanel store={store} updateStore={updateStore} conversations={conversations} tags={tags} />
+          <SettingsPanel store={store} updateStore={updateStore} conversations={conversations} tags={tags} syncUsage={syncUsage} />
         )}
       </div>
     </div>
@@ -847,9 +855,10 @@ interface SettingsPanelProps {
   updateStore: (s: Store) => Promise<void>;
   conversations: Conversation[];
   tags: Tag[];
+  syncUsage: SyncUsage | null;
 }
 
-function SettingsPanel({ store, updateStore, conversations, tags }: SettingsPanelProps) {
+function SettingsPanel({ store, updateStore, conversations, tags, syncUsage }: SettingsPanelProps) {
   const settings = store.settings as Record<string, unknown>;
 
   const toggleSetting = async (key: string, val: boolean) => {
@@ -934,10 +943,49 @@ function SettingsPanel({ store, updateStore, conversations, tags }: SettingsPane
             Import Data
           </button>
         </div>
-        <div style={{ marginTop: 12, fontSize: 12, color: '#aaa' }}>
-          {conversations.length} conversations, {tags.length} tags stored in chrome.storage.local
-        </div>
+        <SyncMeter usage={syncUsage} convCount={conversations.length} tagCount={tags.length} />
       </div>
+    </div>
+  );
+}
+
+function SyncMeter({ usage, convCount, tagCount }: { usage: SyncUsage | null; convCount: number; tagCount: number }) {
+  const summary = `${convCount} conversations, ${tagCount} tags`;
+
+  if (!usage || !usage.available) {
+    return (
+      <div style={{ marginTop: 16, fontSize: 12, color: '#aaa' }}>
+        {summary} · chrome.storage.sync unavailable (using local backup)
+      </div>
+    );
+  }
+
+  const bytePct = Math.min(100, (usage.bytesInUse / usage.quotaBytes) * 100);
+  const itemPct = Math.min(100, (usage.itemCount / usage.maxItems) * 100);
+  const pct = Math.max(bytePct, itemPct); // whichever limit is closer
+  const near = pct >= 80;
+  const barColor = pct >= 90 ? '#e74c3c' : pct >= 80 ? '#f39c12' : '#2ecc71';
+
+  return (
+    <div style={{ marginTop: 16, padding: '12px 14px', background: '#f7f8fa', borderRadius: 8, border: '1px solid #eee' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+        <span style={{ fontSize: 12, fontWeight: 600, color: '#555' }}>☁️ Cloud sync storage</span>
+        <span style={{ fontSize: 12, color: '#888' }}>
+          {formatBytes(usage.bytesInUse)} / {formatBytes(usage.quotaBytes)} ({pct.toFixed(0)}%)
+        </span>
+      </div>
+      <div style={{ height: 8, background: '#e6e8eb', borderRadius: 5, overflow: 'hidden' }}>
+        <div style={{ width: `${pct}%`, height: '100%', background: barColor, transition: 'width 0.3s, background 0.3s' }} />
+      </div>
+      <div style={{ marginTop: 7, fontSize: 11, color: '#999', display: 'flex', justifyContent: 'space-between' }}>
+        <span>{summary} · {usage.itemCount}/{usage.maxItems} items</span>
+        <span>synced across your devices</span>
+      </div>
+      {near && (
+        <div style={{ marginTop: 8, fontSize: 11, color: '#b9770e', background: '#fff6e5', padding: '6px 8px', borderRadius: 6 }}>
+          ⚠️ Approaching the chrome.storage.sync limit. New changes still save to your local backup, but may stop syncing to other devices once full. Consider exporting/archiving older contacts.
+        </div>
+      )}
     </div>
   );
 }

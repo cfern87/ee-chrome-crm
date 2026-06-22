@@ -1,8 +1,18 @@
-// Dual-layer storage: chrome.storage.local (primary) + IndexedDB (backup).
+// Cross-machine storage for the Facebook CRM.
 //
-// IndexedDB persists independently of chrome.storage.local. If chrome.storage
-// ever gets wiped (manual clear, extension reinstall, etc.) we restore from IDB
-// on next load. Every save writes to both layers simultaneously.
+// Canonical store:   chrome.storage.sync  (syncs across machines signed into
+//                    the same Chrome profile — no backend required).
+// Local backups:     chrome.storage.local single key + IndexedDB. These are
+//                    per-machine and protect against a sync wipe / offline use.
+//
+// IMPORTANT — chrome.storage.sync limits we design around:
+//   * QUOTA_BYTES_PER_ITEM = 8 KB  → we CANNOT store the whole store under one
+//     key. We SHARD: one item per conversation ("c:<id>") and per tag
+//     ("t:<id>"), plus "s" (settings) and "n" (notes).
+//   * QUOTA_BYTES = 100 KB total, MAX_ITEMS = 512  → ~400-500 conversations.
+//   * Write-rate limits (120 ops/min) → saveStore writes only the DELTA
+//     (changed/removed shards) versus the last synced snapshot, so tagging one
+//     person costs a single write.
 
 export const STORAGE_KEY = 'facebook_crm_store';
 
@@ -10,6 +20,19 @@ const IDB_NAME = 'messenger_crm_idb';
 const IDB_STORE = 'crm';
 const IDB_KEY = 'data';
 const IDB_VERSION = 1;
+
+// chrome.storage.sync shard key scheme
+const CONV_PREFIX = 'c:';
+const TAG_PREFIX = 't:';
+const SETTINGS_KEY = 's';
+const NOTES_KEY = 'n';
+
+// Stay safely under the 8 KB per-item limit.
+const MAX_ITEM_BYTES = 7800;
+const LAST_MESSAGE_MAX = 500;
+// Batch size for the initial migration write so we don't trip the per-minute
+// write-op limit in one shot.
+const SYNC_SET_BATCH = 60;
 
 export interface Tag {
   id: string;
@@ -56,7 +79,41 @@ function normalize(s: Partial<Store>): Store {
   };
 }
 
-// ---- IndexedDB ----
+function clone<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v));
+}
+
+function hasData(s: Store | null | undefined): s is Store {
+  return !!s && (Object.keys(s.conversations).length > 0 || Object.keys(s.tags).length > 0);
+}
+
+// Keys our sync shards use — lets listeners tell our changes from others'.
+export function isCrmSyncKey(key: string): boolean {
+  return key === SETTINGS_KEY || key === NOTES_KEY ||
+    key.startsWith(CONV_PREFIX) || key.startsWith(TAG_PREFIX);
+}
+
+// ---- Liveness ----
+
+function isExtensionAlive(): boolean {
+  try {
+    return typeof chrome !== 'undefined' &&
+      typeof chrome.runtime !== 'undefined' &&
+      !!chrome.runtime.id;
+  } catch {
+    return false;
+  }
+}
+
+function syncAvailable(): boolean {
+  try {
+    return isExtensionAlive() && !!chrome.storage && !!chrome.storage.sync;
+  } catch {
+    return false;
+  }
+}
+
+// ---- IndexedDB (local backup) ----
 
 let _db: IDBDatabase | null = null;
 
@@ -65,9 +122,7 @@ function openIDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     try {
       const req = indexedDB.open(IDB_NAME, IDB_VERSION);
-      req.onupgradeneeded = () => {
-        req.result.createObjectStore(IDB_STORE);
-      };
+      req.onupgradeneeded = () => { req.result.createObjectStore(IDB_STORE); };
       req.onsuccess = () => { _db = req.result; resolve(req.result); };
       req.onerror = () => reject(req.error);
     } catch (e) {
@@ -100,23 +155,13 @@ export async function idbSet(store: Store): Promise<void> {
       tx.onerror = () => resolve();
     });
   } catch {
-    // IDB not available — silently ignore
+    /* IDB unavailable — ignore */
   }
 }
 
-// ---- chrome.storage.local helpers ----
+// ---- chrome.storage.local (single-key local backup) ----
 
-function isExtensionAlive(): boolean {
-  try {
-    return typeof chrome !== 'undefined' &&
-      typeof chrome.runtime !== 'undefined' &&
-      !!chrome.runtime.id;
-  } catch {
-    return false;
-  }
-}
-
-function chromeGet(): Promise<Store | null> {
+function chromeLocalGet(): Promise<Store | null> {
   if (!isExtensionAlive()) return Promise.resolve(null);
   return new Promise((resolve) => {
     try {
@@ -131,7 +176,7 @@ function chromeGet(): Promise<Store | null> {
   });
 }
 
-function chromeSet(store: Store): Promise<void> {
+function chromeLocalSet(store: Store): Promise<void> {
   if (!isExtensionAlive()) return Promise.resolve();
   return new Promise((resolve) => {
     try {
@@ -142,39 +187,209 @@ function chromeSet(store: Store): Promise<void> {
   });
 }
 
+// ---- chrome.storage.sync (canonical, sharded) ----
+
+// Trim a conversation so a single shard never exceeds the 8 KB item limit.
+function shardConv(conv: Conversation): Conversation {
+  const c = clone(conv);
+  if (typeof c.lastMessage === 'string' && c.lastMessage.length > LAST_MESSAGE_MAX) {
+    c.lastMessage = c.lastMessage.slice(0, LAST_MESSAGE_MAX);
+  }
+  // Final guard: if still oversized (e.g. an enormous name/url), drop lastMessage.
+  if (JSON.stringify(c).length > MAX_ITEM_BYTES) c.lastMessage = '';
+  return c;
+}
+
+function syncGetAll(): Promise<Store | null> {
+  if (!syncAvailable()) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.sync.get(null, (items) => {
+        if (!isExtensionAlive() || chrome.runtime.lastError || !items) { resolve(null); return; }
+        const store: Store = { conversations: {}, tags: {}, notes: {}, settings: {} };
+        let found = false;
+        for (const [key, val] of Object.entries(items)) {
+          if (key.startsWith(CONV_PREFIX)) {
+            store.conversations[(val as Conversation).id] = val as Conversation;
+            found = true;
+          } else if (key.startsWith(TAG_PREFIX)) {
+            store.tags[(val as Tag).id] = val as Tag;
+            found = true;
+          } else if (key === SETTINGS_KEY) {
+            store.settings = (val as Record<string, unknown>) || {};
+            found = true;
+          } else if (key === NOTES_KEY) {
+            store.notes = (val as Record<string, unknown>) || {};
+            found = true;
+          }
+        }
+        resolve(found ? store : null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function syncSet(items: Record<string, unknown>): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.sync.set(items, () => {
+        const err = chrome.runtime.lastError;
+        if (err) console.warn('[CRM] sync write skipped:', err.message);
+        resolve();
+      });
+    } catch (e) {
+      console.warn('[CRM] sync write threw:', e);
+      resolve();
+    }
+  });
+}
+
+function syncRemove(keys: string[]): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.sync.remove(keys, () => { void chrome.runtime.lastError; resolve(); });
+    } catch {
+      resolve();
+    }
+  });
+}
+
+// Snapshot of what we last pushed to sync, so saveStore can write only deltas.
+let lastSyncSnapshot: Store = clone(EMPTY_STORE);
+
+async function syncWriteDelta(store: Store): Promise<void> {
+  if (!syncAvailable()) return;
+  const prev = lastSyncSnapshot;
+  const toSet: Record<string, unknown> = {};
+  const toRemove: string[] = [];
+
+  // Conversations
+  for (const [id, conv] of Object.entries(store.conversations)) {
+    const sharded = shardConv(conv);
+    const prevConv = prev.conversations[id];
+    if (!prevConv || JSON.stringify(shardConv(prevConv)) !== JSON.stringify(sharded)) {
+      toSet[CONV_PREFIX + id] = sharded;
+    }
+  }
+  for (const id of Object.keys(prev.conversations)) {
+    if (!store.conversations[id]) toRemove.push(CONV_PREFIX + id);
+  }
+
+  // Tags
+  for (const [id, tag] of Object.entries(store.tags)) {
+    const prevTag = prev.tags[id];
+    if (!prevTag || JSON.stringify(prevTag) !== JSON.stringify(tag)) {
+      toSet[TAG_PREFIX + id] = tag;
+    }
+  }
+  for (const id of Object.keys(prev.tags)) {
+    if (!store.tags[id]) toRemove.push(TAG_PREFIX + id);
+  }
+
+  // Settings / notes (single items)
+  if (JSON.stringify(prev.settings) !== JSON.stringify(store.settings)) {
+    toSet[SETTINGS_KEY] = store.settings;
+  }
+  if (JSON.stringify(prev.notes) !== JSON.stringify(store.notes)) {
+    toSet[NOTES_KEY] = store.notes;
+  }
+
+  // Write in batches to respect the per-minute write-op limit.
+  const setKeys = Object.keys(toSet);
+  for (let i = 0; i < setKeys.length; i += SYNC_SET_BATCH) {
+    const batch: Record<string, unknown> = {};
+    for (const k of setKeys.slice(i, i + SYNC_SET_BATCH)) batch[k] = toSet[k];
+    await syncSet(batch);
+  }
+  if (toRemove.length) await syncRemove(toRemove);
+
+  lastSyncSnapshot = clone(store);
+}
+
 // ---- Public API ----
 
 /**
- * Load store: try chrome.storage.local first; if empty, restore from IndexedDB;
- * if both empty, return EMPTY_STORE. When restoring from IDB, also repopulate
- * chrome.storage so subsequent reads are fast.
+ * Load the store. Order of precedence:
+ *   1. chrome.storage.sync (canonical, cross-machine) — if it has data.
+ *   2. Migrate: if sync is empty but local/IDB has data, push it up to sync.
+ *   3. Fall back to whatever local/IDB has (or an empty store).
+ * Always refreshes the in-memory sync snapshot and local backups.
  */
 export async function loadStore(): Promise<Store> {
-  const fromChrome = await chromeGet();
-  if (fromChrome && Object.keys(fromChrome.conversations).length > 0) {
-    // Chrome storage has data — mirror it into IDB to keep IDB fresh
-    idbSet(fromChrome);
-    return fromChrome;
+  // 1. Canonical: chrome.storage.sync
+  const fromSync = await syncGetAll();
+  if (hasData(fromSync)) {
+    lastSyncSnapshot = clone(fromSync);
+    // Keep local backups fresh for this machine.
+    chromeLocalSet(fromSync);
+    idbSet(fromSync);
+    return fromSync;
   }
 
-  // Chrome storage empty or missing — try IndexedDB
-  const fromIDB = await idbGet();
-  if (fromIDB && Object.keys(fromIDB.conversations).length > 0) {
-    console.info('[CRM] Restored data from IndexedDB backup');
-    // Repopulate chrome.storage from the IDB backup
-    await chromeSet(fromIDB);
-    return fromIDB;
+  // 2. Sync empty — migrate from local backups if present.
+  const fromLocal = await chromeLocalGet();
+  const fromIDB = hasData(fromLocal) ? null : await idbGet();
+  const migrated = hasData(fromLocal) ? fromLocal : (hasData(fromIDB) ? fromIDB : null);
+
+  if (migrated) {
+    console.info('[CRM] Migrating existing data into chrome.storage.sync');
+    lastSyncSnapshot = clone(EMPTY_STORE); // force a full delta write
+    await syncWriteDelta(migrated);
+    chromeLocalSet(migrated);
+    idbSet(migrated);
+    return migrated;
   }
 
-  // Both empty — check if chrome had tags/settings even with no conversations
-  if (fromChrome) return fromChrome;
-  if (fromIDB) return fromIDB;
-  return { ...EMPTY_STORE };
+  // 3. Nothing anywhere — return whatever shell we have.
+  const fallback = fromLocal || fromIDB || { ...EMPTY_STORE };
+  lastSyncSnapshot = clone(fallback);
+  return fallback;
 }
 
 /**
- * Save store: write to chrome.storage.local and IndexedDB simultaneously.
+ * Save the store: write the delta to chrome.storage.sync (canonical) and
+ * mirror the full store to chrome.storage.local + IndexedDB as local backups.
  */
 export async function saveStore(store: Store): Promise<void> {
-  await Promise.all([chromeSet(store), idbSet(store)]);
+  await syncWriteDelta(store);
+  await Promise.all([chromeLocalSet(store), idbSet(store)]);
+}
+
+export interface SyncUsage {
+  available: boolean;     // is chrome.storage.sync usable
+  bytesInUse: number;     // bytes currently used
+  quotaBytes: number;     // total byte quota (≈102400)
+  itemCount: number;      // number of synced items (shards)
+  maxItems: number;       // item quota (≈512)
+}
+
+const SYNC_QUOTA_BYTES = 102400; // chrome.storage.sync.QUOTA_BYTES
+const SYNC_MAX_ITEMS = 512;      // chrome.storage.sync.MAX_ITEMS
+
+/**
+ * Report how much of the chrome.storage.sync quota is in use, for a usage
+ * meter in the dashboard. Counts only our CRM shard items/bytes.
+ */
+export async function getSyncUsage(): Promise<SyncUsage> {
+  const quotaBytes = (chrome?.storage?.sync as { QUOTA_BYTES?: number })?.QUOTA_BYTES || SYNC_QUOTA_BYTES;
+  const maxItems = (chrome?.storage?.sync as { MAX_ITEMS?: number })?.MAX_ITEMS || SYNC_MAX_ITEMS;
+  const base: SyncUsage = { available: false, bytesInUse: 0, quotaBytes, itemCount: 0, maxItems };
+  if (!syncAvailable()) return base;
+
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.sync.get(null, (items) => {
+        if (!isExtensionAlive() || chrome.runtime.lastError || !items) { resolve(base); return; }
+        const crmKeys = Object.keys(items).filter(isCrmSyncKey);
+        chrome.storage.sync.getBytesInUse(crmKeys, (bytes) => {
+          if (chrome.runtime.lastError) { resolve({ ...base, available: true, itemCount: crmKeys.length }); return; }
+          resolve({ available: true, bytesInUse: bytes || 0, quotaBytes, itemCount: crmKeys.length, maxItems });
+        });
+      });
+    } catch {
+      resolve(base);
+    }
+  });
 }

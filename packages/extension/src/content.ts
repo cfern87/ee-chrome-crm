@@ -13,6 +13,7 @@
 
 import {
   STORAGE_KEY,
+  isCrmSyncKey,
   loadStore as _loadStore,
   saveStore as _saveStore,
 } from './storage';
@@ -273,16 +274,20 @@ function startSidebarObserver() {
   obs.observe(document.body, { childList: true, subtree: true });
 }
 
-// Re-inject whenever storage changes (tag added/removed from panel or popup)
-// Only register if the extension context is alive
+// Re-inject whenever the store changes. Two sources:
+//   * local namespace, STORAGE_KEY  → same-machine writes (panel/popup mirror)
+//   * sync  namespace, crm shard keys → updates arriving from ANOTHER machine
+// Both just invalidate the cache and re-render; injection is idempotent.
 if (isExtensionAlive()) {
   try {
-    chrome.storage.onChanged.addListener(changes => {
-      if (changes[STORAGE_KEY]) {
-        storeCache = null;
-        scheduleSidebarInject();
-        if (panelEl && panelEl.style.display !== 'none') renderPanel();
-      }
+    chrome.storage.onChanged.addListener((changes, area) => {
+      const relevant =
+        (area === 'local' && !!changes[STORAGE_KEY]) ||
+        (area === 'sync' && Object.keys(changes).some(isCrmSyncKey));
+      if (!relevant) return;
+      storeCache = null;
+      scheduleSidebarInject();
+      if (panelEl && panelEl.style.display !== 'none') renderPanel();
     });
   } catch (e) {
     console.warn('[CRM] Failed to register storage listener:', e);
