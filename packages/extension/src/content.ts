@@ -792,6 +792,241 @@ function init() {
   );
 }
 
+// ---- Automated bulk messaging (driven by the background service worker) ----
+//
+// The background worker owns the campaign queue and the human-like pacing
+// (random 2-4 min gaps, 30-45 min batch pauses). For each recipient it
+// navigates a tab to the chat and asks THIS content script to actually type
+// and send the message, then to VALIDATE that it really went out before the
+// recipient is marked "sent". Every step is logged so a failed send carries
+// enough diagnostics to figure out what broke.
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Collapse whitespace so DOM text (which wraps/reflows) compares cleanly
+// against the message we intended to send.
+function normalizeText(s: string): string {
+  return (s || '').replace(/\s+/g, ' ').trim();
+}
+
+// Count non-overlapping occurrences of needle in haystack.
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let i = 0;
+  while ((i = haystack.indexOf(needle, i)) !== -1) {
+    count++;
+    i += needle.length;
+  }
+  return count;
+}
+
+// Poll `fn` until it returns truthy or we time out. Returns the truthy value
+// or null. Used instead of fixed sleeps so we react as soon as Facebook's UI
+// settles (it lazy-renders, so timings vary).
+async function pollFor<T>(fn: () => T, timeoutMs: number, intervalMs: number): Promise<T | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const v = fn();
+      if (v) return v;
+    } catch { /* keep polling */ }
+    if (Date.now() >= deadline) return null;
+    await sleep(intervalMs);
+  }
+}
+
+// Locate the message composer for the open thread. The composer is a
+// contenteditable textbox inside [role="main"]; the sidebar search box is a
+// plain <input>, so this never grabs it.
+function findComposer(): HTMLElement | null {
+  const main = document.querySelector('[role="main"]') || document;
+  const candidates = main.querySelectorAll<HTMLElement>(
+    '[contenteditable="true"][role="textbox"], [contenteditable="true"]'
+  );
+  for (const el of candidates) {
+    if (isMessageComposer(el) && el.offsetParent !== null) return el;
+  }
+  return null;
+}
+
+function composerText(composer: HTMLElement): string {
+  return normalizeText(composer.innerText || composer.textContent || '');
+}
+
+// Simulate the user pressing Enter to send. Facebook listens on keydown, but
+// we fire the full sequence for safety.
+function pressEnter(target: HTMLElement): void {
+  for (const type of ['keydown', 'keypress', 'keyup'] as const) {
+    const ev = new KeyboardEvent(type, {
+      key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+      bubbles: true, cancelable: true,
+    });
+    target.dispatchEvent(ev);
+  }
+}
+
+// Click the paper-plane Send button as a fallback when Enter doesn't clear the
+// composer (some layouts swallow the synthetic key event).
+function clickSendButton(near: HTMLElement): boolean {
+  const main = document.querySelector('[role="main"]') || document;
+  const buttons = main.querySelectorAll<HTMLElement>('[aria-label]');
+  for (const b of buttons) {
+    const label = b.getAttribute('aria-label') || '';
+    if (/^send\b|send message|press enter to send/i.test(label) && b.offsetParent !== null) {
+      b.click();
+      return true;
+    }
+  }
+  // Fallback: nearest clickable ancestor sibling labelled send
+  const sendIcon = near.closest('[role="main"]')?.querySelector<HTMLElement>('[aria-label="Press enter to send"]');
+  if (sendIcon) { sendIcon.click(); return true; }
+  return false;
+}
+
+interface SendResult { ok: boolean; error?: string; log: string[] }
+
+// Core send + validate routine. Returns ok only after CONFIRMING the message
+// text appears as a new bubble in the thread and the composer has cleared.
+async function performAutomatedSend(threadId: string, message: string): Promise<SendResult> {
+  const log: string[] = [];
+  const stamp = (m: string) => log.push(`[${new Date().toISOString()}] ${m}`);
+  const target = normalizeText(message);
+
+  stamp(`url=${window.location.href}`);
+  stamp(`requestedThread=${threadId} activeThread=${getActiveThreadId() || '(none)'}`);
+  stamp(`messageLength=${message.length} normalizedLength=${target.length}`);
+
+  if (!isMessagesPage()) {
+    return { ok: false, error: 'Not on a Messenger page', log };
+  }
+
+  // 1. Make sure we're on the right thread (background navigates first, but the
+  //    URL is our last line of defence against sending to the wrong person).
+  const active = getActiveThreadId();
+  if (active && active !== threadId) {
+    return { ok: false, error: `Thread mismatch: on ${active}, expected ${threadId}`, log };
+  }
+
+  // 2. Find the composer (poll — the thread view renders asynchronously).
+  const composer = await pollFor(() => findComposer(), 12_000, 300);
+  if (!composer) {
+    stamp('composer NOT found within 12s');
+    return { ok: false, error: 'Message composer not found', log };
+  }
+  stamp('composer found');
+
+  // 3. Snapshot the thread so we can detect the NEW outgoing bubble afterwards.
+  const main = document.querySelector('[role="main"]');
+  const beforeText = main ? normalizeText((main as HTMLElement).innerText) : '';
+  const beforeCount = countOccurrences(beforeText, target);
+  stamp(`occurrencesBefore=${beforeCount}`);
+
+  // 4. Type the message. execCommand('insertText') fires the beforeinput/input
+  //    events Facebook's editor expects, unlike setting textContent directly.
+  composer.focus();
+  await sleep(80);
+  try { document.execCommand('selectAll', false); } catch { /* ignore */ }
+  let inserted = false;
+  try {
+    inserted = document.execCommand('insertText', false, message);
+  } catch (e) {
+    stamp(`execCommand threw: ${String(e)}`);
+  }
+  await sleep(150);
+  let typed = composerText(composer);
+  stamp(`afterInsert execCommandReturned=${inserted} composerLen=${typed.length}`);
+
+  // Fallback: dispatch a manual beforeinput/input pair if the editor ignored us.
+  if (!typed.includes(target) || typed.length === 0) {
+    stamp('insertText incomplete — trying InputEvent fallback');
+    composer.focus();
+    try {
+      composer.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: message, bubbles: true, cancelable: true }));
+      composer.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: message, bubbles: true }));
+    } catch (e) {
+      stamp(`InputEvent fallback threw: ${String(e)}`);
+    }
+    await sleep(200);
+    typed = composerText(composer);
+    stamp(`afterFallback composerLen=${typed.length}`);
+  }
+
+  if (typed.length === 0) {
+    return { ok: false, error: 'Could not type message into composer', log };
+  }
+  if (!typed.includes(target)) {
+    stamp(`WARN composer text does not match target. composer="${typed.slice(0, 120)}"`);
+  }
+
+  // 5. Send.
+  pressEnter(composer);
+  stamp('pressed Enter');
+
+  // 6. Validate: composer clears AND a new bubble containing the text appears.
+  const confirmed = await pollFor(() => {
+    const c = composerText(composer);
+    const m = document.querySelector('[role="main"]');
+    const afterCount = m ? countOccurrences(normalizeText((m as HTMLElement).innerText), target) : 0;
+    return c.length === 0 && afterCount > beforeCount;
+  }, 10_000, 400);
+
+  if (!confirmed) {
+    // Try the Send button once, in case Enter was swallowed.
+    stamp('not confirmed after Enter — trying Send button');
+    if (clickSendButton(composer)) {
+      stamp('clicked Send button');
+    } else {
+      stamp('no Send button found');
+    }
+    const confirmed2 = await pollFor(() => {
+      const c = composerText(composer);
+      const m = document.querySelector('[role="main"]');
+      const afterCount = m ? countOccurrences(normalizeText((m as HTMLElement).innerText), target) : 0;
+      return c.length === 0 && afterCount > beforeCount;
+    }, 8_000, 400);
+    if (!confirmed2) {
+      const finalComposer = composerText(composer);
+      const m = document.querySelector('[role="main"]');
+      const afterCount = m ? countOccurrences(normalizeText((m as HTMLElement).innerText), target) : 0;
+      stamp(`FAILED composerEmpty=${finalComposer.length === 0} occurrencesAfter=${afterCount}`);
+      return { ok: false, error: 'Could not confirm message was delivered', log };
+    }
+  }
+
+  stamp('CONFIRMED delivered (composer cleared + new bubble present)');
+
+  // Stamp lastContacted on the saved contact, mirroring manual sends.
+  try { await markContacted(threadId); } catch { /* non-fatal */ }
+
+  return { ok: true, log };
+}
+
+if (isExtensionAlive()) {
+  try {
+    chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+      if (!request || typeof request.type !== 'string') return;
+
+      if (request.type === 'CRM_PING') {
+        sendResponse({ pong: true, threadId: getActiveThreadId(), url: window.location.href, ready: isMessagesPage() });
+        return; // synchronous
+      }
+
+      if (request.type === 'CRM_SEND_MESSAGE') {
+        const { threadId, message } = request.payload || {};
+        performAutomatedSend(String(threadId), String(message))
+          .then((res) => sendResponse(res))
+          .catch((e) => sendResponse({ ok: false, error: 'Exception: ' + String(e), log: [String(e)] }));
+        return true; // async response
+      }
+    });
+  } catch (e) {
+    console.warn('[CRM] Failed to register send-message listener:', e);
+  }
+}
+
 console.log('[CRM] Content script loaded, document.readyState:', document.readyState);
 if (document.readyState === 'loading') {
   console.log('[CRM] Waiting for DOMContentLoaded...');
