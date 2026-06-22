@@ -115,6 +115,12 @@ function getNameFromLink(link: HTMLAnchorElement): string {
 
 let storeCache: Store | null = null;
 
+// Timestamp of our own most recent write. The storage onChanged listener uses
+// this to tell "we just saved this" apart from "another tab/device changed
+// something", so our own writes don't trigger a full panel rebuild (which would
+// steal focus from — and wipe — the new-tag inputs while the user is typing).
+let lastSelfWriteAt = 0;
+
 async function getStore(): Promise<Store> {
   if (storeCache) return storeCache;
   const store = await _loadStore();
@@ -124,7 +130,10 @@ async function getStore(): Promise<Store> {
 
 async function saveStore(store: Store): Promise<void> {
   storeCache = store;
+  lastSelfWriteAt = Date.now();
   await _saveStore(store);
+  // Cover the window until chrome.storage fires onChanged for this write.
+  lastSelfWriteAt = Date.now();
 }
 
 function isExtensionAlive(): boolean {
@@ -287,7 +296,12 @@ if (isExtensionAlive()) {
       if (!relevant) return;
       storeCache = null;
       scheduleSidebarInject();
-      if (panelEl && panelEl.style.display !== 'none') renderPanel();
+      // Skip the panel rebuild if this change is the echo of our own save —
+      // the action handlers already call renderPanel() explicitly when needed.
+      // Rebuilding here on every self-write created a render→save→onChanged
+      // loop that wiped the new-tag input and re-randomized the color picker.
+      const selfTriggered = Date.now() - lastSelfWriteAt < 1500;
+      if (!selfTriggered && panelEl && panelEl.style.display !== 'none') renderPanel();
     });
   } catch (e) {
     console.warn('[CRM] Failed to register storage listener:', e);
@@ -369,6 +383,13 @@ let panelEl: HTMLElement | null = null;
 let currentPanelThreadId: string | null = null;
 let lastRenderedThread: string | null = null;
 let editingName: string | null = null;
+
+// In-progress "create new tag" inputs. Kept at module scope so they survive a
+// panel re-render (otherwise typing a tag name would be wiped, and the color
+// would re-randomize, on any storage change). The color is chosen once, not on
+// every render.
+const newTagDraft: { name: string; color: string } = { name: '', color: randomColor() };
+let newTagNameFocused = false;
 
 function buildLauncher() {
   const existing = document.getElementById('fb-crm-launcher');
@@ -477,8 +498,8 @@ async function renderPanel() {
 
       <div class="fb-crm-section-title">Create new tag</div>
       <div class="fb-crm-new">
-        <input type="text" id="fb-crm-new-name" placeholder="Tag name..." />
-        <input type="color" id="fb-crm-new-color" value="${randomColor()}" />
+        <input type="text" id="fb-crm-new-name" placeholder="Tag name..." value="${escapeHtml(newTagDraft.name)}" />
+        <input type="color" id="fb-crm-new-color" value="${newTagDraft.color}" />
         <button id="fb-crm-create">Add</button>
       </div>
     </div>`;
@@ -486,6 +507,17 @@ async function renderPanel() {
   wireClose();
   panelEl.querySelector('.fb-crm-pick-btn')?.addEventListener('click', enterPickMode);
   wirePanelActions(threadId);
+
+  // If the user was typing a tag name when a re-render happened, restore focus
+  // and place the caret at the end so their typing isn't interrupted.
+  if (newTagNameFocused) {
+    const el = panelEl.querySelector<HTMLInputElement>('#fb-crm-new-name');
+    if (el) {
+      el.focus();
+      const v = el.value;
+      try { el.setSelectionRange(v.length, v.length); } catch { /* ignore */ }
+    }
+  }
 }
 
 function wireClose() {
@@ -534,13 +566,25 @@ function wirePanelActions(threadId: string) {
     store.tags[tag.id] = tag;
     const conv = store.conversations[threadId];
     if (conv) { conv.tags.push(tag.id); conv.updatedAt = Date.now(); }
+    // Reset the draft for the next tag (fresh random color, empty name).
+    newTagDraft.name = '';
+    newTagDraft.color = randomColor();
+    newTagNameFocused = false;
     await saveStore(store);
     await renderPanel();
     await injectSidebarTags();
   });
 
+  // Keep the in-progress draft in sync so a re-render can't lose it.
+  const nameInput = panelEl.querySelector<HTMLInputElement>('#fb-crm-new-name');
+  nameInput?.addEventListener('input', e => { newTagDraft.name = (e.target as HTMLInputElement).value; });
+  nameInput?.addEventListener('focus', () => { newTagNameFocused = true; });
+  nameInput?.addEventListener('blur', () => { newTagNameFocused = false; });
+  panelEl.querySelector<HTMLInputElement>('#fb-crm-new-color')
+    ?.addEventListener('input', e => { newTagDraft.color = (e.target as HTMLInputElement).value; });
+
   // Allow Enter key in the tag name input to create the tag
-  panelEl.querySelector<HTMLInputElement>('#fb-crm-new-name')?.addEventListener('keydown', e => {
+  nameInput?.addEventListener('keydown', e => {
     if (e.key === 'Enter') panelEl?.querySelector<HTMLButtonElement>('#fb-crm-create')?.click();
   });
 
