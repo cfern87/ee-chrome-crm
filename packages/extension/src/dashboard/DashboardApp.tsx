@@ -326,9 +326,9 @@ export default function DashboardApp() {
 
         {/* Conversations tab */}
         {activeTab === 'conversations' && (
-          <div style={{ display: 'flex', gap: 16 }}>
+          <div style={{ display: 'flex', gap: 14 }}>
             {/* Left: list */}
-            <div style={{ flex: '0 0 360px' }}>
+            <div style={{ flex: '0 0 320px' }}>
               {/* Search */}
               <div style={{ marginBottom: 12 }}>
                 <input
@@ -522,10 +522,18 @@ export default function DashboardApp() {
                 </div>
               )}
 
+              {/* List header with count */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, paddingBottom: 8, borderBottom: '1px solid #e8e8e8' }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: '#555' }}>Contacts</span>
+                <span style={{ fontSize: 12, color: '#aaa', fontWeight: 500 }}>
+                  {filtered.length} {filtered.length === 1 ? 'contact' : 'contacts'}
+                </span>
+              </div>
+
               {/* List */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                 {filtered.length === 0 && (
-                  <div style={{ textAlign: 'center', padding: '32px 16px', color: '#aaa', fontSize: 13 }}>
+                  <div style={{ textAlign: 'center', padding: '24px 12px', color: '#aaa', fontSize: 12 }}>
                     {conversations.length === 0
                       ? 'No conversations yet. Open Messenger and visit some chats.'
                       : 'No results match your search.'}
@@ -539,13 +547,13 @@ export default function DashboardApp() {
                       key={conv.id}
                       style={{
                         background: isDetailSelected ? '#e8f0fe' : '#fff',
-                        border: `1px solid ${isDetailSelected ? '#065fd4' : '#e8e8e8'}`,
-                        borderRadius: 8,
-                        padding: '10px 10px',
+                        border: `1px solid ${isDetailSelected ? '#065fd4' : '#e0e0e0'}`,
+                        borderRadius: 6,
+                        padding: '8px 9px',
                         cursor: 'pointer',
                         transition: 'background 0.15s',
                         display: 'flex',
-                        gap: 8,
+                        gap: 7,
                         alignItems: 'flex-start',
                       }}
                     >
@@ -554,31 +562,31 @@ export default function DashboardApp() {
                         checked={isBulkSelected}
                         onChange={() => handleToggleSelect(conv.id)}
                         onClick={(e) => e.stopPropagation()}
-                        style={{ cursor: 'pointer', marginTop: 3, flexShrink: 0 }}
+                        style={{ cursor: 'pointer', marginTop: 2, flexShrink: 0 }}
                       />
                       <div
                         onClick={() => setSelectedConv(isDetailSelected ? null : conv)}
                         style={{ flex: 1, minWidth: 0 }}
                       >
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                          <div style={{ fontWeight: 600, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 6 }}>
+                          <div style={{ fontWeight: 600, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
                             {conv.participantName || 'Unknown'}
                           </div>
-                          <div style={{ fontSize: 11, color: '#aaa', flexShrink: 0, marginLeft: 8 }}>
+                          <div style={{ fontSize: 10, color: '#bbb', flexShrink: 0 }}>
                             {conv.updatedAt ? formatRelativeTime(conv.updatedAt) : ''}
                           </div>
                         </div>
-                        <div style={{ fontSize: 12, color: '#888', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 3 }}>
+                        <div style={{ fontSize: 11, color: '#999', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2 }}>
                           {conv.lastMessage || ''}
                         </div>
                         {conv.tags.length > 0 && (
-                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginTop: 4 }}>
                             {conv.tags.map((tagId) => {
                               const tag = store.tags[tagId];
                               return tag ? (
                                 <span
                                   key={tagId}
-                                  style={{ background: tag.color, color: '#fff', fontSize: 10, padding: '2px 7px', borderRadius: 10, fontWeight: 600 }}
+                                  style={{ background: tag.color, color: '#fff', fontSize: 9, padding: '2px 6px', borderRadius: 8, fontWeight: 600 }}
                                 >
                                   {tag.name}
                                 </span>
