@@ -3,15 +3,22 @@ import { Store, Conversation, Tag, loadStore, saveStore, EMPTY_STORE, getSyncUsa
 import { Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS } from '../campaigns';
 
 // Promise wrapper around the background message channel (campaign control).
-function sendBg<T = any>(message: unknown): Promise<T | null> {
+// Always settles: a timeout guards against a service worker that failed to
+// register its handler (e.g. before a full extension reload), so the UI can
+// never hang waiting for a response that will never come.
+function sendBg<T = any>(message: unknown, timeoutMs = 15000): Promise<T | null> {
   return new Promise((resolve) => {
+    let settled = false;
+    const done = (v: T | null) => { if (!settled) { settled = true; resolve(v); } };
+    const timer = setTimeout(() => done(null), timeoutMs);
     try {
-      if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) { resolve(null); return; }
+      if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) { clearTimeout(timer); done(null); return; }
       chrome.runtime.sendMessage(message, (res) => {
-        if (chrome.runtime.lastError) { resolve(null); return; }
-        resolve(res as T);
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) { done(null); return; }
+        done(res as T);
       });
-    } catch { resolve(null); }
+    } catch { clearTimeout(timer); done(null); }
   });
 }
 
@@ -1209,8 +1216,10 @@ function MessagingPanel({ conversations, tags, store, campaigns, preselected, on
       setTemplate('');
       onChanged();
       onViewHistory();
+    } else if (res === null) {
+      setError('No response from the extension background. Fully reload the extension at chrome://extensions (Developer mode → ⟳ on this extension), then refresh this page — the messaging feature needs the new "alarms" permission.');
     } else {
-      setError(res?.error || 'Failed to start campaign.');
+      setError(res.error || 'Failed to start campaign.');
     }
   };
 

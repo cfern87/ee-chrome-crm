@@ -37,16 +37,22 @@ const SENDER_TAB_KEY = 'facebook_crm_sender_tab';
 const MAX_ATTEMPTS = 3; // give up on a recipient after this many tries
 
 // Chrome clamps one-shot alarms to a 30s floor; our real gaps are minutes.
+// All alarm calls are guarded: if the "alarms" permission isn't active yet
+// (e.g. the extension hasn't been fully reloaded after the manifest change),
+// they must NOT throw — otherwise the service worker would crash on startup and
+// never register the message handler below, hanging the dashboard's Start button.
 function scheduleTick(delayMs: number): void {
-  chrome.alarms.create(TICK_ALARM, { delayInMinutes: Math.max(0.5, delayMs / 60_000) });
+  try { chrome.alarms?.create(TICK_ALARM, { delayInMinutes: Math.max(0.5, delayMs / 60_000) }); }
+  catch (e) { console.warn('[CRM] alarms unavailable (scheduleTick):', e); }
 }
 
 function clearTick(): void {
-  chrome.alarms.clear(TICK_ALARM);
+  try { chrome.alarms?.clear(TICK_ALARM); } catch { /* ignore */ }
 }
 
 function ensureWatchdog(): void {
-  chrome.alarms.create(WATCHDOG_ALARM, { periodInMinutes: 1 });
+  try { chrome.alarms?.create(WATCHDOG_ALARM, { periodInMinutes: 1 }); }
+  catch (e) { console.warn('[CRM] alarms unavailable (watchdog):', e); }
 }
 
 // ---- sender tab bookkeeping (survives SW restarts) ----
@@ -400,10 +406,14 @@ async function watchdog(): Promise<void> {
   processTick();
 }
 
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === TICK_ALARM) processTick();
-  else if (alarm.name === WATCHDOG_ALARM) watchdog();
-});
+try {
+  chrome.alarms?.onAlarm.addListener((alarm) => {
+    if (alarm.name === TICK_ALARM) processTick();
+    else if (alarm.name === WATCHDOG_ALARM) watchdog();
+  });
+} catch (e) {
+  console.warn('[CRM] could not register alarm listener:', e);
+}
 
 // Re-arm the watchdog whenever the worker spins up.
 ensureWatchdog();
