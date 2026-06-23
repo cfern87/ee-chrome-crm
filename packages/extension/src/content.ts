@@ -18,6 +18,7 @@ import {
   saveStore as _saveStore,
 } from './storage';
 import type { Store, Tag, Conversation } from './storage';
+import { profileKey } from './csv';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
 const COLORS = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E2'];
@@ -767,6 +768,8 @@ function watchNavigation() {
       } else {
         console.log('[CRM] Navigated away from Messenger page, removing launcher');
         removeLauncher();
+        // Landed on a profile? Try to resolve any imported contact's thread id.
+        setTimeout(resolveImportedProfileOnThisPage, 1200);
       }
       const newThreadId = getActiveThreadId();
       if (newThreadId && panelEl && panelEl.style.display !== 'none') {
@@ -776,6 +779,73 @@ function watchNavigation() {
       }
     }
   }, 800);
+}
+
+// ---- Resolve imported contacts' thread ids from their profile page ----
+//
+// CSV-imported contacts start with a chat URL derived from their profile URL
+// (numeric for profile.php?id=N, the vanity username otherwise). When the user
+// actually opens such a profile on facebook.com we read the *exact* thread id
+// Facebook uses — preferring the numeric fbid — and upgrade the stored contact
+// so the bulk messenger targets the canonical /t/<id>/ URL. We only ever touch
+// the contact whose stored profile URL matches the page we're on.
+
+function isProfilePage(): boolean {
+  if (isMessagesPage()) return false;
+  if (/^\/profile\.php$/i.test(window.location.pathname)) return true;
+  return window.location.pathname.split('/').filter(Boolean).length === 1; // facebook.com/<username>
+}
+
+function getProfilePageThreadId(): string | null {
+  // profile.php?id=N — exact, straight from the URL.
+  if (/^\/profile\.php$/i.test(window.location.pathname)) {
+    const id = new URLSearchParams(window.location.search).get('id');
+    if (id && /^\d+$/.test(id)) return id;
+  }
+  // The page's own app deep link → numeric fbid (specific to this profile).
+  const meta = document.querySelector<HTMLMetaElement>('meta[property="al:android:url"], meta[property="al:ios:url"]');
+  const metaId = meta?.content.match(/fb:\/\/(?:profile|page)\/(\d+)/);
+  if (metaId) return metaId[1];
+  // Constrained fallback: a single, unambiguous /messages/t/<id> link.
+  const ids = new Set<string>();
+  document.querySelectorAll<HTMLAnchorElement>('a[href*="/messages/t/"]').forEach((a) => {
+    const id = extractThreadId(a.href);
+    if (id) ids.add(id);
+  });
+  if (ids.size === 1) return [...ids][0];
+  // Last resort: the first profile deep link anywhere in the page source.
+  const html = document.documentElement.innerHTML.match(/fb:\/\/profile\/(\d+)/);
+  return html ? html[1] : null;
+}
+
+let lastProfileResolveAt = 0;
+async function resolveImportedProfileOnThisPage(): Promise<void> {
+  if (!isProfilePage()) return;
+  if (Date.now() - lastProfileResolveAt < 2500) return;
+  lastProfileResolveAt = Date.now();
+
+  const pageKey = profileKey(window.location.href);
+  if (!pageKey) return;
+  const threadId = getProfilePageThreadId();
+  if (!threadId) return;
+  const numeric = /^\d+$/.test(threadId);
+  const chatUrl = `https://www.facebook.com/messages/t/${threadId}/`;
+
+  const store = await getStore();
+  let dirty = false;
+  for (const conv of Object.values(store.conversations)) {
+    if (profileKey(conv.profileUrl) !== pageKey) continue;
+    // Upgrade when there's no chat URL yet, or when we found the more reliable
+    // numeric id and the stored one differs (e.g. an earlier vanity guess).
+    if (!conv.chatUrl || (numeric && conv.chatUrl !== chatUrl)) {
+      conv.chatUrl = chatUrl;
+      conv.participantId = threadId;
+      conv.updatedAt = Date.now();
+      dirty = true;
+      console.log('[CRM] Resolved imported contact thread id from profile:', conv.participantName, '→', threadId);
+    }
+  }
+  if (dirty) await saveStore(store);
 }
 
 // ---- Init ----
@@ -789,6 +859,12 @@ function init() {
   startSidebarObserver();
   watchNavigation();
   watchOutgoingMessages();
+
+  // Opportunistically resolve imported contacts' thread ids while the user
+  // browses profiles. Self-gates to profile pages and self-throttles, so it's
+  // cheap to poll. Runs once shortly after load, then periodically.
+  setTimeout(resolveImportedProfileOnThisPage, 2000);
+  setInterval(resolveImportedProfileOnThisPage, 2500);
 
   if (isMessagesPage()) {
     console.log('[CRM] On Messenger page, building launcher...');

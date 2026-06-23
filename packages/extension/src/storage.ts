@@ -49,6 +49,19 @@ export interface Conversation {
   lastMessageTime: number;
   tags: string[];
   chatUrl?: string;
+  email?: string;
+  // Facebook *profile* URL (distinct from chatUrl, which is a Messenger thread
+  // URL). Populated by CSV import; used to open a contact's profile and as the
+  // dedup key on re-import. May be synthesized from fbUserId/fbUsername when the
+  // import only supplied an id or username.
+  profileUrl?: string;
+  // Facebook identity, populated by CSV import. fbUserId is the numeric fbid
+  // (the most reliable thread id); fbUsername is the vanity handle.
+  fbUserId?: string;
+  fbUsername?: string;
+  // Provenance: 'messenger' for contacts captured from Messenger, 'import' for
+  // contacts added via CSV import. Absent = legacy/messenger.
+  source?: 'messenger' | 'import';
   archived: boolean;
   createdAt: number;
   updatedAt: number;
