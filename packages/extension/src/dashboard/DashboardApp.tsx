@@ -6,6 +6,7 @@ import {
   resolveThread, csvHeaders, detectMapping, MAPPABLE_FIELDS, Mapping, Field,
   loadImportHistory, recordImport, ImportHistoryEntry,
 } from '../csv';
+import { mergeConversations, findDuplicateGroups, cleanStoredNames, pickPrimary, DuplicateGroup } from '../contacts';
 
 // Trigger a client-side file download of text content.
 function downloadText(filename: string, mime: string, content: string) {
@@ -265,6 +266,16 @@ export default function DashboardApp() {
     setBulkDeleteConfirm(false);
   };
 
+  const handleBulkMerge = async () => {
+    if (selectedIds.size < 2) return;
+    const ids = Array.from(selectedIds);
+    const { store: next, mergedInto, removed } = mergeConversations(store, ids);
+    await updateStore(next);
+    console.info(`[CRM][merge] Merged ${removed + 1} contacts into ${mergedInto}`);
+    setSelectedIds(new Set());
+    setSelectedConv(next.conversations[mergedInto] || null);
+  };
+
   const deleteConversation = async (id: string) => {
     const next = { ...store, conversations: { ...store.conversations } };
     delete next.conversations[id];
@@ -291,6 +302,16 @@ export default function DashboardApp() {
     const next = { ...store, conversations: { ...store.conversations, [conv.id]: updated } };
     await updateStore(next);
     if (selectedConv?.id === conv.id) setSelectedConv(updated);
+  };
+
+  const renameConversation = async (conv: Conversation, newName: string) => {
+    const name = newName.trim();
+    if (!name || name === conv.participantName) return;
+    const updated = { ...conv, participantName: name, nameManual: true, updatedAt: Date.now() };
+    const next = { ...store, conversations: { ...store.conversations, [conv.id]: updated } };
+    await updateStore(next);
+    if (selectedConv?.id === conv.id) setSelectedConv(updated);
+    console.info(`[CRM] Renamed contact ${conv.id} → "${name}"`);
   };
 
   const addTagToConv = async (conv: Conversation, tagId: string) => {
@@ -534,6 +555,15 @@ export default function DashboardApp() {
                     >
                       Remove Tag
                     </button>
+                    {selectedIds.size >= 2 && (
+                      <button
+                        onClick={handleBulkMerge}
+                        title="Combine the selected contacts into one (unions tags, keeps the best identity/thread id)"
+                        style={{ background: '#9B5DE5', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                      >
+                        Merge ({selectedIds.size})
+                      </button>
+                    )}
                     <button
                       onClick={() => { setBulkDeleteConfirm(true); setBulkTagMenu(null); }}
                       style={{ background: '#fff0f0', color: '#e53e3e', border: '1px solid #fecaca', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
@@ -717,6 +747,7 @@ export default function DashboardApp() {
                   onOpen={() => markOpened([selectedConv.id])}
                   onRemoveTag={(tagId) => removeTagFromConv(selectedConv, tagId)}
                   onAddTag={(tagId) => addTagToConv(selectedConv, tagId)}
+                  onRename={(name) => renameConversation(selectedConv, name)}
                   onStartDelete={() => { setDeleteConfirm(selectedConv.id); setDeleteConfirm2(false); }}
                   onConfirmDelete1={() => setDeleteConfirm2(true)}
                   onCancelDelete={() => { setDeleteConfirm(null); setDeleteConfirm2(false); }}
@@ -830,28 +861,56 @@ interface ConvDetailProps {
   onOpen: () => void;
   onRemoveTag: (tagId: string) => void;
   onAddTag: (tagId: string) => void;
+  onRename: (name: string) => void;
   onStartDelete: () => void;
   onConfirmDelete1: () => void;
   onCancelDelete: () => void;
 }
 
-function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
+function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onRename, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
   const availableTags = tags.filter((t) => !conv.tags.includes(t.id));
   const [addingTag, setAddingTag] = useState(false);
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState('');
+
+  // Reset rename editor whenever a different contact is shown.
+  useEffect(() => { setEditingName(false); }, [conv.id]);
+
+  const startRename = () => { setNameDraft(conv.participantName || ''); setEditingName(true); };
+  const commitRename = () => { onRename(nameDraft); setEditingName(false); };
 
   return (
     <div style={{ background: '#fff', borderRadius: 10, padding: '20px 24px', boxShadow: '0 1px 3px rgba(0,0,0,0.08)' }}>
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 18 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>{conv.participantName || 'Unknown'}</h2>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {editingName ? (
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <input
+                autoFocus
+                value={nameDraft}
+                onChange={(e) => setNameDraft(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') setEditingName(false); }}
+                placeholder="Contact name…"
+                style={{ flex: 1, minWidth: 0, fontSize: 18, fontWeight: 700, padding: '4px 8px', border: '1px solid #cfe0f5', borderRadius: 6, outline: 'none' }}
+              />
+              <button onClick={commitRename} style={{ background: '#0a7c4a', color: '#fff', border: 'none', padding: '7px 12px', borderRadius: 6, fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>Save</button>
+              <button onClick={() => setEditingName(false)} style={{ background: '#f5f5f5', color: '#555', border: '1px solid #ddd', padding: '7px 12px', borderRadius: 6, fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>Cancel</button>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis' }}>{conv.participantName || 'Unknown'}</h2>
+              <button onClick={startRename} title="Rename contact" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14, color: '#999', padding: 2, lineHeight: 1 }}>✎</button>
+              {conv.nameManual && <span title="Custom name — kept even when this chat is reopened" style={{ fontSize: 10, color: '#7b3fb8', background: '#f3eafb', padding: '2px 6px', borderRadius: 8, fontWeight: 600 }}>custom</span>}
+            </div>
+          )}
           <div style={{ fontSize: 12, color: '#aaa', marginTop: 4 }}>
             Last activity: {conv.updatedAt ? formatRelativeTime(conv.updatedAt) : 'unknown'}
             {conv.lastContactedAt ? ` · 📨 Last contacted: ${formatRelativeTime(conv.lastContactedAt)}` : ''}
             {conv.lastOpenedAt ? ` · Last opened: ${formatRelativeTime(conv.lastOpenedAt)}` : ''}
           </div>
         </div>
-        <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 20, color: '#aaa', lineHeight: 1 }}>×</button>
+        <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 20, color: '#aaa', lineHeight: 1, marginLeft: 8 }}>×</button>
       </div>
 
       {/* Actions */}
@@ -1088,6 +1147,7 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
         <h3 style={{ margin: '0 0 16px', fontSize: 15, fontWeight: 600 }}>Preferences</h3>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {[
+            { key: 'autoCapture', label: 'Auto-capture conversations you open', default: true },
             { key: 'autoTagging', label: 'Auto-tagging', default: true },
             { key: 'notificationEnabled', label: 'Notifications', default: true },
           ].map(({ key, label, default: def }) => (
@@ -1118,7 +1178,13 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
             </div>
           ))}
         </div>
+        <p style={{ margin: '12px 0 0', fontSize: 11, color: '#aaa', lineHeight: 1.5 }}>
+          <strong>Auto-capture</strong> saves every conversation you open while the CRM panel is visible in Messenger. Turn it off to
+          only add contacts you explicitly save (a "Save contact" button appears instead). It never adds anyone just from replying.
+        </p>
       </div>
+
+      <ContactsMaintenance store={store} updateStore={updateStore} />
 
       <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
         <h3 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>Chrome Sync</h3>
@@ -1186,6 +1252,121 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
 interface CsvImportPanelProps {
   store: Store;
   updateStore: (s: Store) => Promise<void>;
+}
+
+// --- Contacts maintenance: clean names + find/merge duplicates ---
+function ContactsMaintenance({ store, updateStore }: { store: Store; updateStore: (s: Store) => Promise<void> }) {
+  const [status, setStatus] = useState<{ type: 'success' | 'info'; msg: string } | null>(null);
+  const [groups, setGroups] = useState<DuplicateGroup[] | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const cardStyle: React.CSSProperties = { background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 };
+
+  const cleanNames = async () => {
+    setBusy(true);
+    try {
+      const { store: next, changed, examples } = cleanStoredNames(store);
+      if (changed === 0) { setStatus({ type: 'info', msg: 'No names needed cleaning.' }); return; }
+      await updateStore(next);
+      const sample = examples.map((e) => `“${e.from}” → “${e.to}”`).join(', ');
+      console.info(`[CRM][names] Cleaned ${changed} name(s)`);
+      setStatus({ type: 'success', msg: `Cleaned ${changed} name${changed !== 1 ? 's' : ''}. ${sample}${changed > examples.length ? '…' : ''}` });
+    } finally { setBusy(false); }
+  };
+
+  const scan = () => {
+    setGroups(findDuplicateGroups(store.conversations));
+    setStatus(null);
+  };
+
+  const mergeGroup = async (g: DuplicateGroup) => {
+    const { store: next, removed, mergedInto } = mergeConversations(store, g.ids);
+    await updateStore(next);
+    console.info(`[CRM][merge] Merged ${removed + 1} contacts into ${mergedInto}`);
+    setGroups((gs) => (gs ? gs.filter((x) => x !== g) : gs));
+    setStatus({ type: 'success', msg: `Merged ${removed + 1} contacts into “${next.conversations[mergedInto]?.participantName || mergedInto}”.` });
+  };
+
+  const identityCount = groups?.filter((g) => g.reason === 'identity').length ?? 0;
+  const nameCount = groups?.filter((g) => g.reason === 'name').length ?? 0;
+
+  return (
+    <div style={cardStyle}>
+      <h3 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>Contacts maintenance</h3>
+      <p style={{ margin: '0 0 14px', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
+        <strong>Clean up names</strong> re-tidies stored names (strips "Conversation with", trailing "· 3h", etc.).
+        <strong> Find duplicates</strong> groups contacts that share an identity (profile/id/username/thread) or just a name, so you can merge them.
+      </p>
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+        <button onClick={cleanNames} disabled={busy} style={{ background: '#065fd4', color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: busy ? 'not-allowed' : 'pointer' }}>
+          Clean up names
+        </button>
+        <button onClick={scan} disabled={busy} style={{ background: '#9B5DE5', color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: busy ? 'not-allowed' : 'pointer' }}>
+          Find duplicates
+        </button>
+      </div>
+
+      {status && (
+        <div style={{
+          marginTop: 12, fontSize: 12, padding: '8px 10px', borderRadius: 6, lineHeight: 1.5,
+          background: status.type === 'success' ? '#e8f5e9' : '#e3f2fd', color: status.type === 'success' ? '#2e7d32' : '#1565c0',
+        }}>
+          {status.msg}
+        </div>
+      )}
+
+      {groups && (
+        <div style={{ marginTop: 14 }}>
+          {groups.length === 0 ? (
+            <div style={{ fontSize: 13, color: '#2e7d32', background: '#e8f5e9', padding: '10px 12px', borderRadius: 7 }}>
+              ✓ No duplicates found.
+            </div>
+          ) : (
+            <>
+              <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>
+                {identityCount} identity match{identityCount !== 1 ? 'es' : ''} · {nameCount} same-name group{nameCount !== 1 ? 's' : ''}
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {groups.map((g, i) => (
+                  <DuplicateGroupRow key={i} group={g} store={store} onMerge={() => mergeGroup(g)} />
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DuplicateGroupRow({ group, store, onMerge }: { group: DuplicateGroup; store: Store; onMerge: () => void }) {
+  const convs = group.ids.map((id) => store.conversations[id]).filter(Boolean) as Conversation[];
+  if (convs.length < 2) return null;
+  const primary = pickPrimary(convs);
+  const strong = group.reason === 'identity';
+  return (
+    <div style={{ background: '#fafafa', borderRadius: 8, padding: '10px 12px', border: `1px solid ${strong ? '#e6d8f5' : '#eee'}` }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
+        <div style={{ minWidth: 0 }}>
+          <span style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.4, color: strong ? '#7b3fb8' : '#b9770e' }}>
+            {strong ? 'Same identity' : 'Same name'}
+          </span>
+          <div style={{ fontSize: 13, marginTop: 2 }}>
+            {convs.map((c) => (
+              <span key={c.id} style={{ marginRight: 8 }}>
+                {c.id === primary.id ? '★ ' : ''}{c.participantName || 'Unknown'}
+                <span style={{ color: '#bbb', fontSize: 11 }}> ({c.tags.length}🏷{c.chatUrl ? ' · ✉' : ''})</span>
+              </span>
+            ))}
+          </div>
+        </div>
+        <button onClick={onMerge} style={{ flexShrink: 0, background: '#9B5DE5', color: '#fff', border: 'none', padding: '7px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
+          Merge {convs.length}
+        </button>
+      </div>
+      <div style={{ fontSize: 10, color: '#aaa', marginTop: 4 }}>★ survivor keeps the best thread id; tags are combined.</div>
+    </div>
+  );
 }
 
 function CsvImportPanel({ store, updateStore }: CsvImportPanelProps) {

@@ -62,6 +62,9 @@ export interface Conversation {
   // Provenance: 'messenger' for contacts captured from Messenger, 'import' for
   // contacts added via CSV import. Absent = legacy/messenger.
   source?: 'messenger' | 'import';
+  // Set when the user renames the contact by hand. While true, the content
+  // script will not overwrite participantName with a name scraped from the DOM.
+  nameManual?: boolean;
   archived: boolean;
   createdAt: number;
   updatedAt: number;

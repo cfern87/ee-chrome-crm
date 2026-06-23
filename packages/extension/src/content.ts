@@ -19,6 +19,7 @@ import {
 } from './storage';
 import type { Store, Tag, Conversation } from './storage';
 import { profileKey } from './csv';
+import { extractNameFromLink, extractActiveThreadName } from './names';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
 const COLORS = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E2'];
@@ -43,70 +44,17 @@ function formatRelative(ts?: number): string {
 }
 function getActiveThreadId(): string | null { return extractThreadId(window.location.pathname); }
 
+// Name extraction now lives in ./names (the "intelligent namegrabber"): it
+// prefers the profile-photo alt / accessible label, strips "Conversation with",
+// trailing timestamps ("· 3h"), status words and message previews, and validates
+// that what's left actually looks like a name. These thin wrappers keep the
+// existing call sites unchanged.
 function getActiveThreadName(): string {
-  // Try multiple sources in order of reliability:
-
-  // 1. Active/current sidebar link for this thread
-  const threadId = getActiveThreadId();
-  if (threadId) {
-    const activeLink = document.querySelector<HTMLAnchorElement>(
-      `a[href*="/t/${threadId}"]`
-    );
-    if (activeLink) {
-      const name = getNameFromLink(activeLink);
-      if (name && name !== 'Unknown') return name;
-    }
-  }
-
-  // 2. Conversation header — usually the first prominent heading in [role="main"]
-  const main = document.querySelector('[role="main"]');
-  if (main) {
-    // Look for visible text in headings or high-level elements
-    const candidates = main.querySelectorAll('h1, h2, h3, [role="heading"]');
-    for (const el of candidates) {
-      const text = el.textContent?.trim();
-      if (text && text.length > 1 && text.length < 100 && !/^\d+$/.test(text)) {
-        return text.split(/[\n•]/)[0].trim();
-      }
-    }
-
-    // Fallback: find the first substantial text node in the header area
-    // (usually a div or section at the top)
-    const headerLike = main.querySelector('div:first-child, section:first-child');
-    if (headerLike) {
-      const text = headerLike.textContent?.trim();
-      if (text && text.length > 1 && text.length < 200) {
-        // Extract first line or first "word group"
-        const firstLine = text.split(/[\n•]/)[0].trim();
-        if (firstLine.length > 1 && firstLine.length < 100) {
-          return firstLine;
-        }
-      }
-    }
-  }
-
-  // 3. Page title (least reliable, but fallback)
-  const title = document.title
-    .replace(/\s*[|·-]\s*(Messenger|Facebook).*$/i, '')
-    .replace(/^\(\d+\)\s*/, '').trim();
-  if (title && !/^(messenger|facebook)$/i.test(title) && title.length < 100) {
-    return title;
-  }
-
-  return 'Unknown';
+  return extractActiveThreadName(getActiveThreadId());
 }
 
-// Extract best name from the DOM subtree of a sidebar link
 function getNameFromLink(link: HTMLAnchorElement): string {
-  // The first non-empty short text node that isn't a timestamp/number usually is the name.
-  const spans = Array.from(link.querySelectorAll('span, div'));
-  for (const el of spans) {
-    const text = el.textContent?.trim() || '';
-    if (text.length >= 2 && text.length <= 60 && !/^\d+$/.test(text) && !/^[•·]\s*\d/.test(text)) {
-      return text.split('\n')[0].trim();
-    }
-  }
-  return link.textContent?.trim().split('\n')[0] || 'Unknown';
+  return extractNameFromLink(link);
 }
 
 // ---- Storage ----
@@ -180,8 +128,9 @@ async function ensureConversation(threadId: string, link?: HTMLAnchorElement): P
     dirty = true;
   } else {
     const conv = store.conversations[threadId];
-    // Refresh name if we got a better one from the sidebar link
-    if (link) {
+    // Refresh name if we got a better one from the sidebar link — unless the
+    // user has manually renamed this contact, in which case their name wins.
+    if (link && !conv.nameManual) {
       const name = getNameFromLink(link);
       if (name !== 'Unknown' && conv.participantName !== name) {
         conv.participantName = name;
@@ -463,6 +412,32 @@ async function renderPanel() {
     return;
   }
 
+  // Auto-capture: by default we save (and keep fresh) any thread you open while
+  // the panel is visible. When the user turns this off, only contacts they've
+  // already saved are updated — a new thread shows a "Save contact" button
+  // instead of being added silently.
+  const preStore = await getStore();
+  const autoCapture = (preStore.settings as Record<string, unknown>)?.autoCapture !== false;
+  if (!autoCapture && !preStore.conversations[threadId]) {
+    const guessName = getActiveThreadName();
+    panelEl.innerHTML = `
+      <div class="fb-crm-header">
+        <span>Messenger CRM</span>
+        <button class="fb-crm-close">✕</button>
+      </div>
+      <div class="fb-crm-body">
+        <div class="fb-crm-name-row"><div class="fb-crm-name">${escapeHtml(guessName)}</div></div>
+        <div class="fb-crm-muted" style="margin:6px 0 12px">Not saved yet · auto-capture is off.</div>
+        <button class="fb-crm-pick-btn" id="fb-crm-save-contact">➕ Save this contact</button>
+      </div>`;
+    wireClose();
+    panelEl.querySelector('#fb-crm-save-contact')?.addEventListener('click', async () => {
+      await ensureConversation(threadId);
+      renderPanel();
+    });
+    return;
+  }
+
   const conv = await ensureConversation(threadId);
   const store = await getStore();
   const convTags = conv.tags.map(tid => store.tags[tid]).filter(Boolean) as Tag[];
@@ -602,6 +577,7 @@ function wirePanelActions(threadId: string) {
       const conv = store.conversations[threadId];
       if (conv) {
         conv.participantName = newName.trim();
+        conv.nameManual = true; // user-set name — don't let DOM scraping override it
         conv.updatedAt = Date.now();
         await saveStore(store);
         editingName = null;
