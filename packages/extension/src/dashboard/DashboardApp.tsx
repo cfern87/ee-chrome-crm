@@ -1,6 +1,27 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Store, Conversation, Tag, loadStore, saveStore, EMPTY_STORE, getSyncUsage, SyncUsage } from '../storage';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { Store, Conversation, Tag, loadStore, saveStore, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync } from '../storage';
 import { Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS } from '../campaigns';
+import {
+  parseContactsCsv, applyContacts, contactsToCsv, sampleCsv,
+  resolveThread, csvHeaders, detectMapping, MAPPABLE_FIELDS, Mapping, Field,
+  loadImportHistory, recordImport, ImportHistoryEntry,
+} from '../csv';
+import { mergeConversations, findDuplicateGroups, cleanStoredNames, pickPrimary, DuplicateGroup } from '../contacts';
+
+// Trigger a client-side file download of text content.
+function downloadText(filename: string, mime: string, content: string) {
+  const blob = new Blob([content], { type: mime + ';charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function tsStamp(): string {
+  return new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+}
 
 // Promise wrapper around the background message channel (campaign control).
 // Always settles: a timeout guards against a service worker that failed to
@@ -168,6 +189,14 @@ export default function DashboardApp() {
 
   const archived = conversations.filter((c) => c.archived);
 
+  // Export the current filtered/sorted view as a re-importable CSV.
+  const exportFilteredCsv = () => {
+    if (filtered.length === 0) return;
+    const csv = contactsToCsv(filtered, store.tags);
+    downloadText(`messenger-crm-contacts-${tsStamp()}.csv`, 'text/csv', csv);
+    console.info(`[CRM][export] Exported ${filtered.length} contacts to CSV`);
+  };
+
   // Mark conversations as opened (tracks lastOpenedAt for sort-by-last-opened)
   const markOpened = async (ids: string[]) => {
     const ts = Date.now();
@@ -237,6 +266,16 @@ export default function DashboardApp() {
     setBulkDeleteConfirm(false);
   };
 
+  const handleBulkMerge = async () => {
+    if (selectedIds.size < 2) return;
+    const ids = Array.from(selectedIds);
+    const { store: next, mergedInto, removed } = mergeConversations(store, ids);
+    await updateStore(next);
+    console.info(`[CRM][merge] Merged ${removed + 1} contacts into ${mergedInto}`);
+    setSelectedIds(new Set());
+    setSelectedConv(next.conversations[mergedInto] || null);
+  };
+
   const deleteConversation = async (id: string) => {
     const next = { ...store, conversations: { ...store.conversations } };
     delete next.conversations[id];
@@ -263,6 +302,16 @@ export default function DashboardApp() {
     const next = { ...store, conversations: { ...store.conversations, [conv.id]: updated } };
     await updateStore(next);
     if (selectedConv?.id === conv.id) setSelectedConv(updated);
+  };
+
+  const renameConversation = async (conv: Conversation, newName: string) => {
+    const name = newName.trim();
+    if (!name || name === conv.participantName) return;
+    const updated = { ...conv, participantName: name, nameManual: true, updatedAt: Date.now() };
+    const next = { ...store, conversations: { ...store.conversations, [conv.id]: updated } };
+    await updateStore(next);
+    if (selectedConv?.id === conv.id) setSelectedConv(updated);
+    console.info(`[CRM] Renamed contact ${conv.id} → "${name}"`);
   };
 
   const addTagToConv = async (conv: Conversation, tagId: string) => {
@@ -506,6 +555,15 @@ export default function DashboardApp() {
                     >
                       Remove Tag
                     </button>
+                    {selectedIds.size >= 2 && (
+                      <button
+                        onClick={handleBulkMerge}
+                        title="Combine the selected contacts into one (unions tags, keeps the best identity/thread id)"
+                        style={{ background: '#9B5DE5', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                      >
+                        Merge ({selectedIds.size})
+                      </button>
+                    )}
                     <button
                       onClick={() => { setBulkDeleteConfirm(true); setBulkTagMenu(null); }}
                       style={{ background: '#fff0f0', color: '#e53e3e', border: '1px solid #fecaca', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
@@ -581,12 +639,26 @@ export default function DashboardApp() {
                 </div>
               )}
 
-              {/* List header with count */}
+              {/* List header with count + CSV export of the current view */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, paddingBottom: 8, borderBottom: '1px solid #e8e8e8' }}>
                 <span style={{ fontSize: 12, fontWeight: 600, color: '#555' }}>Contacts</span>
-                <span style={{ fontSize: 12, color: '#aaa', fontWeight: 500 }}>
-                  {filtered.length} {filtered.length === 1 ? 'contact' : 'contacts'}
-                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 12, color: '#aaa', fontWeight: 500 }}>
+                    {filtered.length} {filtered.length === 1 ? 'contact' : 'contacts'}
+                  </span>
+                  <button
+                    onClick={exportFilteredCsv}
+                    disabled={filtered.length === 0}
+                    title="Export the contacts currently shown (matching your search, tag, date and archive filters) as a CSV"
+                    style={{
+                      background: filtered.length === 0 ? '#f0f0f0' : '#fff', color: filtered.length === 0 ? '#bbb' : '#065fd4',
+                      border: '1px solid #cfe0f5', padding: '4px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600,
+                      cursor: filtered.length === 0 ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    ⤓ Export CSV
+                  </button>
+                </div>
               </div>
 
               {/* List */}
@@ -675,6 +747,7 @@ export default function DashboardApp() {
                   onOpen={() => markOpened([selectedConv.id])}
                   onRemoveTag={(tagId) => removeTagFromConv(selectedConv, tagId)}
                   onAddTag={(tagId) => addTagToConv(selectedConv, tagId)}
+                  onRename={(name) => renameConversation(selectedConv, name)}
                   onStartDelete={() => { setDeleteConfirm(selectedConv.id); setDeleteConfirm2(false); }}
                   onConfirmDelete1={() => setDeleteConfirm2(true)}
                   onCancelDelete={() => { setDeleteConfirm(null); setDeleteConfirm2(false); }}
@@ -768,7 +841,7 @@ export default function DashboardApp() {
 
         {/* Settings tab */}
         {activeTab === 'settings' && (
-          <SettingsPanel store={store} updateStore={updateStore} conversations={conversations} tags={tags} syncUsage={syncUsage} />
+          <SettingsPanel store={store} updateStore={updateStore} conversations={conversations} tags={tags} syncUsage={syncUsage} onStoreReplaced={async (s) => { setStore(s); getSyncUsage().then(setSyncUsage).catch(() => {}); }} />
         )}
       </div>
     </div>
@@ -788,28 +861,56 @@ interface ConvDetailProps {
   onOpen: () => void;
   onRemoveTag: (tagId: string) => void;
   onAddTag: (tagId: string) => void;
+  onRename: (name: string) => void;
   onStartDelete: () => void;
   onConfirmDelete1: () => void;
   onCancelDelete: () => void;
 }
 
-function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
+function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onRename, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
   const availableTags = tags.filter((t) => !conv.tags.includes(t.id));
   const [addingTag, setAddingTag] = useState(false);
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState('');
+
+  // Reset rename editor whenever a different contact is shown.
+  useEffect(() => { setEditingName(false); }, [conv.id]);
+
+  const startRename = () => { setNameDraft(conv.participantName || ''); setEditingName(true); };
+  const commitRename = () => { onRename(nameDraft); setEditingName(false); };
 
   return (
     <div style={{ background: '#fff', borderRadius: 10, padding: '20px 24px', boxShadow: '0 1px 3px rgba(0,0,0,0.08)' }}>
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 18 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>{conv.participantName || 'Unknown'}</h2>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {editingName ? (
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <input
+                autoFocus
+                value={nameDraft}
+                onChange={(e) => setNameDraft(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') setEditingName(false); }}
+                placeholder="Contact name…"
+                style={{ flex: 1, minWidth: 0, fontSize: 18, fontWeight: 700, padding: '4px 8px', border: '1px solid #cfe0f5', borderRadius: 6, outline: 'none' }}
+              />
+              <button onClick={commitRename} style={{ background: '#0a7c4a', color: '#fff', border: 'none', padding: '7px 12px', borderRadius: 6, fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>Save</button>
+              <button onClick={() => setEditingName(false)} style={{ background: '#f5f5f5', color: '#555', border: '1px solid #ddd', padding: '7px 12px', borderRadius: 6, fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>Cancel</button>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis' }}>{conv.participantName || 'Unknown'}</h2>
+              <button onClick={startRename} title="Rename contact" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14, color: '#999', padding: 2, lineHeight: 1 }}>✎</button>
+              {conv.nameManual && <span title="Custom name — kept even when this chat is reopened" style={{ fontSize: 10, color: '#7b3fb8', background: '#f3eafb', padding: '2px 6px', borderRadius: 8, fontWeight: 600 }}>custom</span>}
+            </div>
+          )}
           <div style={{ fontSize: 12, color: '#aaa', marginTop: 4 }}>
             Last activity: {conv.updatedAt ? formatRelativeTime(conv.updatedAt) : 'unknown'}
             {conv.lastContactedAt ? ` · 📨 Last contacted: ${formatRelativeTime(conv.lastContactedAt)}` : ''}
             {conv.lastOpenedAt ? ` · Last opened: ${formatRelativeTime(conv.lastOpenedAt)}` : ''}
           </div>
         </div>
-        <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 20, color: '#aaa', lineHeight: 1 }}>×</button>
+        <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 20, color: '#aaa', lineHeight: 1, marginLeft: 8 }}>×</button>
       </div>
 
       {/* Actions */}
@@ -823,6 +924,16 @@ function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose,
             style={{ background: '#065fd4', color: '#fff', padding: '8px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 6 }}
           >
             Open Chat ↗
+          </a>
+        )}
+        {conv.profileUrl && (
+          <a
+            href={conv.profileUrl}
+            target="_blank"
+            rel="noreferrer"
+            style={{ background: '#fff', color: '#065fd4', border: '1px solid #065fd4', padding: '8px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 6 }}
+          >
+            Open Profile ↗
           </a>
         )}
         <button
@@ -925,10 +1036,28 @@ function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose,
         </div>
       </div>
 
+      {/* Contact fields */}
+      {(conv.email || conv.profileUrl || conv.fbUserId || conv.fbUsername) && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: '#888', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Contact</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13, color: '#444' }}>
+            {conv.email && (
+              <div>✉️ <a href={`mailto:${conv.email}`} style={{ color: '#065fd4' }}>{conv.email}</a></div>
+            )}
+            {conv.profileUrl && (
+              <div>🔗 <a href={conv.profileUrl} target="_blank" rel="noreferrer" style={{ color: '#065fd4', wordBreak: 'break-all' }}>{conv.profileUrl}</a></div>
+            )}
+            {conv.fbUserId && <div>🆔 FB user id: <code style={{ background: '#f0f0f0', padding: '1px 5px', borderRadius: 4 }}>{conv.fbUserId}</code></div>}
+            {conv.fbUsername && <div>👤 FB username: <code style={{ background: '#f0f0f0', padding: '1px 5px', borderRadius: 4 }}>{conv.fbUsername}</code></div>}
+          </div>
+        </div>
+      )}
+
       {/* Meta info */}
       <div style={{ fontSize: 12, color: '#bbb', marginTop: 8 }}>
         <div>ID: {conv.participantId || conv.id}</div>
-        {conv.chatUrl && <div>URL: <a href={conv.chatUrl} target="_blank" rel="noreferrer" style={{ color: '#065fd4' }}>{conv.chatUrl}</a></div>}
+        {conv.source === 'import' && <div>Source: CSV import</div>}
+        {conv.chatUrl && <div>Chat URL: <a href={conv.chatUrl} target="_blank" rel="noreferrer" style={{ color: '#065fd4' }}>{conv.chatUrl}</a></div>}
         {conv.createdAt && <div>Added: {new Date(conv.createdAt).toLocaleString()}</div>}
       </div>
     </div>
@@ -942,10 +1071,41 @@ interface SettingsPanelProps {
   conversations: Conversation[];
   tags: Tag[];
   syncUsage: SyncUsage | null;
+  onStoreReplaced: (s: Store) => Promise<void>;
 }
 
-function SettingsPanel({ store, updateStore, conversations, tags, syncUsage }: SettingsPanelProps) {
+function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onStoreReplaced }: SettingsPanelProps) {
   const settings = store.settings as Record<string, unknown>;
+  const [syncStatus, setSyncStatus] = useState<{ type: 'success' | 'error' | 'info'; msg: string } | null>(null);
+  const [pushConfirm, setPushConfirm] = useState(false);
+
+  const handlePull = async () => {
+    setSyncStatus({ type: 'info', msg: 'Pulling from Chrome sync…' });
+    try {
+      const pulled = await forcePullFromSync();
+      if (!pulled) {
+        setSyncStatus({ type: 'error', msg: 'Nothing found in Chrome sync. Make sure you are signed into Chrome with the same account on both machines and that the extension has been active long enough to sync (development-mode extensions may not sync).' });
+        return;
+      }
+      await onStoreReplaced(pulled);
+      const convCount = Object.keys(pulled.conversations).length;
+      const tagCount = Object.keys(pulled.tags).length;
+      setSyncStatus({ type: 'success', msg: `Pulled ${convCount} contacts and ${tagCount} tags from Chrome sync.` });
+    } catch (e) {
+      setSyncStatus({ type: 'error', msg: `Pull failed: ${String(e)}` });
+    }
+  };
+
+  const handlePush = async () => {
+    setPushConfirm(false);
+    setSyncStatus({ type: 'info', msg: 'Pushing to Chrome sync…' });
+    try {
+      await forcePushToSync(store);
+      setSyncStatus({ type: 'success', msg: 'Local data pushed to Chrome sync successfully.' });
+    } catch (e) {
+      setSyncStatus({ type: 'error', msg: `Push failed: ${String(e)}` });
+    }
+  };
 
   const toggleSetting = async (key: string, val: boolean) => {
     await updateStore({ ...store, settings: { ...settings, [key]: val } });
@@ -987,6 +1147,7 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage }: S
         <h3 style={{ margin: '0 0 16px', fontSize: 15, fontWeight: 600 }}>Preferences</h3>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {[
+            { key: 'autoCapture', label: 'Auto-capture conversations you open', default: true },
             { key: 'autoTagging', label: 'Auto-tagging', default: true },
             { key: 'notificationEnabled', label: 'Notifications', default: true },
           ].map(({ key, label, default: def }) => (
@@ -1017,6 +1178,54 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage }: S
             </div>
           ))}
         </div>
+        <p style={{ margin: '12px 0 0', fontSize: 11, color: '#aaa', lineHeight: 1.5 }}>
+          <strong>Auto-capture</strong> saves every conversation you open while the CRM panel is visible in Messenger. Turn it off to
+          only add contacts you explicitly save (a "Save contact" button appears instead). It never adds anyone just from replying.
+        </p>
+      </div>
+
+      <ContactsMaintenance store={store} updateStore={updateStore} />
+
+      <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
+        <h3 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>Chrome Sync</h3>
+        <p style={{ margin: '0 0 14px', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
+          Pull loads data from Chrome's sync storage into this machine. Push uploads this machine's data to Chrome sync so other machines pick it up.
+          {' '}<strong>Note:</strong> Chrome may not sync data for extensions installed in developer mode — if contacts are missing after pulling, try the Export/Import buttons below as a fallback.
+        </p>
+        <div style={{ display: 'flex', gap: 10, marginBottom: syncStatus ? 10 : 0 }}>
+          <button
+            onClick={handlePull}
+            style={{ flex: 1, background: '#4ECDC4', color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}
+          >
+            Pull from Sync
+          </button>
+          {!pushConfirm ? (
+            <button
+              onClick={() => setPushConfirm(true)}
+              style={{ flex: 1, background: '#f0a500', color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}
+            >
+              Push to Sync
+            </button>
+          ) : (
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span style={{ fontSize: 11, color: '#c0392b', fontWeight: 600 }}>This overwrites Chrome sync with local data. Other machines will pick up these changes on their next load.</span>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button onClick={handlePush} style={{ flex: 1, background: '#c0392b', color: '#fff', border: 'none', padding: '7px 10px', borderRadius: 6, fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>Confirm Push</button>
+                <button onClick={() => setPushConfirm(false)} style={{ flex: 1, background: '#eee', color: '#333', border: 'none', padding: '7px 10px', borderRadius: 6, fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>Cancel</button>
+              </div>
+            </div>
+          )}
+        </div>
+        {syncStatus && (
+          <div style={{
+            fontSize: 12, padding: '8px 10px', borderRadius: 6, lineHeight: 1.5,
+            background: syncStatus.type === 'success' ? '#e8f5e9' : syncStatus.type === 'error' ? '#fdecea' : '#e3f2fd',
+            color: syncStatus.type === 'success' ? '#2e7d32' : syncStatus.type === 'error' ? '#c62828' : '#1565c0',
+          }}>
+            {syncStatus.msg}
+          </div>
+        )}
+        <SyncMeter usage={syncUsage} convCount={conversations.length} tagCount={tags.length} />
       </div>
 
       <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
@@ -1029,8 +1238,495 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage }: S
             Import Data
           </button>
         </div>
-        <SyncMeter usage={syncUsage} convCount={conversations.length} tagCount={tags.length} />
+        <p style={{ margin: '10px 0 0', fontSize: 11, color: '#aaa', lineHeight: 1.5 }}>
+          Export/Import here is a full JSON backup of everything. To import or export <strong>contacts as CSV</strong>, use the section below (and the <strong>Export CSV</strong> button on the Conversations tab for the current filtered view).
+        </p>
       </div>
+
+      <CsvImportPanel store={store} updateStore={updateStore} />
+    </div>
+  );
+}
+
+// --- CSV contact import (with preview + machine-local import history) ---
+interface CsvImportPanelProps {
+  store: Store;
+  updateStore: (s: Store) => Promise<void>;
+}
+
+// --- Contacts maintenance: clean names + find/merge duplicates ---
+function ContactsMaintenance({ store, updateStore }: { store: Store; updateStore: (s: Store) => Promise<void> }) {
+  const [status, setStatus] = useState<{ type: 'success' | 'info'; msg: string } | null>(null);
+  const [groups, setGroups] = useState<DuplicateGroup[] | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const cardStyle: React.CSSProperties = { background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 };
+
+  const cleanNames = async () => {
+    setBusy(true);
+    try {
+      const { store: next, changed, examples } = cleanStoredNames(store);
+      if (changed === 0) { setStatus({ type: 'info', msg: 'No names needed cleaning.' }); return; }
+      await updateStore(next);
+      const sample = examples.map((e) => `“${e.from}” → “${e.to}”`).join(', ');
+      console.info(`[CRM][names] Cleaned ${changed} name(s)`);
+      setStatus({ type: 'success', msg: `Cleaned ${changed} name${changed !== 1 ? 's' : ''}. ${sample}${changed > examples.length ? '…' : ''}` });
+    } finally { setBusy(false); }
+  };
+
+  const scan = () => {
+    setGroups(findDuplicateGroups(store.conversations));
+    setStatus(null);
+  };
+
+  const mergeGroup = async (g: DuplicateGroup) => {
+    const { store: next, removed, mergedInto } = mergeConversations(store, g.ids);
+    await updateStore(next);
+    console.info(`[CRM][merge] Merged ${removed + 1} contacts into ${mergedInto}`);
+    setGroups((gs) => (gs ? gs.filter((x) => x !== g) : gs));
+    setStatus({ type: 'success', msg: `Merged ${removed + 1} contacts into “${next.conversations[mergedInto]?.participantName || mergedInto}”.` });
+  };
+
+  const identityCount = groups?.filter((g) => g.reason === 'identity').length ?? 0;
+  const nameCount = groups?.filter((g) => g.reason === 'name').length ?? 0;
+
+  return (
+    <div style={cardStyle}>
+      <h3 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>Contacts maintenance</h3>
+      <p style={{ margin: '0 0 14px', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
+        <strong>Clean up names</strong> re-tidies stored names (strips "Conversation with", trailing "· 3h", etc.).
+        <strong> Find duplicates</strong> groups contacts that share an identity (profile/id/username/thread) or just a name, so you can merge them.
+      </p>
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+        <button onClick={cleanNames} disabled={busy} style={{ background: '#065fd4', color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: busy ? 'not-allowed' : 'pointer' }}>
+          Clean up names
+        </button>
+        <button onClick={scan} disabled={busy} style={{ background: '#9B5DE5', color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: busy ? 'not-allowed' : 'pointer' }}>
+          Find duplicates
+        </button>
+      </div>
+
+      {status && (
+        <div style={{
+          marginTop: 12, fontSize: 12, padding: '8px 10px', borderRadius: 6, lineHeight: 1.5,
+          background: status.type === 'success' ? '#e8f5e9' : '#e3f2fd', color: status.type === 'success' ? '#2e7d32' : '#1565c0',
+        }}>
+          {status.msg}
+        </div>
+      )}
+
+      {groups && (
+        <div style={{ marginTop: 14 }}>
+          {groups.length === 0 ? (
+            <div style={{ fontSize: 13, color: '#2e7d32', background: '#e8f5e9', padding: '10px 12px', borderRadius: 7 }}>
+              ✓ No duplicates found.
+            </div>
+          ) : (
+            <>
+              <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>
+                {identityCount} identity match{identityCount !== 1 ? 'es' : ''} · {nameCount} same-name group{nameCount !== 1 ? 's' : ''}
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {groups.map((g, i) => (
+                  <DuplicateGroupRow key={i} group={g} store={store} onMerge={() => mergeGroup(g)} />
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DuplicateGroupRow({ group, store, onMerge }: { group: DuplicateGroup; store: Store; onMerge: () => void }) {
+  const convs = group.ids.map((id) => store.conversations[id]).filter(Boolean) as Conversation[];
+  if (convs.length < 2) return null;
+  const primary = pickPrimary(convs);
+  const strong = group.reason === 'identity';
+  return (
+    <div style={{ background: '#fafafa', borderRadius: 8, padding: '10px 12px', border: `1px solid ${strong ? '#e6d8f5' : '#eee'}` }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
+        <div style={{ minWidth: 0 }}>
+          <span style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.4, color: strong ? '#7b3fb8' : '#b9770e' }}>
+            {strong ? 'Same identity' : 'Same name'}
+          </span>
+          <div style={{ fontSize: 13, marginTop: 2 }}>
+            {convs.map((c) => (
+              <span key={c.id} style={{ marginRight: 8 }}>
+                {c.id === primary.id ? '★ ' : ''}{c.participantName || 'Unknown'}
+                <span style={{ color: '#bbb', fontSize: 11 }}> ({c.tags.length}🏷{c.chatUrl ? ' · ✉' : ''})</span>
+              </span>
+            ))}
+          </div>
+        </div>
+        <button onClick={onMerge} style={{ flexShrink: 0, background: '#9B5DE5', color: '#fff', border: 'none', padding: '7px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
+          Merge {convs.length}
+        </button>
+      </div>
+      <div style={{ fontSize: 10, color: '#aaa', marginTop: 4 }}>★ survivor keeps the best thread id; tags are combined.</div>
+    </div>
+  );
+}
+
+function CsvImportPanel({ store, updateStore }: CsvImportPanelProps) {
+  const [file, setFile] = useState<{ name: string; text: string } | null>(null);
+  const [headers, setHeaders] = useState<string[]>([]);
+  const [mapping, setMapping] = useState<Mapping>({});
+  const [applyTags, setApplyTags] = useState<string[]>([]);
+  const [importFileTags, setImportFileTags] = useState(true);
+  const [history, setHistory] = useState<ImportHistoryEntry[]>([]);
+  const [status, setStatus] = useState<{ type: 'success' | 'error' | 'info'; msg: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [showAllIssues, setShowAllIssues] = useState(false);
+
+  const refreshHistory = useCallback(async () => {
+    setHistory(await loadImportHistory());
+  }, []);
+
+  useEffect(() => { refreshHistory(); }, [refreshHistory]);
+
+  const reset = () => { setFile(null); setHeaders([]); setMapping({}); setApplyTags([]); setImportFileTags(true); setShowAllIssues(false); };
+
+  const pickFile = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.csv,text/csv';
+    input.onchange = (e) => {
+      const f = (e.target as HTMLInputElement).files?.[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const text = String(ev.target?.result || '');
+          const hdrs = csvHeaders(text);
+          setStatus(null);
+          setShowAllIssues(false);
+          setHeaders(hdrs);
+          setMapping(detectMapping(hdrs));   // auto-map matching headers
+          setApplyTags([]);
+          setImportFileTags(true);
+          setFile({ name: f.name, text });
+        } catch (err) {
+          setStatus({ type: 'error', msg: `Could not read CSV: ${String(err)}` });
+        }
+      };
+      reader.readAsText(f);
+    };
+    input.click();
+  };
+
+  // Recompute the parse + dry-run preview whenever the file, mapping or tag
+  // options change. Cheap and pure, so it's fine to derive on every render.
+  const preview = useMemo(() => {
+    if (!file) return null;
+    const parse = parseContactsCsv(file.text, { mapping, applyTags, importFileTags });
+    if (parse.missingRequired.length > 0) return { parse, blocked: true as const };
+    const dry = applyContacts(store, parse.contacts);
+    const messageable = parse.contacts.filter((c) => resolveThread(c)).length;
+    return { parse, blocked: false as const, willAdd: dry.added, willUpdate: dry.updated, newTags: dry.tagsCreated, messageable };
+  }, [file, mapping, applyTags, importFileTags, store]);
+
+  const confirmImport = async () => {
+    if (!file || !preview || preview.blocked) return;
+    setBusy(true);
+    try {
+      // Re-parse against the live store at confirm time.
+      const parse = parseContactsCsv(file.text, { mapping, applyTags, importFileTags });
+      const { contacts, errors, warnings, totalDataRows } = parse;
+      const result = applyContacts(store, contacts);
+      await updateStore(result.store);
+      const entry = await recordImport({
+        fileName: file.name,
+        totalRows: totalDataRows,
+        added: result.added,
+        updated: result.updated,
+        errors: errors.length,
+        warnings: warnings.length,
+        tagsCreated: result.tagsCreated,
+        errorSamples: errors,
+      });
+      console.info(`[CRM][import] "${file.name}": +${result.added} added, ${result.updated} updated, ${errors.length} errors, ${result.tagsCreated.length} tags created${applyTags.length ? `, applied ${applyTags.length} tag(s) to all` : ''}`);
+      setHistory((h) => [entry, ...h].slice(0, 50));
+      setStatus({ type: 'success', msg: `Imported "${file.name}": ${result.added} added, ${result.updated} updated${errors.length ? `, ${errors.length} skipped` : ''}.` });
+      reset();
+    } catch (err) {
+      setStatus({ type: 'error', msg: `Import failed: ${String(err)}` });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const downloadSample = () => downloadText('contacts-template.csv', 'text/csv', sampleCsv());
+
+  const cardStyle: React.CSSProperties = { background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 };
+  const p = preview?.parse;
+  const issues = p ? [...p.errors.map((e) => ({ ...e, kind: 'error' as const })), ...p.warnings.map((w) => ({ ...w, kind: 'warning' as const }))] : [];
+  const shownIssues = showAllIssues ? issues : issues.slice(0, 6);
+  const total = preview && !preview.blocked ? preview.willAdd + preview.willUpdate : 0;
+
+  return (
+    <>
+      <div style={cardStyle}>
+        <h3 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>Contacts — CSV import</h3>
+        <p style={{ margin: '0 0 14px', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
+          Required: a <strong>name</strong> (Full Name, or First + Last) and <strong>at least one</strong> of
+          <strong> Facebook Profile URL</strong>, <strong>FB User ID</strong>, or <strong>FB Username</strong>. Matching headers are
+          auto-mapped — adjust the mapping below if your column names differ. Each identity is resolved to a Messenger thread id so
+          imports are <strong>messageable</strong>. Rows merge with existing contacts on any matching identity.
+        </p>
+
+        {!file && (
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <button onClick={pickFile} style={{ background: '#0a7c4a', color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
+              Choose CSV file…
+            </button>
+            <button onClick={downloadSample} style={{ background: '#fff', color: '#065fd4', border: '1px solid #cfe0f5', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
+              Download template
+            </button>
+          </div>
+        )}
+
+        {file && p && (
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>
+                <span style={{ color: '#065fd4' }}>{file.name}</span>
+                <span style={{ color: '#aaa', fontWeight: 500 }}> · {p.totalDataRows} row{p.totalDataRows !== 1 ? 's' : ''}</span>
+              </div>
+              <button onClick={reset} disabled={busy} style={{ background: 'none', border: 'none', color: '#888', fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}>Choose a different file</button>
+            </div>
+
+            {/* Field mapping */}
+            <FieldMapper headers={headers} mapping={mapping} onChange={setMapping} />
+
+            {/* Tag controls */}
+            <ImportTagControls
+              existingTags={Object.values(store.tags)}
+              applyTags={applyTags}
+              onApplyTags={setApplyTags}
+              hasTagsColumn={mapping.tags != null}
+              importFileTags={importFileTags}
+              onImportFileTags={setImportFileTags}
+            />
+
+            {/* Blocked: required fields not mapped */}
+            {preview.blocked ? (
+              <div style={{ background: '#fdecea', color: '#c62828', borderRadius: 7, padding: '12px 14px', fontSize: 13, lineHeight: 1.5, marginTop: 12 }}>
+                Map the required field{p.missingRequired.length !== 1 ? 's' : ''} above to continue:
+                <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+                  {p.missingRequired.map((m) => <li key={m}>{m}</li>)}
+                </ul>
+              </div>
+            ) : (
+              <div style={{ background: '#f7f9fc', border: '1px solid #e6ecf5', borderRadius: 8, padding: '12px 14px', marginTop: 12 }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, fontSize: 12, marginBottom: 10 }}>
+                  <Stat label="Add" value={preview.willAdd} color="#0a7c4a" />
+                  <Stat label="Update" value={preview.willUpdate} color="#065fd4" />
+                  <Stat label="Messageable" value={preview.messageable} color="#0a7c4a" />
+                  <Stat label="Skipped (errors)" value={p.errors.length} color={p.errors.length ? '#c62828' : '#999'} />
+                  <Stat label="Warnings" value={p.warnings.length} color={p.warnings.length ? '#b9770e' : '#999'} />
+                  <Stat label="New tags" value={preview.newTags.length} color="#9B5DE5" />
+                </div>
+                {preview.messageable < total && (
+                  <div style={{ fontSize: 11, color: '#777', marginBottom: 8, lineHeight: 1.5 }}>
+                    {total - preview.messageable} contact(s) couldn't be resolved to a Messenger thread. Vanity-username contacts become fully messageable once you open their profile in Facebook (the numeric thread id is captured automatically).
+                  </div>
+                )}
+                {preview.newTags.length > 0 && (
+                  <div style={{ fontSize: 11, color: '#777', marginBottom: 8 }}>
+                    Will create tags: {preview.newTags.map((t) => <span key={t} style={{ background: '#eee', borderRadius: 8, padding: '1px 7px', marginRight: 4 }}>{t}</span>)}
+                  </div>
+                )}
+
+                {issues.length > 0 && (
+                  <div style={{ marginTop: 6 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: '#888', marginBottom: 4 }}>Issues</div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 3, maxHeight: 180, overflowY: 'auto' }}>
+                      {shownIssues.map((it, i) => (
+                        <div key={i} style={{ fontSize: 11, color: it.kind === 'error' ? '#c62828' : '#b9770e' }}>
+                          {it.kind === 'error' ? '⛔' : '⚠️'} Row {it.rowNumber}: {it.reason}
+                        </div>
+                      ))}
+                    </div>
+                    {issues.length > shownIssues.length && (
+                      <button onClick={() => setShowAllIssues(true)} style={{ background: 'none', border: 'none', color: '#065fd4', fontSize: 11, fontWeight: 600, cursor: 'pointer', padding: '4px 0 0', textDecoration: 'underline' }}>
+                        Show all {issues.length} issues
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                  <button
+                    onClick={confirmImport}
+                    disabled={busy || total === 0}
+                    style={{ background: busy || total === 0 ? '#9ec7b3' : '#0a7c4a', color: '#fff', border: 'none', padding: '9px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: busy || total === 0 ? 'not-allowed' : 'pointer' }}
+                  >
+                    {busy ? 'Importing…' : `Import ${total} contact${total !== 1 ? 's' : ''}`}
+                  </button>
+                  <button onClick={reset} disabled={busy} style={{ background: '#fff', color: '#666', border: '1px solid #d0d0d0', padding: '9px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {status && (
+          <div style={{
+            marginTop: 12, fontSize: 12, padding: '8px 10px', borderRadius: 6, lineHeight: 1.5,
+            background: status.type === 'success' ? '#e8f5e9' : status.type === 'error' ? '#fdecea' : '#e3f2fd',
+            color: status.type === 'success' ? '#2e7d32' : status.type === 'error' ? '#c62828' : '#1565c0',
+          }}>
+            {status.msg}
+          </div>
+        )}
+      </div>
+
+      {/* Import history */}
+      <div style={cardStyle}>
+        <h3 style={{ margin: '0 0 12px', fontSize: 15, fontWeight: 600 }}>Import history</h3>
+        {history.length === 0 ? (
+          <div style={{ fontSize: 12, color: '#aaa' }}>No CSV imports yet. (History is stored on this machine.)</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {history.map((h) => <ImportHistoryRow key={h.id} entry={h} />)}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+function FieldMapper({ headers, mapping, onChange }: { headers: string[]; mapping: Mapping; onChange: (m: Mapping) => void }) {
+  const set = (field: Field, idx: number) => {
+    const next: Mapping = { ...mapping };
+    if (idx < 0) delete next[field]; else next[field] = idx;
+    onChange(next);
+  };
+  const hasName = mapping.fullName != null || mapping.firstName != null || mapping.lastName != null;
+  const hasIdentity = mapping.profileUrl != null || mapping.fbUserId != null || mapping.fbUsername != null;
+  const selStyle: React.CSSProperties = { padding: '6px 8px', border: '1px solid #d0d0d0', borderRadius: 6, fontSize: 12, background: '#fff', width: '100%', boxSizing: 'border-box' };
+  return (
+    <div style={{ border: '1px solid #eee', borderRadius: 8, padding: '12px 14px', marginBottom: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+        <span style={{ fontSize: 12, fontWeight: 700, color: '#555' }}>Map fields</span>
+        <span style={{ fontSize: 11 }}>
+          <span style={{ color: hasName ? '#0a7c4a' : '#c62828', fontWeight: 600 }}>{hasName ? '✓' : '•'} Name</span>
+          <span style={{ color: '#ccc', margin: '0 6px' }}>|</span>
+          <span style={{ color: hasIdentity ? '#0a7c4a' : '#c62828', fontWeight: 600 }}>{hasIdentity ? '✓' : '•'} Identity</span>
+        </span>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+        {MAPPABLE_FIELDS.map(({ field, label, group }) => (
+          <label key={field} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            <span style={{ fontSize: 11, color: '#666', fontWeight: 600 }}>
+              {label}{group !== 'other' && <span style={{ color: '#aaa', fontWeight: 500 }}> · {group}</span>}
+            </span>
+            <select value={mapping[field] ?? -1} onChange={(e) => set(field, Number(e.target.value))} style={selStyle}>
+              <option value={-1}>— Not mapped —</option>
+              {headers.map((h, i) => <option key={i} value={i}>{h || `Column ${i + 1}`}</option>)}
+            </select>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ImportTagControls({ existingTags, applyTags, onApplyTags, hasTagsColumn, importFileTags, onImportFileTags }: {
+  existingTags: Tag[];
+  applyTags: string[];
+  onApplyTags: (v: string[]) => void;
+  hasTagsColumn: boolean;
+  importFileTags: boolean;
+  onImportFileTags: (v: boolean) => void;
+}) {
+  const [input, setInput] = useState('');
+  const has = (name: string) => applyTags.some((v) => v.toLowerCase() === name.toLowerCase());
+  const toggle = (name: string) => onApplyTags(has(name) ? applyTags.filter((v) => v.toLowerCase() !== name.toLowerCase()) : [...applyTags, name]);
+  const addCustom = () => { const n = input.trim(); if (n && !has(n)) onApplyTags([...applyTags, n]); setInput(''); };
+  const existingNames = new Set(existingTags.map((t) => t.name.toLowerCase()));
+  const customSelected = applyTags.filter((t) => !existingNames.has(t.toLowerCase()));
+  return (
+    <div style={{ border: '1px solid #eee', borderRadius: 8, padding: '12px 14px', marginBottom: 12 }}>
+      <span style={{ fontSize: 12, fontWeight: 700, color: '#555' }}>Tags</span>
+      <div style={{ fontSize: 11, color: '#888', margin: '4px 0 8px' }}>Apply tags to <strong>every</strong> imported contact (created if new):</div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+        {existingTags.map((t) => {
+          const on = has(t.name);
+          return (
+            <button key={t.id} onClick={() => toggle(t.name)} style={{ padding: '4px 10px', borderRadius: 12, border: on ? 'none' : `1px solid ${t.color}`, background: on ? t.color : t.color + '22', color: on ? '#fff' : t.color, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
+              {on ? '✓ ' : '+ '}{t.name}
+            </button>
+          );
+        })}
+        {existingTags.length === 0 && <span style={{ fontSize: 11, color: '#aaa' }}>No tags yet — type one below.</span>}
+      </div>
+      {customSelected.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+          {customSelected.map((t) => (
+            <span key={t} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '4px 10px', borderRadius: 12, background: '#9B5DE5', color: '#fff', fontSize: 12, fontWeight: 600 }}>
+              {t} <span style={{ fontSize: 10, opacity: 0.85 }}>new</span>
+              <span onClick={() => toggle(t)} style={{ cursor: 'pointer', marginLeft: 2 }}>×</span>
+            </span>
+          ))}
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); addCustom(); } }}
+          placeholder="Add a tag for all contacts…"
+          style={{ flex: 1, padding: '7px 10px', border: '1px solid #e0e0e0', borderRadius: 6, fontSize: 12, outline: 'none', boxSizing: 'border-box' }}
+        />
+        <button onClick={addCustom} style={{ background: '#fff', color: '#065fd4', border: '1px solid #cfe0f5', padding: '7px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Add</button>
+      </div>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: hasTagsColumn ? '#444' : '#aaa', cursor: hasTagsColumn ? 'pointer' : 'default' }}>
+        <input type="checkbox" checked={hasTagsColumn && importFileTags} disabled={!hasTagsColumn} onChange={(e) => onImportFileTags(e.target.checked)} style={{ cursor: hasTagsColumn ? 'pointer' : 'default' }} />
+        Also import tags from the file's Tags column{!hasTagsColumn && ' (no Tags column mapped)'}
+      </label>
+    </div>
+  );
+}
+
+function Stat({ label, value, color }: { label: string; value: number; color: string }) {
+  return (
+    <span style={{ background: '#fff', border: '1px solid #e6ecf5', borderRadius: 7, padding: '5px 10px', display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+      <strong style={{ color, fontSize: 14 }}>{value}</strong>
+      <span style={{ color: '#888' }}>{label}</span>
+    </span>
+  );
+}
+
+function ImportHistoryRow({ entry }: { entry: ImportHistoryEntry }) {
+  const [open, setOpen] = useState(false);
+  const hasErrors = entry.errorSamples.length > 0;
+  return (
+    <div style={{ background: '#fafafa', borderRadius: 8, padding: '10px 12px' }}>
+      <div onClick={() => hasErrors && setOpen(!open)} style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: hasErrors ? 'pointer' : 'default' }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.fileName}</div>
+          <div style={{ fontSize: 11, color: '#999', marginTop: 2 }}>{formatDateTime(entry.importedAt)} · {entry.totalRows} row{entry.totalRows !== 1 ? 's' : ''}</div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, fontSize: 12, alignItems: 'center' }}>
+          <span style={{ color: '#0a7c4a', fontWeight: 600 }}>+{entry.added}</span>
+          <span style={{ color: '#065fd4', fontWeight: 600 }}>↻{entry.updated}</span>
+          {entry.errors > 0 && <span style={{ color: '#c62828', fontWeight: 600 }}>⛔{entry.errors}</span>}
+          {entry.tagsCreated.length > 0 && <span style={{ color: '#9B5DE5', fontWeight: 600 }}>🏷{entry.tagsCreated.length}</span>}
+          {hasErrors && <span style={{ fontSize: 11, color: '#065fd4' }}>{open ? 'hide' : 'details'}</span>}
+        </div>
+      </div>
+      {open && hasErrors && (
+        <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid #eee', display: 'flex', flexDirection: 'column', gap: 3 }}>
+          {entry.errorSamples.map((e, i) => (
+            <div key={i} style={{ fontSize: 11, color: '#c62828' }}>Row {e.rowNumber}: {e.reason}</div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

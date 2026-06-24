@@ -18,6 +18,8 @@ import {
   saveStore as _saveStore,
 } from './storage';
 import type { Store, Tag, Conversation } from './storage';
+import { profileKey } from './csv';
+import { extractNameFromLink, extractActiveThreadName } from './names';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
 const COLORS = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E2'];
@@ -42,70 +44,17 @@ function formatRelative(ts?: number): string {
 }
 function getActiveThreadId(): string | null { return extractThreadId(window.location.pathname); }
 
+// Name extraction now lives in ./names (the "intelligent namegrabber"): it
+// prefers the profile-photo alt / accessible label, strips "Conversation with",
+// trailing timestamps ("· 3h"), status words and message previews, and validates
+// that what's left actually looks like a name. These thin wrappers keep the
+// existing call sites unchanged.
 function getActiveThreadName(): string {
-  // Try multiple sources in order of reliability:
-
-  // 1. Active/current sidebar link for this thread
-  const threadId = getActiveThreadId();
-  if (threadId) {
-    const activeLink = document.querySelector<HTMLAnchorElement>(
-      `a[href*="/t/${threadId}"]`
-    );
-    if (activeLink) {
-      const name = getNameFromLink(activeLink);
-      if (name && name !== 'Unknown') return name;
-    }
-  }
-
-  // 2. Conversation header — usually the first prominent heading in [role="main"]
-  const main = document.querySelector('[role="main"]');
-  if (main) {
-    // Look for visible text in headings or high-level elements
-    const candidates = main.querySelectorAll('h1, h2, h3, [role="heading"]');
-    for (const el of candidates) {
-      const text = el.textContent?.trim();
-      if (text && text.length > 1 && text.length < 100 && !/^\d+$/.test(text)) {
-        return text.split(/[\n•]/)[0].trim();
-      }
-    }
-
-    // Fallback: find the first substantial text node in the header area
-    // (usually a div or section at the top)
-    const headerLike = main.querySelector('div:first-child, section:first-child');
-    if (headerLike) {
-      const text = headerLike.textContent?.trim();
-      if (text && text.length > 1 && text.length < 200) {
-        // Extract first line or first "word group"
-        const firstLine = text.split(/[\n•]/)[0].trim();
-        if (firstLine.length > 1 && firstLine.length < 100) {
-          return firstLine;
-        }
-      }
-    }
-  }
-
-  // 3. Page title (least reliable, but fallback)
-  const title = document.title
-    .replace(/\s*[|·-]\s*(Messenger|Facebook).*$/i, '')
-    .replace(/^\(\d+\)\s*/, '').trim();
-  if (title && !/^(messenger|facebook)$/i.test(title) && title.length < 100) {
-    return title;
-  }
-
-  return 'Unknown';
+  return extractActiveThreadName(getActiveThreadId());
 }
 
-// Extract best name from the DOM subtree of a sidebar link
 function getNameFromLink(link: HTMLAnchorElement): string {
-  // The first non-empty short text node that isn't a timestamp/number usually is the name.
-  const spans = Array.from(link.querySelectorAll('span, div'));
-  for (const el of spans) {
-    const text = el.textContent?.trim() || '';
-    if (text.length >= 2 && text.length <= 60 && !/^\d+$/.test(text) && !/^[•·]\s*\d/.test(text)) {
-      return text.split('\n')[0].trim();
-    }
-  }
-  return link.textContent?.trim().split('\n')[0] || 'Unknown';
+  return extractNameFromLink(link);
 }
 
 // ---- Storage ----
@@ -179,8 +128,9 @@ async function ensureConversation(threadId: string, link?: HTMLAnchorElement): P
     dirty = true;
   } else {
     const conv = store.conversations[threadId];
-    // Refresh name if we got a better one from the sidebar link
-    if (link) {
+    // Refresh name if we got a better one from the sidebar link — unless the
+    // user has manually renamed this contact, in which case their name wins.
+    if (link && !conv.nameManual) {
       const name = getNameFromLink(link);
       if (name !== 'Unknown' && conv.participantName !== name) {
         conv.participantName = name;
@@ -462,6 +412,32 @@ async function renderPanel() {
     return;
   }
 
+  // Auto-capture: by default we save (and keep fresh) any thread you open while
+  // the panel is visible. When the user turns this off, only contacts they've
+  // already saved are updated — a new thread shows a "Save contact" button
+  // instead of being added silently.
+  const preStore = await getStore();
+  const autoCapture = (preStore.settings as Record<string, unknown>)?.autoCapture !== false;
+  if (!autoCapture && !preStore.conversations[threadId]) {
+    const guessName = getActiveThreadName();
+    panelEl.innerHTML = `
+      <div class="fb-crm-header">
+        <span>Messenger CRM</span>
+        <button class="fb-crm-close">✕</button>
+      </div>
+      <div class="fb-crm-body">
+        <div class="fb-crm-name-row"><div class="fb-crm-name">${escapeHtml(guessName)}</div></div>
+        <div class="fb-crm-muted" style="margin:6px 0 12px">Not saved yet · auto-capture is off.</div>
+        <button class="fb-crm-pick-btn" id="fb-crm-save-contact">➕ Save this contact</button>
+      </div>`;
+    wireClose();
+    panelEl.querySelector('#fb-crm-save-contact')?.addEventListener('click', async () => {
+      await ensureConversation(threadId);
+      renderPanel();
+    });
+    return;
+  }
+
   const conv = await ensureConversation(threadId);
   const store = await getStore();
   const convTags = conv.tags.map(tid => store.tags[tid]).filter(Boolean) as Tag[];
@@ -601,6 +577,7 @@ function wirePanelActions(threadId: string) {
       const conv = store.conversations[threadId];
       if (conv) {
         conv.participantName = newName.trim();
+        conv.nameManual = true; // user-set name — don't let DOM scraping override it
         conv.updatedAt = Date.now();
         await saveStore(store);
         editingName = null;
@@ -767,6 +744,8 @@ function watchNavigation() {
       } else {
         console.log('[CRM] Navigated away from Messenger page, removing launcher');
         removeLauncher();
+        // Landed on a profile? Try to resolve any imported contact's thread id.
+        setTimeout(resolveImportedProfileOnThisPage, 1200);
       }
       const newThreadId = getActiveThreadId();
       if (newThreadId && panelEl && panelEl.style.display !== 'none') {
@@ -776,6 +755,73 @@ function watchNavigation() {
       }
     }
   }, 800);
+}
+
+// ---- Resolve imported contacts' thread ids from their profile page ----
+//
+// CSV-imported contacts start with a chat URL derived from their profile URL
+// (numeric for profile.php?id=N, the vanity username otherwise). When the user
+// actually opens such a profile on facebook.com we read the *exact* thread id
+// Facebook uses — preferring the numeric fbid — and upgrade the stored contact
+// so the bulk messenger targets the canonical /t/<id>/ URL. We only ever touch
+// the contact whose stored profile URL matches the page we're on.
+
+function isProfilePage(): boolean {
+  if (isMessagesPage()) return false;
+  if (/^\/profile\.php$/i.test(window.location.pathname)) return true;
+  return window.location.pathname.split('/').filter(Boolean).length === 1; // facebook.com/<username>
+}
+
+function getProfilePageThreadId(): string | null {
+  // profile.php?id=N — exact, straight from the URL.
+  if (/^\/profile\.php$/i.test(window.location.pathname)) {
+    const id = new URLSearchParams(window.location.search).get('id');
+    if (id && /^\d+$/.test(id)) return id;
+  }
+  // The page's own app deep link → numeric fbid (specific to this profile).
+  const meta = document.querySelector<HTMLMetaElement>('meta[property="al:android:url"], meta[property="al:ios:url"]');
+  const metaId = meta?.content.match(/fb:\/\/(?:profile|page)\/(\d+)/);
+  if (metaId) return metaId[1];
+  // Constrained fallback: a single, unambiguous /messages/t/<id> link.
+  const ids = new Set<string>();
+  document.querySelectorAll<HTMLAnchorElement>('a[href*="/messages/t/"]').forEach((a) => {
+    const id = extractThreadId(a.href);
+    if (id) ids.add(id);
+  });
+  if (ids.size === 1) return [...ids][0];
+  // Last resort: the first profile deep link anywhere in the page source.
+  const html = document.documentElement.innerHTML.match(/fb:\/\/profile\/(\d+)/);
+  return html ? html[1] : null;
+}
+
+let lastProfileResolveAt = 0;
+async function resolveImportedProfileOnThisPage(): Promise<void> {
+  if (!isProfilePage()) return;
+  if (Date.now() - lastProfileResolveAt < 2500) return;
+  lastProfileResolveAt = Date.now();
+
+  const pageKey = profileKey(window.location.href);
+  if (!pageKey) return;
+  const threadId = getProfilePageThreadId();
+  if (!threadId) return;
+  const numeric = /^\d+$/.test(threadId);
+  const chatUrl = `https://www.facebook.com/messages/t/${threadId}/`;
+
+  const store = await getStore();
+  let dirty = false;
+  for (const conv of Object.values(store.conversations)) {
+    if (profileKey(conv.profileUrl) !== pageKey) continue;
+    // Upgrade when there's no chat URL yet, or when we found the more reliable
+    // numeric id and the stored one differs (e.g. an earlier vanity guess).
+    if (!conv.chatUrl || (numeric && conv.chatUrl !== chatUrl)) {
+      conv.chatUrl = chatUrl;
+      conv.participantId = threadId;
+      conv.updatedAt = Date.now();
+      dirty = true;
+      console.log('[CRM] Resolved imported contact thread id from profile:', conv.participantName, '→', threadId);
+    }
+  }
+  if (dirty) await saveStore(store);
 }
 
 // ---- Init ----
@@ -789,6 +835,12 @@ function init() {
   startSidebarObserver();
   watchNavigation();
   watchOutgoingMessages();
+
+  // Opportunistically resolve imported contacts' thread ids while the user
+  // browses profiles. Self-gates to profile pages and self-throttles, so it's
+  // cheap to poll. Runs once shortly after load, then periodically.
+  setTimeout(resolveImportedProfileOnThisPage, 2000);
+  setInterval(resolveImportedProfileOnThisPage, 2500);
 
   if (isMessagesPage()) {
     console.log('[CRM] On Messenger page, building launcher...');

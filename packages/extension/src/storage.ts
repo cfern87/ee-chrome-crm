@@ -49,6 +49,22 @@ export interface Conversation {
   lastMessageTime: number;
   tags: string[];
   chatUrl?: string;
+  email?: string;
+  // Facebook *profile* URL (distinct from chatUrl, which is a Messenger thread
+  // URL). Populated by CSV import; used to open a contact's profile and as the
+  // dedup key on re-import. May be synthesized from fbUserId/fbUsername when the
+  // import only supplied an id or username.
+  profileUrl?: string;
+  // Facebook identity, populated by CSV import. fbUserId is the numeric fbid
+  // (the most reliable thread id); fbUsername is the vanity handle.
+  fbUserId?: string;
+  fbUsername?: string;
+  // Provenance: 'messenger' for contacts captured from Messenger, 'import' for
+  // contacts added via CSV import. Absent = legacy/messenger.
+  source?: 'messenger' | 'import';
+  // Set when the user renames the contact by hand. While true, the content
+  // script will not overwrite participantName with a name scraped from the DOM.
+  nameManual?: boolean;
   archived: boolean;
   createdAt: number;
   updatedAt: number;
@@ -367,6 +383,45 @@ export interface SyncUsage {
 
 const SYNC_QUOTA_BYTES = 102400; // chrome.storage.sync.QUOTA_BYTES
 const SYNC_MAX_ITEMS = 512;      // chrome.storage.sync.MAX_ITEMS
+
+/**
+ * Force a fresh pull from chrome.storage.sync, bypassing the in-memory
+ * snapshot. Updates local backups and resets the snapshot so subsequent
+ * saves only write real deltas. Returns the pulled store, or null if sync
+ * has no CRM data (so the caller can decide whether to keep local data).
+ */
+export async function forcePullFromSync(): Promise<Store | null> {
+  const fromSync = await syncGetAll();
+  if (!fromSync) return null;
+  lastSyncSnapshot = clone(fromSync);
+  chromeLocalSet(fromSync);
+  idbSet(fromSync);
+  return fromSync;
+}
+
+/**
+ * Force a full push of the given store to chrome.storage.sync by clearing
+ * the in-memory snapshot first, which makes syncWriteDelta treat every shard
+ * as changed and write all of them. Also mirrors to local backups.
+ */
+export async function forcePushToSync(store: Store): Promise<void> {
+  if (!syncAvailable()) {
+    throw new Error('chrome.storage.sync is not available in this context.');
+  }
+  lastSyncSnapshot = clone(EMPTY_STORE); // forces full delta
+  await syncWriteDelta(store);
+  await Promise.all([chromeLocalSet(store), idbSet(store)]);
+
+  // Verify the write actually landed: read sync back and confirm it now holds
+  // data when the store we pushed had some. Catches silently-dropped writes
+  // (quota errors, sync disabled) that syncSet swallows.
+  if (hasData(store)) {
+    const readback = await syncGetAll();
+    if (!hasData(readback)) {
+      throw new Error('Push did not land in Chrome sync (the write was rejected or sync is disabled). Use Export/Import as a fallback.');
+    }
+  }
+}
 
 /**
  * Report how much of the chrome.storage.sync quota is in use, for a usage
