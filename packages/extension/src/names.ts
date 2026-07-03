@@ -118,6 +118,40 @@ export function extractActiveThreadName(threadId: string | null, doc: Document =
   return 'Unknown';
 }
 
+/**
+ * Best name for a Facebook profile page (not a Messenger thread).
+ *
+ * A blind document-wide `h1` scan is unreliable: Facebook's top nav bar has
+ * its own (often visually-hidden) accessibility headings — "Notifications",
+ * "Marketplace", "Messenger", etc. — that are also `<h1>` elements and can sit
+ * before the actual profile heading in DOM order, so the first "name-shaped"
+ * h1 found is frequently the wrong one. Prefer sources that are specific to
+ * the profile rather than the page chrome.
+ */
+export function extractProfilePageName(doc: Document = document): string {
+  // 1. og:title — Facebook sets this Open Graph meta tag to the profile
+  //    owner's name for link-preview purposes; it never contains nav chrome.
+  const og = doc.querySelector('meta[property="og:title"]') as HTMLMetaElement | null;
+  const ogName = cleanName(og?.content);
+  if (looksLikeName(ogName)) return ogName;
+
+  // 2. The heading inside the main content region (excludes the nav bar,
+  //    where the misleading "Notifications" etc. headings live).
+  const main = doc.querySelector('[role="main"]');
+  if (main) {
+    for (const el of Array.from(main.querySelectorAll('h1'))) {
+      const n = cleanName(el.textContent);
+      if (looksLikeName(n)) return n;
+    }
+  }
+
+  // 3. Page title fallback: "Jane Doe | Facebook" / "Jane Doe - Facebook".
+  const title = cleanName(doc.title.replace(/\s*[|·-]\s*Facebook.*$/i, ''));
+  if (looksLikeName(title)) return title;
+
+  return 'Unknown';
+}
+
 /** Normalized key for grouping by name (case/space/diacritic-insensitive). */
 export function nameKey(name: string | null | undefined): string {
   const stripped = (name || '').normalize('NFKD').replace(/[̀-ͯ]/g, ''); // strip accents

@@ -18,8 +18,8 @@ import {
   saveStore as _saveStore,
 } from './storage';
 import type { Store, Tag, Conversation } from './storage';
-import { profileKey } from './csv';
-import { extractNameFromLink, extractActiveThreadName } from './names';
+import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
+import { extractNameFromLink, extractActiveThreadName, extractProfilePageName } from './names';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
 const COLORS = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E2'];
@@ -147,6 +147,52 @@ async function ensureConversation(threadId: string, link?: HTMLAnchorElement): P
 
   if (dirty) await saveStore(store);
   return store.conversations[threadId];
+}
+
+// Find an already-saved contact that matches a profile page, by profile URL
+// or by the Messenger thread id the URL resolves to.
+function findConversationForProfile(store: Store, profileUrl: string): Conversation | null {
+  const pk = profileKey(profileUrl);
+  if (pk) {
+    for (const conv of Object.values(store.conversations)) {
+      if (profileKey(conv.profileUrl) === pk) return conv;
+    }
+  }
+  const thread = extractThreadFromProfileUrl(profileUrl);
+  if (thread && store.conversations[thread.threadId]) return store.conversations[thread.threadId];
+  return null;
+}
+
+// Create a new contact directly from a profile page (no Messenger thread
+// required yet). Mirrors the CSV-import identity resolution so the contact
+// lines up with any Messenger-captured or imported copy of the same person.
+async function addProfileContact(profileUrl: string, name: string): Promise<Conversation> {
+  const store = await getStore();
+  const existing = findConversationForProfile(store, profileUrl);
+  if (existing) return existing;
+
+  const thread = extractThreadFromProfileUrl(profileUrl);
+  const norm = normalizeProfileUrl(profileUrl) || profileUrl;
+  const pk = profileKey(profileUrl) || Math.random().toString(36).slice(2);
+  const id = thread?.threadId || `imp_${pk.replace(/[^a-z0-9]+/gi, '_').slice(0, 40)}_${Math.random().toString(36).slice(2, 6)}`;
+  const now = Date.now();
+  const conv: Conversation = {
+    id,
+    participantName: name || 'Unknown',
+    participantId: id,
+    lastMessage: '',
+    lastMessageTime: now,
+    tags: [],
+    profileUrl: norm,
+    chatUrl: thread?.chatUrl,
+    source: 'import',
+    archived: false,
+    createdAt: now,
+    updatedAt: now,
+  };
+  store.conversations[id] = conv;
+  await saveStore(store);
+  return conv;
 }
 
 // ---- Sidebar tag injection ----
@@ -394,10 +440,44 @@ async function togglePanel() {
 
 async function renderPanel() {
   if (!panelEl) return;
-  const threadId = currentPanelThreadId || getActiveThreadId();
+  let threadId = currentPanelThreadId || getActiveThreadId();
+
+  // On a profile page there's no thread id in the URL. If this profile has
+  // already been saved (from Messenger or CSV import), bind the panel to that
+  // existing contact so the normal tag-editing UI below just works.
+  if (!threadId && isProfilePage()) {
+    const profileUrl = normalizeProfileUrl(window.location.href) || window.location.href;
+    const store = await getStore();
+    const existing = findConversationForProfile(store, profileUrl);
+    if (existing) threadId = existing.id;
+  }
+  currentPanelThreadId = threadId;
   lastRenderedThread = threadId;
 
   if (!threadId) {
+    if (isProfilePage()) {
+      const profileUrl = normalizeProfileUrl(window.location.href) || window.location.href;
+      const guessName = extractProfilePageName();
+      panelEl.innerHTML = `
+        <div class="fb-crm-header">
+          <span>Messenger CRM</span>
+          <button class="fb-crm-close">✕</button>
+        </div>
+        <div class="fb-crm-body">
+          <div class="fb-crm-name-row"><div class="fb-crm-name">${escapeHtml(guessName)}</div></div>
+          <div class="fb-crm-muted" style="margin:6px 0 12px">Not in your CRM yet.</div>
+          <button class="fb-crm-pick-btn" id="fb-crm-add-profile">➕ Add to CRM</button>
+        </div>`;
+      wireClose();
+      panelEl.querySelector('#fb-crm-add-profile')?.addEventListener('click', async () => {
+        const conv = await addProfileContact(profileUrl, guessName);
+        currentPanelThreadId = conv.id;
+        await renderPanel();
+        await injectSidebarTags();
+      });
+      return;
+    }
+
     panelEl.innerHTML = `
       <div class="fb-crm-header">
         <span>Messenger CRM</span>
@@ -454,7 +534,7 @@ async function renderPanel() {
         <button class="fb-crm-name-edit" title="Edit name">✎</button>
       </div>
       <div class="fb-crm-meta">📨 Last contacted: <strong>${formatRelative(conv.lastContactedAt)}</strong></div>
-      <button class="fb-crm-pick-btn">🎯 Select different conversation</button>
+      ${isProfilePage() ? '' : '<button class="fb-crm-pick-btn">🎯 Select different conversation</button>'}
 
       <div class="fb-crm-section-title">Tags on this conversation</div>
       <div class="fb-crm-chips">
@@ -719,6 +799,13 @@ function isMessagesPage(): boolean {
   return result;
 }
 
+// Whether the CRM launcher/panel should be shown at all: Messenger threads
+// (the original use case) plus profile pages, so "add a person" works from
+// wherever a profile is being viewed, not just from an open conversation.
+function shouldShowLauncher(): boolean {
+  return isMessagesPage() || isProfilePage();
+}
+
 function removeLauncher() {
   document.getElementById('fb-crm-launcher')?.remove();
   document.getElementById('fb-crm-panel')?.remove();
@@ -735,22 +822,24 @@ function watchNavigation() {
     if (path !== lastPath) {
       console.log('[CRM] Navigation detected: ', lastPath, ' -> ', path);
       lastPath = path;
-      // Entering Messenger from elsewhere in the SPA: build the UI.
-      // Leaving Messenger: tear it down so it doesn't linger on other pages.
-      if (isMessagesPage()) {
-        console.log('[CRM] Navigated to Messenger page, building launcher');
+      // Entering Messenger or a profile page from elsewhere in the SPA: build
+      // the UI. Leaving both: tear it down so it doesn't linger elsewhere.
+      if (shouldShowLauncher()) {
+        console.log('[CRM] Navigated to Messenger/profile page, building launcher');
         buildLauncher();
-        scheduleSidebarInject();
+        if (isMessagesPage()) scheduleSidebarInject();
       } else {
-        console.log('[CRM] Navigated away from Messenger page, removing launcher');
+        console.log('[CRM] Navigated away from Messenger/profile page, removing launcher');
         removeLauncher();
-        // Landed on a profile? Try to resolve any imported contact's thread id.
-        setTimeout(resolveImportedProfileOnThisPage, 1200);
       }
-      const newThreadId = getActiveThreadId();
-      if (newThreadId && panelEl && panelEl.style.display !== 'none') {
-        console.log('[CRM] Active thread changed to:', newThreadId, ', re-rendering panel');
-        currentPanelThreadId = newThreadId;
+      // Landed on a profile? Try to resolve any imported contact's thread id.
+      setTimeout(resolveImportedProfileOnThisPage, 1200);
+
+      // Re-render an open panel for the new page (new thread, or a different
+      // profile — renderPanel() re-resolves both from scratch).
+      if (panelEl && panelEl.style.display !== 'none') {
+        currentPanelThreadId = getActiveThreadId();
+        console.log('[CRM] Re-rendering panel for new page');
         renderPanel();
       }
     }
@@ -768,8 +857,12 @@ function watchNavigation() {
 
 function isProfilePage(): boolean {
   if (isMessagesPage()) return false;
+  if (!/(^|\.)facebook\.com$/i.test(window.location.hostname.replace(/^www\./i, ''))) return false;
   if (/^\/profile\.php$/i.test(window.location.pathname)) return true;
-  return window.location.pathname.split('/').filter(Boolean).length === 1; // facebook.com/<username>
+  const segs = window.location.pathname.split('/').filter(Boolean);
+  // facebook.com/<username> — a single path segment that isn't one of FB's own
+  // app/section paths (marketplace, groups, watch, settings, …).
+  return segs.length === 1 && !RESERVED_FB_PATHS.has(segs[0].toLowerCase());
 }
 
 function getProfilePageThreadId(): string | null {
@@ -842,32 +935,31 @@ function init() {
   setTimeout(resolveImportedProfileOnThisPage, 2000);
   setInterval(resolveImportedProfileOnThisPage, 2500);
 
-  if (isMessagesPage()) {
-    console.log('[CRM] On Messenger page, building launcher...');
+  if (shouldShowLauncher()) {
+    console.log('[CRM] On Messenger/profile page, building launcher...');
     buildLauncher();
     console.log('[CRM] Launcher button element:', document.getElementById('fb-crm-launcher'));
-    // First injection once the sidebar has had a moment to render.
-    setTimeout(injectSidebarTags, 1500);
+    // First injection once the sidebar has had a moment to render (Messenger only).
+    if (isMessagesPage()) setTimeout(injectSidebarTags, 1500);
   } else {
-    console.log('[CRM] NOT on Messenger page, skipping launcher');
+    console.log('[CRM] NOT on Messenger/profile page, skipping launcher');
   }
 
-  // Safety net: every 2s, if we're on a Messenger page, make sure the launcher
-  // still exists (Facebook's React re-renders can remove our nodes) and re-run
-  // injection. Facebook lazy-loads conversations via AJAX as you scroll and the
-  // MutationObserver can miss bursts on a constantly-mutating page. Both
-  // operations are idempotent and cheap.
+  // Safety net: every 2s, if we're on a Messenger or profile page, make sure
+  // the launcher still exists (Facebook's React re-renders can remove our
+  // nodes) and re-run sidebar injection. Facebook lazy-loads conversations via
+  // AJAX as you scroll and the MutationObserver can miss bursts on a
+  // constantly-mutating page. Both operations are idempotent and cheap.
   setInterval(() => {
-    const isMsg = isMessagesPage();
-    if (!isMsg) return;
+    if (!shouldShowLauncher()) return;
     console.log('[CRM] Safety interval: checking launcher... exists?', !!document.getElementById('fb-crm-launcher'));
     buildLauncher();        // no-op if it already exists; self-heals if removed
     const exists = document.getElementById('fb-crm-launcher');
-    if (exists) {
+    if (!exists) {
+      console.warn('[CRM] Launcher button not found after buildLauncher() call!');
+    } else if (isMessagesPage()) {
       console.log('[CRM] Launcher exists, injecting tags...');
       injectSidebarTags();
-    } else {
-      console.warn('[CRM] Launcher button not found after buildLauncher() call!');
     }
   }, 2000);
 

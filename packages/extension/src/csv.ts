@@ -180,7 +180,7 @@ const FB_HOST_RE = /(facebook\.com|fb\.com|fb\.me|messenger\.com)/i;
 // App/section paths (groups, pages, watch, …) are NOT user profiles, so they
 // resolve to null and the contact is imported without a chat URL.
 
-const RESERVED_FB_PATHS = new Set([
+export const RESERVED_FB_PATHS = new Set([
   'messages', 'profile.php', 'pages', 'page', 'pg', 'groups', 'group', 'watch',
   'marketplace', 'events', 'event', 'gaming', 'games', 'photo', 'photo.php',
   'story.php', 'permalink.php', 'media', 'sharer', 'sharer.php', 'share', 'login',
