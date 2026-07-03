@@ -836,7 +836,17 @@ export default function DashboardApp() {
 
         {/* History tab */}
         {activeTab === 'history' && (
-          <HistoryPanel campaigns={campaigns} onChanged={refreshCampaigns} />
+          <HistoryPanel
+            campaigns={campaigns}
+            onChanged={refreshCampaigns}
+            store={store}
+            onViewProfile={(threadId) => {
+              const conv = store.conversations[threadId];
+              if (!conv) return;
+              setSelectedConv(conv);
+              setActiveTab('conversations');
+            }}
+          />
         )}
 
         {/* Settings tab */}
@@ -2153,7 +2163,7 @@ function ActiveCampaignCard({ campaign, onChanged }: { campaign: Campaign; onCha
 //  Campaign history
 // =====================================================================
 
-function HistoryPanel({ campaigns, onChanged }: { campaigns: Campaign[]; onChanged: () => void }) {
+function HistoryPanel({ campaigns, onChanged, store, onViewProfile }: { campaigns: Campaign[]; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void }) {
   const sorted = campaigns.slice().sort((a, b) => b.createdAt - a.createdAt);
   if (sorted.length === 0) {
     return (
@@ -2164,12 +2174,12 @@ function HistoryPanel({ campaigns, onChanged }: { campaigns: Campaign[]; onChang
   }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {sorted.map((c) => <CampaignHistoryCard key={c.id} campaign={c} onChanged={onChanged} />)}
+      {sorted.map((c) => <CampaignHistoryCard key={c.id} campaign={c} onChanged={onChanged} store={store} onViewProfile={onViewProfile} />)}
     </div>
   );
 }
 
-function CampaignHistoryCard({ campaign, onChanged }: { campaign: Campaign; onChanged: () => void }) {
+function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile }: { campaign: Campaign; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void }) {
   const [expanded, setExpanded] = useState(false);
   const sum = summarize(campaign);
 
@@ -2177,6 +2187,17 @@ function CampaignHistoryCard({ campaign, onChanged }: { campaign: Campaign; onCh
     await sendBg({ type, payload: { campaignId: campaign.id } });
     onChanged();
   };
+
+  const removeRecipient = async (threadId: string) => {
+    const res = await sendBg<{ success: boolean; error?: string }>({
+      type: 'REMOVE_CAMPAIGN_RECIPIENT',
+      payload: { campaignId: campaign.id, threadId },
+    });
+    if (res && !res.success && res.error) window.alert(res.error);
+    onChanged();
+  };
+
+  const canRemove = campaign.status === 'running' || campaign.status === 'paused';
 
   return (
     <div style={{ background: '#fff', borderRadius: 10, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', overflow: 'hidden' }}>
@@ -2240,7 +2261,15 @@ function CampaignHistoryCard({ campaign, onChanged }: { campaign: Campaign; onCh
           {/* Recipients */}
           <div style={{ fontSize: 11, fontWeight: 600, color: '#888', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>Recipients</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            {campaign.recipients.map((r, i) => <RecipientRow key={r.threadId + i} r={r} />)}
+            {campaign.recipients.map((r, i) => (
+              <RecipientRow
+                key={r.threadId + i}
+                r={r}
+                conv={store.conversations[r.threadId]}
+                onViewProfile={() => onViewProfile(r.threadId)}
+                onRemove={canRemove && r.status !== 'sending' ? () => removeRecipient(r.threadId) : undefined}
+              />
+            ))}
           </div>
         </div>
       )}
@@ -2248,9 +2277,12 @@ function CampaignHistoryCard({ campaign, onChanged }: { campaign: Campaign; onCh
   );
 }
 
-function RecipientRow({ r }: { r: CampaignRecipient }) {
+function RecipientRow({ r, conv, onViewProfile, onRemove }: { r: CampaignRecipient; conv?: Conversation; onViewProfile: () => void; onRemove?: () => void }) {
   const [open, setOpen] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState(false);
   const hasLog = !!(r.log && r.log.length);
+  const chatUrl = r.chatUrl || conv?.chatUrl;
+
   return (
     <div style={{ background: '#fafafa', borderRadius: 6, padding: '8px 10px' }}>
       <div
@@ -2262,6 +2294,53 @@ function RecipientRow({ r }: { r: CampaignRecipient }) {
         <span style={{ fontSize: 11, color: statusColor(r.status), fontWeight: 600 }}>{statusLabel(r.status)}</span>
         {r.sentAt && <span style={{ fontSize: 11, color: '#aaa' }}>{new Date(r.sentAt).toLocaleTimeString()}</span>}
         {hasLog && <span style={{ fontSize: 11, color: '#065fd4' }}>{open ? 'hide log' : 'log'}</span>}
+
+        <button
+          onClick={(e) => { e.stopPropagation(); onViewProfile(); }}
+          title="View contact profile"
+          style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 13, padding: 2, lineHeight: 1 }}
+        >
+          👤
+        </button>
+        {chatUrl && (
+          <a
+            href={chatUrl}
+            target="_blank"
+            rel="noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            title="Open Messenger chat"
+            style={{ fontSize: 13, textDecoration: 'none', lineHeight: 1 }}
+          >
+            💬
+          </a>
+        )}
+        {onRemove && (
+          confirmRemove ? (
+            <span onClick={(e) => e.stopPropagation()} style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+              <span style={{ fontSize: 11, color: '#e53e3e' }}>Remove?</span>
+              <button
+                onClick={onRemove}
+                style={{ background: '#e53e3e', color: '#fff', border: 'none', padding: '2px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, cursor: 'pointer' }}
+              >
+                Yes
+              </button>
+              <button
+                onClick={() => setConfirmRemove(false)}
+                style={{ background: '#f5f5f5', color: '#555', border: '1px solid #ddd', padding: '2px 8px', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}
+              >
+                No
+              </button>
+            </span>
+          ) : (
+            <button
+              onClick={(e) => { e.stopPropagation(); setConfirmRemove(true); }}
+              title="Remove from queue"
+              style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 13, color: '#e53e3e', padding: 2, lineHeight: 1 }}
+            >
+              ✕
+            </button>
+          )
+        )}
       </div>
       {r.error && (
         <div style={{ marginTop: 6, marginLeft: 18, fontSize: 12, color: '#e53e3e' }}>⚠️ {r.error}</div>

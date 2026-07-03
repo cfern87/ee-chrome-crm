@@ -433,6 +433,24 @@ async function cancelCampaign(id: string): Promise<{ success: boolean }> {
   return { success: true };
 }
 
+// Drop a single recipient from a campaign's queue (e.g. sent in error, or the
+// user changed their mind). Refuses to touch one that's actively mid-send —
+// that recipient is about to be written back by the in-flight processTick,
+// and removing it out from under that write would race.
+async function removeCampaignRecipient(id: string, threadId: string): Promise<{ success: boolean; error?: string }> {
+  const c = await getCampaign(id);
+  if (!c) return { success: false, error: 'Campaign not found.' };
+  const idx = c.recipients.findIndex((r) => r.threadId === threadId);
+  if (idx === -1) return { success: false, error: 'Recipient not found.' };
+  if (c.recipients[idx].status === 'sending') {
+    return { success: false, error: 'That message is sending right now — try again in a moment.' };
+  }
+  c.recipients.splice(idx, 1);
+  if (idx < c.cursor) c.cursor -= 1;
+  await upsertCampaign(c);
+  return { success: true };
+}
+
 // Watchdog: catch stalls (worker killed mid-step, missed alarm, etc.).
 async function watchdog(): Promise<void> {
   const c = await getActiveCampaign();
@@ -543,6 +561,10 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         }
         case 'CANCEL_CAMPAIGN': {
           sendResponse(await cancelCampaign(request.payload.campaignId));
+          break;
+        }
+        case 'REMOVE_CAMPAIGN_RECIPIENT': {
+          sendResponse(await removeCampaignRecipient(request.payload.campaignId, request.payload.threadId));
           break;
         }
 
