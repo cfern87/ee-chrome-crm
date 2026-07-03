@@ -994,9 +994,12 @@ function sleep(ms: number): Promise<void> {
 }
 
 // Collapse whitespace so DOM text (which wraps/reflows) compares cleanly
-// against the message we intended to send.
+// against the message we intended to send. Also strip zero-width characters
+// (ZWSP/ZWNJ/ZWJ/word-joiner) that Messenger's composer inserts around line
+// breaks — they aren't matched by \s, so left in they cause the composer text
+// to differ from the target by one invisible character per line break.
 function normalizeText(s: string): string {
-  return (s || '').replace(/\s+/g, ' ').trim();
+  return (s || '').replace(/[\u200B\u200C\u200D\u2060\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
 }
 
 // Count non-overlapping occurrences of needle in haystack.
@@ -1044,6 +1047,15 @@ function composerText(composer: HTMLElement): string {
   return normalizeText(composer.innerText || composer.textContent || '');
 }
 
+// Truncated DOM snapshot for diagnosing whether a line break actually made it
+// in as a structural element (<br>/<div> boundary) or the insertion collapsed
+// everything into one run of text — logged so future failures are diagnosable
+// from the log alone instead of guessing.
+function composerHtmlSnippet(composer: HTMLElement): string {
+  const html = composer.innerHTML || '';
+  return html.length > 400 ? html.slice(0, 400) + '…' : html;
+}
+
 // Simulate the user pressing Enter to send. Facebook listens on keydown, but
 // we fire the full sequence for safety.
 function pressEnter(target: HTMLElement): void {
@@ -1056,29 +1068,109 @@ function pressEnter(target: HTMLElement): void {
   }
 }
 
-// Click the paper-plane Send button as a fallback when Enter doesn't clear the
-// composer (some layouts swallow the synthetic key event).
-function clickSendButton(near: HTMLElement): boolean {
-  const main = document.querySelector('[role="main"]') || document;
-  const buttons = main.querySelectorAll<HTMLElement>('[aria-label]');
-  for (const b of buttons) {
-    const label = b.getAttribute('aria-label') || '';
-    if (/^send\b|send message|press enter to send/i.test(label) && b.offsetParent !== null) {
-      b.click();
-      return true;
+// Simulate Shift+Enter — Messenger's own keydown handler inserts a soft line
+// break for this (same reason plain Enter triggers send: the editor reacts to
+// the dispatched keydown, it doesn't rely on native contenteditable behavior).
+// A raw "\n" character passed straight through execCommand('insertText') gets
+// silently dropped by Messenger's editor, so line breaks must be created this
+// way rather than embedded in the inserted string.
+function pressShiftEnter(target: HTMLElement): void {
+  for (const type of ['keydown', 'keypress', 'keyup'] as const) {
+    const ev = new KeyboardEvent(type, {
+      key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+      shiftKey: true, bubbles: true, cancelable: true,
+    });
+    target.dispatchEvent(ev);
+  }
+}
+
+// Type a (possibly multi-line) message into the composer, inserting each line
+// via execCommand and creating real line breaks with Shift+Enter in between.
+async function typeMessage(composer: HTMLElement, message: string): Promise<boolean> {
+  const lines = message.split('\n');
+  let allInserted = true;
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0) {
+      // A synthetic (untrusted) Shift+Enter keydown doesn't trigger the
+      // browser's native "insert line break" default action, so it's not
+      // enough on its own. insertLineBreak/insertParagraph are scripted
+      // execCommands — like insertText, they run regardless of event trust
+      // and fire the beforeinput/input events Messenger's editor reacts to.
+      let broke = false;
+      try { broke = document.execCommand('insertLineBreak', false); } catch { /* ignore */ }
+      if (!broke) {
+        try { broke = document.execCommand('insertParagraph', false); } catch { /* ignore */ }
+      }
+      if (!broke) {
+        try { broke = document.execCommand('insertHTML', false, '<br>'); } catch { /* ignore */ }
+      }
+      if (!broke) pressShiftEnter(composer);
+      await sleep(30);
+    }
+    if (lines[i].length === 0) continue;
+    try {
+      if (!document.execCommand('insertText', false, lines[i])) allInserted = false;
+    } catch {
+      allInserted = false;
     }
   }
-  // Fallback: nearest clickable ancestor sibling labelled send
-  const sendIcon = near.closest('[role="main"]')?.querySelector<HTMLElement>('[aria-label="Press enter to send"]');
-  if (sendIcon) { sendIcon.click(); return true; }
-  return false;
+  return allInserted;
+}
+
+// Insert text via a synthetic paste. Pasting multi-line clipboard content
+// (addresses, signatures, etc.) is a code path every rich-text editor has to
+// handle correctly regardless of how it wires up keyboard shortcuts, so it's
+// far more likely than execCommand/keydown tricks to preserve line breaks —
+// both of those turned out to still silently drop embedded "\n" characters.
+function dispatchPaste(composer: HTMLElement, text: string): boolean {
+  try {
+    const dt = new DataTransfer();
+    dt.setData('text/plain', text);
+    const before = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+    composer.dispatchEvent(before);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Temporarily block getUserMedia({audio:...}) so nothing can start an actual
+// mic recording during the send window. Belt-and-suspenders: we no longer
+// click any on-screen button to retry a send (see performAutomatedSend step
+// 6 — clicking was how the voice-note button used to get triggered, since
+// Messenger swaps a mic control into the exact same toolbar slot as Send
+// when it considers the composer empty), but this guarantees no audio is
+// ever captured even if some other path reaches that control.
+function blockMicAccess(): () => void {
+  const md = navigator.mediaDevices as (MediaDevices & { getUserMedia?: typeof navigator.mediaDevices.getUserMedia }) | undefined;
+  if (!md || typeof md.getUserMedia !== 'function') return () => { /* nothing to restore */ };
+  const original = md.getUserMedia.bind(md);
+  md.getUserMedia = (constraints?: MediaStreamConstraints) => {
+    if (constraints && constraints.audio) {
+      return Promise.reject(new DOMException('Blocked during automated send', 'NotAllowedError'));
+    }
+    return original(constraints);
+  };
+  return () => { md.getUserMedia = original; };
 }
 
 interface SendResult { ok: boolean; error?: string; log: string[] }
 
 // Core send + validate routine. Returns ok only after CONFIRMING the message
 // text appears as a new bubble in the thread and the composer has cleared.
-async function performAutomatedSend(threadId: string, message: string, dryRun = false): Promise<SendResult> {
+async function performAutomatedSend(threadId: string, rawMessage: string, dryRun = false): Promise<SendResult> {
+  // Templates typed/pasted from other editors can carry CRLF or the Unicode
+  // LINE/PARAGRAPH SEPARATOR characters (U+2028/U+2029) instead of a plain
+  // "\n" — textareas preserve whatever the clipboard had verbatim. Every line-
+  // break check below (message.includes('\n'), message.split('\n')) only
+  // recognizes "\n", so a message with one of those other separators would
+  // silently skip the multi-line typing path entirely and fall through to a
+  // single insertText call — which is exactly what was happening: the raw
+  // separator character then got dropped with no replacement by Messenger's
+  // editor/execCommand, one character per line break, with none of our line-
+  // break-preserving logic ever running. Normalize up front so everything
+  // downstream only ever has to deal with "\n".
+  const message = rawMessage.replace(/\r\n|\r|\u2028|\u2029/g, '\n');
   const log: string[] = [];
   const stamp = (m: string) => log.push(`[${new Date().toISOString()}] ${m}`);
   const target = normalizeText(message);
@@ -1115,18 +1207,39 @@ async function performAutomatedSend(threadId: string, message: string, dryRun = 
 
   // 4. Type the message. execCommand('insertText') fires the beforeinput/input
   //    events Facebook's editor expects, unlike setting textContent directly.
+  //    A raw "\n" embedded in that string gets silently dropped by Messenger's
+  //    editor, so multi-line messages try a synthetic paste first, then fall
+  //    back to typing line-by-line with simulated line breaks (typeMessage).
   composer.focus();
   await sleep(80);
   try { document.execCommand('selectAll', false); } catch { /* ignore */ }
   let inserted = false;
-  try {
-    inserted = document.execCommand('insertText', false, message);
-  } catch (e) {
-    stamp(`execCommand threw: ${String(e)}`);
+  let typed = '';
+
+  // Multi-line messages: try a synthetic paste first. execCommand line-break
+  // tricks and synthetic Shift+Enter keydowns both turned out to still lose
+  // the "\n" characters entirely (Messenger's editor only reacted to the
+  // plain-text insertion, not the line-break signal) — paste is the one path
+  // every rich-text editor has to get right for real multi-line clipboard
+  // content, so it's the best shot at preserving line breaks.
+  if (message.includes('\n')) {
+    dispatchPaste(composer, message);
+    await sleep(150);
+    typed = composerText(composer);
+    stamp(`afterPaste composerLen=${typed.length} html=${composerHtmlSnippet(composer)}`);
   }
-  await sleep(150);
-  let typed = composerText(composer);
-  stamp(`afterInsert execCommandReturned=${inserted} composerLen=${typed.length}`);
+
+  if (!typed.includes(target)) {
+    try { document.execCommand('selectAll', false); } catch { /* ignore */ }
+    try {
+      inserted = await typeMessage(composer, message);
+    } catch (e) {
+      stamp(`execCommand threw: ${String(e)}`);
+    }
+    await sleep(150);
+    typed = composerText(composer);
+    stamp(`afterInsert execCommandReturned=${inserted} composerLen=${typed.length} html=${composerHtmlSnippet(composer)}`);
+  }
 
   // Fallback: dispatch a manual beforeinput/input pair if the editor ignored us.
   if (!typed.includes(target) || typed.length === 0) {
@@ -1159,39 +1272,48 @@ async function performAutomatedSend(threadId: string, message: string, dryRun = 
     return { ok: true, log };
   }
 
-  // 5. Send.
-  pressEnter(composer);
-  stamp('pressed Enter');
+  // 5. Send. Block mic access for the whole send+confirm window: we used to
+  // retry by clicking whatever on-screen button looked like "Send" when
+  // confirmation was slow, but Messenger swaps a voice-note/mic control into
+  // that exact same toolbar slot once it considers the composer empty, so
+  // that click could start an actual recording. We now only ever retry via
+  // Enter (see below), never a click — this is just a hard backstop.
+  const restoreMic = blockMicAccess();
+  try {
+    pressEnter(composer);
+    stamp('pressed Enter');
 
-  // 6. Validate: composer clears AND a new bubble containing the text appears.
-  const confirmed = await pollFor(() => {
-    const c = composerText(composer);
-    const m = document.querySelector('[role="main"]');
-    const afterCount = m ? countOccurrences(normalizeText((m as HTMLElement).innerText), target) : 0;
-    return c.length === 0 && afterCount > beforeCount;
-  }, 10_000, 400);
-
-  if (!confirmed) {
-    // Try the Send button once, in case Enter was swallowed.
-    stamp('not confirmed after Enter — trying Send button');
-    if (clickSendButton(composer)) {
-      stamp('clicked Send button');
-    } else {
-      stamp('no Send button found');
-    }
-    const confirmed2 = await pollFor(() => {
+    // 6. Validate: composer clears AND a new bubble containing the text appears.
+    const confirmed = await pollFor(() => {
       const c = composerText(composer);
       const m = document.querySelector('[role="main"]');
       const afterCount = m ? countOccurrences(normalizeText((m as HTMLElement).innerText), target) : 0;
       return c.length === 0 && afterCount > beforeCount;
-    }, 8_000, 400);
-    if (!confirmed2) {
-      const finalComposer = composerText(composer);
-      const m = document.querySelector('[role="main"]');
-      const afterCount = m ? countOccurrences(normalizeText((m as HTMLElement).innerText), target) : 0;
-      stamp(`FAILED composerEmpty=${finalComposer.length === 0} occurrencesAfter=${afterCount}`);
-      return { ok: false, error: 'Could not confirm message was delivered', log };
+    }, 10_000, 400);
+
+    if (!confirmed) {
+      // Retry by pressing Enter again rather than clicking any button — Enter
+      // is the one action we know Facebook's own JS reliably reacts to
+      // (that's how every send here works), and unlike a click it can never
+      // land on the mic.
+      stamp('not confirmed after Enter — retrying Enter once');
+      pressEnter(composer);
+      const confirmed2 = await pollFor(() => {
+        const c = composerText(composer);
+        const m = document.querySelector('[role="main"]');
+        const afterCount = m ? countOccurrences(normalizeText((m as HTMLElement).innerText), target) : 0;
+        return c.length === 0 && afterCount > beforeCount;
+      }, 8_000, 400);
+      if (!confirmed2) {
+        const finalComposer = composerText(composer);
+        const m = document.querySelector('[role="main"]');
+        const afterCount = m ? countOccurrences(normalizeText((m as HTMLElement).innerText), target) : 0;
+        stamp(`FAILED composerEmpty=${finalComposer.length === 0} occurrencesAfter=${afterCount}`);
+        return { ok: false, error: 'Could not confirm message was delivered', log };
+      }
     }
+  } finally {
+    restoreMic();
   }
 
   stamp('CONFIRMED delivered (composer cleared + new bubble present)');
@@ -1222,6 +1344,30 @@ if (isExtensionAlive()) {
     });
   } catch (e) {
     console.warn('[CRM] Failed to register send-message listener:', e);
+  }
+
+  // A send-and-validate cycle can run 30s+ (composer/confirmation polling),
+  // which regularly outlives a plain chrome.tabs.sendMessage round trip once
+  // the MV3 service worker's idle timer fires — the background script then
+  // sees the callback error out with "message port closed" and reports the
+  // send as failed even though we're still typing. An open chrome.runtime
+  // Port is treated as ongoing activity and keeps the service worker alive
+  // for as long as it stays connected, so CRM_SEND_MESSAGE is also served
+  // over a port; the one-shot listener above stays for CRM_PING and as a
+  // fallback for older background builds.
+  try {
+    chrome.runtime.onConnect.addListener((port) => {
+      if (port.name !== 'crm-send') return;
+      port.onMessage.addListener((request) => {
+        if (!request || request.type !== 'CRM_SEND_MESSAGE') return;
+        const { threadId, message, dryRun } = request.payload || {};
+        performAutomatedSend(String(threadId), String(message), !!dryRun)
+          .then((res) => { try { port.postMessage(res); } catch { /* port gone */ } })
+          .catch((e) => { try { port.postMessage({ ok: false, error: 'Exception: ' + String(e), log: [String(e)] }); } catch { /* port gone */ } });
+      });
+    });
+  } catch (e) {
+    console.warn('[CRM] Failed to register send-message port listener:', e);
   }
 }
 

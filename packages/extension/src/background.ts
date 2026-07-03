@@ -135,6 +135,43 @@ function sendToTab<T = any>(tabId: number, message: unknown): Promise<T | null> 
   });
 }
 
+// Like sendToTab, but over a long-lived Port. A send-and-validate cycle can
+// run 30s+ (composer/confirmation polling in the content script), which
+// regularly outlives a plain sendMessage round trip once this MV3 service
+// worker's idle timer fires mid-wait — the callback then errors out with
+// "message port closed" and we'd wrongly report the send as failed. An open
+// Port counts as activity and keeps the worker alive for as long as it's
+// connected, so use one for anything that can run long. timeoutMs is a
+// backstop in case the content script never responds (e.g. tab closed).
+function sendViaPort<T = any>(tabId: number, message: unknown, timeoutMs: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let port: chrome.runtime.Port;
+    const finish = (val: T | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { port?.disconnect(); } catch { /* ignore */ }
+      resolve(val);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    try {
+      port = chrome.tabs.connect(tabId, { name: 'crm-send' });
+    } catch {
+      clearTimeout(timer);
+      resolve(null);
+      return;
+    }
+    port.onMessage.addListener((res) => finish(res as T));
+    port.onDisconnect.addListener(() => { void chrome.runtime.lastError; finish(null); });
+    try {
+      port.postMessage(message);
+    } catch {
+      finish(null);
+    }
+  });
+}
+
 // PING the content script until it answers and reports it's on a Messenger page
 // showing the expected thread. Keeps the worker alive (tab messaging resets the
 // idle timer) while the SPA finishes rendering the conversation.
@@ -199,11 +236,11 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
   const ready = await waitForContentReady(tabId, r.threadId, log);
   if (!ready) return { ok: false, error: 'Content script not ready on the chat page', log };
 
-  const res = await sendToTab<SendResult>(tabId, {
+  const res = await sendViaPort<SendResult>(tabId, {
     type: 'CRM_SEND_MESSAGE',
     payload: { threadId: r.threadId, message: r.renderedMessage, dryRun },
-  });
-  if (!res) return { ok: false, error: 'No response from content script (tab closed?)', log: [...log, 'tabs.sendMessage returned null'] };
+  }, 60_000);
+  if (!res) return { ok: false, error: 'No response from content script (tab closed or send timed out)', log: [...log, 'send port closed without a response'] };
   return { ok: res.ok, error: res.error, log: [...log, ...(res.log || [])] };
 }
 
