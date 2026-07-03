@@ -100,10 +100,14 @@ function createTab(url: string): Promise<chrome.tabs.Tab | null> {
 // Facebook doesn't throttle its timers; see ensureSenderTab), but the window
 // itself is created with focused:false so it never steals the user's
 // keyboard focus or interrupts whatever they're currently doing.
+//
+// This must be a regular ("normal") window at a normal browser size, not the
+// chromeless "popup" window type — Messenger's layout collapses the composer
+// (and other UI) below certain width/type breakpoints, which broke typing.
 function createSenderWindow(url: string): Promise<chrome.windows.Window | null> {
   return new Promise((resolve) => {
     try {
-      chrome.windows.create({ url, focused: false, type: 'popup', width: 480, height: 760 }, (win) => {
+      chrome.windows.create({ url, focused: false, type: 'normal', width: 1280, height: 900 }, (win) => {
         if (chrome.runtime.lastError || !win) { resolve(null); return; }
         resolve(win);
       });
