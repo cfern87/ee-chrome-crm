@@ -2179,6 +2179,40 @@ function HistoryPanel({ campaigns, onChanged, store, onViewProfile }: { campaign
   );
 }
 
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      return;
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <button
+      onClick={copy}
+      title="Copy template"
+      style={{
+        background: copied ? '#e6f7ee' : '#fff',
+        color: copied ? '#0a7c4a' : '#666',
+        border: '1px solid #ddd',
+        borderRadius: 6,
+        padding: '3px 10px',
+        fontSize: 11,
+        fontWeight: 600,
+        cursor: 'pointer',
+      }}
+    >
+      {copied ? 'Copied ✓' : 'Copy'}
+    </button>
+  );
+}
+
 function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile }: { campaign: Campaign; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void }) {
   const [expanded, setExpanded] = useState(false);
   const sum = summarize(campaign);
@@ -2235,7 +2269,10 @@ function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile }: { ca
           )}
 
           {/* Template */}
-          <div style={{ fontSize: 11, fontWeight: 600, color: '#888', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Template</div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: '#888', textTransform: 'uppercase', letterSpacing: 0.5 }}>Template</div>
+            <CopyButton text={campaign.template} />
+          </div>
           <div style={{ background: '#f8f8f8', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#444', whiteSpace: 'pre-wrap', marginBottom: 14, lineHeight: 1.5 }}>{campaign.template}</div>
 
           {/* Config summary */}
