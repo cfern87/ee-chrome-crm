@@ -95,6 +95,31 @@ function createTab(url: string): Promise<chrome.tabs.Tab | null> {
   });
 }
 
+// Opens the sender tab in its own dedicated, unfocused window — a "pop-under"
+// rather than a popup. The tab is still `active` *within that window* (so
+// Facebook doesn't throttle its timers; see ensureSenderTab), but the window
+// itself is created with focused:false so it never steals the user's
+// keyboard focus or interrupts whatever they're currently doing.
+function createSenderWindow(url: string): Promise<chrome.windows.Window | null> {
+  return new Promise((resolve) => {
+    try {
+      chrome.windows.create({ url, focused: false, type: 'popup', width: 480, height: 760 }, (win) => {
+        if (chrome.runtime.lastError || !win) { resolve(null); return; }
+        resolve(win);
+      });
+    } catch { resolve(null); }
+  });
+}
+
+// Bring a window out of a minimized state without giving it OS focus (omitting
+// `focused` leaves the current focus untouched).
+function unminimizeWindow(windowId: number): Promise<void> {
+  return new Promise((resolve) => {
+    try { chrome.windows.update(windowId, { state: 'normal' }, () => { void chrome.runtime.lastError; resolve(); }); }
+    catch { resolve(); }
+  });
+}
+
 function updateTab(tabId: number, props: chrome.tabs.UpdateProperties): Promise<chrome.tabs.Tab | null> {
   return new Promise((resolve) => {
     try {
@@ -103,13 +128,6 @@ function updateTab(tabId: number, props: chrome.tabs.UpdateProperties): Promise<
         resolve(tab);
       });
     } catch { resolve(null); }
-  });
-}
-
-function focusWindow(windowId: number): Promise<void> {
-  return new Promise((resolve) => {
-    try { chrome.windows.update(windowId, { focused: true }, () => { void chrome.runtime.lastError; resolve(); }); }
-    catch { resolve(); }
   });
 }
 
@@ -195,25 +213,30 @@ async function waitForContentReady(tabId: number, threadId: string, log: string[
   }
 }
 
-// Ensure a single reusable "sender" tab is open and pointed at chatUrl, brought
-// to the foreground. Foreground matters: Facebook throttles timers in
-// background tabs, which would break the content script's validation polling.
+// Ensure a single reusable "sender" tab is open and pointed at chatUrl, kept as
+// the active tab *within its own dedicated window*. Tab-foreground matters:
+// Facebook throttles timers in background tabs, which would break the content
+// script's validation polling. Window-foreground does NOT matter for that (page
+// visibility only cares about the tab's position within its window, not OS
+// focus), so we deliberately never steal OS focus — the sender window opens
+// and stays as a pop-under, behind whatever the user is currently doing.
 async function ensureSenderTab(chatUrl: string, log: string[]): Promise<number | null> {
   let tabId = await getStoredSenderTab();
   let tab = tabId != null ? await getTab(tabId) : null;
 
   if (!tab) {
-    log.push('creating new sender tab');
-    tab = await createTab(chatUrl);
-    if (!tab || tab.id == null) { log.push('failed to create sender tab'); return null; }
+    log.push('creating new sender window');
+    const win = await createSenderWindow(chatUrl);
+    tab = win?.tabs?.[0] ?? null;
+    if (!tab || tab.id == null) { log.push('failed to create sender window'); return null; }
     tabId = tab.id;
     await setStoredSenderTab(tabId);
   } else {
     log.push(`reusing sender tab ${tabId}`);
     await updateTab(tabId!, { url: chatUrl, active: true });
+    if (tab.windowId != null) await unminimizeWindow(tab.windowId);
   }
 
-  if (tab.windowId != null) await focusWindow(tab.windowId);
   const ok = await waitForTabComplete(tabId!);
   log.push(`tab load complete=${ok}`);
   if (!ok) return null;
