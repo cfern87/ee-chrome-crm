@@ -478,6 +478,39 @@ async function removeCampaignRecipient(id: string, threadId: string): Promise<{ 
   return { success: true };
 }
 
+// Put a failed recipient back in the queue for another attempt. The cursor
+// only ever moves forward, so it must be rewound to (or before) this
+// recipient's index or processTick would just skip past it again. A campaign
+// that already finished/was cancelled is revived as 'paused' so the resend
+// requires an explicit Resume rather than silently kicking off.
+async function requeueCampaignRecipient(id: string, threadId: string): Promise<{ success: boolean; error?: string }> {
+  const c = await getCampaign(id);
+  if (!c) return { success: false, error: 'Campaign not found.' };
+  const idx = c.recipients.findIndex((r) => r.threadId === threadId);
+  if (idx === -1) return { success: false, error: 'Recipient not found.' };
+  if (c.recipients[idx].status !== 'error') {
+    return { success: false, error: 'Only failed messages can be requeued.' };
+  }
+
+  c.recipients[idx].status = 'pending';
+  c.recipients[idx].error = undefined;
+  c.cursor = Math.min(c.cursor, idx);
+
+  if (c.status === 'completed' || c.status === 'cancelled') {
+    c.status = 'paused';
+    c.completedAt = undefined;
+    c.pausedForBatchUntil = undefined;
+    c.nextSendAt = undefined;
+  }
+
+  await upsertCampaign(c);
+  if (c.status === 'running') {
+    ensureWatchdog();
+    processTick();
+  }
+  return { success: true };
+}
+
 // Watchdog: catch stalls (worker killed mid-step, missed alarm, etc.).
 async function watchdog(): Promise<void> {
   const c = await getActiveCampaign();
@@ -592,6 +625,10 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         }
         case 'REMOVE_CAMPAIGN_RECIPIENT': {
           sendResponse(await removeCampaignRecipient(request.payload.campaignId, request.payload.threadId));
+          break;
+        }
+        case 'REQUEUE_CAMPAIGN_RECIPIENT': {
+          sendResponse(await requeueCampaignRecipient(request.payload.campaignId, request.payload.threadId));
           break;
         }
 

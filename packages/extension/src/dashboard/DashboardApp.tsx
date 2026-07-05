@@ -2231,6 +2231,15 @@ function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile }: { ca
     onChanged();
   };
 
+  const requeueRecipient = async (threadId: string) => {
+    const res = await sendBg<{ success: boolean; error?: string }>({
+      type: 'REQUEUE_CAMPAIGN_RECIPIENT',
+      payload: { campaignId: campaign.id, threadId },
+    });
+    if (res && !res.success && res.error) window.alert(res.error);
+    onChanged();
+  };
+
   const canRemove = campaign.status === 'running' || campaign.status === 'paused';
 
   return (
@@ -2305,6 +2314,7 @@ function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile }: { ca
                 conv={store.conversations[r.threadId]}
                 onViewProfile={() => onViewProfile(r.threadId)}
                 onRemove={canRemove && r.status !== 'sending' ? () => removeRecipient(r.threadId) : undefined}
+                onRequeue={r.status === 'error' ? () => requeueRecipient(r.threadId) : undefined}
               />
             ))}
           </div>
@@ -2314,7 +2324,7 @@ function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile }: { ca
   );
 }
 
-function RecipientRow({ r, conv, onViewProfile, onRemove }: { r: CampaignRecipient; conv?: Conversation; onViewProfile: () => void; onRemove?: () => void }) {
+function RecipientRow({ r, conv, onViewProfile, onRemove, onRequeue }: { r: CampaignRecipient; conv?: Conversation; onViewProfile: () => void; onRemove?: () => void; onRequeue?: () => void }) {
   const [open, setOpen] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const hasLog = !!(r.log && r.log.length);
@@ -2350,6 +2360,15 @@ function RecipientRow({ r, conv, onViewProfile, onRemove }: { r: CampaignRecipie
           >
             💬
           </a>
+        )}
+        {onRequeue && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onRequeue(); }}
+            title="Requeue — try sending this again"
+            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 13, color: '#065fd4', padding: 2, lineHeight: 1 }}
+          >
+            ↻
+          </button>
         )}
         {onRemove && (
           confirmRemove ? (

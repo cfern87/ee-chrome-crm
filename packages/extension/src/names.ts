@@ -14,6 +14,11 @@ const STATUS_WORDS = /\b(active now|active|online|offline|sent|seen|delivered|ty
 const TRAILING_TIME =
   /[\s,·•|–—-]*\b\d+\s*(?:s|m|h|d|w|y|sec|secs|min|mins|hr|hrs|hour|hours|day|days|week|weeks|mo|mos|month|months|yr|yrs|year|years)\b\.?\s*$/i;
 
+// Facebook announces the verified badge as text glued onto the name (e.g. an
+// aria-label of "Dominic Young, Verified account") — it's not part of the
+// name, so it should be dropped rather than kept.
+const TRAILING_VERIFIED = /[\s,·•|–—-]*verified\s+account\b\.?\s*$/i;
+
 /** Strip Facebook's surrounding noise from a candidate name string. */
 export function cleanName(raw: string | null | undefined): string {
   let s = (raw || '').replace(/\s+/g, ' ').trim();
@@ -34,10 +39,20 @@ export function cleanName(raw: string | null | undefined): string {
   }
   // Trailing timestamp ("- 3h", "· 2m").
   s = s.replace(TRAILING_TIME, '').trim();
+  // Trailing "Verified account" badge text.
+  s = s.replace(TRAILING_VERIFIED, '').trim();
   // Trailing status words ("Active now", "Sent").
   s = s.replace(new RegExp(`[\\s,·•|–—-]*${STATUS_WORDS.source}\\b.*$`, 'i'), '').trim();
   // Leftover trailing separators/punctuation.
   s = s.replace(/[\s,·•|–—-]+$/, '').trim();
+  // Trailing parenthetical secondary name/nickname ("Jane Doe (Janey)") — keep
+  // the primary name. Looped since removing one can expose leftover
+  // punctuation before another (rare, but cheap to handle).
+  for (let i = 0; i < 3 && /\)\s*$/.test(s); i++) {
+    const next = s.replace(/\s*\([^()]*\)\s*$/, '').trim().replace(/[\s,·•|–—-]+$/, '').trim();
+    if (next === s) break;
+    s = next;
+  }
   return s;
 }
 
