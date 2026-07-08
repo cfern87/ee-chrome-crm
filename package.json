@@ -11,7 +11,8 @@
     "install-all": "npm install",
     "dev": "npm run dev --workspaces",
     "build": "npm run build --workspaces",
-    "start": "npm start --workspaces"
+    "start": "npm start --workspaces",
+    "prepare": "git config core.hooksPath .githooks"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.260",

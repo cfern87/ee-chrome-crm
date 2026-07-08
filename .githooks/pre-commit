@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Auto-bumps the extension's revision (patch) version on every commit to main.
+branch="$(git symbolic-ref --short HEAD 2>/dev/null)"
+
+if [ "$branch" = "main" ]; then
+  node "$(git rev-parse --show-toplevel)/scripts/bump-version.js" || exit 1
+  git add packages/extension/public/manifest.json
+fi
+
+exit 0
