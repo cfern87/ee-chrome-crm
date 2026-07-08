@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Facebook Messenger CRM",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Manage conversations and tags directly in Facebook Messenger",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyhKpKmkvh0Mq1NuU/MdFWowmdCapWS0YLSQJNtL50wjVL8yIdB0ZBj2NncnUJKkQtk8NmdNN1ZCC5EtKUh0ES+GTup1jKbCful2rZZN+PTWzKIQq7mTOD/e5cTpxeUldGPkOY3lgbG6Aell1f3CJ3+b9k/W2C6bzAtAdeqfyqd7tB0y7fGB2onAmYyYZd//nAZ38HKTH0lKOiA7CxcggVedSgiFfmnfyM5XygR5a5L3RYRU25TkNSskzXmVXNSI78jkLXPhliAeIre9u4LCa3zqZ3B/d4CPHxxjn/e8VY6p7f7XA28jI7ZyF5cdpQ5dJJNj/T8qfHEVBg9OcYx1ITQIDAQAB",
   "permissions": [

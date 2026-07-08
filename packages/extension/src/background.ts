@@ -101,16 +101,25 @@ function createTab(url: string): Promise<chrome.tabs.Tab | null> {
 // itself is created with focused:false so it never steals the user's
 // keyboard focus or interrupts whatever they're currently doing.
 //
+// Messenger's layout collapses the composer (and other UI), which breaks
+// typing/sending, once the window drops below roughly this size. Never let a
+// sender window get (or stay) smaller than this.
+const MIN_SENDER_WIDTH = 1024;
+const MIN_SENDER_HEIGHT = 768;
+
 // This must be a regular ("normal") window at a normal browser size, not the
 // chromeless "popup" window type — Messenger's layout collapses the composer
 // (and other UI) below certain width/type breakpoints, which broke typing.
 function createSenderWindow(url: string): Promise<chrome.windows.Window | null> {
   return new Promise((resolve) => {
     try {
-      chrome.windows.create({ url, focused: false, type: 'normal', width: 1280, height: 900 }, (win) => {
-        if (chrome.runtime.lastError || !win) { resolve(null); return; }
-        resolve(win);
-      });
+      chrome.windows.create(
+        { url, focused: false, type: 'normal', width: 1280, height: 900 },
+        (win) => {
+          if (chrome.runtime.lastError || !win) { resolve(null); return; }
+          resolve(win);
+        }
+      );
     } catch { resolve(null); }
   });
 }
@@ -121,6 +130,24 @@ function unminimizeWindow(windowId: number): Promise<void> {
   return new Promise((resolve) => {
     try { chrome.windows.update(windowId, { state: 'normal' }, () => { void chrome.runtime.lastError; resolve(); }); }
     catch { resolve(); }
+  });
+}
+
+// The sender window is reused across sends rather than recreated, so it can
+// end up smaller than our minimum (e.g. someone drags/resizes it, or the OS
+// restores it undersized) and stay that way indefinitely. Check and restore
+// it on every reuse rather than only at creation time.
+function ensureSenderWindowSize(windowId: number): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      chrome.windows.get(windowId, (win) => {
+        if (chrome.runtime.lastError || !win) { resolve(); return; }
+        const width = Math.max(win.width ?? 0, MIN_SENDER_WIDTH);
+        const height = Math.max(win.height ?? 0, MIN_SENDER_HEIGHT);
+        if (width === win.width && height === win.height) { resolve(); return; }
+        chrome.windows.update(windowId, { width, height }, () => { void chrome.runtime.lastError; resolve(); });
+      });
+    } catch { resolve(); }
   });
 }
 
@@ -238,7 +265,10 @@ async function ensureSenderTab(chatUrl: string, log: string[]): Promise<number |
   } else {
     log.push(`reusing sender tab ${tabId}`);
     await updateTab(tabId!, { url: chatUrl, active: true });
-    if (tab.windowId != null) await unminimizeWindow(tab.windowId);
+    if (tab.windowId != null) {
+      await unminimizeWindow(tab.windowId);
+      await ensureSenderWindowSize(tab.windowId);
+    }
   }
 
   const ok = await waitForTabComplete(tabId!);
