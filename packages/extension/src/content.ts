@@ -201,6 +201,56 @@ let sidebarDebounce: number | null = null;
 let lastInjectAt = 0;
 let lastLoggedLinkCount = -1;
 
+// Open the CRM panel bound to a specific thread, without navigating the page
+// into that conversation. Used by the per-row "add tags" button so the user can
+// tag people straight from the message list.
+async function openPanelForThread(threadId: string, link?: HTMLAnchorElement) {
+  if (!panelEl) buildLauncher();
+  try {
+    await ensureConversation(threadId, link);
+  } catch (e) {
+    console.error('[CRM] openPanelForThread: failed to ensure conversation', e);
+  }
+  currentPanelThreadId = threadId;
+  if (panelEl) {
+    panelEl.style.display = 'block';
+    await renderPanel();
+  }
+}
+
+// Attach a small always-visible "+" button to a sidebar conversation link
+// (idempotent). It's absolutely positioned inside the link so it adds no row
+// height. Its own click/mousedown are swallowed so clicking it opens the panel
+// for this exact person instead of following the link into the thread.
+function ensureAddTagButton(link: HTMLAnchorElement) {
+  if (link.querySelector('[data-crm-add-tag]')) return;
+
+  // Anchor must be a positioning context so the button can sit in its corner.
+  if (getComputedStyle(link).position === 'static') link.style.position = 'relative';
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.setAttribute('data-crm-add-tag', '');
+  btn.className = 'fb-crm-add-tag-btn';
+  btn.title = 'Add tags';
+  btn.textContent = '+';
+
+  // Swallow the events Facebook's row uses for navigation so clicking the
+  // button tags the person instead of opening the conversation.
+  const swallow = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
+  btn.addEventListener('mousedown', swallow, true);
+  btn.addEventListener('click', (e) => {
+    swallow(e);
+    // Resolve the thread from the current link href at click time (Facebook
+    // recycles row nodes, so a captured id could be stale).
+    const anchor = btn.closest<HTMLAnchorElement>('a[href*="/t/"]');
+    const id = anchor ? extractThreadId(anchor.href) : null;
+    if (id) openPanelForThread(id, anchor || undefined);
+  }, true);
+
+  link.appendChild(btn);
+}
+
 async function injectSidebarTags() {
   lastInjectAt = Date.now();
   const store = await getStore();
@@ -241,6 +291,11 @@ async function injectSidebarTags() {
         .map(t => `<span class="fb-crm-sidebar-chip" style="background:${t.color}">${escapeHtml(t.name)}</span>`)
         .join('');
     }
+
+    // Add-tags button: a small always-visible "+" on each conversation row that
+    // opens the CRM panel for THIS person without navigating into the thread.
+    // Absolutely positioned so it never adds height to the row.
+    ensureAddTagButton(link);
   });
 }
 

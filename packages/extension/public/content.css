@@ -263,6 +263,41 @@
   pointer-events: none;
 }
 
+/* ---- Per-row "add tags" button ---- */
+
+/* A small "+" button anchored in the corner of each conversation row. Always
+   visible so it's a reliable click target — it adds no height to the row
+   (absolute) and its own click/mousedown are swallowed in JS so tapping it
+   never falls through to opening the conversation. */
+.fb-crm-add-tag-btn {
+  position: absolute;
+  bottom: 4px;
+  right: 6px;
+  z-index: 5;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: #065fd4;
+  color: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 22px;
+  text-align: center;
+  cursor: pointer;
+  opacity: 0.9;
+  transition: transform 0.12s ease, filter 0.12s ease;
+  pointer-events: auto;
+}
+
+.fb-crm-add-tag-btn:hover {
+  opacity: 1;
+  transform: scale(1.12);
+  filter: brightness(1.1);
+}
+
 /* ---- Pick mode ---- */
 
 /* Subtle blue ring on every detectable sidebar link while in pick mode */
