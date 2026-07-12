@@ -22,10 +22,14 @@ const SITE_NAMES = /^(facebook|messenger|meta|marketplace|notifications?|home|fr
 const TRAILING_TIME =
   /[\s,·•|–—-]*\b\d+\s*(?:s|m|h|d|w|y|sec|secs|min|mins|hr|hrs|hour|hours|day|days|week|weeks|mo|mos|month|months|yr|yrs|year|years)\b\.?\s*$/i;
 
-// Facebook announces the verified badge as text glued onto the name (e.g. an
-// aria-label of "Dominic Young, Verified account") — it's not part of the
-// name, so it should be dropped rather than kept.
-const TRAILING_VERIFIED = /[\s,·•|–—-]*verified\s+account\b\.?\s*$/i;
+// Facebook announces the verified badge as text glued onto the name ("Verified
+// account", sometimes "Verified page", occasionally just "Verified"). It can
+// land BEFORE or AFTER the name depending on where the badge sits in the markup,
+// so strip every occurrence wherever it appears — it's never part of a real
+// name. (No word boundaries: the badge text is often glued straight onto the
+// name with no separator — "Dominic YoungVerified account" when the badge span
+// follows the name, or "Verified accountDominic Young" when it precedes it.)
+const VERIFIED_BADGE = /[\s,·•|–—-]*verified(?:\s+(?:account|page))?\.?/gi;
 
 /** Strip Facebook's surrounding noise from a candidate name string. */
 export function cleanName(raw: string | null | undefined): string {
@@ -47,8 +51,8 @@ export function cleanName(raw: string | null | undefined): string {
   }
   // Trailing timestamp ("- 3h", "· 2m").
   s = s.replace(TRAILING_TIME, '').trim();
-  // Trailing "Verified account" badge text.
-  s = s.replace(TRAILING_VERIFIED, '').trim();
+  // "Verified account" badge text, wherever it appears (before/after the name).
+  s = s.replace(VERIFIED_BADGE, ' ').replace(/\s+/g, ' ').trim();
   // Trailing status words ("Active now", "Sent").
   s = s.replace(new RegExp(`[\\s,·•|–—-]*${STATUS_WORDS.source}\\b.*$`, 'i'), '').trim();
   // Leftover trailing separators/punctuation.
@@ -177,26 +181,34 @@ function bestNameIn(container: Element): string {
   return '';
 }
 
-// Elements on the page that represent the profile's "followers" / "following"
-// counter — either the tab/link (href like /<user>/followers/) or a short text
-// leaf like "1.2K followers".
-function collectFollowEls(doc: Document, kind: 'followers' | 'following'): Element[] {
+// Elements on the page that represent one of a profile's stat counters — the
+// bits of chrome that always sit in the profile header, right next to the name.
+// Facebook shows different ones depending on the profile and your relationship
+// to it: "followers" / "following" on creator-style profiles, "friends" /
+// "mutual friends" on personal ones. We match both the tab/link form (href like
+// /<user>/followers/) and a short text leaf ("1.2K followers", "342 friends",
+// "12 mutual friends"). Bounded text length so we grab the counter itself, not a
+// big container that merely contains it.
+function collectStatEls(doc: Document): Element[] {
   const els: Element[] = [];
   const seen = new Set<Element>();
   const push = (el: Element | null) => { if (el && !seen.has(el)) { seen.add(el); els.push(el); } };
 
-  const hrefRe = new RegExp(`/${kind}(?:[/?#]|$)`, 'i');
-  doc.querySelectorAll('a[href]').forEach((a) => {
-    if (hrefRe.test(a.getAttribute('href') || '')) push(a);
-  });
+  // Link form: /<user>/followers/, /following/, /friends/. ("mutual" has no
+  // dedicated link, so it's text-only below.)
+  for (const kind of ['followers', 'following', 'friends'] as const) {
+    const hrefRe = new RegExp(`/${kind}(?:[/?#]|$)`, 'i');
+    doc.querySelectorAll('a[href]').forEach((a) => {
+      if (hrefRe.test(a.getAttribute('href') || '')) push(a);
+    });
+  }
 
-  // Text fallback: a short leaf reading "<count> followers" / "<count> following"
-  // (e.g. "1.2K followers"). Bounded length so we grab the counter itself, not a
-  // big container that merely contains it.
-  const textRe = new RegExp(`^\\s*\\d[\\d.,]*\\s*[kmb]?\\s+${kind}\\s*$`, 'i');
+  // Text form: "<count> <word>", e.g. "1.2K followers", "342 friends",
+  // "12 mutual friends" / "3 mutual".
+  const textRe = /^\s*\d[\d.,]*\s*[kmb]?\s+(?:followers|following|friends|mutual(?:\s+friends)?)\s*$/i;
   doc.querySelectorAll('span, a, div').forEach((el) => {
     const t = (el.textContent || '').trim();
-    if (t.length <= 30 && textRe.test(t)) push(el);
+    if (t.length <= 40 && textRe.test(t)) push(el);
   });
 
   return els;
@@ -204,36 +216,40 @@ function collectFollowEls(doc: Document, kind: 'followers' | 'following'): Eleme
 
 /**
  * Find the profile owner's name by scanning the page structure around the
- * "followers" / "following" counters. On a Facebook profile the name heading
- * sits in the same header block as those two counters, so we locate the
- * tightest followers+following pairing, then climb from their shared ancestor
+ * profile's stat counters ("followers"/"following", or "friends"/"mutual
+ * friends"). On a Facebook profile the name heading sits in the same header
+ * block as those counters, so we locate the tightest pair of counters (the two
+ * sitting closest together in the DOM), then climb from their shared ancestor
  * until we find a name. This is DOM-shape based — it does not rely on og:title
  * or the page <title>, both of which Facebook now serves as a generic
  * "Facebook" on logged-in profile pages.
  */
-export function extractProfileNameByFollowCounts(doc: Document = document): string {
-  const followers = collectFollowEls(doc, 'followers');
-  const following = collectFollowEls(doc, 'following');
-  if (!followers.length || !following.length) return '';
+export function extractProfileNameByStats(doc: Document = document): string {
+  const stats = collectStatEls(doc);
+  if (!stats.length) return '';
 
-  // Pick the followers/following pair sitting closest together (deepest shared
-  // ancestor) — that ancestor is the profile header, right beside the name.
-  let bestAnc: Element | null = null;
-  let bestDepth = -1;
-  for (const f of followers) {
-    for (const g of following) {
-      if (f === g) continue;
-      const anc = commonAncestor(f, g);
-      if (!anc) continue;
-      const d = elementDepth(anc);
-      if (d > bestDepth) { bestDepth = d; bestAnc = anc; }
+  // Anchor on the tightest pair of counters (deepest shared ancestor = the
+  // profile header, right beside the name). With only one counter present,
+  // climb from it directly.
+  let anchor: Element | null = null;
+  if (stats.length === 1) {
+    anchor = stats[0];
+  } else {
+    let bestDepth = -1;
+    for (let i = 0; i < stats.length; i++) {
+      for (let j = i + 1; j < stats.length; j++) {
+        const anc = commonAncestor(stats[i], stats[j]);
+        if (!anc) continue;
+        const d = elementDepth(anc);
+        if (d > bestDepth) { bestDepth = d; anchor = anc; }
+      }
     }
+    if (!anchor) anchor = stats[0];
   }
-  if (!bestAnc) return '';
 
-  // Climb from the counters' shared container outward; the name heading is a
+  // Climb from the counters' container outward; the name heading is a
   // sibling/near-ancestor of the counts, so the first name we hit is it.
-  for (let el: Element | null = bestAnc, i = 0; el && i < 6; el = el.parentElement, i++) {
+  for (let el: Element | null = anchor, i = 0; el && i < 6; el = el.parentElement, i++) {
     const name = bestNameIn(el);
     if (name) return name;
   }
@@ -243,17 +259,18 @@ export function extractProfileNameByFollowCounts(doc: Document = document): stri
 /**
  * Best name for a Facebook profile page (not a Messenger thread).
  *
- * Primary strategy is a structural page scan around the followers/following
- * counters (extractProfileNameByFollowCounts): Facebook no longer exposes the
- * profile name via og:title or the page <title> on logged-in profile pages —
- * both now read a generic "Facebook" — so we read the name straight out of the
- * profile header DOM. The meta/title sources remain only as last-ditch
- * fallbacks for layouts where the counters aren't present.
+ * Primary strategy is a structural page scan around the profile's stat counters
+ * (extractProfileNameByStats — "followers"/"following" or "friends"/"mutual
+ * friends"): Facebook no longer exposes the profile name via og:title or the
+ * page <title> on logged-in profile pages — both now read a generic "Facebook"
+ * — so we read the name straight out of the profile header DOM. The meta/title
+ * sources remain only as last-ditch fallbacks for layouts where the counters
+ * aren't present.
  */
 export function extractProfilePageName(doc: Document = document): string {
-  // 1. Structural scan anchored on the followers/following counts.
-  const byCounts = extractProfileNameByFollowCounts(doc);
-  if (looksLikeName(byCounts)) return byCounts;
+  // 1. Structural scan anchored on the profile's stat counters.
+  const byStats = extractProfileNameByStats(doc);
+  if (looksLikeName(byStats)) return byStats;
 
   // 2. The heading inside the main content region (excludes the nav bar, where
   //    misleading "Notifications" etc. headings live).
