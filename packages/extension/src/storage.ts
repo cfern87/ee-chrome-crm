@@ -24,6 +24,8 @@ const IDB_VERSION = 1;
 // chrome.storage.sync shard key scheme
 const CONV_PREFIX = 'c:';
 const TAG_PREFIX = 't:';
+const GROUP_PREFIX = 'g:';
+const FIELD_PREFIX = 'f:';
 const SETTINGS_KEY = 's';
 const NOTES_KEY = 'n';
 
@@ -38,6 +40,31 @@ export interface Tag {
   id: string;
   name: string;
   color: string;
+  // Optional grouping: the id of the TagGroup this tag belongs to. Absent =
+  // ungrouped. Used to give tags order/structure in the dashboard.
+  groupId?: string;
+  createdAt: number;
+}
+
+// A named bucket that tags can be organized under (e.g. "Stage", "Source").
+export interface TagGroup {
+  id: string;
+  name: string;
+  color?: string;   // optional accent color for the group header
+  order: number;    // display order among groups
+  createdAt: number;
+}
+
+export type CustomFieldType = 'text' | 'number' | 'date' | 'select';
+
+// A user-defined field that can hold a value per contact. `options` is only
+// used by 'select' fields (the allowed dropdown choices).
+export interface CustomFieldDef {
+  id: string;
+  name: string;
+  type: CustomFieldType;
+  options?: string[];
+  order: number;    // display order among fields
   createdAt: number;
 }
 
@@ -65,6 +92,9 @@ export interface Conversation {
   // Set when the user renames the contact by hand. While true, the content
   // script will not overwrite participantName with a name scraped from the DOM.
   nameManual?: boolean;
+  // Values for user-defined custom fields, keyed by CustomFieldDef.id. Stored
+  // as strings (numbers/dates serialized) to keep the conversation shard small.
+  customFields?: Record<string, string>;
   archived: boolean;
   createdAt: number;
   updatedAt: number;
@@ -75,6 +105,8 @@ export interface Conversation {
 export interface Store {
   conversations: Record<string, Conversation>;
   tags: Record<string, Tag>;
+  tagGroups: Record<string, TagGroup>;
+  fieldDefs: Record<string, CustomFieldDef>;
   notes: Record<string, unknown>;
   settings: Record<string, unknown>;
 }
@@ -82,6 +114,8 @@ export interface Store {
 export const EMPTY_STORE: Store = {
   conversations: {},
   tags: {},
+  tagGroups: {},
+  fieldDefs: {},
   notes: {},
   settings: {},
 };
@@ -90,6 +124,8 @@ function normalize(s: Partial<Store>): Store {
   return {
     conversations: s.conversations || {},
     tags: s.tags || {},
+    tagGroups: s.tagGroups || {},
+    fieldDefs: s.fieldDefs || {},
     notes: s.notes || {},
     settings: s.settings || {},
   };
@@ -106,7 +142,8 @@ function hasData(s: Store | null | undefined): s is Store {
 // Keys our sync shards use — lets listeners tell our changes from others'.
 export function isCrmSyncKey(key: string): boolean {
   return key === SETTINGS_KEY || key === NOTES_KEY ||
-    key.startsWith(CONV_PREFIX) || key.startsWith(TAG_PREFIX);
+    key.startsWith(CONV_PREFIX) || key.startsWith(TAG_PREFIX) ||
+    key.startsWith(GROUP_PREFIX) || key.startsWith(FIELD_PREFIX);
 }
 
 // ---- Liveness ----
@@ -222,7 +259,7 @@ function syncGetAll(): Promise<Store | null> {
     try {
       chrome.storage.sync.get(null, (items) => {
         if (!isExtensionAlive() || chrome.runtime.lastError || !items) { resolve(null); return; }
-        const store: Store = { conversations: {}, tags: {}, notes: {}, settings: {} };
+        const store: Store = { conversations: {}, tags: {}, tagGroups: {}, fieldDefs: {}, notes: {}, settings: {} };
         let found = false;
         for (const [key, val] of Object.entries(items)) {
           if (key.startsWith(CONV_PREFIX)) {
@@ -230,6 +267,12 @@ function syncGetAll(): Promise<Store | null> {
             found = true;
           } else if (key.startsWith(TAG_PREFIX)) {
             store.tags[(val as Tag).id] = val as Tag;
+            found = true;
+          } else if (key.startsWith(GROUP_PREFIX)) {
+            store.tagGroups[(val as TagGroup).id] = val as TagGroup;
+            found = true;
+          } else if (key.startsWith(FIELD_PREFIX)) {
+            store.fieldDefs[(val as CustomFieldDef).id] = val as CustomFieldDef;
             found = true;
           } else if (key === SETTINGS_KEY) {
             store.settings = (val as Record<string, unknown>) || {};
@@ -302,6 +345,28 @@ async function syncWriteDelta(store: Store): Promise<void> {
   }
   for (const id of Object.keys(prev.tags)) {
     if (!store.tags[id]) toRemove.push(TAG_PREFIX + id);
+  }
+
+  // Tag groups
+  for (const [id, group] of Object.entries(store.tagGroups)) {
+    const prevGroup = prev.tagGroups[id];
+    if (!prevGroup || JSON.stringify(prevGroup) !== JSON.stringify(group)) {
+      toSet[GROUP_PREFIX + id] = group;
+    }
+  }
+  for (const id of Object.keys(prev.tagGroups)) {
+    if (!store.tagGroups[id]) toRemove.push(GROUP_PREFIX + id);
+  }
+
+  // Custom field definitions
+  for (const [id, def] of Object.entries(store.fieldDefs)) {
+    const prevDef = prev.fieldDefs[id];
+    if (!prevDef || JSON.stringify(prevDef) !== JSON.stringify(def)) {
+      toSet[FIELD_PREFIX + id] = def;
+    }
+  }
+  for (const id of Object.keys(prev.fieldDefs)) {
+    if (!store.fieldDefs[id]) toRemove.push(FIELD_PREFIX + id);
   }
 
   // Settings / notes (single items)

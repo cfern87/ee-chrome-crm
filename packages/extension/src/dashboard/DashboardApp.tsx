@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Store, Conversation, Tag, loadStore, saveStore, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync } from '../storage';
+import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync } from '../storage';
 import { Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS } from '../campaigns';
 import {
   parseContactsCsv, applyContacts, contactsToCsv, sampleCsv,
@@ -69,7 +69,7 @@ function formatRelativeTime(ts: number): string {
   return new Date(ts).toLocaleDateString();
 }
 
-type Tab = 'conversations' | 'messaging' | 'history' | 'tags' | 'settings';
+type Tab = 'conversations' | 'messaging' | 'history' | 'tags' | 'fields' | 'settings';
 type DateFilter = 'all' | 'today' | 'week' | 'month';
 type SortBy = 'recent' | 'lastContacted' | 'lastOpened' | 'dateAdded' | 'tagCount' | 'name';
 
@@ -82,6 +82,9 @@ export default function DashboardApp() {
   const [deleteConfirm2, setDeleteConfirm2] = useState(false);
   const [newTagName, setNewTagName] = useState('');
   const [newTagColor, setNewTagColor] = useState('#FF6B6B');
+  const [newTagGroup, setNewTagGroup] = useState<string>(''); // '' = ungrouped
+  const [newGroupName, setNewGroupName] = useState('');
+  const [newGroupColor, setNewGroupColor] = useState('#065fd4');
   const [loading, setLoading] = useState(true);
   const [filterTag, setFilterTag] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
@@ -192,7 +195,8 @@ export default function DashboardApp() {
   // Export the current filtered/sorted view as a re-importable CSV.
   const exportFilteredCsv = () => {
     if (filtered.length === 0) return;
-    const csv = contactsToCsv(filtered, store.tags);
+    const exportFields = Object.values(store.fieldDefs).sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
+    const csv = contactsToCsv(filtered, store.tags, exportFields);
     downloadText(`messenger-crm-contacts-${tsStamp()}.csv`, 'text/csv', csv);
     console.info(`[CRM][export] Exported ${filtered.length} contacts to CSV`);
   };
@@ -328,7 +332,13 @@ export default function DashboardApp() {
   const addTag = async () => {
     const name = newTagName.trim();
     if (!name) return;
-    const tag: Tag = { id: Date.now().toString(), name, color: newTagColor, createdAt: Date.now() };
+    const tag: Tag = {
+      id: Date.now().toString(),
+      name,
+      color: newTagColor,
+      ...(newTagGroup ? { groupId: newTagGroup } : {}),
+      createdAt: Date.now(),
+    };
     const next = { ...store, tags: { ...store.tags, [tag.id]: tag } };
     await updateStore(next);
     setNewTagName('');
@@ -342,6 +352,108 @@ export default function DashboardApp() {
       nextConvs[id] = { ...nextConvs[id], tags: nextConvs[id].tags.filter((t) => t !== tagId) };
     }
     await updateStore({ ...store, tags: nextTags, conversations: nextConvs });
+  };
+
+  const renameTag = async (tagId: string, name: string) => {
+    const tag = store.tags[tagId];
+    const trimmed = name.trim();
+    if (!tag || !trimmed || trimmed === tag.name) return;
+    await updateStore({ ...store, tags: { ...store.tags, [tagId]: { ...tag, name: trimmed } } });
+  };
+
+  // Change a tag's color.
+  const recolorTag = async (tagId: string, color: string) => {
+    const tag = store.tags[tagId];
+    if (!tag || color === tag.color) return;
+    await updateStore({ ...store, tags: { ...store.tags, [tagId]: { ...tag, color } } });
+  };
+
+  // Move a tag into a group (or out of one when groupId is '').
+  const setTagGroup = async (tagId: string, groupId: string) => {
+    const tag = store.tags[tagId];
+    if (!tag) return;
+    const nextTag: Tag = { ...tag };
+    if (groupId) nextTag.groupId = groupId;
+    else delete nextTag.groupId;
+    await updateStore({ ...store, tags: { ...store.tags, [tagId]: nextTag } });
+  };
+
+  // --- Tag groups ---
+  const tagGroups = Object.values(store.tagGroups).sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
+
+  const addTagGroup = async () => {
+    const name = newGroupName.trim();
+    if (!name) return;
+    const id = `grp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const group: TagGroup = { id, name, color: newGroupColor, order: tagGroups.length, createdAt: Date.now() };
+    await updateStore({ ...store, tagGroups: { ...store.tagGroups, [id]: group } });
+    setNewGroupName('');
+  };
+
+  const renameTagGroup = async (groupId: string, name: string) => {
+    const g = store.tagGroups[groupId];
+    if (!g || !name.trim() || name.trim() === g.name) return;
+    await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: { ...g, name: name.trim() } } });
+  };
+
+  // Deleting a group leaves its tags intact but ungrouped.
+  const deleteTagGroup = async (groupId: string) => {
+    const nextGroups = { ...store.tagGroups };
+    delete nextGroups[groupId];
+    const nextTags = { ...store.tags };
+    for (const id in nextTags) {
+      if (nextTags[id].groupId === groupId) {
+        const t = { ...nextTags[id] };
+        delete t.groupId;
+        nextTags[id] = t;
+      }
+    }
+    await updateStore({ ...store, tagGroups: nextGroups, tags: nextTags });
+  };
+
+  // --- Custom fields ---
+  const fieldDefs = Object.values(store.fieldDefs).sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
+
+  const addField = async (name: string, type: CustomFieldType, options: string[]) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const id = `fld_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const def: CustomFieldDef = {
+      id,
+      name: trimmed,
+      type,
+      ...(type === 'select' ? { options } : {}),
+      order: fieldDefs.length,
+      createdAt: Date.now(),
+    };
+    await updateStore({ ...store, fieldDefs: { ...store.fieldDefs, [id]: def } });
+  };
+
+  const deleteField = async (fieldId: string) => {
+    const nextDefs = { ...store.fieldDefs };
+    delete nextDefs[fieldId];
+    // Drop the stored value from every contact so we don't leave orphans.
+    const nextConvs = { ...store.conversations };
+    for (const id in nextConvs) {
+      const cf = nextConvs[id].customFields;
+      if (cf && fieldId in cf) {
+        const nextCf = { ...cf };
+        delete nextCf[fieldId];
+        nextConvs[id] = { ...nextConvs[id], customFields: nextCf };
+      }
+    }
+    await updateStore({ ...store, fieldDefs: nextDefs, conversations: nextConvs });
+  };
+
+  // Set (or clear, when value is '') a custom field value on a contact.
+  const setCustomField = async (conv: Conversation, fieldId: string, value: string) => {
+    const nextCf = { ...(conv.customFields || {}) };
+    if (value === '') delete nextCf[fieldId];
+    else nextCf[fieldId] = value;
+    const updated = { ...conv, customFields: nextCf, updatedAt: Date.now() };
+    const next = { ...store, conversations: { ...store.conversations, [conv.id]: updated } };
+    await updateStore(next);
+    if (selectedConv?.id === conv.id) setSelectedConv(updated);
   };
 
   // --- Stats ---
@@ -375,7 +487,7 @@ export default function DashboardApp() {
 
       {/* Tabs */}
       <div style={{ display: 'flex', background: '#fff', borderBottom: '1px solid #e0e0e0' }}>
-        {(['conversations', 'messaging', 'history', 'tags', 'settings'] as Tab[]).map((tab) => (
+        {(['conversations', 'messaging', 'history', 'tags', 'fields', 'settings'] as Tab[]).map((tab) => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
@@ -401,6 +513,8 @@ export default function DashboardApp() {
               ? `History (${campaigns.length})`
               : tab === 'tags'
               ? `Tags (${totalTags})`
+              : tab === 'fields'
+              ? `Fields (${fieldDefs.length})`
               : 'Settings'}
           </button>
         ))}
@@ -739,6 +853,7 @@ export default function DashboardApp() {
                   conv={selectedConv}
                   store={store}
                   tags={tags}
+                  fieldDefs={fieldDefs}
                   deleteConfirm={deleteConfirm}
                   deleteConfirm2={deleteConfirm2}
                   onClose={() => setSelectedConv(null)}
@@ -747,6 +862,7 @@ export default function DashboardApp() {
                   onOpen={() => markOpened([selectedConv.id])}
                   onRemoveTag={(tagId) => removeTagFromConv(selectedConv, tagId)}
                   onAddTag={(tagId) => addTagToConv(selectedConv, tagId)}
+                  onSetCustomField={(fieldId, value) => setCustomField(selectedConv, fieldId, value)}
                   onRename={(name) => renameConversation(selectedConv, name)}
                   onStartDelete={() => { setDeleteConfirm(selectedConv.id); setDeleteConfirm2(false); }}
                   onConfirmDelete1={() => setDeleteConfirm2(true)}
@@ -763,61 +879,39 @@ export default function DashboardApp() {
 
         {/* Tags tab */}
         {activeTab === 'tags' && (
-          <div style={{ maxWidth: 600 }}>
-            {/* Add tag */}
-            <div style={{ background: '#fff', borderRadius: 10, padding: 18, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 16 }}>
-              <h3 style={{ margin: '0 0 14px', fontSize: 15, fontWeight: 600 }}>Create New Tag</h3>
-              <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-                <input
-                  type="text"
-                  placeholder="Tag name..."
-                  value={newTagName}
-                  onChange={(e) => setNewTagName(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && addTag()}
-                  style={{ flex: 1, padding: '9px 12px', border: '1px solid #e0e0e0', borderRadius: 7, fontSize: 13, outline: 'none' }}
-                />
-                <input
-                  type="color"
-                  value={newTagColor}
-                  onChange={(e) => setNewTagColor(e.target.value)}
-                  style={{ width: 44, height: 38, border: '1px solid #e0e0e0', borderRadius: 7, cursor: 'pointer', padding: 2 }}
-                />
-                <button
-                  onClick={addTag}
-                  style={{ background: '#065fd4', color: '#fff', border: 'none', padding: '9px 20px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}
-                >
-                  Add Tag
-                </button>
-              </div>
-            </div>
+          <TagsPanel
+            tags={tags}
+            tagGroups={tagGroups}
+            conversations={conversations}
+            newTagName={newTagName}
+            setNewTagName={setNewTagName}
+            newTagColor={newTagColor}
+            setNewTagColor={setNewTagColor}
+            newTagGroup={newTagGroup}
+            setNewTagGroup={setNewTagGroup}
+            newGroupName={newGroupName}
+            setNewGroupName={setNewGroupName}
+            newGroupColor={newGroupColor}
+            setNewGroupColor={setNewGroupColor}
+            onAddTag={addTag}
+            onDeleteTag={deleteTag}
+            onRenameTag={renameTag}
+            onRecolorTag={recolorTag}
+            onSetTagGroup={setTagGroup}
+            onAddGroup={addTagGroup}
+            onRenameGroup={renameTagGroup}
+            onDeleteGroup={deleteTagGroup}
+          />
+        )}
 
-            {/* Tags list */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {tags.length === 0 && (
-                <div style={{ textAlign: 'center', padding: '32px 16px', color: '#aaa', fontSize: 13 }}>
-                  No tags yet. Create one above.
-                </div>
-              )}
-              {tags.map((tag) => {
-                const usageCount = conversations.filter((c) => c.tags.includes(tag.id)).length;
-                return (
-                  <div key={tag.id} style={{ background: '#fff', borderRadius: 8, padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12, boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }}>
-                    <div style={{ width: 28, height: 28, borderRadius: 6, background: tag.color, flexShrink: 0 }} />
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontWeight: 600, fontSize: 14 }}>{tag.name}</div>
-                      <div style={{ fontSize: 12, color: '#aaa' }}>{usageCount} conversation{usageCount !== 1 ? 's' : ''}</div>
-                    </div>
-                    <button
-                      onClick={() => deleteTag(tag.id)}
-                      style={{ background: '#fff0f0', color: '#e53e3e', border: '1px solid #fecaca', padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
-                    >
-                      Delete
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
+        {/* Fields tab */}
+        {activeTab === 'fields' && (
+          <FieldsPanel
+            fieldDefs={fieldDefs}
+            conversations={conversations}
+            onAddField={addField}
+            onDeleteField={deleteField}
+          />
         )}
 
         {/* Messaging tab */}
@@ -863,6 +957,7 @@ interface ConvDetailProps {
   conv: Conversation;
   store: Store;
   tags: Tag[];
+  fieldDefs: CustomFieldDef[];
   deleteConfirm: string | null;
   deleteConfirm2: boolean;
   onClose: () => void;
@@ -871,13 +966,14 @@ interface ConvDetailProps {
   onOpen: () => void;
   onRemoveTag: (tagId: string) => void;
   onAddTag: (tagId: string) => void;
+  onSetCustomField: (fieldId: string, value: string) => void;
   onRename: (name: string) => void;
   onStartDelete: () => void;
   onConfirmDelete1: () => void;
   onCancelDelete: () => void;
 }
 
-function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onRename, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
+function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm2, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onSetCustomField, onRename, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
   const availableTags = tags.filter((t) => !conv.tags.includes(t.id));
   const [addingTag, setAddingTag] = useState(false);
   const [editingName, setEditingName] = useState(false);
@@ -1046,6 +1142,25 @@ function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose,
         </div>
       </div>
 
+      {/* Custom fields */}
+      {fieldDefs.length > 0 && (
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: '#888', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Details</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {fieldDefs.map((def) => (
+              <div key={def.id} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <label style={{ fontSize: 13, color: '#666', width: 130, flexShrink: 0 }}>{def.name}</label>
+                <CustomFieldInput
+                  def={def}
+                  value={conv.customFields?.[def.id] ?? ''}
+                  onCommit={(v) => onSetCustomField(def.id, v)}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Contact fields */}
       {(conv.email || conv.profileUrl || conv.fbUserId || conv.fbUsername) && (
         <div style={{ marginBottom: 16 }}>
@@ -1069,6 +1184,361 @@ function ConvDetail({ conv, store, tags, deleteConfirm, deleteConfirm2, onClose,
         {conv.source === 'import' && <div>Source: CSV import</div>}
         {conv.chatUrl && <div>Chat URL: <a href={conv.chatUrl} target="_blank" rel="noreferrer" style={{ color: '#065fd4' }}>{conv.chatUrl}</a></div>}
         {conv.createdAt && <div>Added: {new Date(conv.createdAt).toLocaleString()}</div>}
+      </div>
+    </div>
+  );
+}
+
+// --- Custom field editor (used in ConvDetail) ---
+interface CustomFieldInputProps {
+  def: CustomFieldDef;
+  value: string;
+  onCommit: (value: string) => void;
+}
+
+function CustomFieldInput({ def, value, onCommit }: CustomFieldInputProps) {
+  // Keep a local draft so free-text typing doesn't write to storage on every
+  // keystroke — we commit on blur / Enter. Selects/dates/numbers commit on change.
+  const [draft, setDraft] = useState(value);
+  useEffect(() => { setDraft(value); }, [value, def.id]);
+
+  const inputStyle: React.CSSProperties = {
+    flex: 1, minWidth: 0, padding: '7px 10px', border: '1px solid #e0e0e0',
+    borderRadius: 6, fontSize: 13, outline: 'none', background: '#fff',
+  };
+
+  if (def.type === 'select') {
+    return (
+      <select value={value} onChange={(e) => onCommit(e.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}>
+        <option value="">—</option>
+        {(def.options || []).map((opt) => (
+          <option key={opt} value={opt}>{opt}</option>
+        ))}
+      </select>
+    );
+  }
+
+  const type = def.type === 'number' ? 'number' : def.type === 'date' ? 'date' : 'text';
+  const commitOnChange = def.type === 'date';
+  return (
+    <input
+      type={type}
+      value={draft}
+      placeholder={def.type === 'text' ? 'Add value…' : ''}
+      onChange={(e) => { setDraft(e.target.value); if (commitOnChange) onCommit(e.target.value); }}
+      onBlur={() => { if (!commitOnChange && draft !== value) onCommit(draft); }}
+      onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+      style={inputStyle}
+    />
+  );
+}
+
+// --- Tags sub-component ---
+interface TagsPanelProps {
+  tags: Tag[];
+  tagGroups: TagGroup[];
+  conversations: Conversation[];
+  newTagName: string;
+  setNewTagName: (v: string) => void;
+  newTagColor: string;
+  setNewTagColor: (v: string) => void;
+  newTagGroup: string;
+  setNewTagGroup: (v: string) => void;
+  newGroupName: string;
+  setNewGroupName: (v: string) => void;
+  newGroupColor: string;
+  setNewGroupColor: (v: string) => void;
+  onAddTag: () => void;
+  onDeleteTag: (id: string) => void;
+  onRenameTag: (tagId: string, name: string) => void;
+  onRecolorTag: (tagId: string, color: string) => void;
+  onSetTagGroup: (tagId: string, groupId: string) => void;
+  onAddGroup: () => void;
+  onRenameGroup: (groupId: string, name: string) => void;
+  onDeleteGroup: (groupId: string) => void;
+}
+
+function TagsPanel(props: TagsPanelProps) {
+  const {
+    tags, tagGroups, conversations,
+    newTagName, setNewTagName, newTagColor, setNewTagColor, newTagGroup, setNewTagGroup,
+    newGroupName, setNewGroupName, newGroupColor, setNewGroupColor,
+    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onAddGroup, onRenameGroup, onDeleteGroup,
+  } = props;
+
+  const usageOf = (tagId: string) => conversations.filter((c) => c.tags.includes(tagId)).length;
+
+  const tagRow = (tag: Tag) => {
+    const usageCount = usageOf(tag.id);
+    return (
+      <div key={tag.id} style={{ background: '#fff', borderRadius: 8, padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 12, boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }}>
+        <input
+          type="color"
+          value={tag.color}
+          title="Change tag color"
+          onChange={(e) => onRecolorTag(tag.id, e.target.value)}
+          style={{ width: 26, height: 26, border: 'none', borderRadius: 6, background: 'none', flexShrink: 0, cursor: 'pointer', padding: 0 }}
+        />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <input
+            defaultValue={tag.name}
+            key={tag.name}
+            title="Rename tag"
+            onBlur={(e) => onRenameTag(tag.id, e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); if (e.key === 'Escape') { (e.target as HTMLInputElement).value = tag.name; (e.target as HTMLInputElement).blur(); } }}
+            style={{ fontWeight: 600, fontSize: 14, color: '#222', border: '1px solid transparent', borderRadius: 6, padding: '2px 6px', outline: 'none', background: 'transparent', width: '100%', boxSizing: 'border-box' }}
+            onFocus={(e) => (e.currentTarget.style.border = '1px solid #cfe0f5')}
+            onBlurCapture={(e) => (e.currentTarget.style.border = '1px solid transparent')}
+          />
+          <div style={{ fontSize: 12, color: '#aaa', paddingLeft: 6 }}>{usageCount} conversation{usageCount !== 1 ? 's' : ''}</div>
+        </div>
+        <select
+          value={tag.groupId || ''}
+          onChange={(e) => onSetTagGroup(tag.id, e.target.value)}
+          title="Move tag to a group"
+          style={{ padding: '5px 8px', border: '1px solid #e0e0e0', borderRadius: 6, fontSize: 12, cursor: 'pointer', background: '#fff', color: '#555' }}
+        >
+          <option value="">No group</option>
+          {tagGroups.map((g) => (
+            <option key={g.id} value={g.id}>{g.name}</option>
+          ))}
+        </select>
+        <button
+          onClick={() => onDeleteTag(tag.id)}
+          style={{ background: '#fff0f0', color: '#e53e3e', border: '1px solid #fecaca', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+        >
+          Delete
+        </button>
+      </div>
+    );
+  };
+
+  const ungrouped = tags.filter((t) => !t.groupId || !tagGroups.some((g) => g.id === t.groupId));
+
+  return (
+    <div style={{ maxWidth: 640 }}>
+      {/* Create tag */}
+      <div style={{ background: '#fff', borderRadius: 10, padding: 18, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
+        <h3 style={{ margin: '0 0 14px', fontSize: 15, fontWeight: 600 }}>Create New Tag</h3>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input
+            type="text"
+            placeholder="Tag name..."
+            value={newTagName}
+            onChange={(e) => setNewTagName(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && onAddTag()}
+            style={{ flex: 1, minWidth: 140, padding: '9px 12px', border: '1px solid #e0e0e0', borderRadius: 7, fontSize: 13, outline: 'none' }}
+          />
+          <select
+            value={newTagGroup}
+            onChange={(e) => setNewTagGroup(e.target.value)}
+            style={{ padding: '9px 10px', border: '1px solid #e0e0e0', borderRadius: 7, fontSize: 13, cursor: 'pointer', background: '#fff', color: '#555' }}
+          >
+            <option value="">No group</option>
+            {tagGroups.map((g) => (
+              <option key={g.id} value={g.id}>{g.name}</option>
+            ))}
+          </select>
+          <input
+            type="color"
+            value={newTagColor}
+            onChange={(e) => setNewTagColor(e.target.value)}
+            style={{ width: 44, height: 38, border: '1px solid #e0e0e0', borderRadius: 7, cursor: 'pointer', padding: 2 }}
+          />
+          <button
+            onClick={onAddTag}
+            style={{ background: '#065fd4', color: '#fff', border: 'none', padding: '9px 20px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}
+          >
+            Add Tag
+          </button>
+        </div>
+      </div>
+
+      {/* Create group */}
+      <div style={{ background: '#fff', borderRadius: 10, padding: 18, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 18 }}>
+        <h3 style={{ margin: '0 0 14px', fontSize: 15, fontWeight: 600 }}>Create Tag Group</h3>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input
+            type="text"
+            placeholder="Group name (e.g. Stage, Source)..."
+            value={newGroupName}
+            onChange={(e) => setNewGroupName(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && onAddGroup()}
+            style={{ flex: 1, minWidth: 140, padding: '9px 12px', border: '1px solid #e0e0e0', borderRadius: 7, fontSize: 13, outline: 'none' }}
+          />
+          <input
+            type="color"
+            value={newGroupColor}
+            onChange={(e) => setNewGroupColor(e.target.value)}
+            style={{ width: 44, height: 38, border: '1px solid #e0e0e0', borderRadius: 7, cursor: 'pointer', padding: 2 }}
+          />
+          <button
+            onClick={onAddGroup}
+            style={{ background: '#0a7c4a', color: '#fff', border: 'none', padding: '9px 20px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}
+          >
+            Add Group
+          </button>
+        </div>
+      </div>
+
+      {tags.length === 0 && tagGroups.length === 0 && (
+        <div style={{ textAlign: 'center', padding: '32px 16px', color: '#aaa', fontSize: 13 }}>
+          No tags yet. Create one above.
+        </div>
+      )}
+
+      {/* Grouped tags */}
+      {tagGroups.map((group) => {
+        const groupTags = tags.filter((t) => t.groupId === group.id);
+        return (
+          <div key={group.id} style={{ marginBottom: 18 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <div style={{ width: 12, height: 12, borderRadius: 3, background: group.color || '#999', flexShrink: 0 }} />
+              <input
+                defaultValue={group.name}
+                onBlur={(e) => onRenameGroup(group.id, e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+                style={{ fontWeight: 700, fontSize: 14, color: '#333', border: '1px solid transparent', borderRadius: 6, padding: '3px 6px', outline: 'none', background: 'transparent' }}
+                onFocus={(e) => (e.currentTarget.style.border = '1px solid #cfe0f5')}
+                onBlurCapture={(e) => (e.currentTarget.style.border = '1px solid transparent')}
+              />
+              <span style={{ fontSize: 12, color: '#aaa' }}>{groupTags.length}</span>
+              <button
+                onClick={() => onDeleteGroup(group.id)}
+                title="Delete group (its tags become ungrouped)"
+                style={{ marginLeft: 'auto', background: 'none', color: '#c0392b', border: 'none', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+              >
+                Delete group
+              </button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {groupTags.length === 0 ? (
+                <div style={{ fontSize: 12, color: '#bbb', padding: '4px 2px' }}>No tags in this group yet.</div>
+              ) : groupTags.map(tagRow)}
+            </div>
+          </div>
+        );
+      })}
+
+      {/* Ungrouped tags */}
+      {ungrouped.length > 0 && (
+        <div style={{ marginBottom: 18 }}>
+          {tagGroups.length > 0 && (
+            <div style={{ fontWeight: 700, fontSize: 14, color: '#333', marginBottom: 8, padding: '0 6px' }}>Ungrouped</div>
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {ungrouped.map(tagRow)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// --- Custom fields sub-component ---
+interface FieldsPanelProps {
+  fieldDefs: CustomFieldDef[];
+  conversations: Conversation[];
+  onAddField: (name: string, type: CustomFieldType, options: string[]) => void;
+  onDeleteField: (id: string) => void;
+}
+
+function FieldsPanel({ fieldDefs, conversations, onAddField, onDeleteField }: FieldsPanelProps) {
+  const [name, setName] = useState('');
+  const [type, setType] = useState<CustomFieldType>('text');
+  const [optionsText, setOptionsText] = useState('');
+
+  const submit = () => {
+    if (!name.trim()) return;
+    const options = optionsText.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+    if (type === 'select' && options.length === 0) return;
+    onAddField(name, type, options);
+    setName('');
+    setOptionsText('');
+    setType('text');
+  };
+
+  const filledCount = (fieldId: string) => conversations.filter((c) => (c.customFields?.[fieldId] ?? '') !== '').length;
+
+  const typeLabel: Record<CustomFieldType, string> = { text: 'Text', number: 'Number', date: 'Date', select: 'Dropdown' };
+
+  return (
+    <div style={{ maxWidth: 640 }}>
+      <div style={{ background: '#fff', borderRadius: 10, padding: 18, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 18 }}>
+        <h3 style={{ margin: '0 0 6px', fontSize: 15, fontWeight: 600 }}>Create Custom Field</h3>
+        <p style={{ margin: '0 0 14px', fontSize: 12, color: '#999' }}>
+          Custom fields let you store structured info on each contact — pick <strong>Dropdown</strong> for a preset list of choices.
+        </p>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input
+            type="text"
+            placeholder="Field name (e.g. Budget, Status)..."
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && type !== 'select') submit(); }}
+            style={{ flex: 1, minWidth: 160, padding: '9px 12px', border: '1px solid #e0e0e0', borderRadius: 7, fontSize: 13, outline: 'none' }}
+          />
+          <select
+            value={type}
+            onChange={(e) => setType(e.target.value as CustomFieldType)}
+            style={{ padding: '9px 10px', border: '1px solid #e0e0e0', borderRadius: 7, fontSize: 13, cursor: 'pointer', background: '#fff', color: '#555' }}
+          >
+            <option value="text">Text</option>
+            <option value="number">Number</option>
+            <option value="date">Date</option>
+            <option value="select">Dropdown</option>
+          </select>
+          <button
+            onClick={submit}
+            style={{ background: '#065fd4', color: '#fff', border: 'none', padding: '9px 20px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}
+          >
+            Add Field
+          </button>
+        </div>
+        {type === 'select' && (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>Dropdown options — one per line (or comma-separated):</div>
+            <textarea
+              placeholder={'New\nContacted\nQualified\nWon'}
+              value={optionsText}
+              onChange={(e) => setOptionsText(e.target.value)}
+              rows={4}
+              style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', border: '1px solid #e0e0e0', borderRadius: 7, fontSize: 13, outline: 'none', resize: 'vertical', fontFamily: 'inherit' }}
+            />
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {fieldDefs.length === 0 && (
+          <div style={{ textAlign: 'center', padding: '32px 16px', color: '#aaa', fontSize: 13 }}>
+            No custom fields yet. Create one above.
+          </div>
+        )}
+        {fieldDefs.map((def) => {
+          const filled = filledCount(def.id);
+          return (
+            <div key={def.id} style={{ background: '#fff', borderRadius: 8, padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12, boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 600, fontSize: 14 }}>
+                  {def.name}
+                  <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 600, color: '#065fd4', background: '#eaf2fd', padding: '2px 8px', borderRadius: 8 }}>{typeLabel[def.type]}</span>
+                </div>
+                <div style={{ fontSize: 12, color: '#aaa', marginTop: 2 }}>
+                  {def.type === 'select' && def.options?.length ? `${def.options.join(', ')} · ` : ''}
+                  set on {filled} contact{filled !== 1 ? 's' : ''}
+                </div>
+              </div>
+              <button
+                onClick={() => onDeleteField(def.id)}
+                title="Delete this field and clear its values from all contacts"
+                style={{ background: '#fff0f0', color: '#e53e3e', border: '1px solid #fecaca', padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+              >
+                Delete
+              </button>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

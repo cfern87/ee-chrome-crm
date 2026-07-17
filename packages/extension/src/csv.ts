@@ -18,7 +18,7 @@
 // Import history is verbose and machine-specific, so — like campaign history —
 // it lives in chrome.storage.local (not the tiny chrome.storage.sync quota).
 
-import { Store, Conversation, Tag } from './storage';
+import { Store, Conversation, Tag, CustomFieldDef } from './storage';
 
 // ---------------------------------------------------------------------------
 // Low-level CSV parse / serialize (RFC 4180-ish: quotes, escaped quotes,
@@ -577,9 +577,14 @@ export function applyContacts(store: Store, contacts: ParsedContact[]): ApplyRes
 
 const EXPORT_COLUMNS = ['Full Name', 'Email', 'Facebook Profile URL', 'FB User ID', 'FB Username', 'Tags', 'Archived', 'Date Added', 'Last Contacted'];
 
-/** Serialize contacts to a re-importable CSV. `tagsById` resolves tag ids → names. */
-export function contactsToCsv(convs: Conversation[], tagsById: Record<string, Tag>): string {
-  const rows: (string | number)[][] = [EXPORT_COLUMNS];
+/**
+ * Serialize contacts to a re-importable CSV. `tagsById` resolves tag ids →
+ * names. When `fieldDefs` are supplied, one extra column per custom field is
+ * appended (in the given order), carrying each contact's value.
+ */
+export function contactsToCsv(convs: Conversation[], tagsById: Record<string, Tag>, fieldDefs: CustomFieldDef[] = []): string {
+  const header = [...EXPORT_COLUMNS, ...fieldDefs.map((f) => f.name)];
+  const rows: (string | number)[][] = [header];
   for (const c of convs) {
     const tagNames = c.tags.map((id) => tagsById[id]?.name).filter(Boolean).join('; ');
     rows.push([
@@ -594,6 +599,7 @@ export function contactsToCsv(convs: Conversation[], tagsById: Record<string, Ta
       c.archived ? 'yes' : 'no',
       c.createdAt ? new Date(c.createdAt).toISOString() : '',
       c.lastContactedAt ? new Date(c.lastContactedAt).toISOString() : '',
+      ...fieldDefs.map((f) => c.customFields?.[f.id] ?? ''),
     ]);
   }
   return toCsv(rows);
