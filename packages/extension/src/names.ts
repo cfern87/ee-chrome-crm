@@ -9,15 +9,27 @@
 
 const STATUS_WORDS = /\b(active now|active|online|offline|sent|seen|delivered|typing|just now|you)\b/i;
 
+// Facebook's own brand / page-chrome words. These are letters-only strings that
+// otherwise sail through looksLikeName, so when a name source degrades to a
+// generic value — a logged-in profile page's og:title is frequently just
+// "Facebook", and the tab title is "Facebook" until the SPA hydrates — the
+// extractor would happily accept "Facebook" as the person's name. Rejecting the
+// whole-string match lets extraction fall through to the next (real) source.
+const SITE_NAMES = /^(facebook|messenger|meta|marketplace|notifications?|home|friends|watch|groups|gaming|reels?)$/i;
+
 // A trailing relative timestamp like "3h", "2 m", "5 mins", "1 day", optionally
 // preceded by a separator: "Name · 3h", "Name - 2m", "Name, 1d".
 const TRAILING_TIME =
   /[\s,·•|–—-]*\b\d+\s*(?:s|m|h|d|w|y|sec|secs|min|mins|hr|hrs|hour|hours|day|days|week|weeks|mo|mos|month|months|yr|yrs|year|years)\b\.?\s*$/i;
 
-// Facebook announces the verified badge as text glued onto the name (e.g. an
-// aria-label of "Dominic Young, Verified account") — it's not part of the
-// name, so it should be dropped rather than kept.
-const TRAILING_VERIFIED = /[\s,·•|–—-]*verified\s+account\b\.?\s*$/i;
+// Facebook announces the verified badge as text glued onto the name ("Verified
+// account", sometimes "Verified page", occasionally just "Verified"). It can
+// land BEFORE or AFTER the name depending on where the badge sits in the markup,
+// so strip every occurrence wherever it appears — it's never part of a real
+// name. (No word boundaries: the badge text is often glued straight onto the
+// name with no separator — "Dominic YoungVerified account" when the badge span
+// follows the name, or "Verified accountDominic Young" when it precedes it.)
+const VERIFIED_BADGE = /[\s,·•|–—-]*verified(?:\s+(?:account|page))?\.?/gi;
 
 /** Strip Facebook's surrounding noise from a candidate name string. */
 export function cleanName(raw: string | null | undefined): string {
@@ -39,8 +51,8 @@ export function cleanName(raw: string | null | undefined): string {
   }
   // Trailing timestamp ("- 3h", "· 2m").
   s = s.replace(TRAILING_TIME, '').trim();
-  // Trailing "Verified account" badge text.
-  s = s.replace(TRAILING_VERIFIED, '').trim();
+  // "Verified account" badge text, wherever it appears (before/after the name).
+  s = s.replace(VERIFIED_BADGE, ' ').replace(/\s+/g, ' ').trim();
   // Trailing status words ("Active now", "Sent").
   s = s.replace(new RegExp(`[\\s,·•|–—-]*${STATUS_WORDS.source}\\b.*$`, 'i'), '').trim();
   // Leftover trailing separators/punctuation.
@@ -64,6 +76,7 @@ export function cleanName(raw: string | null | undefined): string {
 export function looksLikeName(s: string | null | undefined): boolean {
   const v = (s || '').trim();
   if (v.length < 2 || v.length > 60) return false;
+  if (SITE_NAMES.test(v)) return false;         // "Facebook"/"Messenger"/nav chrome, not a person
   if (/\d/.test(v)) return false;               // names rarely contain digits
   if (/[:?!@#/\\_=+*]/.test(v)) return false;   // previews/handles/urls
   if (STATUS_WORDS.test(v) && /^(you|active|online|sent|seen)$/i.test(v)) return false;
@@ -133,25 +146,134 @@ export function extractActiveThreadName(threadId: string | null, doc: Document =
   return 'Unknown';
 }
 
+// The lowest DOM node that is an ancestor of both `a` and `b`, or null.
+function commonAncestor(a: Element, b: Element): Element | null {
+  const seen = new Set<Element>();
+  for (let el: Element | null = a; el; el = el.parentElement) seen.add(el);
+  for (let el: Element | null = b; el; el = el.parentElement) if (seen.has(el)) return el;
+  return null;
+}
+
+// How deep an element sits (root = 1). Deeper common ancestors mean the two
+// nodes are "closer together", which is how we pick the tightest followers/
+// following pairing.
+function elementDepth(el: Element | null): number {
+  let d = 0;
+  for (let e = el; e; e = e.parentElement) d++;
+  return d;
+}
+
+// The best name-shaped string found anywhere inside `container`. Headings win
+// over loose spans; among spans the shortest plausible candidate wins (the
+// tight name span beats a longer bio/preview line).
+function bestNameIn(container: Element): string {
+  for (const el of Array.from(container.querySelectorAll('h1, h2, [role="heading"]'))) {
+    const n = cleanName(el.textContent);
+    if (looksLikeName(n)) return n;
+  }
+  const cands = Array.from(container.querySelectorAll('span, div, a'))
+    .map((el) => cleanName(el.textContent))
+    .filter((t) => looksLikeName(t));
+  if (cands.length) {
+    cands.sort((a, b) => a.length - b.length);
+    return cands[0];
+  }
+  return '';
+}
+
+// Elements on the page that represent one of a profile's stat counters — the
+// bits of chrome that always sit in the profile header, right next to the name.
+// Facebook shows different ones depending on the profile and your relationship
+// to it: "followers" / "following" on creator-style profiles, "friends" /
+// "mutual friends" on personal ones. We match both the tab/link form (href like
+// /<user>/followers/) and a short text leaf ("1.2K followers", "342 friends",
+// "12 mutual friends"). Bounded text length so we grab the counter itself, not a
+// big container that merely contains it.
+function collectStatEls(doc: Document): Element[] {
+  const els: Element[] = [];
+  const seen = new Set<Element>();
+  const push = (el: Element | null) => { if (el && !seen.has(el)) { seen.add(el); els.push(el); } };
+
+  // Link form: /<user>/followers/, /following/, /friends/. ("mutual" has no
+  // dedicated link, so it's text-only below.)
+  for (const kind of ['followers', 'following', 'friends'] as const) {
+    const hrefRe = new RegExp(`/${kind}(?:[/?#]|$)`, 'i');
+    doc.querySelectorAll('a[href]').forEach((a) => {
+      if (hrefRe.test(a.getAttribute('href') || '')) push(a);
+    });
+  }
+
+  // Text form: "<count> <word>", e.g. "1.2K followers", "342 friends",
+  // "12 mutual friends" / "3 mutual".
+  const textRe = /^\s*\d[\d.,]*\s*[kmb]?\s+(?:followers|following|friends|mutual(?:\s+friends)?)\s*$/i;
+  doc.querySelectorAll('span, a, div').forEach((el) => {
+    const t = (el.textContent || '').trim();
+    if (t.length <= 40 && textRe.test(t)) push(el);
+  });
+
+  return els;
+}
+
+/**
+ * Find the profile owner's name by scanning the page structure around the
+ * profile's stat counters ("followers"/"following", or "friends"/"mutual
+ * friends"). On a Facebook profile the name heading sits in the same header
+ * block as those counters, so we locate the tightest pair of counters (the two
+ * sitting closest together in the DOM), then climb from their shared ancestor
+ * until we find a name. This is DOM-shape based — it does not rely on og:title
+ * or the page <title>, both of which Facebook now serves as a generic
+ * "Facebook" on logged-in profile pages.
+ */
+export function extractProfileNameByStats(doc: Document = document): string {
+  const stats = collectStatEls(doc);
+  if (!stats.length) return '';
+
+  // Anchor on the tightest pair of counters (deepest shared ancestor = the
+  // profile header, right beside the name). With only one counter present,
+  // climb from it directly.
+  let anchor: Element | null = null;
+  if (stats.length === 1) {
+    anchor = stats[0];
+  } else {
+    let bestDepth = -1;
+    for (let i = 0; i < stats.length; i++) {
+      for (let j = i + 1; j < stats.length; j++) {
+        const anc = commonAncestor(stats[i], stats[j]);
+        if (!anc) continue;
+        const d = elementDepth(anc);
+        if (d > bestDepth) { bestDepth = d; anchor = anc; }
+      }
+    }
+    if (!anchor) anchor = stats[0];
+  }
+
+  // Climb from the counters' container outward; the name heading is a
+  // sibling/near-ancestor of the counts, so the first name we hit is it.
+  for (let el: Element | null = anchor, i = 0; el && i < 6; el = el.parentElement, i++) {
+    const name = bestNameIn(el);
+    if (name) return name;
+  }
+  return '';
+}
+
 /**
  * Best name for a Facebook profile page (not a Messenger thread).
  *
- * A blind document-wide `h1` scan is unreliable: Facebook's top nav bar has
- * its own (often visually-hidden) accessibility headings — "Notifications",
- * "Marketplace", "Messenger", etc. — that are also `<h1>` elements and can sit
- * before the actual profile heading in DOM order, so the first "name-shaped"
- * h1 found is frequently the wrong one. Prefer sources that are specific to
- * the profile rather than the page chrome.
+ * Primary strategy is a structural page scan around the profile's stat counters
+ * (extractProfileNameByStats — "followers"/"following" or "friends"/"mutual
+ * friends"): Facebook no longer exposes the profile name via og:title or the
+ * page <title> on logged-in profile pages — both now read a generic "Facebook"
+ * — so we read the name straight out of the profile header DOM. The meta/title
+ * sources remain only as last-ditch fallbacks for layouts where the counters
+ * aren't present.
  */
 export function extractProfilePageName(doc: Document = document): string {
-  // 1. og:title — Facebook sets this Open Graph meta tag to the profile
-  //    owner's name for link-preview purposes; it never contains nav chrome.
-  const og = doc.querySelector('meta[property="og:title"]') as HTMLMetaElement | null;
-  const ogName = cleanName(og?.content);
-  if (looksLikeName(ogName)) return ogName;
+  // 1. Structural scan anchored on the profile's stat counters.
+  const byStats = extractProfileNameByStats(doc);
+  if (looksLikeName(byStats)) return byStats;
 
-  // 2. The heading inside the main content region (excludes the nav bar,
-  //    where the misleading "Notifications" etc. headings live).
+  // 2. The heading inside the main content region (excludes the nav bar, where
+  //    misleading "Notifications" etc. headings live).
   const main = doc.querySelector('[role="main"]');
   if (main) {
     for (const el of Array.from(main.querySelectorAll('h1'))) {
@@ -160,7 +282,13 @@ export function extractProfilePageName(doc: Document = document): string {
     }
   }
 
-  // 3. Page title fallback: "Jane Doe | Facebook" / "Jane Doe - Facebook".
+  // 3. og:title — historically the profile owner's name; now often the generic
+  //    "Facebook" (rejected by looksLikeName), but harmless to try.
+  const og = doc.querySelector('meta[property="og:title"]') as HTMLMetaElement | null;
+  const ogName = cleanName(og?.content);
+  if (looksLikeName(ogName)) return ogName;
+
+  // 4. Page title fallback: "Jane Doe | Facebook" / "Jane Doe - Facebook".
   const title = cleanName(doc.title.replace(/\s*[|·-]\s*Facebook.*$/i, ''));
   if (looksLikeName(title)) return title;
 
