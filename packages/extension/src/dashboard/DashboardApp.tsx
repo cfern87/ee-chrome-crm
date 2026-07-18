@@ -7,6 +7,7 @@ import {
   loadImportHistory, recordImport, ImportHistoryEntry,
 } from '../csv';
 import { mergeConversations, findDuplicateGroups, cleanStoredNames, pickPrimary, DuplicateGroup } from '../contacts';
+import { isDriveConfigured, getDriveStatus, connectDrive, disconnectDrive, getAuthRedirectUri, readStore as driveReadStore, writeStore as driveWriteStore, DriveStatus } from '../drive';
 
 // Trigger a client-side file download of text content.
 function downloadText(filename: string, mime: string, content: string) {
@@ -1708,6 +1709,8 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
         <SyncMeter usage={syncUsage} convCount={conversations.length} tagCount={tags.length} />
       </div>
 
+      <DriveBackupPanel store={store} updateStore={updateStore} />
+
       <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
         <h3 style={{ margin: '0 0 16px', fontSize: 15, fontWeight: 600 }}>Data</h3>
         <div style={{ display: 'flex', gap: 10 }}>
@@ -1724,6 +1727,149 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
       </div>
 
       <CsvImportPanel store={store} updateStore={updateStore} />
+    </div>
+  );
+}
+
+// --- Google Drive backup (Phase 1: opt-in, manual push/pull) ---
+//
+// Chrome sync stays canonical for now. This card lets a user connect their
+// Google account and manually push the store up to / pull it down from the
+// hidden Drive app-data folder, so the round-trip can be validated on two
+// machines before Drive becomes the canonical layer (Phase 2). Pull persists
+// the fetched store through updateStore, so it lands in the normal store.
+function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (s: Store) => Promise<void> }) {
+  const [driveStatus, setDriveStatus] = useState<DriveStatus | null>(null);
+  const [status, setStatus] = useState<{ type: 'success' | 'error' | 'info'; msg: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [pushConfirm, setPushConfirm] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try { setDriveStatus(await getDriveStatus()); } catch { setDriveStatus(null); }
+  }, []);
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  const configured = driveStatus?.configured ?? isDriveConfigured();
+  const connected = !!driveStatus?.connected;
+
+  const handleConnect = async () => {
+    setBusy(true);
+    setStatus({ type: 'info', msg: 'Opening Google sign-in…' });
+    try {
+      const res = await connectDrive();
+      if (!res.ok) { setStatus({ type: 'error', msg: res.error || 'Sign-in was cancelled or denied.' }); return; }
+      await refresh();
+      setStatus({ type: 'success', msg: 'Connected to Google Drive.' });
+    } catch (e) {
+      setStatus({ type: 'error', msg: `Connect failed: ${String(e)}` });
+    } finally { setBusy(false); }
+  };
+
+  const handleDisconnect = async () => {
+    setBusy(true);
+    try {
+      await disconnectDrive();
+      await refresh();
+      setStatus({ type: 'info', msg: 'Disconnected. Your Drive data was left untouched.' });
+    } finally { setBusy(false); }
+  };
+
+  const handlePush = async () => {
+    setPushConfirm(false);
+    setBusy(true);
+    setStatus({ type: 'info', msg: 'Pushing to Google Drive…' });
+    try {
+      const meta = await driveWriteStore(store, true);
+      await refresh();
+      const when = meta.modifiedTime ? new Date(meta.modifiedTime).toLocaleString() : 'now';
+      setStatus({ type: 'success', msg: `Pushed ${Object.keys(store.conversations).length} contacts to Drive (${when}).` });
+    } catch (e) {
+      setStatus({ type: 'error', msg: `Push failed: ${String(e)}` });
+    } finally { setBusy(false); }
+  };
+
+  const handlePull = async () => {
+    setBusy(true);
+    setStatus({ type: 'info', msg: 'Pulling from Google Drive…' });
+    try {
+      const result = await driveReadStore(true);
+      if (!result) { setStatus({ type: 'error', msg: 'No CRM data found in Drive yet — push from another machine first.' }); return; }
+      await updateStore(result.store);
+      await refresh();
+      const convCount = Object.keys(result.store.conversations).length;
+      const tagCount = Object.keys(result.store.tags).length;
+      setStatus({ type: 'success', msg: `Pulled ${convCount} contacts and ${tagCount} tags from Drive.` });
+    } catch (e) {
+      setStatus({ type: 'error', msg: `Pull failed: ${String(e)}` });
+    } finally { setBusy(false); }
+  };
+
+  const cardStyle: React.CSSProperties = { background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 };
+  const btn = (bg: string): React.CSSProperties => ({ flex: 1, background: bg, color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.6 : 1 });
+
+  return (
+    <div style={cardStyle}>
+      <h3 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>
+        Google Drive Backup <span style={{ fontSize: 10, fontWeight: 700, color: '#065fd4', background: '#e8f0fe', borderRadius: 4, padding: '2px 6px', verticalAlign: 'middle' }}>BETA</span>
+      </h3>
+      <p style={{ margin: '0 0 14px', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
+        Sync your CRM through your own Google Drive (a hidden app-data folder) to get past Chrome sync's ~500-contact limit.
+        Chrome sync still runs as usual — this is an optional backup you can validate first.
+      </p>
+
+      {!configured ? (
+        <div style={{ fontSize: 12, padding: '10px 12px', borderRadius: 6, background: '#fff8e1', color: '#8a6d00', lineHeight: 1.6 }}>
+          <strong>Setup needed.</strong> A Google OAuth client id hasn't been added to the extension yet. In the Google Cloud Console:
+          create a project → enable the <strong>Google Drive API</strong> → create an <strong>OAuth client ID</strong> of type
+          <strong>“Web application”</strong> → add the redirect URI below → paste the client id into <code>manifest.json</code> under <code>oauth2.client_id</code>, then rebuild.
+        </div>
+      ) : (
+        <>
+          <div style={{ fontSize: 11, color: '#888', marginBottom: 12, lineHeight: 1.6, background: '#f8f8f8', borderRadius: 6, padding: '8px 10px' }}>
+            Uses a <strong>“Web application”</strong> OAuth client (works in Edge &amp; Chrome). This exact redirect URI must be listed under the client's <strong>Authorized redirect URIs</strong>:
+            <br />
+            <code style={{ wordBreak: 'break-all', color: '#333' }}>{getAuthRedirectUri() || '(unavailable)'}</code>
+          </div>
+          <div style={{ fontSize: 12, marginBottom: 12, color: connected ? '#2e7d32' : '#888' }}>
+            {connected ? '● Connected to Google Drive' : '○ Not connected'}
+            {connected && driveStatus?.file?.modifiedTime && (
+              <span style={{ color: '#aaa' }}>{' '}· last backup {new Date(driveStatus.file.modifiedTime).toLocaleString()}</span>
+            )}
+          </div>
+
+          {!connected ? (
+            <button onClick={handleConnect} disabled={busy} style={btn('#065fd4')}>Connect Google Drive</button>
+          ) : (
+            <>
+              <div style={{ display: 'flex', gap: 10, marginBottom: 10 }}>
+                <button onClick={handlePull} disabled={busy} style={btn('#4ECDC4')}>Pull from Drive</button>
+                {!pushConfirm ? (
+                  <button onClick={() => setPushConfirm(true)} disabled={busy} style={btn('#f0a500')}>Push to Drive</button>
+                ) : (
+                  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <span style={{ fontSize: 11, color: '#c0392b', fontWeight: 600 }}>Overwrites the Drive copy with this machine's data.</span>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button onClick={handlePush} disabled={busy} style={{ flex: 1, background: '#c0392b', color: '#fff', border: 'none', padding: '7px 10px', borderRadius: 6, fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>Confirm Push</button>
+                      <button onClick={() => setPushConfirm(false)} style={{ flex: 1, background: '#eee', color: '#333', border: 'none', padding: '7px 10px', borderRadius: 6, fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>Cancel</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <button onClick={handleDisconnect} disabled={busy} style={{ background: 'none', border: 'none', color: '#c0392b', fontSize: 12, cursor: 'pointer', padding: 0 }}>Disconnect</button>
+            </>
+          )}
+        </>
+      )}
+
+      {status && (
+        <div style={{
+          marginTop: 12, fontSize: 12, padding: '8px 10px', borderRadius: 6, lineHeight: 1.5,
+          background: status.type === 'success' ? '#e8f5e9' : status.type === 'error' ? '#fdecea' : '#e3f2fd',
+          color: status.type === 'success' ? '#2e7d32' : status.type === 'error' ? '#c62828' : '#1565c0',
+        }}>
+          {status.msg}
+        </div>
+      )}
     </div>
   );
 }

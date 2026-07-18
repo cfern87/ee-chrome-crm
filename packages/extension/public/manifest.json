@@ -1,18 +1,26 @@
 {
   "manifest_version": 3,
   "name": "Facebook Messenger CRM",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Manage conversations and tags directly in Facebook Messenger",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyhKpKmkvh0Mq1NuU/MdFWowmdCapWS0YLSQJNtL50wjVL8yIdB0ZBj2NncnUJKkQtk8NmdNN1ZCC5EtKUh0ES+GTup1jKbCful2rZZN+PTWzKIQq7mTOD/e5cTpxeUldGPkOY3lgbG6Aell1f3CJ3+b9k/W2C6bzAtAdeqfyqd7tB0y7fGB2onAmYyYZd//nAZ38HKTH0lKOiA7CxcggVedSgiFfmnfyM5XygR5a5L3RYRU25TkNSskzXmVXNSI78jkLXPhliAeIre9u4LCa3zqZ3B/d4CPHxxjn/e8VY6p7f7XA28jI7ZyF5cdpQ5dJJNj/T8qfHEVBg9OcYx1ITQIDAQAB",
   "permissions": [
     "storage",
     "tabs",
-    "alarms"
+    "alarms",
+    "identity"
   ],
   "host_permissions": [
     "https://www.facebook.com/*",
-    "https://www.messenger.com/*"
+    "https://www.messenger.com/*",
+    "https://www.googleapis.com/*"
   ],
+  "oauth2": {
+    "client_id": "280559630109-495ir27lgbd07qeu8vcki1n914ocfbf6.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/drive.appdata"
+    ]
+  },
   "action": {
     "default_popup": "popup.html",
     "default_title": "Facebook CRM"
