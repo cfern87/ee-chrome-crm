@@ -1,18 +1,27 @@
 // Cross-machine storage for the Facebook CRM.
 //
-// Canonical store:   chrome.storage.sync  (syncs across machines signed into
-//                    the same Chrome profile — no backend required).
-// Local backups:     chrome.storage.local single key + IndexedDB. These are
-//                    per-machine and protect against a sync wipe / offline use.
+// Two canonical modes, chosen per-machine by whether the user has connected
+// Google Drive (isDriveEnabled — a flag in chrome.storage.local set when they
+// connect in the dashboard):
 //
-// IMPORTANT — chrome.storage.sync limits we design around:
+//   * Drive ON  → canonical = Google Drive appDataFolder (one JSON blob, the
+//     user's own Drive, no 512-item ceiling). See drive.ts. chrome.storage.local
+//     + IndexedDB act as the offline cache / write buffer; a dirty flag + a
+//     background flush push local edits up when Drive was unreachable.
+//   * Drive OFF → canonical = chrome.storage.sync (legacy; syncs across machines
+//     on the same Chrome profile, no backend). Sharded because of its limits.
+//
+// LEGACY chrome.storage.sync limits the sharding design works around:
 //   * QUOTA_BYTES_PER_ITEM = 8 KB  → we CANNOT store the whole store under one
 //     key. We SHARD: one item per conversation ("c:<id>") and per tag
 //     ("t:<id>"), plus "s" (settings) and "n" (notes).
 //   * QUOTA_BYTES = 100 KB total, MAX_ITEMS = 512  → ~400-500 conversations.
+//     This ceiling is the reason for the Drive mode above.
 //   * Write-rate limits (120 ops/min) → saveStore writes only the DELTA
 //     (changed/removed shards) versus the last synced snapshot, so tagging one
 //     person costs a single write.
+
+import { readStore as driveReadStore, writeStore as driveWriteStore, mergeStores } from './drive';
 
 export const STORAGE_KEY = 'facebook_crm_store';
 
@@ -389,16 +398,148 @@ async function syncWriteDelta(store: Store): Promise<void> {
   lastSyncSnapshot = clone(store);
 }
 
+// ---- Drive mode (canonical when the user has connected Google Drive) ----
+
+// Persisted in chrome.storage.local so both the dashboard and the service worker
+// agree on the mode without a network call.
+const DRIVE_ENABLED_KEY = 'crm_drive_enabled';
+// Set when a save couldn't reach Drive, so a later flush knows to retry.
+const DRIVE_DIRTY_KEY = 'crm_drive_dirty';
+
+function localFlagGet(key: string): Promise<boolean> {
+  if (!isExtensionAlive()) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(key, (res) => {
+        if (chrome.runtime.lastError) { resolve(false); return; }
+        resolve(res?.[key] === true);
+      });
+    } catch { resolve(false); }
+  });
+}
+
+function localFlagSet(key: string, val: boolean): Promise<void> {
+  if (!isExtensionAlive()) return Promise.resolve();
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.set({ [key]: val }, () => { void chrome.runtime.lastError; resolve(); });
+    } catch { resolve(); }
+  });
+}
+
+/** True when this machine treats Google Drive as the canonical store. */
+export function isDriveEnabled(): Promise<boolean> {
+  return localFlagGet(DRIVE_ENABLED_KEY);
+}
+
+/**
+ * Turn Drive mode on/off for this machine. Turning it on seeds Drive from the
+ * current local/legacy data (so the canonical copy isn't empty); the dashboard
+ * calls this right after a successful Connect.
+ */
+export async function setDriveEnabled(enabled: boolean): Promise<void> {
+  await localFlagSet(DRIVE_ENABLED_KEY, enabled);
+}
+
+// Coalesced Drive writer: at most one write in flight; the latest store queued
+// behind it wins, so a burst of saves collapses into one final upload.
+let driveWriteInFlight = false;
+let drivePending: Store | null = null;
+
+function flushDrivePending(): void {
+  if (driveWriteInFlight) return;
+  driveWriteInFlight = true;
+  void (async () => {
+    try {
+      while (drivePending) {
+        const s = drivePending;
+        drivePending = null;
+        try {
+          await driveWriteStore(s);
+          await localFlagSet(DRIVE_DIRTY_KEY, false);
+        } catch (e) {
+          console.warn('[CRM] Drive write failed — kept local, will retry:', e);
+          await localFlagSet(DRIVE_DIRTY_KEY, true);
+          break; // stop the loop; a later flush retries from local
+        }
+      }
+    } finally {
+      driveWriteInFlight = false;
+    }
+  })();
+}
+
+function queueDriveWrite(store: Store): void {
+  drivePending = clone(store);
+  flushDrivePending();
+}
+
+/**
+ * If Drive mode is on and a previous write didn't land, push the current local
+ * cache up now. Called from the background watchdog and on worker startup so a
+ * killed service worker (or an offline window) eventually reconciles.
+ */
+export async function flushDriveIfDirty(): Promise<void> {
+  if (!(await isDriveEnabled())) return;
+  if (!(await localFlagGet(DRIVE_DIRTY_KEY))) return;
+  const local = (await chromeLocalGet()) || (await idbGet());
+  if (local) queueDriveWrite(local);
+}
+
+// Drive-mode load: Drive is canonical, but reconcile with any local offline
+// edits and serve the local cache when Drive is unreachable.
+async function loadStoreDrive(): Promise<Store> {
+  const local = (await chromeLocalGet()) || (await idbGet()) || clone(EMPTY_STORE);
+
+  let remote: Store | null = null;
+  let driveReachable = false;
+  try {
+    const res = await driveReadStore();
+    driveReachable = true;
+    remote = res ? res.store : null;
+  } catch (e) {
+    console.warn('[CRM] Drive read failed — serving local cache:', e);
+  }
+
+  // Offline / auth failure: fall back to whatever we have locally.
+  if (!driveReachable) return local;
+
+  // Drive empty (fresh account): seed it from local, or a one-time read of the
+  // legacy sync store if this machine is mid-migration.
+  if (!remote) {
+    let seed = local;
+    if (!hasData(seed)) {
+      const legacy = await syncGetAll();
+      if (hasData(legacy)) seed = legacy;
+    }
+    if (hasData(seed)) queueDriveWrite(seed);
+    await chromeLocalSet(seed);
+    idbSet(seed);
+    return seed;
+  }
+
+  // Merge canonical remote with local edits (last-write-wins per record via the
+  // stores' own timestamps). If local contributed anything newer, push it back.
+  const merged = mergeStores(remote, local);
+  if (JSON.stringify(merged) !== JSON.stringify(remote)) queueDriveWrite(merged);
+  await chromeLocalSet(merged);
+  idbSet(merged);
+  return merged;
+}
+
 // ---- Public API ----
 
 /**
- * Load the store. Order of precedence:
+ * Load the store. In Drive mode, Drive is canonical (reconciled with the local
+ * cache). Otherwise the legacy chrome.storage.sync precedence applies:
  *   1. chrome.storage.sync (canonical, cross-machine) — if it has data.
  *   2. Migrate: if sync is empty but local/IDB has data, push it up to sync.
  *   3. Fall back to whatever local/IDB has (or an empty store).
  * Always refreshes the in-memory sync snapshot and local backups.
  */
 export async function loadStore(): Promise<Store> {
+  if (await isDriveEnabled()) return loadStoreDrive();
+
   // 1. Canonical: chrome.storage.sync
   const fromSync = await syncGetAll();
   if (hasData(fromSync)) {
@@ -430,12 +571,22 @@ export async function loadStore(): Promise<Store> {
 }
 
 /**
- * Save the store: write the delta to chrome.storage.sync (canonical) and
- * mirror the full store to chrome.storage.local + IndexedDB as local backups.
+ * Save the store. Always writes the local cache first (fast, offline-safe), then
+ * pushes to the canonical layer: a coalesced full-blob upload in Drive mode, or
+ * the sharded delta write to chrome.storage.sync in legacy mode.
  */
 export async function saveStore(store: Store): Promise<void> {
-  await syncWriteDelta(store);
+  // Local cache first — durable even if the network write below fails.
   await Promise.all([chromeLocalSet(store), idbSet(store)]);
+
+  if (await isDriveEnabled()) {
+    // Mark dirty up front; queueDriveWrite clears it once the upload lands.
+    await localFlagSet(DRIVE_DIRTY_KEY, true);
+    queueDriveWrite(store);
+    return;
+  }
+
+  await syncWriteDelta(store);
 }
 
 export interface SyncUsage {

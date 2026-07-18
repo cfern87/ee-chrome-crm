@@ -16,6 +16,7 @@ import {
   isCrmSyncKey,
   loadStore as _loadStore,
   saveStore as _saveStore,
+  isDriveEnabled,
 } from './storage';
 import type { Store, Tag, Conversation } from './storage';
 import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
@@ -70,8 +71,30 @@ let storeCache: Store | null = null;
 // steal focus from — and wipe — the new-tag inputs while the user is typing).
 let lastSelfWriteAt = 0;
 
+// Round-trip a message to the background service worker.
+function sendBg<T>(message: unknown): Promise<T | null> {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(message, (res) => {
+        if (chrome.runtime.lastError) { resolve(null); return; }
+        resolve((res as T) ?? null);
+      });
+    } catch { resolve(null); }
+  });
+}
+
+// In Drive mode the content script can't reach Drive itself (content scripts
+// have no chrome.identity), so it routes reads/writes through the background —
+// which holds the OAuth token and treats Drive as canonical. This keeps the
+// content view fresh instead of serving a possibly-stale local cache. If the
+// background is unreachable, fall back to the direct local path (which the
+// background's dirty-flush will later reconcile to Drive).
 async function getStore(): Promise<Store> {
   if (storeCache) return storeCache;
+  if (await isDriveEnabled()) {
+    const res = await sendBg<Store>({ type: 'GET_STORE' });
+    if (res && res.conversations) { storeCache = res; return res; }
+  }
   const store = await _loadStore();
   storeCache = store;
   return store;
@@ -80,7 +103,12 @@ async function getStore(): Promise<Store> {
 async function saveStore(store: Store): Promise<void> {
   storeCache = store;
   lastSelfWriteAt = Date.now();
-  await _saveStore(store);
+  if (await isDriveEnabled()) {
+    const res = await sendBg<{ success?: boolean }>({ type: 'SET_STORE', payload: store });
+    if (!res || !res.success) await _saveStore(store); // background unreachable — keep it local
+  } else {
+    await _saveStore(store);
+  }
   // Cover the window until chrome.storage fires onChanged for this write.
   lastSelfWriteAt = Date.now();
 }

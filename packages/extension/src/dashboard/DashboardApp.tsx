@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync } from '../storage';
+import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled } from '../storage';
 import { Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS } from '../campaigns';
 import {
   parseContactsCsv, applyContacts, contactsToCsv, sampleCsv,
@@ -1559,6 +1559,8 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
   const settings = store.settings as Record<string, unknown>;
   const [syncStatus, setSyncStatus] = useState<{ type: 'success' | 'error' | 'info'; msg: string } | null>(null);
   const [pushConfirm, setPushConfirm] = useState(false);
+  // Chrome Sync is legacy once Drive is canonical, so it starts collapsed.
+  const [syncOpen, setSyncOpen] = useState(false);
 
   const handlePull = async () => {
     setSyncStatus({ type: 'info', msg: 'Pulling from Chrome sync…' });
@@ -1668,10 +1670,21 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
       <ContactsMaintenance store={store} updateStore={updateStore} />
 
       <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
-        <h3 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>Chrome Sync</h3>
+        <button
+          onClick={() => setSyncOpen((v) => !v)}
+          style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', background: 'none', border: 'none', padding: 0, cursor: 'pointer', textAlign: 'left' }}
+          aria-expanded={syncOpen}
+        >
+          <span style={{ fontSize: 11, color: '#888', transform: syncOpen ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s', display: 'inline-block' }}>▶</span>
+          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600 }}>Chrome Sync</h3>
+          <span style={{ fontSize: 10, fontWeight: 700, color: '#999', background: '#f0f0f0', borderRadius: 4, padding: '2px 6px' }}>LEGACY</span>
+        </button>
+        {syncOpen && (
+        <div style={{ marginTop: 12 }}>
         <p style={{ margin: '0 0 14px', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
           Pull loads data from Chrome's sync storage into this machine. Push uploads this machine's data to Chrome sync so other machines pick it up.
           {' '}<strong>Note:</strong> Chrome may not sync data for extensions installed in developer mode — if contacts are missing after pulling, try the Export/Import buttons below as a fallback.
+          {' '}Superseded by Google Drive sync below, which has no ~500-contact limit.
         </p>
         <div style={{ display: 'flex', gap: 10, marginBottom: syncStatus ? 10 : 0 }}>
           <button
@@ -1707,6 +1720,8 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
           </div>
         )}
         <SyncMeter usage={syncUsage} convCount={conversations.length} tagCount={tags.length} />
+        </div>
+        )}
       </div>
 
       <DriveBackupPanel store={store} updateStore={updateStore} />
@@ -1731,21 +1746,23 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
   );
 }
 
-// --- Google Drive backup (Phase 1: opt-in, manual push/pull) ---
+// --- Google Drive sync ---
 //
-// Chrome sync stays canonical for now. This card lets a user connect their
-// Google account and manually push the store up to / pull it down from the
-// hidden Drive app-data folder, so the round-trip can be validated on two
-// machines before Drive becomes the canonical layer (Phase 2). Pull persists
-// the fetched store through updateStore, so it lands in the normal store.
+// Connecting makes Drive this machine's canonical store (setDriveEnabled(true)),
+// after seeding it with the current data. loadStore/saveStore then read/write
+// Drive, with chrome.storage.local + IDB as the offline cache. Manual Push/Pull
+// remain for explicit control and cross-machine seeding. Disconnect reverts the
+// machine to Chrome sync (the Drive file is left intact).
 function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (s: Store) => Promise<void> }) {
   const [driveStatus, setDriveStatus] = useState<DriveStatus | null>(null);
+  const [enabled, setEnabled] = useState(false);
   const [status, setStatus] = useState<{ type: 'success' | 'error' | 'info'; msg: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [pushConfirm, setPushConfirm] = useState(false);
 
   const refresh = useCallback(async () => {
     try { setDriveStatus(await getDriveStatus()); } catch { setDriveStatus(null); }
+    try { setEnabled(await isDriveEnabled()); } catch { setEnabled(false); }
   }, []);
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -1758,8 +1775,12 @@ function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (
     try {
       const res = await connectDrive();
       if (!res.ok) { setStatus({ type: 'error', msg: res.error || 'Sign-in was cancelled or denied.' }); return; }
+      // Seed the canonical Drive copy with this machine's data, then switch this
+      // machine into Drive mode so loadStore/saveStore treat Drive as canonical.
+      await driveWriteStore(store, true);
+      await setDriveEnabled(true);
       await refresh();
-      setStatus({ type: 'success', msg: 'Connected to Google Drive.' });
+      setStatus({ type: 'success', msg: 'Connected. Google Drive is now your canonical store — Chrome sync is no longer used on this machine.' });
     } catch (e) {
       setStatus({ type: 'error', msg: `Connect failed: ${String(e)}` });
     } finally { setBusy(false); }
@@ -1768,9 +1789,10 @@ function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (
   const handleDisconnect = async () => {
     setBusy(true);
     try {
+      await setDriveEnabled(false);
       await disconnectDrive();
       await refresh();
-      setStatus({ type: 'info', msg: 'Disconnected. Your Drive data was left untouched.' });
+      setStatus({ type: 'info', msg: 'Disconnected. This machine is back on Chrome sync; your Drive data was left untouched.' });
     } finally { setBusy(false); }
   };
 
@@ -1810,11 +1832,13 @@ function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (
   return (
     <div style={cardStyle}>
       <h3 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>
-        Google Drive Backup <span style={{ fontSize: 10, fontWeight: 700, color: '#065fd4', background: '#e8f0fe', borderRadius: 4, padding: '2px 6px', verticalAlign: 'middle' }}>BETA</span>
+        Google Drive Sync {enabled && <span style={{ fontSize: 10, fontWeight: 700, color: '#2e7d32', background: '#e8f5e9', borderRadius: 4, padding: '2px 6px', verticalAlign: 'middle' }}>CANONICAL</span>}
       </h3>
       <p style={{ margin: '0 0 14px', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
         Sync your CRM through your own Google Drive (a hidden app-data folder) to get past Chrome sync's ~500-contact limit.
-        Chrome sync still runs as usual — this is an optional backup you can validate first.
+        {enabled
+          ? ' This machine now reads and writes Drive as the source of truth; the local copy is an offline cache.'
+          : ' Connecting makes Drive this machine\'s canonical store in place of Chrome sync.'}
       </p>
 
       {!configured ? (

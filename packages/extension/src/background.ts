@@ -17,7 +17,7 @@
 // periodic watchdog alarm self-heals any stall (e.g. if the worker was killed
 // mid-step).
 
-import { loadStore, saveStore } from './storage';
+import { loadStore, saveStore, flushDriveIfDirty } from './storage';
 import type { Store } from './storage';
 import {
   Campaign,
@@ -543,6 +543,9 @@ async function requeueCampaignRecipient(id: string, threadId: string): Promise<{
 
 // Watchdog: catch stalls (worker killed mid-step, missed alarm, etc.).
 async function watchdog(): Promise<void> {
+  // Reconcile any Drive write that didn't land (offline, worker killed mid-flush).
+  void flushDriveIfDirty();
+
   const c = await getActiveCampaign();
   if (!c || c.status !== 'running') return;
   const now = Date.now();
@@ -562,6 +565,9 @@ try {
 
 // Re-arm the watchdog whenever the worker spins up.
 ensureWatchdog();
+
+// On startup, push up any local edits that didn't reach Drive last session.
+void flushDriveIfDirty();
 
 // If the sender tab is closed, forget it so the next send opens a fresh one.
 chrome.tabs.onRemoved.addListener(async (tabId) => {

@@ -8,16 +8,16 @@
 // single JSON blob, which fits how the rest of the extension already works
 // (load the entire store into memory, write it back whole).
 //
-// PHASE 1 (this file): opt-in. The dashboard exposes Connect / Push / Pull so a
-// user can validate the round-trip on two machines. chrome.storage.sync stays
-// canonical. PHASE 2 will rewire storage.ts's loadStore/saveStore to treat Drive
-// as canonical and retire the shard/delta machinery.
+// This module owns Drive I/O only. storage.ts decides *when* to use it (Drive is
+// canonical once the user connects — see isDriveEnabled there) and keeps the
+// chrome.storage.local + IndexedDB cache as the offline write buffer.
 //
-// AUTH: chrome.identity.getAuthToken (works in both the options page and the MV3
-// service worker). Requires an OAuth2 client_id in the manifest and the Drive
-// API enabled — see the setup notes the dashboard links to.
+// AUTH: chrome.identity.launchWebAuthFlow (cross-browser — works in Edge AND
+// Chrome, unlike the Chrome-only getAuthToken). OAuth 2.0 implicit flow; needs a
+// "Web application" OAuth client whose Authorized redirect URIs include
+// getAuthRedirectUri(), plus the Drive API enabled.
 
-import { Store, EMPTY_STORE } from './storage';
+import type { Store } from './storage';
 
 // The single file we keep in the app-data folder.
 const STORE_FILE_NAME = 'crm-store.json';
@@ -398,6 +398,3 @@ export function mergeStores(a: Store, b: Store): Store {
   }
   return out;
 }
-
-// Re-export for callers that want a blank baseline without importing storage.
-export { EMPTY_STORE };
