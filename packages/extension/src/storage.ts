@@ -299,36 +299,85 @@ function syncGetAll(): Promise<Store | null> {
   });
 }
 
-function syncSet(items: Record<string, unknown>): Promise<void> {
+// A single sync write attempt. Reports whether it actually landed: a rejected
+// write (quota / rate limit) sets chrome.runtime.lastError, which we must NOT
+// swallow — otherwise saveStore reports success for data that never persisted,
+// and the delta snapshot advances past records that were silently dropped.
+interface SyncOpResult { ok: boolean; error?: string; }
+
+function syncSet(items: Record<string, unknown>): Promise<SyncOpResult> {
   return new Promise((resolve) => {
     try {
       chrome.storage.sync.set(items, () => {
         const err = chrome.runtime.lastError;
-        if (err) console.warn('[CRM] sync write skipped:', err.message);
-        resolve();
+        if (err) { console.warn('[CRM] sync write rejected:', err.message); resolve({ ok: false, error: err.message }); return; }
+        resolve({ ok: true });
       });
     } catch (e) {
       console.warn('[CRM] sync write threw:', e);
-      resolve();
+      resolve({ ok: false, error: String((e as Error)?.message || e) });
     }
   });
 }
 
-function syncRemove(keys: string[]): Promise<void> {
+function syncRemove(keys: string[]): Promise<SyncOpResult> {
   return new Promise((resolve) => {
     try {
-      chrome.storage.sync.remove(keys, () => { void chrome.runtime.lastError; resolve(); });
-    } catch {
-      resolve();
+      chrome.storage.sync.remove(keys, () => {
+        const err = chrome.runtime.lastError;
+        if (err) { console.warn('[CRM] sync remove rejected:', err.message); resolve({ ok: false, error: err.message }); return; }
+        resolve({ ok: true });
+      });
+    } catch (e) {
+      resolve({ ok: false, error: String((e as Error)?.message || e) });
     }
   });
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// chrome.storage.sync rejects writes for two very different reasons, which need
+// opposite handling:
+//   * 'rate'  — MAX_WRITE_OPERATIONS_PER_MINUTE/_HOUR exceeded. Transient: the
+//     same write succeeds after a short wait, so we retry.
+//   * 'space' — QUOTA_BYTES / QUOTA_BYTES_PER_ITEM / MAX_ITEMS (the ~500-item
+//     ceiling). A hard wall retrying can't clear; the fix is Google Drive mode.
+function classifySyncError(msg: string | undefined): 'rate' | 'space' | 'other' {
+  const m = (msg || '').toLowerCase();
+  // Check rate first: the rate message also contains "quota exceeded".
+  if (/per_minute|per_hour|write_operations|throttl|rate/.test(m)) return 'rate';
+  if (/quota|max_items|bytes/.test(m)) return 'space';
+  return 'other';
+}
+
+const SYNC_RATE_RETRIES = 4;
+const SYNC_RATE_RETRY_MS = 1500;
+
+// Write one batch, retrying transient rate-limit rejections with a short wait.
+async function syncSetBatch(batch: Record<string, unknown>): Promise<{ ok: boolean; kind?: 'rate' | 'space' | 'other'; error?: string }> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await syncSet(batch);
+    if (res.ok) return { ok: true };
+    const kind = classifySyncError(res.error);
+    if (kind === 'rate' && attempt < SYNC_RATE_RETRIES) { await sleep(SYNC_RATE_RETRY_MS); continue; }
+    return { ok: false, kind, error: res.error };
+  }
 }
 
 // Snapshot of what we last pushed to sync, so saveStore can write only deltas.
 let lastSyncSnapshot: Store = clone(EMPTY_STORE);
 
-async function syncWriteDelta(store: Store): Promise<void> {
-  if (!syncAvailable()) return;
+// Outcome of pushing a delta to chrome.storage.sync, so callers can tell a
+// fully-synced write from one that only landed on this device.
+export interface SyncWriteResult {
+  ok: boolean;              // every changed shard reached chrome.storage.sync
+  failed: number;           // shards that couldn't be written
+  itemLimitReached: boolean; // failure was the sync space/item ceiling (→ Drive)
+  reason?: string;          // representative error message
+}
+
+async function syncWriteDelta(store: Store): Promise<SyncWriteResult> {
+  if (!syncAvailable()) return { ok: true, failed: 0, itemLimitReached: false };
   const prev = lastSyncSnapshot;
   const toSet: Record<string, unknown> = {};
   const toRemove: string[] = [];
@@ -388,14 +437,38 @@ async function syncWriteDelta(store: Store): Promise<void> {
 
   // Write in batches to respect the per-minute write-op limit.
   const setKeys = Object.keys(toSet);
+  let failed = 0;
+  let itemLimitReached = false;
+  let reason: string | undefined;
   for (let i = 0; i < setKeys.length; i += SYNC_SET_BATCH) {
+    const keys = setKeys.slice(i, i + SYNC_SET_BATCH);
     const batch: Record<string, unknown> = {};
-    for (const k of setKeys.slice(i, i + SYNC_SET_BATCH)) batch[k] = toSet[k];
-    await syncSet(batch);
+    for (const k of keys) batch[k] = toSet[k];
+    const res = await syncSetBatch(batch);
+    if (!res.ok) {
+      failed += keys.length;
+      reason = res.error || reason;
+      if (res.kind === 'space') itemLimitReached = true;
+    }
   }
-  if (toRemove.length) await syncRemove(toRemove);
+  if (toRemove.length) {
+    const rem = await syncRemove(toRemove);
+    if (!rem.ok) { failed += toRemove.length; reason = rem.error || reason; }
+  }
 
-  lastSyncSnapshot = clone(store);
+  // Reconcile the delta snapshot with what ACTUALLY persisted. On full success
+  // the store is the truth (cheap, no extra read). On any failure we can't
+  // assume the store landed, so re-read sync and treat that as the baseline —
+  // this is what keeps the dropped shards marked dirty so the next save retries
+  // them, instead of advancing past them and losing them silently.
+  if (failed === 0) {
+    lastSyncSnapshot = clone(store);
+  } else {
+    const actual = await syncGetAll();
+    lastSyncSnapshot = actual ? clone(actual) : clone(EMPTY_STORE);
+  }
+
+  return { ok: failed === 0, failed, itemLimitReached, reason };
 }
 
 // ---- Drive mode (canonical when the user has connected Google Drive) ----
@@ -571,22 +644,40 @@ export async function loadStore(): Promise<Store> {
 }
 
 /**
+ * Result of a save. `ok` is true when the store fully reached the canonical
+ * layer. In legacy (chrome.storage.sync) mode a save can partially fail — the
+ * data is always durable in the local cache, but some shards may not have
+ * synced because the sync item ceiling was hit. Callers that need to report
+ * this to the user (e.g. CSV import) can inspect it; the many fire-and-forget
+ * callers can keep ignoring the return value.
+ */
+export interface SaveResult {
+  ok: boolean;               // fully persisted to the canonical layer
+  pending: number;           // shards saved locally but not yet in canonical
+  itemLimitReached: boolean; // sync ~500-item ceiling hit → connect Drive
+  reason?: string;
+}
+
+/**
  * Save the store. Always writes the local cache first (fast, offline-safe), then
  * pushes to the canonical layer: a coalesced full-blob upload in Drive mode, or
  * the sharded delta write to chrome.storage.sync in legacy mode.
  */
-export async function saveStore(store: Store): Promise<void> {
+export async function saveStore(store: Store): Promise<SaveResult> {
   // Local cache first — durable even if the network write below fails.
   await Promise.all([chromeLocalSet(store), idbSet(store)]);
 
   if (await isDriveEnabled()) {
     // Mark dirty up front; queueDriveWrite clears it once the upload lands.
+    // Drive has no item ceiling and retries on its own, so a save is "ok" once
+    // it's durable locally and queued.
     await localFlagSet(DRIVE_DIRTY_KEY, true);
     queueDriveWrite(store);
-    return;
+    return { ok: true, pending: 0, itemLimitReached: false };
   }
 
-  await syncWriteDelta(store);
+  const res = await syncWriteDelta(store);
+  return { ok: res.ok, pending: res.failed, itemLimitReached: res.itemLimitReached, reason: res.reason };
 }
 
 export interface SyncUsage {

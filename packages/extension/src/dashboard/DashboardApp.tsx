@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled } from '../storage';
+import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled } from '../storage';
 import { Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS } from '../campaigns';
 import {
   parseContactsCsv, applyContacts, contactsToCsv, sampleCsv,
@@ -136,9 +136,9 @@ export default function DashboardApp() {
     return () => clearInterval(interval);
   }, [refresh]);
 
-  const updateStore = async (next: Store) => {
+  const updateStore = async (next: Store): Promise<SaveResult> => {
     setStore(next);
-    await saveStore(next);
+    return saveStore(next);
   };
 
   // --- Conversations ---
@@ -1548,7 +1548,7 @@ function FieldsPanel({ fieldDefs, conversations, onAddField, onDeleteField }: Fi
 // --- Settings sub-component ---
 interface SettingsPanelProps {
   store: Store;
-  updateStore: (s: Store) => Promise<void>;
+  updateStore: (s: Store) => Promise<SaveResult>;
   conversations: Conversation[];
   tags: Tag[];
   syncUsage: SyncUsage | null;
@@ -1753,7 +1753,7 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
 // Drive, with chrome.storage.local + IDB as the offline cache. Manual Push/Pull
 // remain for explicit control and cross-machine seeding. Disconnect reverts the
 // machine to Chrome sync (the Drive file is left intact).
-function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (s: Store) => Promise<void> }) {
+function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (s: Store) => Promise<SaveResult> }) {
   const [driveStatus, setDriveStatus] = useState<DriveStatus | null>(null);
   const [enabled, setEnabled] = useState(false);
   const [status, setStatus] = useState<{ type: 'success' | 'error' | 'info'; msg: string } | null>(null);
@@ -1901,11 +1901,11 @@ function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (
 // --- CSV contact import (with preview + machine-local import history) ---
 interface CsvImportPanelProps {
   store: Store;
-  updateStore: (s: Store) => Promise<void>;
+  updateStore: (s: Store) => Promise<SaveResult>;
 }
 
 // --- Contacts maintenance: clean names + find/merge duplicates ---
-function ContactsMaintenance({ store, updateStore }: { store: Store; updateStore: (s: Store) => Promise<void> }) {
+function ContactsMaintenance({ store, updateStore }: { store: Store; updateStore: (s: Store) => Promise<SaveResult> }) {
   const [status, setStatus] = useState<{ type: 'success' | 'info'; msg: string } | null>(null);
   const [groups, setGroups] = useState<DuplicateGroup[] | null>(null);
   const [busy, setBusy] = useState(false);
@@ -2085,7 +2085,7 @@ function CsvImportPanel({ store, updateStore }: CsvImportPanelProps) {
       const parse = parseContactsCsv(file.text, { mapping, applyTags, importFileTags });
       const { contacts, errors, warnings, totalDataRows } = parse;
       const result = applyContacts(store, contacts);
-      await updateStore(result.store);
+      const save = await updateStore(result.store);
       const entry = await recordImport({
         fileName: file.name,
         totalRows: totalDataRows,
@@ -2096,9 +2096,19 @@ function CsvImportPanel({ store, updateStore }: CsvImportPanelProps) {
         tagsCreated: result.tagsCreated,
         errorSamples: errors,
       });
-      console.info(`[CRM][import] "${file.name}": +${result.added} added, ${result.updated} updated, ${errors.length} errors, ${result.tagsCreated.length} tags created${applyTags.length ? `, applied ${applyTags.length} tag(s) to all` : ''}`);
+      console.info(`[CRM][import] "${file.name}": +${result.added} added, ${result.updated} updated, ${errors.length} errors, ${result.tagsCreated.length} tags created${applyTags.length ? `, applied ${applyTags.length} tag(s) to all` : ''}${save.ok ? '' : `, ${save.pending} shard(s) not synced`}`);
       setHistory((h) => [entry, ...h].slice(0, 50));
-      setStatus({ type: 'success', msg: `Imported "${file.name}": ${result.added} added, ${result.updated} updated${errors.length ? `, ${errors.length} skipped` : ''}.` });
+      const applied = `${result.added} added, ${result.updated} updated${errors.length ? `, ${errors.length} skipped` : ''}`;
+      if (save.ok) {
+        setStatus({ type: 'success', msg: `Imported "${file.name}": ${applied}.` });
+      } else if (save.itemLimitReached) {
+        // The contacts/tags are safely stored on this device, but Chrome sync's
+        // ~500-item ceiling stopped them syncing — this is exactly what Google
+        // Drive mode fixes. Surface it instead of falsely reporting success.
+        setStatus({ type: 'error', msg: `Imported "${file.name}" on this device (${applied}), but Chrome sync is full — ${save.pending} record(s) couldn't sync (the ~500-item limit). Connect Google Drive in Settings to store and sync more than ~500 contacts.` });
+      } else {
+        setStatus({ type: 'error', msg: `Imported "${file.name}" on this device (${applied}), but ${save.pending} record(s) couldn't sync to Chrome (${save.reason || 'write rejected'}). They'll retry on your next change.` });
+      }
       reset();
     } catch (err) {
       setStatus({ type: 'error', msg: `Import failed: ${String(err)}` });
