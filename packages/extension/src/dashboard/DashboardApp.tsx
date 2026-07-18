@@ -847,8 +847,8 @@ export default function DashboardApp() {
               </div>
             </div>
 
-            {/* Right: detail panel */}
-            <div style={{ flex: 1, minWidth: 0 }}>
+            {/* Right: detail panel — sticky so it stays pinned in view while the contact list scrolls */}
+            <div style={{ flex: 1, minWidth: 0, position: 'sticky', top: 16, alignSelf: 'flex-start', maxHeight: 'calc(100vh - 32px)', overflowY: 'auto' }}>
               {selectedConv ? (
                 <ConvDetail
                   conv={selectedConv}
