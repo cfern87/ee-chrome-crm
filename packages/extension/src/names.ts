@@ -53,6 +53,10 @@ export function cleanName(raw: string | null | undefined): string {
   s = s.replace(TRAILING_TIME, '').trim();
   // "Verified account" badge text, wherever it appears (before/after the name).
   s = s.replace(VERIFIED_BADGE, ' ').replace(/\s+/g, ' ').trim();
+  // Image alt text often reads "Jane Doe, profile picture" / "Jane Doe's profile
+  // photo" — drop the "profile/cover photo/picture" suffix so the name is clean.
+  s = s.replace(/[,'’]?\s*(?:['’]s)?\s*(?:profile|cover)\s+(?:photo|picture)s?\s*$/i, '').trim();
+  s = s.replace(/[\s,·•|–—-]+$/, '').trim();
   // Trailing status words ("Active now", "Sent").
   s = s.replace(new RegExp(`[\\s,·•|–—-]*${STATUS_WORDS.source}\\b.*$`, 'i'), '').trim();
   // Leftover trailing separators/punctuation.
@@ -163,54 +167,73 @@ function elementDepth(el: Element | null): number {
   return d;
 }
 
-// The best name-shaped string found anywhere inside `container`. Headings win
-// over loose spans; among spans the shortest plausible candidate wins (the
-// tight name span beats a longer bio/preview line).
+// The best name-shaped string found anywhere inside `container`, used to read
+// the profile owner's name out of the header block around the stat counters.
 function bestNameIn(container: Element): string {
+  // 1. A heading — the profile name is normally an <h1>.
   for (const el of Array.from(container.querySelectorAll('h1, h2, [role="heading"]'))) {
     const n = cleanName(el.textContent);
     if (looksLikeName(n)) return n;
   }
-  const cands = Array.from(container.querySelectorAll('span, div, a'))
-    .map((el) => cleanName(el.textContent))
-    .filter((t) => looksLikeName(t));
-  if (cands.length) {
-    cands.sort((a, b) => a.length - b.length);
-    return cands[0];
+  // 2. The profile photo's alt text is usually exactly the name.
+  for (const img of Array.from(container.querySelectorAll('img[alt]'))) {
+    const n = cleanName(img.getAttribute('alt'));
+    if (looksLikeName(n)) return n;
+  }
+  // 3. Fallback: the EARLIEST name-shaped text block in document order. The name
+  //    leads the profile header, ahead of the friends/education/location lines —
+  //    so position beats the shortest-string heuristic, which would otherwise
+  //    grab a short school or place name ("Texas State") over the real name.
+  for (const el of Array.from(container.querySelectorAll('span, div, a'))) {
+    const n = cleanName(el.textContent);
+    if (looksLikeName(n)) return n;
   }
   return '';
 }
+
+// A "<count> <statword>" fragment: "4.2K followers", "342 friends", "131 mutual",
+// "12 mutual friends". Not anchored to the whole string, so it matches even when
+// Facebook renders both counters in one line ("4.2K friends · 131 mutual") or
+// glues them next to other header text. Requiring the NUMBER keeps bare nav tab
+// labels ("Friends", "Followers") from matching.
+const STAT_COUNT =
+  /(?:^|[\s·•|(])\d[\d.,]*\s*[kmb]?\s+(?:followers|following|friends|mutual(?:\s+friends)?)\b/i;
 
 // Elements on the page that represent one of a profile's stat counters — the
 // bits of chrome that always sit in the profile header, right next to the name.
 // Facebook shows different ones depending on the profile and your relationship
 // to it: "followers" / "following" on creator-style profiles, "friends" /
-// "mutual friends" on personal ones. We match both the tab/link form (href like
-// /<user>/followers/) and a short text leaf ("1.2K followers", "342 friends",
-// "12 mutual friends"). Bounded text length so we grab the counter itself, not a
-// big container that merely contains it.
+// "mutual friends" on personal ones — and it may render them as separate leaves
+// or as one combined line.
 function collectStatEls(doc: Document): Element[] {
   const els: Element[] = [];
   const seen = new Set<Element>();
   const push = (el: Element | null) => { if (el && !seen.has(el)) { seen.add(el); els.push(el); } };
 
-  // Link form: /<user>/followers/, /following/, /friends/. ("mutual" has no
-  // dedicated link, so it's text-only below.)
+  // Elements whose own text carries a count fragment. Bounded length so we grab
+  // the counter line itself, not a big wrapper that merely contains it.
+  const raw: Element[] = [];
+  doc.querySelectorAll('a, span, div').forEach((el) => {
+    const t = (el.textContent || '').trim();
+    if (t.length > 0 && t.length <= 80 && STAT_COUNT.test(t)) raw.push(el);
+  });
+  // Keep only the tightest matches: drop an element if one of its descendants
+  // also matched (we want the leaf carrying the count, not its wrappers).
+  const rawSet = new Set(raw);
+  for (const el of raw) {
+    const hasMatchingDescendant = Array.from(el.querySelectorAll('a, span, div')).some((d) => rawSet.has(d));
+    if (!hasMatchingDescendant) push(el);
+  }
+  if (els.length) return els;
+
+  // Fallback for layouts with no count text visible: the stat tab/links by href
+  // (/<user>/followers/, /following/, /friends/).
   for (const kind of ['followers', 'following', 'friends'] as const) {
     const hrefRe = new RegExp(`/${kind}(?:[/?#]|$)`, 'i');
     doc.querySelectorAll('a[href]').forEach((a) => {
       if (hrefRe.test(a.getAttribute('href') || '')) push(a);
     });
   }
-
-  // Text form: "<count> <word>", e.g. "1.2K followers", "342 friends",
-  // "12 mutual friends" / "3 mutual".
-  const textRe = /^\s*\d[\d.,]*\s*[kmb]?\s+(?:followers|following|friends|mutual(?:\s+friends)?)\s*$/i;
-  doc.querySelectorAll('span, a, div').forEach((el) => {
-    const t = (el.textContent || '').trim();
-    if (t.length <= 40 && textRe.test(t)) push(el);
-  });
-
   return els;
 }
 

@@ -29,6 +29,7 @@ import {
   randMs,
   nextBatchTarget,
   NewCampaignInput,
+  SendFailureKind,
 } from './campaigns';
 
 const TICK_ALARM = 'crm-campaign-tick';
@@ -279,7 +280,7 @@ async function ensureSenderTab(chatUrl: string, log: string[]): Promise<number |
   return tabId!;
 }
 
-interface SendResult { ok: boolean; error?: string; log: string[] }
+interface SendResult { ok: boolean; error?: string; failureKind?: SendFailureKind; log: string[] }
 
 async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolean): Promise<SendResult> {
   const log: string[] = [];
@@ -298,7 +299,7 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
     payload: { threadId: r.threadId, message: r.renderedMessage, dryRun },
   }, 60_000);
   if (!res) return { ok: false, error: 'No response from content script (tab closed or send timed out)', log: [...log, 'send port closed without a response'] };
-  return { ok: res.ok, error: res.error, log: [...log, ...(res.log || [])] };
+  return { ok: res.ok, error: res.error, failureKind: res.failureKind, log: [...log, ...(res.log || [])] };
 }
 
 // ---- the orchestrator step ----
@@ -342,6 +343,7 @@ async function processTick(): Promise<void> {
     if (r.status === 'sending' && r.attempts >= MAX_ATTEMPTS) {
       r.status = 'error';
       r.error = 'Aborted after repeated interrupted attempts';
+      r.failedAt = Date.now();
       r.log = [...(r.log || []), `gave up after ${r.attempts} attempts`];
       camp.cursor = idx + 1;
       await upsertCampaign(camp);
@@ -376,12 +378,16 @@ async function processTick(): Promise<void> {
       rr.sentAt = Date.now();
       rr.batchIndex = b.index;
       rr.error = undefined;
+      rr.errorKind = undefined;
+      rr.failedAt = undefined;
       rr.log = result.log;
       b.count += 1;
       after.sentSinceBatchPause += 1;
     } else {
       rr.status = 'error';
       rr.error = result.error;
+      rr.errorKind = result.failureKind;
+      rr.failedAt = Date.now();
       rr.batchIndex = b.index;
       rr.log = result.log;
       // Errors don't count toward batch pacing — only confirmed sends do.
@@ -524,6 +530,8 @@ async function requeueCampaignRecipient(id: string, threadId: string): Promise<{
 
   c.recipients[idx].status = 'pending';
   c.recipients[idx].error = undefined;
+  c.recipients[idx].errorKind = undefined;
+  c.recipients[idx].failedAt = undefined;
   c.cursor = Math.min(c.cursor, idx);
 
   if (c.status === 'completed' || c.status === 'cancelled') {

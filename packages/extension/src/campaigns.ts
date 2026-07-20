@@ -33,6 +33,14 @@ export const DEFAULTS = {
 export type RecipientStatus = 'pending' | 'sending' | 'sent' | 'error';
 export type CampaignStatus = 'running' | 'paused' | 'completed' | 'cancelled';
 
+// Why a send failed, when the content script could actually diagnose it.
+// 'unavailable' means Facebook told us the recipient can't be messaged at all
+// (they blocked us, deactivated, or restricted who can reach them) — retrying
+// is pointless, which is worth saying differently in the UI from a generic
+// glitch. 'no-composer' is the undiagnosed case: the thread never rendered a
+// composer and we found no explanation on the page.
+export type SendFailureKind = 'unavailable' | 'no-composer';
+
 export interface CampaignRecipient {
   threadId: string;
   participantName: string;
@@ -43,6 +51,8 @@ export interface CampaignRecipient {
   sentAt?: number;              // when it was confirmed sent
   batchIndex?: number;          // which batch this send belonged to
   error?: string;               // short human-readable failure reason
+  errorKind?: SendFailureKind;  // machine-readable classification of `error`
+  failedAt?: number;            // when it was marked failed (drives the dashboard notice)
   log?: string[];               // detailed diagnostics (esp. for failures)
 }
 
@@ -236,4 +246,54 @@ export async function getCampaign(id: string): Promise<Campaign | null> {
 export async function getActiveCampaign(): Promise<Campaign | null> {
   const all = await loadCampaigns();
   return all.find((c) => c.status === 'running' || c.status === 'paused') || null;
+}
+
+// ---- Failed-message notice ----
+//
+// Campaigns run unattended in a background window, so a failure that happens
+// while the dashboard is closed would otherwise only be found by expanding the
+// right campaign in History. Instead we track when the user last acknowledged
+// the failure notice and surface everything that failed since.
+
+export const FAILED_NOTICE_ACK_KEY = 'facebook_crm_failed_notice_ack';
+
+export interface FailedSend {
+  campaignId: string;
+  campaignName: string;
+  threadId: string;
+  participantName: string;
+  error?: string;
+  errorKind?: SendFailureKind;
+  failedAt: number;
+}
+
+export async function getFailedNoticeAck(): Promise<number> {
+  const v = await localGet<number>(FAILED_NOTICE_ACK_KEY);
+  return typeof v === 'number' ? v : 0;
+}
+
+export async function setFailedNoticeAck(ts: number): Promise<void> {
+  await localSet(FAILED_NOTICE_ACK_KEY, ts);
+}
+
+// Failures the user hasn't acknowledged yet, newest first. Recipients that
+// failed before `failedAt` was recorded have no timestamp and count as already
+// seen, so upgrading the extension doesn't resurface old campaign history.
+export function collectUnseenFailures(campaigns: Campaign[], ackAt: number): FailedSend[] {
+  const out: FailedSend[] = [];
+  for (const c of campaigns) {
+    for (const r of c.recipients) {
+      if (r.status !== 'error' || !r.failedAt || r.failedAt <= ackAt) continue;
+      out.push({
+        campaignId: c.id,
+        campaignName: c.name,
+        threadId: r.threadId,
+        participantName: r.participantName,
+        error: r.error,
+        errorKind: r.errorKind,
+        failedAt: r.failedAt,
+      });
+    }
+  }
+  return out.sort((a, b) => b.failedAt - a.failedAt);
 }

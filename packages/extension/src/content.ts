@@ -21,6 +21,7 @@ import {
 import type { Store, Tag, Conversation } from './storage';
 import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
 import { extractNameFromLink, extractActiveThreadName, extractProfilePageName } from './names';
+import type { SendFailureKind } from './campaigns';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
 const COLORS = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E2'];
@@ -1018,6 +1019,10 @@ function init() {
   setTimeout(resolveImportedProfileOnThisPage, 2000);
   setInterval(resolveImportedProfileOnThisPage, 2500);
 
+  // Finish a legacy-link thread-id resolution that a page load interrupted
+  // (see applyPendingThreadResolve). No-op unless a marker is waiting.
+  void applyPendingThreadResolve();
+
   if (shouldShowLauncher()) {
     console.log('[CRM] On Messenger/profile page, building launcher...');
     buildLauncher();
@@ -1124,6 +1129,149 @@ function findComposer(): HTMLElement | null {
     if (isMessageComposer(el) && el.offsetParent !== null) return el;
   }
   return null;
+}
+
+// ---- Recovery when the composer never appears ----
+//
+// Three reasons a thread page can render without a composer, in the order we
+// check them: a stale link showing an interstitial, a recipient who can't be
+// messaged, or something we can't explain.
+
+// Facebook answers old/legacy Messenger links (the vanity-handle URLs that CSV
+// imports produce, links that have since been re-keyed, e2ee upgrades) with a
+// short confirmation page carrying a single "Continue" button instead of the
+// conversation — and the URL still holds the un-resolved id. Clicking through
+// loads the real thread, and with it the canonical numeric thread id.
+const CONTINUE_LABELS = ['continue', 'continue to messenger', 'open in messenger'];
+
+function findContinueButton(): HTMLElement | null {
+  const root = document.querySelector('[role="main"]') || document.body;
+  if (!root) return null;
+  for (const el of root.querySelectorAll<HTMLElement>('[role="button"], button, a')) {
+    if (el.offsetParent === null) continue; // not visible
+    const label = (el.innerText || el.textContent || '').trim().toLowerCase();
+    // Whole-label match only. Substring matching would happily hit an ancestor
+    // that wraps the entire page and click something arbitrary.
+    if (CONTINUE_LABELS.includes(label)) return el;
+  }
+  return null;
+}
+
+// Facebook renders an explanatory notice where the composer would be when the
+// recipient can't be reached — they blocked us, deactivated the account, or
+// restrict who may message them. The exact wording varies ("X isn't available
+// on Messenger", "You can't message this account"), so match on the shapes
+// rather than one fixed string.
+const UNAVAILABLE_PATTERNS: RegExp[] = [
+  /(?:is|isn['’]t|are|aren['’]t|not)\s+available\s+on\s+messenger/i,
+  /person\s+(?:is|isn['’]t)\s+(?:un)?available/i,
+  /you\s+can['’]?t\s+(?:message|reply\s+to)\s+this\s+(?:account|person|conversation)/i,
+  /can['’]?t\s+reply\s+to\s+this\s+conversation/i,
+  /you\s+can\s+no\s+longer\s+(?:message|reply)/i,
+];
+
+// Returns Facebook's own sentence when one of the notices is on screen, so the
+// campaign log and dashboard show their wording rather than our regex. Matching
+// is done per element and the *smallest* match wins: slicing a sentence out of
+// the whole pane's innerText drags in whatever unrelated text happens to sit
+// next to it (sidebar entries, headers), since these notices carry no reliable
+// punctuation to cut on.
+function detectUnavailableNotice(): string | null {
+  const root = (document.querySelector('[role="main"]') || document.body) as HTMLElement | null;
+  if (!root) return null;
+  const matches = (s: string) => UNAVAILABLE_PATTERNS.some((re) => re.test(s));
+  if (!matches(normalizeText(root.innerText || ''))) return null; // fast path: nothing on the page
+
+  let best: string | null = null;
+  for (const el of root.querySelectorAll<HTMLElement>('span, div, p, h1, h2, h3')) {
+    const text = normalizeText(el.textContent || '');
+    if (text.length === 0 || text.length > 200) continue;
+    if (!matches(text)) continue;
+    if (best === null || text.length < best.length) best = text;
+  }
+  return best ? best.slice(0, 160) : 'This person is not available on Messenger';
+}
+
+// The saved thread id we were asked to send to may be a legacy one that
+// Facebook resolves to a different canonical id. Remember that mapping so the
+// mismatch guard doesn't abort the next send to this contact.
+async function getResolvedThreadId(threadId: string): Promise<string | null> {
+  try {
+    const store = await getStore();
+    return store.conversations[threadId]?.resolvedThreadId || null;
+  } catch {
+    return null;
+  }
+}
+
+// Persist the canonical thread id we landed on after the Continue interstitial,
+// and point the contact's chat URL straight at it so the next send skips the
+// interstitial entirely. The store key stays as the originally captured id —
+// re-keying would orphan every campaign recipient that references it.
+async function saveResolvedThreadId(requestedThreadId: string, resolvedThreadId: string): Promise<boolean> {
+  if (!resolvedThreadId || resolvedThreadId === requestedThreadId) return false;
+  const store = await getStore();
+  const conv = store.conversations[requestedThreadId];
+  if (!conv) return false;
+  if (conv.resolvedThreadId === resolvedThreadId) return true; // already recorded
+  conv.resolvedThreadId = resolvedThreadId;
+  conv.participantId = resolvedThreadId;
+  conv.chatUrl = `https://www.facebook.com/messages/t/${resolvedThreadId}/`;
+  conv.updatedAt = Date.now();
+  await saveStore(store);
+  return true;
+}
+
+// Clicking Continue often triggers a full page load rather than an SPA
+// transition, which tears this content script down mid-send — so the resolved
+// id can't be saved by the code that did the clicking. A marker written
+// *before* the click lets the next script instance finish the job: if we come
+// back up on a real conversation under a different id, that's the resolution
+// we were after.
+const PENDING_RESOLVE_KEY = 'facebook_crm_pending_thread_resolve';
+const PENDING_RESOLVE_TTL_MS = 120_000;
+
+interface PendingResolve { threadId: string; at: number }
+
+function readPendingResolve(): Promise<PendingResolve | null> {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(PENDING_RESOLVE_KEY, (res) => {
+        if (chrome.runtime.lastError) { resolve(null); return; }
+        const v = res?.[PENDING_RESOLVE_KEY] as PendingResolve | undefined;
+        resolve(v && typeof v.threadId === 'string' && typeof v.at === 'number' ? v : null);
+      });
+    } catch { resolve(null); }
+  });
+}
+
+function writePendingResolve(v: PendingResolve | null): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      if (v) chrome.storage.local.set({ [PENDING_RESOLVE_KEY]: v }, () => { void chrome.runtime.lastError; resolve(); });
+      else chrome.storage.local.remove(PENDING_RESOLVE_KEY, () => { void chrome.runtime.lastError; resolve(); });
+    } catch { resolve(); }
+  });
+}
+
+// Run on load: finish a thread-id resolution that a page reload interrupted.
+async function applyPendingThreadResolve(): Promise<void> {
+  const pending = await readPendingResolve();
+  if (!pending) return;
+  if (Date.now() - pending.at > PENDING_RESOLVE_TTL_MS) { await writePendingResolve(null); return; }
+  if (!isMessagesPage()) return; // wrong page; the marker expires on its own
+
+  // Only trust the URL once a real conversation has rendered — otherwise we
+  // could record the id of the very interstitial we just clicked through.
+  const composer = await pollFor(() => findComposer(), 15_000, 400);
+  if (!composer) return; // leave the marker; a later load may still resolve it
+
+  const active = getActiveThreadId();
+  if (active && active !== pending.threadId) {
+    const saved = await saveResolvedThreadId(pending.threadId, active);
+    console.log('[CRM] Resolved legacy thread id after Continue:', pending.threadId, '→', active, 'saved:', saved);
+  }
+  await writePendingResolve(null);
 }
 
 function composerText(composer: HTMLElement): string {
@@ -1237,7 +1385,7 @@ function blockMicAccess(): () => void {
   return () => { md.getUserMedia = original; };
 }
 
-interface SendResult { ok: boolean; error?: string; log: string[] }
+interface SendResult { ok: boolean; error?: string; failureKind?: SendFailureKind; log: string[] }
 
 // Core send + validate routine. Returns ok only after CONFIRMING the message
 // text appears as a new bubble in the thread and the composer has cleared.
@@ -1271,14 +1419,57 @@ async function performAutomatedSend(threadId: string, rawMessage: string, dryRun
   //    URL is our last line of defence against sending to the wrong person).
   const active = getActiveThreadId();
   if (active && active !== threadId) {
-    return { ok: false, error: `Thread mismatch: on ${active}, expected ${threadId}`, log };
+    // Unless this contact's saved id is a legacy one we've already followed to
+    // its canonical thread — then landing on that other id is exactly right.
+    const resolved = await getResolvedThreadId(threadId);
+    if (active !== resolved) {
+      return { ok: false, error: `Thread mismatch: on ${active}, expected ${threadId}`, log };
+    }
+    stamp(`on resolved thread ${active} for saved id ${threadId}`);
   }
 
   // 2. Find the composer (poll — the thread view renders asynchronously).
-  const composer = await pollFor(() => findComposer(), 12_000, 300);
+  let composer = await pollFor(() => findComposer(), 12_000, 300);
   if (!composer) {
-    stamp('composer NOT found within 12s');
-    return { ok: false, error: 'Message composer not found', log };
+    stamp('composer NOT found within 12s — checking for a recoverable page state');
+
+    // 2a. Stale/legacy link: Facebook shows a "Continue" interstitial instead
+    //     of the thread and the URL still carries the un-resolved id. Click
+    //     through, then save whatever canonical id we land on.
+    const cont = findContinueButton();
+    if (cont) {
+      stamp('found Continue button — clicking to load the full conversation');
+      // Written before the click: if this turns into a full page load, this
+      // script dies here and the next instance finishes the resolution.
+      await writePendingResolve({ threadId, at: Date.now() });
+      cont.click();
+      composer = await pollFor(() => findComposer(), 15_000, 300);
+      stamp(`after Continue composerFound=${!!composer} url=${window.location.href}`);
+      if (composer) {
+        const resolved = getActiveThreadId();
+        if (resolved && resolved !== threadId) {
+          const saved = await saveResolvedThreadId(threadId, resolved);
+          stamp(`thread id resolved ${threadId} → ${resolved} (saved=${saved})`);
+        }
+        await writePendingResolve(null);
+      }
+    } else {
+      stamp('no Continue button on the page');
+    }
+
+    // 2b. Recipient can't be messaged (blocked us, deactivated, restricted).
+    //     Facebook puts an explanatory notice where the composer would be, so
+    //     there's nothing to retry — fail with their wording. Checked after
+    //     the Continue click too, since the interstitial can hide it.
+    if (!composer) {
+      const notice = detectUnavailableNotice();
+      if (notice) {
+        stamp(`recipient unavailable: ${notice}`);
+        return { ok: false, error: `Can't message this person — ${notice}`, failureKind: 'unavailable', log };
+      }
+      stamp('no Continue button and no unavailable notice — giving up');
+      return { ok: false, error: 'Message composer not found', failureKind: 'no-composer', log };
+    }
   }
   stamp('composer found');
 

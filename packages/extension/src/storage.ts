@@ -109,6 +109,12 @@ export interface Conversation {
   updatedAt: number;
   lastOpenedAt?: number;
   lastContactedAt?: number;
+  // The canonical thread id Facebook redirected us to when this contact's
+  // saved chat URL turned out to be a stale/legacy link (the kind that renders
+  // a "Continue" interstitial instead of the conversation). The store key and
+  // `id` stay as originally captured — campaign recipients and every other
+  // reference are keyed on those — so this records the real id separately.
+  resolvedThreadId?: string;
 }
 
 export interface Store {

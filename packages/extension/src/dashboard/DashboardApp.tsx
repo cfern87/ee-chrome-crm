@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled } from '../storage';
-import { Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS } from '../campaigns';
+import {
+  Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS,
+  FailedSend, collectUnseenFailures, getFailedNoticeAck, setFailedNoticeAck,
+} from '../campaigns';
 import {
   parseContactsCsv, applyContacts, contactsToCsv, sampleCsv,
   resolveThread, csvHeaders, detectMapping, MAPPABLE_FIELDS, Mapping, Field,
@@ -112,6 +115,25 @@ export default function DashboardApp() {
     const interval = setInterval(refreshCampaigns, 3000);
     return () => clearInterval(interval);
   }, [refreshCampaigns]);
+
+  // Failed-message notice. Campaigns run unattended in a background window, so
+  // failures that happened while this dashboard was closed get surfaced here on
+  // open rather than only inside an expanded campaign in History. `null` while
+  // the acknowledgement timestamp is still loading, so the banner can't flash
+  // up for failures the user already dismissed.
+  const [failedAck, setFailedAck] = useState<number | null>(null);
+  useEffect(() => { getFailedNoticeAck().then(setFailedAck).catch(() => setFailedAck(0)); }, []);
+
+  const unseenFailures: FailedSend[] = useMemo(
+    () => (failedAck === null ? [] : collectUnseenFailures(campaigns, failedAck)),
+    [campaigns, failedAck]
+  );
+
+  const dismissFailures = async () => {
+    const ts = Date.now();
+    setFailedAck(ts);
+    await setFailedNoticeAck(ts);
+  };
 
   const refresh = useCallback(async () => {
     const s = await loadStore();
@@ -523,6 +545,15 @@ export default function DashboardApp() {
 
       {/* Content */}
       <div style={{ maxWidth: 1100, margin: '0 auto', padding: '20px 16px' }}>
+
+        {/* Failed messages since this was last acknowledged */}
+        {unseenFailures.length > 0 && (
+          <FailedSendsNotice
+            failures={unseenFailures}
+            onDismiss={dismissFailures}
+            onReview={() => setActiveTab('history')}
+          />
+        )}
 
         {/* Stats row */}
         {activeTab === 'conversations' && (
@@ -2860,6 +2891,64 @@ function CopyButton({ text }: { text: string }) {
     >
       {copied ? 'Copied ✓' : 'Copy'}
     </button>
+  );
+}
+
+// Banner for messages that failed while nobody was watching. Blocked/
+// unavailable recipients are called out separately: those never succeed on a
+// retry, so requeueing them is wasted effort.
+function FailedSendsNotice({ failures, onDismiss, onReview }: { failures: FailedSend[]; onDismiss: () => void; onReview: () => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const unavailable = failures.filter((f) => f.errorKind === 'unavailable');
+  const shown = expanded ? failures : failures.slice(0, 5);
+
+  return (
+    <div style={{ background: '#fff6f6', border: '1px solid #fecaca', borderRadius: 10, padding: '14px 18px', marginBottom: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={{ fontSize: 16 }}>⚠️</span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 14, color: '#b42318' }}>
+            {failures.length} message{failures.length !== 1 ? 's' : ''} failed to send
+          </div>
+          {unavailable.length > 0 && (
+            <div style={{ fontSize: 12, color: '#8a3a2f', marginTop: 2 }}>
+              {unavailable.length} because the recipient isn't available on Messenger (blocked, deactivated, or restricted) — retrying won't help.
+            </div>
+          )}
+        </div>
+        <button
+          onClick={onReview}
+          style={{ background: '#fff', color: '#b42318', border: '1px solid #fecaca', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+        >
+          Review in History
+        </button>
+        <button
+          onClick={onDismiss}
+          title="Dismiss — these won't be shown again"
+          style={{ background: 'none', border: 'none', color: '#a1655d', fontSize: 13, cursor: 'pointer', padding: 4, lineHeight: 1 }}
+        >
+          ✕
+        </button>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 10 }}>
+        {shown.map((f) => (
+          <div key={f.campaignId + f.threadId} style={{ fontSize: 12, color: '#7a3b33', display: 'flex', gap: 8 }}>
+            <span style={{ fontWeight: 600, flexShrink: 0 }}>{f.participantName || f.threadId}</span>
+            <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.error || 'Unknown error'}</span>
+            <span style={{ color: '#b0837c', flexShrink: 0 }}>{formatRelativeTime(f.failedAt)}</span>
+          </div>
+        ))}
+        {failures.length > shown.length && (
+          <button
+            onClick={() => setExpanded(true)}
+            style={{ alignSelf: 'flex-start', background: 'none', border: 'none', color: '#b42318', fontSize: 12, fontWeight: 600, cursor: 'pointer', padding: '2px 0' }}
+          >
+            Show {failures.length - shown.length} more
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
 
