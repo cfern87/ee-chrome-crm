@@ -3,11 +3,13 @@ import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, lo
 import {
   Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS,
   FailedSend, collectUnseenFailures, getFailedNoticeAck, setFailedNoticeAck,
+  failureKey, getClearedFailures, setClearedFailures, collectFailureKeys,
 } from '../campaigns';
 import {
   parseContactsCsv, applyContacts, contactsToCsv, sampleCsv,
   resolveThread, csvHeaders, detectMapping, MAPPABLE_FIELDS, Mapping, Field,
   loadImportHistory, recordImport, ImportHistoryEntry,
+  normalizeProfileUrl, extractThreadFromProfileUrl,
 } from '../csv';
 import { mergeConversations, findDuplicateGroups, cleanStoredNames, pickPrimary, DuplicateGroup } from '../contacts';
 import { isDriveConfigured, getDriveStatus, connectDrive, disconnectDrive, getAuthRedirectUri, readStore as driveReadStore, writeStore as driveWriteStore, DriveStatus } from '../drive';
@@ -122,17 +124,30 @@ export default function DashboardApp() {
   // the acknowledgement timestamp is still loading, so the banner can't flash
   // up for failures the user already dismissed.
   const [failedAck, setFailedAck] = useState<number | null>(null);
+  const [clearedFailures, setClearedFailuresState] = useState<string[]>([]);
   useEffect(() => { getFailedNoticeAck().then(setFailedAck).catch(() => setFailedAck(0)); }, []);
+  useEffect(() => { getClearedFailures().then(setClearedFailuresState).catch(() => setClearedFailuresState([])); }, []);
 
   const unseenFailures: FailedSend[] = useMemo(
-    () => (failedAck === null ? [] : collectUnseenFailures(campaigns, failedAck)),
-    [campaigns, failedAck]
+    () => (failedAck === null ? [] : collectUnseenFailures(campaigns, failedAck, new Set(clearedFailures))),
+    [campaigns, failedAck, clearedFailures]
   );
 
+  // Dismiss every current failure at once (bumps the ack timestamp).
   const dismissFailures = async () => {
     const ts = Date.now();
     setFailedAck(ts);
     await setFailedNoticeAck(ts);
+  };
+
+  // Clear a single person's failure from the notice, leaving the rest.
+  const clearFailure = async (f: FailedSend) => {
+    // Prune to keys that still correspond to a live failure, then add this one,
+    // so the cleared list stays bounded as campaigns age out of history.
+    const live = new Set(collectFailureKeys(campaigns));
+    const next = Array.from(new Set([...clearedFailures.filter((k) => live.has(k)), failureKey(f)]));
+    setClearedFailuresState(next);
+    await setClearedFailures(next);
   };
 
   const refresh = useCallback(async () => {
@@ -339,6 +354,64 @@ export default function DashboardApp() {
     await updateStore(next);
     if (selectedConv?.id === conv.id) setSelectedConv(updated);
     console.info(`[CRM] Renamed contact ${conv.id} → "${name}"`);
+  };
+
+  // Edit a contact's Facebook profile URL. Because the Messenger chat URL the
+  // messaging queue navigates to is derived from the profile URL, this also
+  // re-derives chatUrl so a corrected URL flows straight through to sending
+  // (the send/retry path reads the contact's current chatUrl from the store).
+  // Returns an error string to show inline, or null on success.
+  const setContactProfileUrl = async (conv: Conversation, rawUrl: string): Promise<string | null> => {
+    const trimmed = rawUrl.trim();
+
+    // Clearing the field removes the profile URL but leaves the existing chat
+    // URL alone — there's nothing to re-derive from, and blowing away a working
+    // chat link would be worse than keeping a now-orphaned one.
+    if (!trimmed) {
+      if (!conv.profileUrl) return null;
+      const updated = { ...conv, profileUrl: undefined, updatedAt: Date.now() };
+      const next = { ...store, conversations: { ...store.conversations, [conv.id]: updated } };
+      await updateStore(next);
+      if (selectedConv?.id === conv.id) setSelectedConv(updated);
+      return null;
+    }
+
+    const norm = normalizeProfileUrl(trimmed);
+    if (!norm) return "That doesn't look like a valid URL.";
+    if (norm === conv.profileUrl) return null; // no change
+
+    const thread = extractThreadFromProfileUrl(norm);
+    const updated: Conversation = {
+      ...conv,
+      profileUrl: norm,
+      // Re-derive the Messenger chat URL. If the new URL isn't a messageable
+      // profile (a page/group/etc.), keep the previous chat URL rather than
+      // wiping a link that may still work.
+      chatUrl: thread?.chatUrl ?? conv.chatUrl,
+      updatedAt: Date.now(),
+    };
+    // When the corrected URL points at a different thread than this contact was
+    // saved under, record it as the resolved thread id. The send path validates
+    // the thread it lands on against threadId OR resolvedThreadId, so without
+    // this a retry to the new URL would be rejected as a "thread mismatch".
+    if (thread && thread.threadId !== conv.id && thread.threadId !== conv.resolvedThreadId) {
+      updated.resolvedThreadId = thread.threadId;
+    }
+
+    const next = { ...store, conversations: { ...store.conversations, [conv.id]: updated } };
+    await updateStore(next);
+    if (selectedConv?.id === conv.id) setSelectedConv(updated);
+    console.info(`[CRM] Updated profile URL for ${conv.id} → ${norm}`);
+    return null;
+  };
+
+  // Edit a queued recipient's profile URL straight from the messaging history.
+  // Recipients are keyed by the contact's id, so this edits the underlying
+  // contact — the same source of truth the send/retry path reads.
+  const editRecipientProfileUrl = async (threadId: string, raw: string): Promise<string | null> => {
+    const conv = store.conversations[threadId];
+    if (!conv) return "This contact is no longer in your CRM, so its URL can't be edited here.";
+    return setContactProfileUrl(conv, raw);
   };
 
   const addTagToConv = async (conv: Conversation, tagId: string) => {
@@ -551,6 +624,7 @@ export default function DashboardApp() {
           <FailedSendsNotice
             failures={unseenFailures}
             onDismiss={dismissFailures}
+            onClear={clearFailure}
             onReview={() => setActiveTab('history')}
           />
         )}
@@ -896,6 +970,7 @@ export default function DashboardApp() {
                   onAddTag={(tagId) => addTagToConv(selectedConv, tagId)}
                   onSetCustomField={(fieldId, value) => setCustomField(selectedConv, fieldId, value)}
                   onRename={(name) => renameConversation(selectedConv, name)}
+                  onSetProfileUrl={(raw) => setContactProfileUrl(selectedConv, raw)}
                   onStartDelete={() => { setDeleteConfirm(selectedConv.id); setDeleteConfirm2(false); }}
                   onConfirmDelete1={() => setDeleteConfirm2(true)}
                   onCancelDelete={() => { setDeleteConfirm(null); setDeleteConfirm2(false); }}
@@ -966,6 +1041,7 @@ export default function DashboardApp() {
             campaigns={campaigns}
             onChanged={refreshCampaigns}
             store={store}
+            onEditProfileUrl={editRecipientProfileUrl}
             onViewProfile={(threadId) => {
               const conv = store.conversations[threadId];
               if (!conv) return;
@@ -981,6 +1057,61 @@ export default function DashboardApp() {
         )}
       </div>
     </div>
+  );
+}
+
+// Inline editor for a contact's Facebook profile URL. Shows the URL as a link
+// with an edit pencil; clicking swaps to an input with Save/Cancel. onSave
+// returns an error string to display inline, or null on success. Reused in the
+// contact detail pane and in the messaging queue so a wrong/changed URL can be
+// fixed right where a send failed, then requeued.
+function ProfileUrlEditor({ value, onSave, compact }: { value?: string; onSave: (raw: string) => Promise<string | null>; compact?: boolean }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const fs = compact ? 12 : 13;
+
+  const start = () => { setDraft(value || ''); setError(null); setEditing(true); };
+  const cancel = () => { setEditing(false); setError(null); };
+  const commit = async () => {
+    if (saving) return;
+    setSaving(true);
+    const err = await onSave(draft);
+    setSaving(false);
+    if (err) { setError(err); return; }
+    setEditing(false);
+  };
+
+  if (editing) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 1, minWidth: 0 }}>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <input
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') cancel(); }}
+            placeholder="https://facebook.com/username"
+            style={{ flex: 1, minWidth: 0, fontSize: fs, padding: '5px 8px', border: '1px solid #cfe0f5', borderRadius: 6, outline: 'none' }}
+          />
+          <button onClick={commit} disabled={saving} style={{ background: '#0a7c4a', color: '#fff', border: 'none', padding: '6px 10px', borderRadius: 6, fontWeight: 600, fontSize: fs - 1, cursor: saving ? 'default' : 'pointer', opacity: saving ? 0.6 : 1 }}>Save</button>
+          <button onClick={cancel} style={{ background: '#f5f5f5', color: '#555', border: '1px solid #ddd', padding: '6px 10px', borderRadius: 6, fontWeight: 600, fontSize: fs - 1, cursor: 'pointer' }}>Cancel</button>
+        </div>
+        {error && <span style={{ fontSize: 11, color: '#e53e3e' }}>{error}</span>}
+      </div>
+    );
+  }
+
+  return (
+    <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center', minWidth: 0, maxWidth: '100%' }}>
+      {value ? (
+        <a href={value} target="_blank" rel="noreferrer" style={{ color: '#065fd4', wordBreak: 'break-all', fontSize: fs }}>{value}</a>
+      ) : (
+        <span style={{ color: '#aaa', fontStyle: 'italic', fontSize: fs }}>No profile URL</span>
+      )}
+      <button onClick={start} title="Edit profile URL" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: fs, color: '#999', padding: 2, lineHeight: 1, flexShrink: 0 }}>✎</button>
+    </span>
   );
 }
 
@@ -1000,12 +1131,13 @@ interface ConvDetailProps {
   onAddTag: (tagId: string) => void;
   onSetCustomField: (fieldId: string, value: string) => void;
   onRename: (name: string) => void;
+  onSetProfileUrl: (raw: string) => Promise<string | null>;
   onStartDelete: () => void;
   onConfirmDelete1: () => void;
   onCancelDelete: () => void;
 }
 
-function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm2, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onSetCustomField, onRename, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
+function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm2, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onSetCustomField, onRename, onSetProfileUrl, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
   const availableTags = tags.filter((t) => !conv.tags.includes(t.id));
   const [addingTag, setAddingTag] = useState(false);
   const [editingName, setEditingName] = useState(false);
@@ -1194,21 +1326,22 @@ function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm
       )}
 
       {/* Contact fields */}
-      {(conv.email || conv.profileUrl || conv.fbUserId || conv.fbUsername) && (
-        <div style={{ marginBottom: 16 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: '#888', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Contact</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13, color: '#444' }}>
-            {conv.email && (
-              <div>✉️ <a href={`mailto:${conv.email}`} style={{ color: '#065fd4' }}>{conv.email}</a></div>
-            )}
-            {conv.profileUrl && (
-              <div>🔗 <a href={conv.profileUrl} target="_blank" rel="noreferrer" style={{ color: '#065fd4', wordBreak: 'break-all' }}>{conv.profileUrl}</a></div>
-            )}
-            {conv.fbUserId && <div>🆔 FB user id: <code style={{ background: '#f0f0f0', padding: '1px 5px', borderRadius: 4 }}>{conv.fbUserId}</code></div>}
-            {conv.fbUsername && <div>👤 FB username: <code style={{ background: '#f0f0f0', padding: '1px 5px', borderRadius: 4 }}>{conv.fbUsername}</code></div>}
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, color: '#888', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Contact</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13, color: '#444' }}>
+          {conv.email && (
+            <div>✉️ <a href={`mailto:${conv.email}`} style={{ color: '#065fd4' }}>{conv.email}</a></div>
+          )}
+          {/* Profile URL is always editable — it drives the chat URL the
+              messaging queue sends to, so a changed/broken one must be fixable. */}
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, minWidth: 0 }}>
+            <span style={{ flexShrink: 0 }}>🔗</span>
+            <ProfileUrlEditor value={conv.profileUrl} onSave={onSetProfileUrl} />
           </div>
+          {conv.fbUserId && <div>🆔 FB user id: <code style={{ background: '#f0f0f0', padding: '1px 5px', borderRadius: 4 }}>{conv.fbUserId}</code></div>}
+          {conv.fbUsername && <div>👤 FB username: <code style={{ background: '#f0f0f0', padding: '1px 5px', borderRadius: 4 }}>{conv.fbUsername}</code></div>}
         </div>
-      )}
+      </div>
 
       {/* Meta info */}
       <div style={{ fontSize: 12, color: '#bbb', marginTop: 8 }}>
@@ -2844,7 +2977,7 @@ function ActiveCampaignCard({ campaign, onChanged }: { campaign: Campaign; onCha
 //  Campaign history
 // =====================================================================
 
-function HistoryPanel({ campaigns, onChanged, store, onViewProfile }: { campaigns: Campaign[]; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void }) {
+function HistoryPanel({ campaigns, onChanged, store, onViewProfile, onEditProfileUrl }: { campaigns: Campaign[]; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null> }) {
   const sorted = campaigns.slice().sort((a, b) => b.createdAt - a.createdAt);
   if (sorted.length === 0) {
     return (
@@ -2855,7 +2988,7 @@ function HistoryPanel({ campaigns, onChanged, store, onViewProfile }: { campaign
   }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {sorted.map((c) => <CampaignHistoryCard key={c.id} campaign={c} onChanged={onChanged} store={store} onViewProfile={onViewProfile} />)}
+      {sorted.map((c) => <CampaignHistoryCard key={c.id} campaign={c} onChanged={onChanged} store={store} onViewProfile={onViewProfile} onEditProfileUrl={onEditProfileUrl} />)}
     </div>
   );
 }
@@ -2897,7 +3030,7 @@ function CopyButton({ text }: { text: string }) {
 // Banner for messages that failed while nobody was watching. Blocked/
 // unavailable recipients are called out separately: those never succeed on a
 // retry, so requeueing them is wasted effort.
-function FailedSendsNotice({ failures, onDismiss, onReview }: { failures: FailedSend[]; onDismiss: () => void; onReview: () => void }) {
+function FailedSendsNotice({ failures, onDismiss, onClear, onReview }: { failures: FailedSend[]; onDismiss: () => void; onClear: (f: FailedSend) => void; onReview: () => void }) {
   const [expanded, setExpanded] = useState(false);
   const unavailable = failures.filter((f) => f.errorKind === 'unavailable');
   const shown = expanded ? failures : failures.slice(0, 5);
@@ -2924,19 +3057,26 @@ function FailedSendsNotice({ failures, onDismiss, onReview }: { failures: Failed
         </button>
         <button
           onClick={onDismiss}
-          title="Dismiss — these won't be shown again"
-          style={{ background: 'none', border: 'none', color: '#a1655d', fontSize: 13, cursor: 'pointer', padding: 4, lineHeight: 1 }}
+          title="Clear all — none of these will be shown again"
+          style={{ background: 'none', border: '1px solid #fecaca', color: '#a1655d', fontSize: 12, fontWeight: 600, cursor: 'pointer', padding: '6px 10px', borderRadius: 6, lineHeight: 1 }}
         >
-          ✕
+          Clear all
         </button>
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 10 }}>
         {shown.map((f) => (
-          <div key={f.campaignId + f.threadId} style={{ fontSize: 12, color: '#7a3b33', display: 'flex', gap: 8 }}>
+          <div key={failureKey(f)} style={{ fontSize: 12, color: '#7a3b33', display: 'flex', gap: 8, alignItems: 'center' }}>
             <span style={{ fontWeight: 600, flexShrink: 0 }}>{f.participantName || f.threadId}</span>
             <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.error || 'Unknown error'}</span>
             <span style={{ color: '#b0837c', flexShrink: 0 }}>{formatRelativeTime(f.failedAt)}</span>
+            <button
+              onClick={() => onClear(f)}
+              title={`Clear ${f.participantName || 'this failure'} from this notice`}
+              style={{ background: 'none', border: 'none', color: '#a1655d', fontSize: 14, cursor: 'pointer', padding: '0 2px', lineHeight: 1, flexShrink: 0 }}
+            >
+              ✕
+            </button>
           </div>
         ))}
         {failures.length > shown.length && (
@@ -2952,7 +3092,7 @@ function FailedSendsNotice({ failures, onDismiss, onReview }: { failures: Failed
   );
 }
 
-function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile }: { campaign: Campaign; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void }) {
+function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile, onEditProfileUrl }: { campaign: Campaign; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null> }) {
   const [expanded, setExpanded] = useState(false);
   const sum = summarize(campaign);
 
@@ -3052,6 +3192,7 @@ function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile }: { ca
                 r={r}
                 conv={store.conversations[r.threadId]}
                 onViewProfile={() => onViewProfile(r.threadId)}
+                onEditProfileUrl={store.conversations[r.threadId] ? (raw) => onEditProfileUrl(r.threadId, raw) : undefined}
                 onRemove={canRemove && r.status !== 'sending' ? () => removeRecipient(r.threadId) : undefined}
                 onRequeue={r.status === 'error' ? () => requeueRecipient(r.threadId) : undefined}
               />
@@ -3063,11 +3204,15 @@ function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile }: { ca
   );
 }
 
-function RecipientRow({ r, conv, onViewProfile, onRemove, onRequeue }: { r: CampaignRecipient; conv?: Conversation; onViewProfile: () => void; onRemove?: () => void; onRequeue?: () => void }) {
+function RecipientRow({ r, conv, onViewProfile, onEditProfileUrl, onRemove, onRequeue }: { r: CampaignRecipient; conv?: Conversation; onViewProfile: () => void; onEditProfileUrl?: (raw: string) => Promise<string | null>; onRemove?: () => void; onRequeue?: () => void }) {
   const [open, setOpen] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
+  // Reveal the profile-URL editor by default for a failed send — a wrong or
+  // changed URL is the thing you most often need to fix before requeuing.
+  const [editingUrl, setEditingUrl] = useState(r.status === 'error');
   const hasLog = !!(r.log && r.log.length);
-  const chatUrl = r.chatUrl || conv?.chatUrl;
+  // Prefer the contact's current chat URL; the recipient snapshot can be stale.
+  const chatUrl = conv?.chatUrl || r.chatUrl;
 
   return (
     <div style={{ background: '#fafafa', borderRadius: 6, padding: '8px 10px' }}>
@@ -3088,6 +3233,15 @@ function RecipientRow({ r, conv, onViewProfile, onRemove, onRequeue }: { r: Camp
         >
           👤
         </button>
+        {onEditProfileUrl && (
+          <button
+            onClick={(e) => { e.stopPropagation(); setEditingUrl((v) => !v); }}
+            title="Edit profile URL used for sending"
+            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 13, padding: 2, lineHeight: 1, color: editingUrl ? '#065fd4' : undefined }}
+          >
+            🔗
+          </button>
+        )}
         {chatUrl && (
           <a
             href={chatUrl}
@@ -3139,6 +3293,12 @@ function RecipientRow({ r, conv, onViewProfile, onRemove, onRequeue }: { r: Camp
       </div>
       {r.error && (
         <div style={{ marginTop: 6, marginLeft: 18, fontSize: 12, color: '#e53e3e' }}>⚠️ {r.error}</div>
+      )}
+      {onEditProfileUrl && editingUrl && (
+        <div style={{ marginTop: 8, marginLeft: 18, display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+          <span style={{ fontSize: 11, fontWeight: 600, color: '#888', flexShrink: 0, paddingTop: 5 }}>Profile URL</span>
+          <ProfileUrlEditor value={conv?.profileUrl} onSave={onEditProfileUrl} compact />
+        </div>
       )}
       {open && hasLog && (
         <pre style={{ marginTop: 8, marginLeft: 18, background: '#1e1e1e', color: '#d4d4d4', padding: '10px 12px', borderRadius: 6, fontSize: 11, lineHeight: 1.5, overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>

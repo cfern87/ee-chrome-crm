@@ -282,13 +282,36 @@ async function ensureSenderTab(chatUrl: string, log: string[]): Promise<number |
 
 interface SendResult { ok: boolean; error?: string; failureKind?: SendFailureKind; log: string[] }
 
+// The chat URL to navigate to for a recipient. A campaign snapshots each
+// recipient's chatUrl at creation time, but a contact's Facebook profile/chat
+// URL can change (or was wrong to begin with) and the user may have corrected
+// it in the dashboard since. The CRM store is the source of truth, so always
+// prefer the contact's CURRENT chatUrl and fall back to the snapshot only when
+// the contact is gone. This is what makes a retry pick up an edited URL.
+async function resolveChatUrl(r: Campaign['recipients'][number], log: string[]): Promise<string | undefined> {
+  try {
+    const store = await loadStore();
+    const conv = store.conversations[r.threadId];
+    if (conv?.chatUrl) {
+      if (conv.chatUrl !== r.chatUrl) {
+        log.push(`using contact's current chat URL ${conv.chatUrl} (recipient snapshot was ${r.chatUrl || 'none'})`);
+      }
+      return conv.chatUrl;
+    }
+  } catch (e) {
+    log.push(`could not read current contact URL, using snapshot: ${String(e)}`);
+  }
+  return r.chatUrl;
+}
+
 async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolean): Promise<SendResult> {
   const log: string[] = [];
-  if (!r.chatUrl) {
-    return { ok: false, error: 'No saved chat URL for this contact', log: ['missing chatUrl — cannot navigate'] };
+  const chatUrl = await resolveChatUrl(r, log);
+  if (!chatUrl) {
+    return { ok: false, error: 'No saved chat URL for this contact', log: [...log, 'missing chatUrl — cannot navigate'] };
   }
-  log.push(`navigating to ${r.chatUrl}`);
-  const tabId = await ensureSenderTab(r.chatUrl, log);
+  log.push(`navigating to ${chatUrl}`);
+  const tabId = await ensureSenderTab(chatUrl, log);
   if (tabId == null) return { ok: false, error: 'Could not open/navigate sender tab', log };
 
   const ready = await waitForContentReady(tabId, r.threadId, log);

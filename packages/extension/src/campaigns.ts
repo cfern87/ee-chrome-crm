@@ -276,15 +276,51 @@ export async function setFailedNoticeAck(ts: number): Promise<void> {
   await localSet(FAILED_NOTICE_ACK_KEY, ts);
 }
 
+// Individually-cleared failures. The ack timestamp above dismisses everything at
+// once; this lets the user clear one person at a time from the notice instead.
+export const FAILED_NOTICE_CLEARED_KEY = 'facebook_crm_failed_notice_cleared';
+
+// Stable identity for a single failed send. `failedAt` is part of the key so a
+// FRESH failure by the same recipient (a later attempt, a new timestamp) still
+// surfaces rather than staying hidden under an earlier dismissal.
+export function failureKey(f: { campaignId: string; threadId: string; failedAt: number }): string {
+  return `${f.campaignId}|${f.threadId}|${f.failedAt}`;
+}
+
+export async function getClearedFailures(): Promise<string[]> {
+  const v = await localGet<string[]>(FAILED_NOTICE_CLEARED_KEY);
+  return Array.isArray(v) ? v : [];
+}
+
+export async function setClearedFailures(keys: string[]): Promise<void> {
+  await localSet(FAILED_NOTICE_CLEARED_KEY, keys);
+}
+
+// Keys for every failure currently on record (any error recipient), used to
+// prune the cleared list so it can't grow without bound as old campaigns age
+// out of history.
+export function collectFailureKeys(campaigns: Campaign[]): string[] {
+  const keys: string[] = [];
+  for (const c of campaigns) {
+    for (const r of c.recipients) {
+      if (r.status === 'error' && r.failedAt) {
+        keys.push(failureKey({ campaignId: c.id, threadId: r.threadId, failedAt: r.failedAt }));
+      }
+    }
+  }
+  return keys;
+}
+
 // Failures the user hasn't acknowledged yet, newest first. Recipients that
 // failed before `failedAt` was recorded have no timestamp and count as already
 // seen, so upgrading the extension doesn't resurface old campaign history.
-export function collectUnseenFailures(campaigns: Campaign[], ackAt: number): FailedSend[] {
+// `cleared` holds keys the user dismissed one-by-one (see failureKey).
+export function collectUnseenFailures(campaigns: Campaign[], ackAt: number, cleared: Set<string> = new Set()): FailedSend[] {
   const out: FailedSend[] = [];
   for (const c of campaigns) {
     for (const r of c.recipients) {
       if (r.status !== 'error' || !r.failedAt || r.failedAt <= ackAt) continue;
-      out.push({
+      const fs: FailedSend = {
         campaignId: c.id,
         campaignName: c.name,
         threadId: r.threadId,
@@ -292,7 +328,9 @@ export function collectUnseenFailures(campaigns: Campaign[], ackAt: number): Fai
         error: r.error,
         errorKind: r.errorKind,
         failedAt: r.failedAt,
-      });
+      };
+      if (cleared.has(failureKey(fs))) continue;
+      out.push(fs);
     }
   }
   return out.sort((a, b) => b.failedAt - a.failedAt);
