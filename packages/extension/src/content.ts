@@ -22,7 +22,8 @@ import {
 } from './storage';
 import type { Store, Tag, Conversation } from './storage';
 import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
-import { buildThreadIndex } from './contacts';
+import { buildThreadIndex, isUnboundOrphan, planOrphanBinds } from './contacts';
+import type { ThreadRow } from './contacts';
 import { extractNameFromLink, extractActiveThreadName, extractProfilePageName, looksLikeName } from './names';
 import type { SendFailureKind } from './campaigns';
 
@@ -387,6 +388,11 @@ async function injectSidebarTags() {
   lastInjectAt = Date.now();
   const store = await getStore();
   const links = document.querySelectorAll<HTMLAnchorElement>('a[href*="/t/"]');
+
+  // Repair legacy contacts before rendering, so their chips appear on this pass
+  // rather than the next one. No-op once everyone visible is bound, which is
+  // why it can sit in the hot path.
+  await bindOrphansByName(store, Array.from(links));
   // Only log when the link count changes, to avoid spamming the console
   // (this now runs on a periodic safety interval as well).
   if (links.length !== lastLoggedLinkCount) {
@@ -447,6 +453,85 @@ function scheduleSidebarInject() {
     injectSidebarTags();
   } else {
     sidebarDebounce = window.setTimeout(injectSidebarTags, MIN_GAP - sinceLast);
+  }
+}
+
+/**
+ * Apply planOrphanBinds (see ./contacts for the matching rules and why they are
+ * as strict as they are) to the rows currently on screen. Every bind is logged.
+ * Returns how many were made.
+ */
+async function bindOrphansByName(store: Store, links: HTMLAnchorElement[]): Promise<number> {
+  const byThread = new Map<string, HTMLAnchorElement>();
+  const rows: ThreadRow[] = [];
+  for (const link of links) {
+    const threadId = extractThreadId(link.href);
+    if (!threadId || byThread.has(threadId)) continue;
+    byThread.set(threadId, link);
+    rows.push({ threadId, name: extractNameFromLink(link) });
+  }
+  if (!rows.length) return 0;
+
+  const binds = planOrphanBinds(store, rows);
+  for (const { conversationId, threadId } of binds) {
+    const conv = store.conversations[conversationId];
+    if (!conv) continue;
+    conv.resolvedThreadId = threadId;
+    conv.participantId = threadId;
+    conv.chatUrl = buildChatUrl(threadId, byThread.get(threadId));
+    conv.updatedAt = Date.now();
+    console.log(`[CRM] Linked "${conv.participantName}" (${conv.id}) to thread ${threadId} by name`);
+  }
+
+  if (binds.length) await saveStore(store);
+  return binds.length;
+}
+
+// ---- Diagnostic: how well do sidebar rows line up with the CRM? ----
+//
+// Runs in the content script because it is the only place that can see BOTH the
+// store and the Messenger DOM. Read-only, and it reports through the same
+// planOrphanBinds the binder uses, so it can never drift from real behaviour.
+// Logs once per page load.
+async function diagnoseSidebarMatching(): Promise<void> {
+  if (!isMessagesPage()) return;
+  const store = await getStore();
+  const links = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href*="/t/"]'));
+  const convs = Object.values(store.conversations);
+  const orphans = convs.filter(isUnboundOrphan);
+
+  const seen = new Set<string>();
+  const rows: ThreadRow[] = [];
+  for (const link of links) {
+    const threadId = extractThreadId(link.href);
+    if (!threadId || seen.has(threadId)) continue;
+    seen.add(threadId);
+    rows.push({ threadId, name: extractNameFromLink(link) });
+  }
+
+  const pending = planOrphanBinds(store, rows);
+  const bindFor = new Map(pending.map((b) => [b.threadId, b.conversationId]));
+  const report = rows.map((r) => {
+    const hit = findConversationForThread(store, r.threadId);
+    return {
+      threadId: r.threadId,
+      numeric: /^\d+$/.test(r.threadId),
+      rowName: r.name,
+      inCrm: !!hit,
+      tags: hit ? hit.tags.length : 0,
+      pendingBindTo: bindFor.get(r.threadId) || '',
+    };
+  });
+  const matched = report.filter((r) => r.inCrm).length;
+  const unresolved = report.length - matched - pending.length;
+
+  console.log(
+    `[CRM-DIAG] rows=${report.length} contacts=${convs.length} unbound-orphans=${orphans.length}\n` +
+    `[CRM-DIAG] matched=${matched} · pending name-bind=${pending.length} · still unresolved=${unresolved}`,
+  );
+  console.table(report.slice(0, 30));
+  if (!report.length) {
+    console.warn('[CRM-DIAG] No /t/ conversation links found — either this is not the message list, or Facebook changed the row markup.');
   }
 }
 
@@ -1055,11 +1140,8 @@ function watchOutgoingMessages() {
 // navigation from the homepage into Messenger, which would otherwise never
 // inject the script). We only show the CRM UI on the Messenger pages.
 function isMessagesPage(): boolean {
-  const isMessengerDomain = window.location.hostname.includes('messenger.com');
-  const isMessagesPath = /^\/messages(\/|$)/.test(window.location.pathname);
-  const result = isMessengerDomain || isMessagesPath;
-  console.log('[CRM] isMessagesPage() -> hostname includes messenger.com?', isMessengerDomain, ', pathname matches /messages/?', isMessagesPath, ', result:', result);
-  return result;
+  return window.location.hostname.includes('messenger.com')
+    || /^\/messages(\/|$)/.test(window.location.pathname);
 }
 
 // Whether the CRM launcher/panel should be shown at all: Messenger threads
@@ -1211,7 +1293,12 @@ function init() {
     buildLauncher();
     console.log('[CRM] Launcher button element:', document.getElementById('fb-crm-launcher'));
     // First injection once the sidebar has had a moment to render (Messenger only).
-    if (isMessagesPage()) setTimeout(injectSidebarTags, 1500);
+    if (isMessagesPage()) {
+      setTimeout(injectSidebarTags, 1500);
+      // Read-only report on how rows line up with the CRM. Late enough that the
+      // list has hydrated and the store has loaded.
+      setTimeout(() => { void diagnoseSidebarMatching(); }, 5000);
+    }
   } else {
     console.log('[CRM] NOT on Messenger/profile page, skipping launcher');
   }
@@ -1223,13 +1310,13 @@ function init() {
   // constantly-mutating page. Both operations are idempotent and cheap.
   setInterval(() => {
     if (!shouldShowLauncher()) return;
-    console.log('[CRM] Safety interval: checking launcher... exists?', !!document.getElementById('fb-crm-launcher'));
     buildLauncher();        // no-op if it already exists; self-heals if removed
     const exists = document.getElementById('fb-crm-launcher');
     if (!exists) {
+      // Only worth saying when something is actually wrong — the routine
+      // "still there, injecting" chatter every 2s just buries real messages.
       console.warn('[CRM] Launcher button not found after buildLauncher() call!');
     } else if (isMessagesPage()) {
-      console.log('[CRM] Launcher exists, injecting tags...');
       injectSidebarTags();
     }
   }, 2000);

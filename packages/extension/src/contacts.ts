@@ -172,6 +172,70 @@ export function mergeConversations(store: Store, ids: string[], primaryId?: stri
   return { store: { ...store, conversations, notes }, mergedInto: merged.id, removed: others.length };
 }
 
+/**
+ * A contact no Messenger row can match by id: added from a vanity profile URL,
+ * so every id we hold for them is the username, never the id Facebook uses in
+ * the message list. `resolvedThreadId` marks one that has since been bound — it
+ * makes binding one-time and one-way per contact, so a later pass can never
+ * re-point someone already connected to a real thread.
+ */
+export function isUnboundOrphan(c: Conversation): boolean {
+  if (c.resolvedThreadId) return false;
+  return !threadAliases(c).some((a) => /^\d+$/.test(a));
+}
+
+/** One conversation row as seen in the Messenger sidebar. */
+export interface ThreadRow {
+  threadId: string;
+  name: string;
+}
+
+export interface OrphanBind {
+  conversationId: string;
+  threadId: string;
+}
+
+/**
+ * Decide which legacy contacts can be reconnected to a Messenger thread using
+ * the one signal a sidebar row and a stored contact share: the person's name.
+ *
+ * Deliberately conservative, because a wrong bind silently attaches someone
+ * else's tags to a real conversation:
+ *   * rows that already resolve by id are left alone;
+ *   * only unbound orphans are eligible — a contact with a numeric identity, or
+ *     one already bound, is never re-pointed by a name guess;
+ *   * the row's name must survive looksLikeName (no "Unknown", no previews);
+ *   * exactly one orphan may carry that name — ties are skipped, not guessed;
+ *   * each orphan is claimed at most once, so two rows can't both take it.
+ *
+ * Pure: returns the binds to apply, writes nothing.
+ */
+export function planOrphanBinds(store: Store, rows: ThreadRow[]): OrphanBind[] {
+  const index = buildThreadIndex(store);
+
+  const byName = new Map<string, Conversation[]>();
+  for (const c of Object.values(store.conversations)) {
+    if (!isUnboundOrphan(c)) continue;
+    const k = nameKey(c.participantName);
+    if (!k) continue;
+    byName.set(k, [...(byName.get(k) || []), c]);
+  }
+  if (!byName.size) return [];
+
+  const binds: OrphanBind[] = [];
+  for (const row of rows) {
+    if (!row.threadId) continue;
+    if (index.has(row.threadId.toLowerCase())) continue; // already reachable by id
+    if (!looksLikeName(row.name)) continue;
+    const k = nameKey(row.name);
+    const cands = byName.get(k) || [];
+    if (cands.length !== 1) continue;
+    binds.push({ conversationId: cands[0].id, threadId: row.threadId });
+    byName.delete(k); // claimed
+  }
+  return binds;
+}
+
 export interface DuplicateGroup {
   reason: 'identity' | 'name';
   ids: string[];
