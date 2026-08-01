@@ -17,6 +17,8 @@ import {
   loadStore as _loadStore,
   saveStore as _saveStore,
   isDriveEnabled,
+  addTagsTo,
+  removeTagsFrom,
 } from './storage';
 import type { Store, Tag, Conversation } from './storage';
 import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
@@ -235,6 +237,9 @@ let lastLoggedLinkCount = -1;
 // tag people straight from the message list.
 async function openPanelForThread(threadId: string, link?: HTMLAnchorElement) {
   if (!panelEl) buildLauncher();
+  // Reaching for this person from the sidebar is an explicit "I want them in
+  // the CRM", so it lifts any earlier removal.
+  removedThreads.delete(threadId);
   try {
     await ensureConversation(threadId, link);
   } catch (e) {
@@ -435,6 +440,7 @@ function enterPickMode() {
       exitPickMode();
 
       try {
+        removedThreads.delete(threadId);
         await ensureConversation(threadId, foundLink);
         currentPanelThreadId = threadId;
         if (panelEl) {
@@ -470,6 +476,18 @@ let editingName: string | null = null;
 // every render.
 const newTagDraft: { name: string; color: string } = { name: '', color: randomColor() };
 let newTagNameFocused = false;
+
+// Threads the user has explicitly removed from the CRM on this page. Without
+// it, auto-capture would re-create the contact on the very next panel render —
+// you'd delete someone and watch them walk straight back in. Cleared whenever
+// the user deliberately re-adds them (the "Add back" button, the sidebar "+"
+// button, or pick mode).
+const removedThreads = new Set<string>();
+
+// Two-step delete: the quiet footer link only *arms* the confirmation, and the
+// destructive click is a separate one. Module-scoped so a storage-driven
+// re-render can't disarm it (or leave it armed) mid-decision.
+let deleteArmed = false;
 
 function buildLauncher() {
   const existing = document.getElementById('fb-crm-launcher');
@@ -518,6 +536,7 @@ async function togglePanel() {
     panelEl.style.display = 'block';
     await renderPanel();
   } else {
+    deleteArmed = false; // never leave a delete armed behind a closed panel
     panelEl.style.display = 'none';
   }
 }
@@ -535,6 +554,9 @@ async function renderPanel() {
     const existing = findConversationForProfile(store, profileUrl);
     if (existing) threadId = existing.id;
   }
+  // Moving to a different contact always disarms a pending delete — an armed
+  // confirmation must never carry over onto someone else.
+  if (threadId !== lastRenderedThread) deleteArmed = false;
   currentPanelThreadId = threadId;
   lastRenderedThread = threadId;
 
@@ -582,8 +604,9 @@ async function renderPanel() {
   // instead of being added silently.
   const preStore = await getStore();
   const autoCapture = (preStore.settings as Record<string, unknown>)?.autoCapture !== false;
-  if (!autoCapture && !preStore.conversations[threadId]) {
-    const guessName = getActiveThreadName();
+  const wasRemoved = removedThreads.has(threadId);
+  if ((!autoCapture || wasRemoved) && !preStore.conversations[threadId]) {
+    const guessName = isProfilePage() ? extractProfilePageName() : getActiveThreadName();
     panelEl.innerHTML = `
       <div class="fb-crm-header">
         <span>Messenger CRM</span>
@@ -591,13 +614,15 @@ async function renderPanel() {
       </div>
       <div class="fb-crm-body">
         <div class="fb-crm-name-row"><div class="fb-crm-name">${escapeHtml(guessName)}</div></div>
-        <div class="fb-crm-muted" style="margin:6px 0 12px">Not saved yet · auto-capture is off.</div>
-        <button class="fb-crm-pick-btn" id="fb-crm-save-contact">➕ Save this contact</button>
+        <div class="fb-crm-muted" style="margin:6px 0 12px">${wasRemoved ? 'Removed from your CRM.' : 'Not saved yet · auto-capture is off.'}</div>
+        <button class="fb-crm-pick-btn" id="fb-crm-save-contact">➕ ${wasRemoved ? 'Add back to CRM' : 'Save this contact'}</button>
       </div>`;
     wireClose();
     panelEl.querySelector('#fb-crm-save-contact')?.addEventListener('click', async () => {
+      removedThreads.delete(threadId);
       await ensureConversation(threadId);
       renderPanel();
+      await injectSidebarTags();
     });
     return;
   }
@@ -642,6 +667,22 @@ async function renderPanel() {
         <input type="color" id="fb-crm-new-color" value="${newTagDraft.color}" />
         <button id="fb-crm-create">Add</button>
       </div>
+
+      <div class="fb-crm-footer">
+        ${deleteArmed ? `
+          <div class="fb-crm-confirm">
+            <div class="fb-crm-confirm-text">
+              Delete <strong>${escapeHtml(conv.participantName)}</strong> from your CRM? Their tags and history go too.
+            </div>
+            <div class="fb-crm-confirm-actions">
+              <button class="fb-crm-confirm-keep" id="fb-crm-delete-cancel">Keep</button>
+              <button class="fb-crm-confirm-yes" id="fb-crm-delete-confirm">Delete contact</button>
+            </div>
+          </div>
+        ` : `
+          <button class="fb-crm-remove" id="fb-crm-delete" title="Remove this contact from your CRM">Remove from CRM</button>
+        `}
+      </div>
     </div>`;
 
   wireClose();
@@ -662,6 +703,7 @@ async function renderPanel() {
 
 function wireClose() {
   panelEl?.querySelector('.fb-crm-close')?.addEventListener('click', () => {
+    deleteArmed = false; // never leave a delete armed behind a closed panel
     if (panelEl) panelEl.style.display = 'none';
   });
 }
@@ -674,8 +716,7 @@ function wirePanelActions(threadId: string) {
       const store = await getStore();
       const conv = store.conversations[threadId];
       if (!conv) return;
-      conv.tags = conv.tags.filter(t => t !== btn.dataset.remove!);
-      conv.updatedAt = Date.now();
+      store.conversations[threadId] = removeTagsFrom(conv, [btn.dataset.remove!]);
       await saveStore(store);
       await renderPanel();
       await injectSidebarTags();
@@ -687,8 +728,7 @@ function wirePanelActions(threadId: string) {
       const store = await getStore();
       const conv = store.conversations[threadId];
       if (!conv || conv.tags.includes(btn.dataset.add!)) return;
-      conv.tags.push(btn.dataset.add!);
-      conv.updatedAt = Date.now();
+      store.conversations[threadId] = addTagsTo(conv, [btn.dataset.add!]);
       await saveStore(store);
       await renderPanel();
       await injectSidebarTags();
@@ -705,7 +745,7 @@ function wirePanelActions(threadId: string) {
     const tag: Tag = { id: genId(), name, color: colorEl?.value || randomColor(), createdAt: Date.now() };
     store.tags[tag.id] = tag;
     const conv = store.conversations[threadId];
-    if (conv) { conv.tags.push(tag.id); conv.updatedAt = Date.now(); }
+    if (conv) store.conversations[threadId] = addTagsTo(conv, [tag.id]);
     // Reset the draft for the next tag (fresh random color, empty name).
     newTagDraft.name = '';
     newTagDraft.color = randomColor();
@@ -726,6 +766,32 @@ function wirePanelActions(threadId: string) {
   // Allow Enter key in the tag name input to create the tag
   nameInput?.addEventListener('keydown', e => {
     if (e.key === 'Enter') panelEl?.querySelector<HTMLButtonElement>('#fb-crm-create')?.click();
+  });
+
+  // Delete contact. Deliberately two clicks on two different controls: the
+  // quiet footer link only arms the confirmation, and the destructive button
+  // doesn't exist until then — so no single misplaced click can lose a contact.
+  panelEl.querySelector('#fb-crm-delete')?.addEventListener('click', async () => {
+    deleteArmed = true;
+    await renderPanel();
+  });
+
+  panelEl.querySelector('#fb-crm-delete-cancel')?.addEventListener('click', async () => {
+    deleteArmed = false;
+    await renderPanel();
+  });
+
+  panelEl.querySelector('#fb-crm-delete-confirm')?.addEventListener('click', async () => {
+    const store = await getStore();
+    const name = store.conversations[threadId]?.participantName || threadId;
+    delete store.conversations[threadId];
+    await saveStore(store);
+    deleteArmed = false;
+    // Keep auto-capture from immediately re-adding the person we just deleted.
+    removedThreads.add(threadId);
+    console.info(`[CRM] Removed contact ${threadId} ("${name}") from the CRM`);
+    await renderPanel();
+    await injectSidebarTags();
   });
 
   // Name edit button

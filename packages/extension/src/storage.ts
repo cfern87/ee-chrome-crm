@@ -22,6 +22,7 @@
 //     person costs a single write.
 
 import { readStore as driveReadStore, writeStore as driveWriteStore, mergeStores } from './drive';
+import type { SavedSearch } from './search';
 
 export const STORAGE_KEY = 'facebook_crm_store';
 
@@ -35,6 +36,7 @@ const CONV_PREFIX = 'c:';
 const TAG_PREFIX = 't:';
 const GROUP_PREFIX = 'g:';
 const FIELD_PREFIX = 'f:';
+const SEARCH_PREFIX = 'q:';
 const SETTINGS_KEY = 's';
 const NOTES_KEY = 'n';
 
@@ -84,6 +86,11 @@ export interface Conversation {
   lastMessage: string;
   lastMessageTime: number;
   tags: string[];
+  // When each tag was applied, keyed by tag id (epoch ms). Written by every
+  // tagging path so advanced search can filter on "tagged in the last N days"
+  // or "last tagged before X". Only tags applied since this was introduced have
+  // an entry — an absent entry means "date unknown", never "tagged at zero".
+  tagAddedAt?: Record<string, number>;
   chatUrl?: string;
   email?: string;
   // Facebook *profile* URL (distinct from chatUrl, which is a Messenger thread
@@ -122,6 +129,10 @@ export interface Store {
   tags: Record<string, Tag>;
   tagGroups: Record<string, TagGroup>;
   fieldDefs: Record<string, CustomFieldDef>;
+  // Named advanced-search presets. Sharded like tags rather than folded into
+  // `settings` so one edited preset costs one small sync write, and so a large
+  // saved query can't push the single settings item past the 8 KB item limit.
+  savedSearches: Record<string, SavedSearch>;
   notes: Record<string, unknown>;
   settings: Record<string, unknown>;
 }
@@ -131,9 +142,48 @@ export const EMPTY_STORE: Store = {
   tags: {},
   tagGroups: {},
   fieldDefs: {},
+  savedSearches: {},
   notes: {},
   settings: {},
 };
+
+// ---- Tag helpers ----
+//
+// Every tagging path goes through these so `tagAddedAt` stays in step with
+// `tags`. Both are pure: they return a new conversation and never mutate.
+
+/** Apply tags, stamping each newly-added one with `ts`. Existing tags keep their original stamp. */
+export function addTagsTo(conv: Conversation, tagIds: string[], ts = Date.now()): Conversation {
+  const added = tagIds.filter((id) => id && !conv.tags.includes(id));
+  if (added.length === 0) return conv;
+  const stamps = { ...(conv.tagAddedAt || {}) };
+  for (const id of added) stamps[id] = ts;
+  return { ...conv, tags: [...conv.tags, ...added], tagAddedAt: stamps, updatedAt: ts };
+}
+
+/** Remove tags and drop their timestamps, so a re-tag later reads as a fresh date. */
+export function removeTagsFrom(conv: Conversation, tagIds: string[], ts = Date.now()): Conversation {
+  const drop = new Set(tagIds);
+  if (!conv.tags.some((t) => drop.has(t))) return conv;
+  const stamps = { ...(conv.tagAddedAt || {}) };
+  for (const id of drop) delete stamps[id];
+  const next: Conversation = { ...conv, tags: conv.tags.filter((t) => !drop.has(t)), updatedAt: ts };
+  if (Object.keys(stamps).length) next.tagAddedAt = stamps;
+  else delete next.tagAddedAt;
+  return next;
+}
+
+/** Most recent tag application on this contact, or undefined when no dates are recorded. */
+export function lastTaggedAt(conv: Conversation): number | undefined {
+  const stamps = Object.values(conv.tagAddedAt || {});
+  return stamps.length ? Math.max(...stamps) : undefined;
+}
+
+/** Earliest recorded tag application on this contact. */
+export function firstTaggedAt(conv: Conversation): number | undefined {
+  const stamps = Object.values(conv.tagAddedAt || {});
+  return stamps.length ? Math.min(...stamps) : undefined;
+}
 
 function normalize(s: Partial<Store>): Store {
   return {
@@ -141,6 +191,7 @@ function normalize(s: Partial<Store>): Store {
     tags: s.tags || {},
     tagGroups: s.tagGroups || {},
     fieldDefs: s.fieldDefs || {},
+    savedSearches: s.savedSearches || {},
     notes: s.notes || {},
     settings: s.settings || {},
   };
@@ -158,7 +209,8 @@ function hasData(s: Store | null | undefined): s is Store {
 export function isCrmSyncKey(key: string): boolean {
   return key === SETTINGS_KEY || key === NOTES_KEY ||
     key.startsWith(CONV_PREFIX) || key.startsWith(TAG_PREFIX) ||
-    key.startsWith(GROUP_PREFIX) || key.startsWith(FIELD_PREFIX);
+    key.startsWith(GROUP_PREFIX) || key.startsWith(FIELD_PREFIX) ||
+    key.startsWith(SEARCH_PREFIX);
 }
 
 // ---- Liveness ----
@@ -274,7 +326,7 @@ function syncGetAll(): Promise<Store | null> {
     try {
       chrome.storage.sync.get(null, (items) => {
         if (!isExtensionAlive() || chrome.runtime.lastError || !items) { resolve(null); return; }
-        const store: Store = { conversations: {}, tags: {}, tagGroups: {}, fieldDefs: {}, notes: {}, settings: {} };
+        const store: Store = { conversations: {}, tags: {}, tagGroups: {}, fieldDefs: {}, savedSearches: {}, notes: {}, settings: {} };
         let found = false;
         for (const [key, val] of Object.entries(items)) {
           if (key.startsWith(CONV_PREFIX)) {
@@ -288,6 +340,9 @@ function syncGetAll(): Promise<Store | null> {
             found = true;
           } else if (key.startsWith(FIELD_PREFIX)) {
             store.fieldDefs[(val as CustomFieldDef).id] = val as CustomFieldDef;
+            found = true;
+          } else if (key.startsWith(SEARCH_PREFIX)) {
+            store.savedSearches[(val as SavedSearch).id] = val as SavedSearch;
             found = true;
           } else if (key === SETTINGS_KEY) {
             store.settings = (val as Record<string, unknown>) || {};
@@ -431,6 +486,17 @@ async function syncWriteDelta(store: Store): Promise<SyncWriteResult> {
   }
   for (const id of Object.keys(prev.fieldDefs)) {
     if (!store.fieldDefs[id]) toRemove.push(FIELD_PREFIX + id);
+  }
+
+  // Saved searches
+  for (const [id, sq] of Object.entries(store.savedSearches)) {
+    const prevSq = prev.savedSearches[id];
+    if (!prevSq || JSON.stringify(prevSq) !== JSON.stringify(sq)) {
+      toSet[SEARCH_PREFIX + id] = sq;
+    }
+  }
+  for (const id of Object.keys(prev.savedSearches)) {
+    if (!store.savedSearches[id]) toRemove.push(SEARCH_PREFIX + id);
   }
 
   // Settings / notes (single items)

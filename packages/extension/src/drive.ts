@@ -361,6 +361,7 @@ function normalizeStore(s: Partial<Store>): Store {
     tags: s.tags || {},
     tagGroups: s.tagGroups || {},
     fieldDefs: s.fieldDefs || {},
+    savedSearches: s.savedSearches || {},
     notes: s.notes || {},
     settings: s.settings || {},
   };
@@ -377,6 +378,7 @@ export function mergeStores(a: Store, b: Store): Store {
     tags: { ...a.tags },
     tagGroups: { ...a.tagGroups },
     fieldDefs: { ...a.fieldDefs },
+    savedSearches: { ...a.savedSearches },
     notes: { ...a.notes, ...b.notes },
     settings: { ...a.settings, ...b.settings },
   };
@@ -395,6 +397,10 @@ export function mergeStores(a: Store, b: Store): Store {
   for (const [id, f] of Object.entries(b.fieldDefs)) {
     const cur = out.fieldDefs[id];
     if (!cur || (f.createdAt || 0) >= (cur.createdAt || 0)) out.fieldDefs[id] = f;
+  }
+  for (const [id, sq] of Object.entries(b.savedSearches)) {
+    const cur = out.savedSearches[id];
+    if (!cur || (sq.updatedAt || 0) >= (cur.updatedAt || 0)) out.savedSearches[id] = sq;
   }
   return out;
 }

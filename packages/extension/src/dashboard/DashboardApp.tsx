@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled } from '../storage';
+import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, addTagsTo, removeTagsFrom, lastTaggedAt } from '../storage';
+import {
+  QueryGroup, SavedSearch, ArchiveScope, QueryContext,
+  emptyQuery, isQueryEmpty, filterByQuery, normalizeQuery, newSavedSearch, sortSavedSearches, describeQuery,
+} from '../search';
+import AdvancedSearch, { PinnedSearchChips } from './SearchBuilder';
 import {
   Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS,
   FailedSend, collectUnseenFailures, getFailedNoticeAck, setFailedNoticeAck,
@@ -23,6 +28,38 @@ function downloadText(filename: string, mime: string, content: string) {
   a.download = filename;
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+// Page numbers for the pager: always the first and last page plus a window
+// around the current one. `null` marks an elided run, rendered as "…".
+function pageWindow(current: number, total: number): (number | null)[] {
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i);
+  const wanted = new Set<number>([0, total - 1]);
+  for (let p = current - 1; p <= current + 1; p++) {
+    if (p >= 0 && p < total) wanted.add(p);
+  }
+  const out: (number | null)[] = [];
+  let prev = -1;
+  for (const p of Array.from(wanted).sort((a, b) => a - b)) {
+    if (prev >= 0 && p - prev > 1) out.push(null);
+    out.push(p);
+    prev = p;
+  }
+  return out;
+}
+
+function pagerBtnStyle(active: boolean, disabled: boolean): React.CSSProperties {
+  return {
+    minWidth: 26,
+    padding: '4px 7px',
+    borderRadius: 6,
+    fontSize: 11,
+    fontWeight: 600,
+    border: `1px solid ${active ? '#065fd4' : '#e0e0e0'}`,
+    background: active ? '#065fd4' : '#fff',
+    color: disabled ? '#ccc' : active ? '#fff' : '#555',
+    cursor: disabled ? 'not-allowed' : 'pointer',
+  };
 }
 
 function tsStamp(): string {
@@ -77,7 +114,13 @@ function formatRelativeTime(ts: number): string {
 
 type Tab = 'conversations' | 'messaging' | 'history' | 'tags' | 'fields' | 'settings';
 type DateFilter = 'all' | 'today' | 'week' | 'month';
-type SortBy = 'recent' | 'lastContacted' | 'lastOpened' | 'dateAdded' | 'tagCount' | 'name';
+type SortBy = 'recent' | 'lastContacted' | 'lastOpened' | 'dateAdded' | 'lastTagged' | 'tagCount' | 'name';
+
+// The query, plus the view settings a preset restores alongside it. Comparing
+// this against the applied preset's own signature is what lights up "Update".
+function viewSignature(query: QueryGroup, sortBy: SortBy, sortDir: 'asc' | 'desc', scope: ArchiveScope): string {
+  return JSON.stringify([query, sortBy, sortDir, scope]);
+}
 
 export default function DashboardApp() {
   const [store, setStore] = useState<Store>(EMPTY_STORE);
@@ -93,13 +136,24 @@ export default function DashboardApp() {
   const [newGroupColor, setNewGroupColor] = useState('#065fd4');
   const [loading, setLoading] = useState(true);
   const [filterTag, setFilterTag] = useState<string | null>(null);
-  const [showArchived, setShowArchived] = useState(false);
+  const [archiveScope, setArchiveScope] = useState<ArchiveScope>('active');
   const [dateFilter, setDateFilter] = useState<DateFilter>('all');
+
+  // Advanced (boolean) search. `presetBaseline` is the signature of the preset
+  // as it was applied, so edits since then can be offered as an update.
+  const [query, setQuery] = useState<QueryGroup>(emptyQuery);
+  const [showBuilder, setShowBuilder] = useState(false);
+  const [activePresetId, setActivePresetId] = useState<string | null>(null);
+  const [presetBaseline, setPresetBaseline] = useState<string | null>(null);
   const [sortBy, setSortBy] = useState<SortBy>('recent');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkTagMenu, setBulkTagMenu] = useState<'assign' | 'remove' | null>(null);
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
+
+  // Pagination of the contact list. `pageSize === 0` means "show everything".
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(50);
 
   const [syncUsage, setSyncUsage] = useState<SyncUsage | null>(null);
 
@@ -183,7 +237,9 @@ export default function DashboardApp() {
   const now = Date.now();
   const DAY = 24 * 60 * 60 * 1000;
 
-  const filtered = conversations.filter((c) => {
+  // Quick filters first (cheap), then the advanced query. The two compose:
+  // whatever the query says, the quick search box and tag chip still narrow it.
+  const quickFiltered = conversations.filter((c) => {
     // Search filter
     const matchesSearch =
       !search ||
@@ -194,7 +250,8 @@ export default function DashboardApp() {
     const matchesTag = !filterTag || c.tags.includes(filterTag);
 
     // Archive filter
-    const matchesArchived = showArchived === c.archived;
+    const matchesArchived =
+      archiveScope === 'all' ? true : archiveScope === 'archived' ? c.archived : !c.archived;
 
     // Date filter
     let matchesDate = true;
@@ -208,6 +265,14 @@ export default function DashboardApp() {
     return matchesSearch && matchesTag && matchesArchived && matchesDate;
   });
 
+  const queryCtx: QueryContext = {
+    now,
+    tags: store.tags,
+    tagGroups: store.tagGroups,
+    fieldDefs: store.fieldDefs,
+  };
+  const filtered = filterByQuery(quickFiltered, query, queryCtx);
+
   // Sort
   const dir = sortDir === 'asc' ? 1 : -1;
   filtered.sort((a, b) => {
@@ -218,6 +283,8 @@ export default function DashboardApp() {
         return dir * ((a.lastOpenedAt || 0) - (b.lastOpenedAt || 0));
       case 'dateAdded':
         return dir * ((a.createdAt || 0) - (b.createdAt || 0));
+      case 'lastTagged':
+        return dir * ((lastTaggedAt(a) || 0) - (lastTaggedAt(b) || 0));
       case 'tagCount':
         return dir * (a.tags.length - b.tags.length);
       case 'name':
@@ -229,6 +296,26 @@ export default function DashboardApp() {
   });
 
   const archived = conversations.filter((c) => c.archived);
+
+  // --- Pagination ---
+  // Bulk actions run on whatever is checked, so paging is also how you scope a
+  // bulk operation: "select this page" checks exactly the visible slice, and
+  // nothing outside it is touched.
+  const pageCount = pageSize === 0 ? 1 : Math.max(1, Math.ceil(filtered.length / pageSize));
+  const currentPage = Math.min(page, pageCount - 1);
+  const pageStart = pageSize === 0 ? 0 : currentPage * pageSize;
+  const pageEnd = pageSize === 0 ? filtered.length : Math.min(pageStart + pageSize, filtered.length);
+  const paged = filtered.slice(pageStart, pageEnd);
+  const pageIds = paged.map((c) => c.id);
+  const pageSelectedCount = pageIds.reduce((n, id) => (selectedIds.has(id) ? n + 1 : n), 0);
+  const offPageSelected = selectedIds.size - pageSelectedCount;
+
+  // Any change to the result set sends you back to page 1 — otherwise a
+  // narrower filter can leave you stranded on a page that no longer exists.
+  const pageResetKey = JSON.stringify([search, filterTag, archiveScope, dateFilter, query, sortBy, sortDir, pageSize]);
+  useEffect(() => { setPage(0); }, [pageResetKey]);
+  // Clamp when the list shrinks underneath us (e.g. after a bulk delete).
+  useEffect(() => { if (page !== currentPage) setPage(currentPage); }, [page, currentPage]);
 
   // Export the current filtered/sorted view as a re-importable CSV.
   const exportFilteredCsv = () => {
@@ -252,13 +339,20 @@ export default function DashboardApp() {
   // Bulk actions
   const selectedConvs = filtered.filter((c) => selectedIds.has(c.id));
 
-  const handleSelectAll = () => {
-    if (selectedIds.size === filtered.length) {
-      setSelectedIds(new Set());
+  // Check/uncheck exactly the contacts on the current page, leaving any
+  // selection made on other pages alone.
+  const handleSelectPage = () => {
+    const next = new Set(selectedIds);
+    if (pageIds.length > 0 && pageSelectedCount === pageIds.length) {
+      pageIds.forEach((id) => next.delete(id));
     } else {
-      setSelectedIds(new Set(filtered.map((c) => c.id)));
+      pageIds.forEach((id) => next.add(id));
     }
+    setSelectedIds(next);
   };
+
+  // Escape hatch for acting on the whole filtered set, not just this page.
+  const handleSelectAllMatching = () => setSelectedIds(new Set(filtered.map((c) => c.id)));
 
   const handleToggleSelect = (id: string) => {
     const next = new Set(selectedIds);
@@ -278,9 +372,7 @@ export default function DashboardApp() {
     const ts = Date.now();
     for (const id of selectedIds) {
       const c = nextConvs[id];
-      if (c && !c.tags.includes(tagId)) {
-        nextConvs[id] = { ...c, tags: [...c.tags, tagId], updatedAt: ts };
-      }
+      if (c) nextConvs[id] = addTagsTo(c, [tagId], ts);
     }
     await updateStore({ ...store, conversations: nextConvs });
     setBulkTagMenu(null);
@@ -291,9 +383,7 @@ export default function DashboardApp() {
     const ts = Date.now();
     for (const id of selectedIds) {
       const c = nextConvs[id];
-      if (c && c.tags.includes(tagId)) {
-        nextConvs[id] = { ...c, tags: c.tags.filter((t) => t !== tagId), updatedAt: ts };
-      }
+      if (c) nextConvs[id] = removeTagsFrom(c, [tagId], ts);
     }
     await updateStore({ ...store, conversations: nextConvs });
     setBulkTagMenu(null);
@@ -340,7 +430,7 @@ export default function DashboardApp() {
   };
 
   const removeTagFromConv = async (conv: Conversation, tagId: string) => {
-    const updated = { ...conv, tags: conv.tags.filter((t) => t !== tagId), updatedAt: Date.now() };
+    const updated = removeTagsFrom(conv, [tagId]);
     const next = { ...store, conversations: { ...store.conversations, [conv.id]: updated } };
     await updateStore(next);
     if (selectedConv?.id === conv.id) setSelectedConv(updated);
@@ -416,10 +506,90 @@ export default function DashboardApp() {
 
   const addTagToConv = async (conv: Conversation, tagId: string) => {
     if (conv.tags.includes(tagId)) return;
-    const updated = { ...conv, tags: [...conv.tags, tagId], updatedAt: Date.now() };
+    const updated = addTagsTo(conv, [tagId]);
     const next = { ...store, conversations: { ...store.conversations, [conv.id]: updated } };
     await updateStore(next);
     if (selectedConv?.id === conv.id) setSelectedConv(updated);
+  };
+
+  // --- Saved searches ---
+  const currentSignature = viewSignature(query, sortBy, sortDir, archiveScope);
+  const presetDirty = presetBaseline !== null && presetBaseline !== currentSignature;
+
+  const applyPreset = (preset: SavedSearch) => {
+    // Re-parse rather than trusting the stored shape: a preset can arrive from
+    // another machine, a restored backup, or a future version of the builder.
+    const q = normalizeQuery(preset.query);
+    const nextSort = (preset.sortBy as SortBy) || sortBy;
+    const nextDir = preset.sortDir || sortDir;
+    const nextScope = preset.archiveScope || 'active';
+    setQuery(q);
+    setSortBy(nextSort);
+    setSortDir(nextDir);
+    setArchiveScope(nextScope);
+    setActivePresetId(preset.id);
+    setPresetBaseline(viewSignature(q, nextSort, nextDir, nextScope));
+    setShowBuilder(true);
+  };
+
+  const clearPreset = () => {
+    setQuery(emptyQuery());
+    setActivePresetId(null);
+    setPresetBaseline(null);
+  };
+
+  const withViewSettings = (base: SavedSearch): SavedSearch => ({
+    ...base,
+    query: JSON.parse(JSON.stringify(query)),
+    sortBy,
+    sortDir,
+    archiveScope,
+    updatedAt: Date.now(),
+  });
+
+  const saveNewPreset = async (name: string) => {
+    const order = Object.keys(store.savedSearches).length;
+    const preset = withViewSettings(newSavedSearch(name, query, order));
+    await updateStore({ ...store, savedSearches: { ...store.savedSearches, [preset.id]: preset } });
+    setActivePresetId(preset.id);
+    setPresetBaseline(currentSignature);
+  };
+
+  const updateActivePreset = async () => {
+    const existing = activePresetId ? store.savedSearches[activePresetId] : null;
+    if (!existing) return;
+    const preset = withViewSettings(existing);
+    await updateStore({ ...store, savedSearches: { ...store.savedSearches, [preset.id]: preset } });
+    setPresetBaseline(currentSignature);
+  };
+
+  const patchPreset = async (id: string, patch: Partial<SavedSearch>) => {
+    const existing = store.savedSearches[id];
+    if (!existing) return;
+    const next = { ...existing, ...patch, updatedAt: Date.now() };
+    await updateStore({ ...store, savedSearches: { ...store.savedSearches, [id]: next } });
+  };
+
+  const deletePreset = async (id: string) => {
+    const next = { ...store.savedSearches };
+    delete next[id];
+    await updateStore({ ...store, savedSearches: next });
+    if (activePresetId === id) { setActivePresetId(null); setPresetBaseline(null); }
+  };
+
+  // Move a preset one slot up or down, renumbering the whole list so the orders
+  // stay dense even after deletions.
+  const reorderPreset = async (id: string, delta: number) => {
+    const ordered = sortSavedSearches(store.savedSearches);
+    const from = ordered.findIndex((p) => p.id === id);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= ordered.length) return;
+    const [moved] = ordered.splice(from, 1);
+    ordered.splice(to, 0, moved);
+    const ts = Date.now();
+    const next: Record<string, SavedSearch> = {};
+    ordered.forEach((p, i) => { next[p.id] = p.order === i ? p : { ...p, order: i, updatedAt: ts }; });
+    await updateStore({ ...store, savedSearches: next });
   };
 
   // --- Tags ---
@@ -444,8 +614,9 @@ export default function DashboardApp() {
     const nextTags = { ...store.tags };
     delete nextTags[tagId];
     const nextConvs = { ...store.conversations };
+    const ts = Date.now();
     for (const id in nextConvs) {
-      nextConvs[id] = { ...nextConvs[id], tags: nextConvs[id].tags.filter((t) => t !== tagId) };
+      nextConvs[id] = removeTagsFrom(nextConvs[id], [tagId], ts);
     }
     await updateStore({ ...store, tags: nextTags, conversations: nextConvs });
   };
@@ -646,6 +817,81 @@ export default function DashboardApp() {
           </div>
         )}
 
+        {/* Advanced search — full width above the two-column layout, since the
+            query builder needs more room than the 320px contact column. */}
+        {activeTab === 'conversations' && (
+          <>
+            <PinnedSearchChips
+              savedSearches={store.savedSearches}
+              activeId={activePresetId}
+              onApply={applyPreset}
+              onClear={clearPreset}
+              ctx={queryCtx}
+            />
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+              <button
+                onClick={() => setShowBuilder(!showBuilder)}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  border: `1px solid ${showBuilder || !isQueryEmpty(query) ? '#065fd4' : '#d8d8d8'}`,
+                  background: showBuilder ? '#065fd4' : '#fff',
+                  color: showBuilder ? '#fff' : '#065fd4',
+                  borderRadius: 6, padding: '6px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                }}
+              >
+                {showBuilder ? '▾' : '▸'} Advanced search
+                {!isQueryEmpty(query) && (
+                  <span
+                    style={{
+                      background: showBuilder ? 'rgba(255,255,255,0.25)' : '#e8f0fe',
+                      color: showBuilder ? '#fff' : '#065fd4',
+                      borderRadius: 8, padding: '1px 7px', fontSize: 11, fontWeight: 700,
+                    }}
+                  >
+                    on
+                  </span>
+                )}
+              </button>
+              {!isQueryEmpty(query) && !showBuilder && (
+                <span style={{ fontSize: 11, color: '#888', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {describeQuery(query, queryCtx)}
+                </span>
+              )}
+              {!isQueryEmpty(query) && (
+                <button
+                  onClick={clearPreset}
+                  style={{ marginLeft: 'auto', border: 'none', background: 'none', color: '#e53e3e', fontSize: 11, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+
+            {showBuilder && (
+              <AdvancedSearch
+                query={query}
+                onQueryChange={setQuery}
+                tags={store.tags}
+                tagGroups={store.tagGroups}
+                fieldDefs={store.fieldDefs}
+                savedSearches={store.savedSearches}
+                activePresetId={activePresetId}
+                dirty={presetDirty}
+                matchCount={filtered.length}
+                totalCount={conversations.length}
+                onApplyPreset={applyPreset}
+                onSaveNewPreset={saveNewPreset}
+                onUpdateActivePreset={updateActivePreset}
+                onRenamePreset={(id, name) => patchPreset(id, { name })}
+                onTogglePinPreset={(id) => patchPreset(id, { pinned: !store.savedSearches[id]?.pinned })}
+                onDeletePreset={deletePreset}
+                onReorderPreset={reorderPreset}
+              />
+            )}
+          </>
+        )}
+
         {/* Conversations tab */}
         {activeTab === 'conversations' && (
           <div style={{ display: 'flex', gap: 14 }}>
@@ -664,11 +910,16 @@ export default function DashboardApp() {
 
               {/* Advanced filters */}
               <div style={{ display: 'flex', gap: 8, marginBottom: 12, fontSize: 12, flexWrap: 'wrap' }}>
-                {/* Archive toggle */}
-                <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', padding: '6px 10px', background: '#f0f0f0', borderRadius: 6, fontWeight: 500 }}>
-                  <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} style={{ cursor: 'pointer' }} />
-                  Archived
-                </label>
+                {/* Archive scope */}
+                <select
+                  value={archiveScope}
+                  onChange={(e) => setArchiveScope(e.target.value as ArchiveScope)}
+                  style={{ padding: '6px 8px', border: '1px solid #d0d0d0', borderRadius: 6, fontSize: 12, cursor: 'pointer', background: '#fff' }}
+                >
+                  <option value="active">Active only</option>
+                  <option value="archived">Archived only</option>
+                  <option value="all">Active + archived</option>
+                </select>
 
                 {/* Date filter */}
                 <select
@@ -695,6 +946,7 @@ export default function DashboardApp() {
                   <option value="lastContacted">Last contacted</option>
                   <option value="lastOpened">Last opened</option>
                   <option value="dateAdded">Date added</option>
+                  <option value="lastTagged">Last tagged</option>
                   <option value="tagCount">Number of tags</option>
                   <option value="name">Name</option>
                 </select>
@@ -741,6 +993,11 @@ export default function DashboardApp() {
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
                     <span style={{ fontSize: 13, fontWeight: 600, color: '#065fd4' }}>
                       {selectedIds.size} selected
+                      {offPageSelected > 0 && (
+                        <span style={{ fontWeight: 500, color: '#5b7fa8' }}>
+                          {' '}· {offPageSelected} on other pages
+                        </span>
+                      )}
                     </span>
                     <button
                       onClick={() => { setSelectedIds(new Set()); setBulkTagMenu(null); setBulkDeleteConfirm(false); }}
@@ -841,21 +1098,32 @@ export default function DashboardApp() {
                 </div>
               )}
 
-              {/* Select all header */}
+              {/* Select-this-page header */}
               {filtered.length > 0 && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', background: '#fafafa', borderRadius: 6, marginBottom: 6, fontSize: 12 }}>
                   <input
                     type="checkbox"
                     ref={(el) => {
-                      if (el) el.indeterminate = selectedIds.size > 0 && selectedIds.size < filtered.length;
+                      if (el) el.indeterminate = pageSelectedCount > 0 && pageSelectedCount < pageIds.length;
                     }}
-                    checked={filtered.length > 0 && selectedIds.size === filtered.length}
-                    onChange={handleSelectAll}
+                    checked={pageIds.length > 0 && pageSelectedCount === pageIds.length}
+                    onChange={handleSelectPage}
                     style={{ cursor: 'pointer' }}
                   />
-                  <label style={{ flex: 1, cursor: 'pointer', fontWeight: 500, color: '#666' }} onClick={handleSelectAll}>
-                    {selectedIds.size > 0 ? `${selectedIds.size} selected` : 'Select all'}
+                  <label style={{ flex: 1, cursor: 'pointer', fontWeight: 500, color: '#666' }} onClick={handleSelectPage}>
+                    {pageSelectedCount > 0
+                      ? `${pageSelectedCount} of ${pageIds.length} on this page selected`
+                      : pageCount > 1 ? `Select this page (${pageIds.length})` : 'Select all'}
                   </label>
+                  {pageCount > 1 && selectedIds.size < filtered.length && (
+                    <button
+                      onClick={handleSelectAllMatching}
+                      title="Select every contact matching the current filters, across all pages"
+                      style={{ background: 'none', border: 'none', color: '#065fd4', fontSize: 11, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', padding: 0 }}
+                    >
+                      Select all {filtered.length}
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -864,12 +1132,27 @@ export default function DashboardApp() {
                 <span style={{ fontSize: 12, fontWeight: 600, color: '#555' }}>Contacts</span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <span style={{ fontSize: 12, color: '#aaa', fontWeight: 500 }}>
-                    {filtered.length} {filtered.length === 1 ? 'contact' : 'contacts'}
+                    {filtered.length === 0
+                      ? '0 contacts'
+                      : pageCount > 1
+                        ? `${pageStart + 1}–${pageEnd} of ${filtered.length}`
+                        : `${filtered.length} ${filtered.length === 1 ? 'contact' : 'contacts'}`}
                   </span>
+                  <select
+                    value={pageSize}
+                    onChange={(e) => setPageSize(Number(e.target.value))}
+                    title="Contacts per page"
+                    style={{ border: '1px solid #e0e0e0', borderRadius: 6, padding: '3px 4px', fontSize: 11, color: '#555', background: '#fff', cursor: 'pointer' }}
+                  >
+                    {[25, 50, 100, 250].map((n) => (
+                      <option key={n} value={n}>{n} / page</option>
+                    ))}
+                    <option value={0}>All</option>
+                  </select>
                   <button
                     onClick={exportFilteredCsv}
                     disabled={filtered.length === 0}
-                    title="Export the contacts currently shown (matching your search, tag, date and archive filters) as a CSV"
+                    title="Export the contacts currently shown (matching your advanced search, plus the search box, tag, date and archive filters) as a CSV"
                     style={{
                       background: filtered.length === 0 ? '#f0f0f0' : '#fff', color: filtered.length === 0 ? '#bbb' : '#065fd4',
                       border: '1px solid #cfe0f5', padding: '4px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600,
@@ -890,7 +1173,7 @@ export default function DashboardApp() {
                       : 'No results match your search.'}
                   </div>
                 )}
-                {filtered.map((conv) => {
+                {paged.map((conv) => {
                   const isDetailSelected = selectedConv?.id === conv.id;
                   const isBulkSelected = selectedIds.has(conv.id);
                   return (
@@ -950,6 +1233,35 @@ export default function DashboardApp() {
                   );
                 })}
               </div>
+
+              {/* Pager */}
+              {pageCount > 1 && (
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flexWrap: 'wrap', gap: 4, marginTop: 10, paddingTop: 10, borderTop: '1px solid #e8e8e8' }}>
+                  <button
+                    onClick={() => setPage(currentPage - 1)}
+                    disabled={currentPage === 0}
+                    style={pagerBtnStyle(false, currentPage === 0)}
+                  >
+                    ‹ Prev
+                  </button>
+                  {pageWindow(currentPage, pageCount).map((p, i) =>
+                    p === null ? (
+                      <span key={`gap-${i}`} style={{ color: '#bbb', fontSize: 11, padding: '0 2px' }}>…</span>
+                    ) : (
+                      <button key={p} onClick={() => setPage(p)} style={pagerBtnStyle(p === currentPage, false)}>
+                        {p + 1}
+                      </button>
+                    )
+                  )}
+                  <button
+                    onClick={() => setPage(currentPage + 1)}
+                    disabled={currentPage >= pageCount - 1}
+                    style={pagerBtnStyle(false, currentPage >= pageCount - 1)}
+                  >
+                    Next ›
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* Right: detail panel — sticky so it stays pinned in view while the contact list scrolls */}

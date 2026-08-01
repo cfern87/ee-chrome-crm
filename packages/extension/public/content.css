@@ -238,6 +238,77 @@
 }
 .fb-crm-new button:hover { background: #0a5bcc; }
 
+/* ---- Delete contact (panel footer) ---- */
+
+/* Deliberately quiet: a small, muted link tucked below a divider at the very
+   bottom of the panel, so it's findable but never in the way of tagging. It
+   only reads as destructive once you're hovering it. */
+.fb-crm-footer {
+  margin-top: 16px;
+  padding-top: 10px;
+  border-top: 1px solid #eceff2;
+}
+
+.fb-crm-remove {
+  display: block;
+  margin-left: auto;
+  padding: 3px 4px;
+  background: none;
+  border: none;
+  color: #b0b3b8;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.fb-crm-remove:hover { color: #e53e3e; text-decoration: underline; }
+
+/* Armed state — full width, red, and explicit about what is about to go. */
+.fb-crm-confirm {
+  background: #fff5f5;
+  border: 1px solid #f8caca;
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.fb-crm-confirm-text {
+  font-size: 12px;
+  line-height: 1.4;
+  color: #92302f;
+  margin-bottom: 9px;
+}
+.fb-crm-confirm-text strong { font-weight: 700; }
+
+.fb-crm-confirm-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.fb-crm-confirm-keep,
+.fb-crm-confirm-yes {
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.fb-crm-confirm-keep {
+  background: #fff;
+  border: 1px solid #d6d9dd;
+  color: #4b4f56;
+}
+.fb-crm-confirm-keep:hover { background: #f0f2f5; }
+
+.fb-crm-confirm-yes {
+  background: #e53e3e;
+  border: 1px solid #e53e3e;
+  color: #fff;
+}
+.fb-crm-confirm-yes:hover { background: #c92f2f; }
+
 /* ---- Sidebar chip injection ---- */
 
 [data-crm-chips] {

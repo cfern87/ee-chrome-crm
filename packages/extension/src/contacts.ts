@@ -58,8 +58,14 @@ export function mergeConversations(store: Store, ids: string[], primaryId?: stri
 
   const merged: Conversation = { ...primary };
   const tagSet = new Set(primary.tags);
+  // Keep the EARLIEST recorded date for each tag — the merged contact was first
+  // tagged whenever the oldest of the duplicates was.
+  const tagStamps: Record<string, number> = { ...(primary.tagAddedAt || {}) };
   for (const o of others) {
     for (const t of o.tags) tagSet.add(t);
+    for (const [t, ts] of Object.entries(o.tagAddedAt || {})) {
+      if (tagStamps[t] === undefined || ts < tagStamps[t]) tagStamps[t] = ts;
+    }
     merged.email = merged.email || o.email;
     merged.profileUrl = merged.profileUrl || o.profileUrl;
     merged.fbUserId = merged.fbUserId || o.fbUserId;
@@ -70,6 +76,7 @@ export function mergeConversations(store: Store, ids: string[], primaryId?: stri
     }
   }
   merged.tags = Array.from(tagSet);
+  if (Object.keys(tagStamps).length) merged.tagAddedAt = tagStamps;
 
   const maxOf = (pick: (c: Conversation) => number | undefined) =>
     present.reduce((m, c) => Math.max(m, pick(c) || 0), 0) || undefined;

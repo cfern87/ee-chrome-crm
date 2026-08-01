@@ -10,6 +10,13 @@ A powerful CRM system for managing Facebook Messenger conversations with advance
 - **Tag Management**: Create, edit, and delete tags with ease
 - **Usage Analytics**: See how many conversations each tag is used in
 
+### 🔍 Advanced Search
+- **Boolean query builder**: Combine conditions with AND / OR, nest groups, and negate any group — e.g. *Hot lead AND NOT (contacted in the last 30 days OR archived)*
+- **Search every field**: Name, last message, email, Facebook profile URL / username, Messenger chat URL, tags, tag groups, tag count, source, archive state, and your own custom fields
+- **Tag dates**: Filter on when a tag was applied — *last tagged over 60 days ago*, *tagged "Hot lead" in the last week*
+- **Rich operators**: contains / is / starts with / regex for text, ranges for numbers, relative and absolute windows for dates, has-any / has-all / has-none / is-exactly for tags
+- **Saved search presets**: Name and save any query (with its sort order and archive scope), pin the ones you use daily to a one-click bar, and update them in place as your process changes
+
 ### 💬 Bulk Messaging (Automated)
 - **Template messages**: Compose once with `{{name}}` / `{{firstName}}` personalization
 - **Pick recipients**: Select any set of saved contacts (or push a selection straight from the Conversations tab)
@@ -217,6 +224,7 @@ npm run dev
 
 ### Conversation Management
 - Search conversations by name or content
+- Advanced boolean search across every tracked field, with saved presets
 - View full conversation details
 - Add/remove tags from conversations
 - Archive conversations

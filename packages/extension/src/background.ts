@@ -17,7 +17,7 @@
 // periodic watchdog alarm self-heals any stall (e.g. if the worker was killed
 // mid-step).
 
-import { loadStore, saveStore, flushDriveIfDirty } from './storage';
+import { loadStore, saveStore, flushDriveIfDirty, removeTagsFrom } from './storage';
 import type { Store } from './storage';
 import {
   Campaign,
@@ -650,9 +650,9 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         case 'DELETE_TAG': {
           const store = await loadStore();
           delete store.tags[request.payload.tagId];
+          const ts = Date.now();
           for (const convId of Object.keys(store.conversations)) {
-            store.conversations[convId].tags =
-              store.conversations[convId].tags.filter((t) => t !== request.payload.tagId);
+            store.conversations[convId] = removeTagsFrom(store.conversations[convId], [request.payload.tagId], ts);
           }
           await saveStore(store);
           sendResponse({ success: true });

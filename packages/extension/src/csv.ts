@@ -524,6 +524,10 @@ export function applyContacts(store: Store, contacts: ParsedContact[]): ApplyRes
       const prev = conversations[existingId];
       // Only fill fields that are currently empty — never clobber data the user
       // may have curated, or a real thread id/chat URL captured from Messenger.
+      // Tags coming in from the CSV are stamped with the import time; tags the
+      // contact already had keep their original date.
+      const newTagStamps: Record<string, number> = { ...(prev.tagAddedAt || {}) };
+      for (const t of tagIds) if (!prev.tags.includes(t)) newTagStamps[t] = now;
       const next: Conversation = {
         ...prev,
         participantName: prev.participantName?.trim() || pc.name,
@@ -534,6 +538,7 @@ export function applyContacts(store: Store, contacts: ParsedContact[]): ApplyRes
         chatUrl: prev.chatUrl || thread?.chatUrl,
         participantId: prev.participantId || thread?.threadId || prev.id,
         tags: Array.from(new Set([...prev.tags, ...tagIds])),
+        ...(Object.keys(newTagStamps).length ? { tagAddedAt: newTagStamps } : {}),
         updatedAt: now,
       };
       conversations[existingId] = next;
@@ -552,6 +557,7 @@ export function applyContacts(store: Store, contacts: ParsedContact[]): ApplyRes
         lastMessage: '',
         lastMessageTime: now,
         tags: tagIds,
+        ...(tagIds.length ? { tagAddedAt: Object.fromEntries(tagIds.map((t) => [t, now])) } : {}),
         email: pc.email || undefined,
         profileUrl: pc.profileUrl || undefined,
         fbUserId: pc.fbUserId || undefined,
