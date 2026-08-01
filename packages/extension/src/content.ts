@@ -22,7 +22,8 @@ import {
 } from './storage';
 import type { Store, Tag, Conversation } from './storage';
 import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
-import { extractNameFromLink, extractActiveThreadName, extractProfilePageName } from './names';
+import { buildThreadIndex } from './contacts';
+import { extractNameFromLink, extractActiveThreadName, extractProfilePageName, looksLikeName } from './names';
 import type { SendFailureKind } from './campaigns';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
@@ -105,6 +106,9 @@ async function getStore(): Promise<Store> {
 
 async function saveStore(store: Store): Promise<void> {
   storeCache = store;
+  // Callers mutate conversations in place before saving, so the alias index
+  // built from the previous snapshot is now stale.
+  invalidateThreadIndex();
   lastSelfWriteAt = Date.now();
   if (await isDriveEnabled()) {
     const res = await sendBg<{ success?: boolean }>({ type: 'SET_STORE', payload: store });
@@ -142,10 +146,67 @@ function buildChatUrl(threadId: string, link?: HTMLAnchorElement): string {
   return `https://www.facebook.com/messages/t/${threadId}/`;
 }
 
+// ---- Thread identity resolution ----
+//
+// The alias logic itself lives in ./contacts (pure, testable). Here we only
+// memoize the index: sidebar injection resolves every visible row on each pass
+// and runs on a 2s safety interval, so rebuilding it per row would be
+// O(rows × contacts) of URL parsing on a page Facebook is already thrashing.
+// Invalidated on every write (saveStore) and every external change.
+let threadIndex: Map<string, Conversation> | null = null;
+let threadIndexFor: Store | null = null;
+
+function invalidateThreadIndex(): void {
+  threadIndex = null;
+  threadIndexFor = null;
+}
+
+/**
+ * The stored contact that owns `threadId`, matching on any of its aliases. An
+ * exact store-key hit always wins; alias matches are the fallback that lets a
+ * profile-added contact line up with their Messenger row.
+ */
+function findConversationForThread(store: Store, threadId: string): Conversation | null {
+  const direct = store.conversations[threadId];
+  if (direct) return direct;
+  if (!threadIndex || threadIndexFor !== store) {
+    threadIndex = buildThreadIndex(store);
+    threadIndexFor = store;
+  }
+  return threadIndex.get(threadId.toLowerCase()) || null;
+}
+
 async function ensureConversation(threadId: string, link?: HTMLAnchorElement): Promise<Conversation> {
   const store = await getStore();
   const chatUrl = buildChatUrl(threadId, link);
   let dirty = false;
+
+  // Someone already in the CRM under a different id (a vanity profile key, a
+  // legacy thread) — adopt this sidebar thread id onto that record instead of
+  // creating a duplicate.
+  const aliased = !store.conversations[threadId] ? findConversationForThread(store, threadId) : null;
+  if (aliased) {
+    if (aliased.resolvedThreadId !== threadId && aliased.id !== threadId) {
+      aliased.resolvedThreadId = threadId;
+      aliased.participantId = threadId;
+      dirty = true;
+    }
+    if (chatUrl !== aliased.chatUrl) {
+      aliased.chatUrl = chatUrl;
+      dirty = true;
+    }
+    // Only fill in a name here — the profile page we captured this contact from
+    // is a better name source than a sidebar row, so a good stored name stands.
+    if (link && !aliased.nameManual && !looksLikeName(aliased.participantName)) {
+      const name = getNameFromLink(link);
+      if (name !== 'Unknown' && aliased.participantName !== name) {
+        aliased.participantName = name;
+        dirty = true;
+      }
+    }
+    if (dirty) await saveStore(store);
+    return aliased;
+  }
 
   if (!store.conversations[threadId]) {
     const name = link ? getNameFromLink(link) : getActiveThreadName();
@@ -190,7 +251,21 @@ function findConversationForProfile(store: Store, profileUrl: string): Conversat
     }
   }
   const thread = extractThreadFromProfileUrl(profileUrl);
-  if (thread && store.conversations[thread.threadId]) return store.conversations[thread.threadId];
+  if (thread) {
+    const byUrlThread = findConversationForThread(store, thread.threadId);
+    if (byUrlThread) return byUrlThread;
+  }
+  // A vanity profile URL carries no numeric id, so a contact captured from
+  // Messenger (keyed on that numeric id, and with no profileUrl to match on)
+  // would look like a stranger here — and clicking "Add to CRM" would make a
+  // second copy of them. Read the numeric id off the page itself to catch it.
+  if (isProfilePage()) {
+    const pageThread = getProfilePageThreadId();
+    if (pageThread) {
+      const byPage = findConversationForThread(store, pageThread);
+      if (byPage) return byPage;
+    }
+  }
   return null;
 }
 
@@ -199,13 +274,34 @@ function findConversationForProfile(store: Store, profileUrl: string): Conversat
 // lines up with any Messenger-captured or imported copy of the same person.
 async function addProfileContact(profileUrl: string, name: string): Promise<Conversation> {
   const store = await getStore();
-  const existing = findConversationForProfile(store, profileUrl);
-  if (existing) return existing;
-
-  const thread = extractThreadFromProfileUrl(profileUrl);
   const norm = normalizeProfileUrl(profileUrl) || profileUrl;
+  const thread = extractThreadFromProfileUrl(profileUrl);
+  // The numeric fbid read off the page. This is the id the Messenger sidebar
+  // uses, so keying on it (rather than on a vanity username) is what keeps this
+  // contact and their message-list row the same person from the start.
+  const pageThread = isProfilePage() ? getProfilePageThreadId() : null;
+
+  const existing = findConversationForProfile(store, profileUrl);
+  if (existing) {
+    // Backfill the identity facets we can see from this page so the match is
+    // direct next time — and so the dashboard's duplicate finder links them.
+    let dirty = false;
+    if (!existing.profileUrl) { existing.profileUrl = norm; dirty = true; }
+    if (pageThread && existing.id !== pageThread && existing.resolvedThreadId !== pageThread) {
+      existing.resolvedThreadId = pageThread;
+      dirty = true;
+    }
+    if (pageThread && /^\d+$/.test(pageThread) && !existing.fbUserId) { existing.fbUserId = pageThread; dirty = true; }
+    if (thread && !thread.numeric && !existing.fbUsername) { existing.fbUsername = thread.threadId; dirty = true; }
+    if (dirty) {
+      existing.updatedAt = Date.now();
+      await saveStore(store);
+    }
+    return existing;
+  }
+
   const pk = profileKey(profileUrl) || Math.random().toString(36).slice(2);
-  const id = thread?.threadId || `imp_${pk.replace(/[^a-z0-9]+/gi, '_').slice(0, 40)}_${Math.random().toString(36).slice(2, 6)}`;
+  const id = pageThread || thread?.threadId || `imp_${pk.replace(/[^a-z0-9]+/gi, '_').slice(0, 40)}_${Math.random().toString(36).slice(2, 6)}`;
   const now = Date.now();
   const conv: Conversation = {
     id,
@@ -215,7 +311,9 @@ async function addProfileContact(profileUrl: string, name: string): Promise<Conv
     lastMessageTime: now,
     tags: [],
     profileUrl: norm,
-    chatUrl: thread?.chatUrl,
+    chatUrl: pageThread ? `https://www.facebook.com/messages/t/${pageThread}/` : thread?.chatUrl,
+    fbUserId: pageThread && /^\d+$/.test(pageThread) ? pageThread : undefined,
+    fbUsername: thread && !thread.numeric ? thread.threadId : undefined,
     source: 'import',
     archived: false,
     createdAt: now,
@@ -300,7 +398,10 @@ async function injectSidebarTags() {
     const threadId = extractThreadId(link.href);
     if (!threadId) return;
 
-    const conv = store.conversations[threadId];
+    // Resolve by alias, not just by store key: a contact first captured from
+    // their profile page is keyed on that profile's id, which differs from the
+    // /t/<id> Facebook uses here. Without this their chips never render.
+    const conv = findConversationForThread(store, threadId);
     const tags: Tag[] = conv
       ? (conv.tags.map(tid => store.tags[tid]).filter(Boolean) as Tag[])
       : [];
@@ -380,6 +481,7 @@ if (isExtensionAlive()) {
         (area === 'sync' && Object.keys(changes).some(isCrmSyncKey));
       if (!relevant) return;
       storeCache = null;
+      invalidateThreadIndex();
       scheduleSidebarInject();
       // Skip the panel rebuild if this change is the echo of our own save —
       // the action handlers already call renderPanel() explicitly when needed.
@@ -553,6 +655,17 @@ async function renderPanel() {
     const store = await getStore();
     const existing = findConversationForProfile(store, profileUrl);
     if (existing) threadId = existing.id;
+  }
+  // Bind the panel to the contact's real store key when the thread id in the URL
+  // is only one of their aliases. Every action below (tag add/remove, rename,
+  // delete) writes through store.conversations[threadId], so an unresolved id
+  // would leave those handlers editing a record that isn't there.
+  if (threadId) {
+    const store = await getStore();
+    if (!store.conversations[threadId]) {
+      const owner = findConversationForThread(store, threadId);
+      if (owner) threadId = owner.id;
+    }
   }
   // Moving to a different contact always disarms a pending delete — an armed
   // confirmation must never carry over onto someone else.
@@ -1059,6 +1172,10 @@ async function resolveImportedProfileOnThisPage(): Promise<void> {
     if (!conv.chatUrl || (numeric && conv.chatUrl !== chatUrl)) {
       conv.chatUrl = chatUrl;
       conv.participantId = threadId;
+      // Record the canonical id separately when it differs from the key we
+      // captured (a vanity profile key). This is what lets the Messenger
+      // sidebar — which only ever sees the numeric id — find this contact.
+      if (threadId !== conv.id) conv.resolvedThreadId = threadId;
       conv.updatedAt = Date.now();
       dirty = true;
       console.log('[CRM] Resolved imported contact thread id from profile:', conv.participantName, '→', threadId);

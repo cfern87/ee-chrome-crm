@@ -3,13 +3,65 @@
 // can run from the dashboard.
 
 import { Store, Conversation } from './storage';
-import { profileKey } from './csv';
+import { profileKey, extractThreadFromProfileUrl } from './csv';
 import { cleanName, looksLikeName, nameKey } from './names';
 
 /** Thread id embedded in a Messenger chat URL, if any. */
 function chatUrlThread(url: string | undefined): string | null {
   const m = (url || '').match(/\/t\/([^/?#]+)/);
   return m ? m[1].toLowerCase() : null;
+}
+
+// ---------------------------------------------------------------------------
+// Thread identity resolution
+// ---------------------------------------------------------------------------
+//
+// A contact's STORE KEY is whatever id we captured first, and that is not always
+// the id Facebook puts in a Messenger sidebar row's /t/<id> href:
+//
+//   * Added from a vanity profile (facebook.com/john.doe) → key "john.doe",
+//     while that person's Messenger row is /t/6123456789.
+//   * Added from profile.php?id=N or CSV → key N, which usually DOES match.
+//   * A legacy thread Facebook redirected → resolvedThreadId holds the canonical
+//     id while the key stays as captured.
+//
+// Looking a row up by its href id alone therefore misses the contact — which is
+// what made tags vanish from the message list and made the row's "+" button
+// create a second copy of someone already in the CRM. These map every id a
+// contact can answer to back onto their record. The store key is never
+// rewritten: campaign recipients and notes reference it.
+
+/** Every thread id `conv` can legitimately be reached by, lowercased. */
+export function threadAliases(conv: Conversation): string[] {
+  const out: (string | undefined)[] = [
+    conv.id,
+    conv.participantId,
+    conv.resolvedThreadId,
+    conv.fbUserId,
+    conv.fbUsername,
+  ];
+  const fromChat = chatUrlThread(conv.chatUrl);
+  if (fromChat) out.push(fromChat);
+  const fromProfile = extractThreadFromProfileUrl(conv.profileUrl);
+  if (fromProfile) out.push(fromProfile.threadId);
+  return out.filter((s): s is string => !!s).map((s) => s.toLowerCase());
+}
+
+/**
+ * Index every thread id in `store` onto its contact. Store keys are indexed
+ * first so a direct hit can never be shadowed by someone else's alias; among
+ * aliases, the first writer wins.
+ */
+export function buildThreadIndex(store: Store): Map<string, Conversation> {
+  const index = new Map<string, Conversation>();
+  const convs = Object.values(store.conversations);
+  for (const conv of convs) index.set(conv.id.toLowerCase(), conv);
+  for (const conv of convs) {
+    for (const alias of threadAliases(conv)) {
+      if (!index.has(alias)) index.set(alias, conv);
+    }
+  }
+  return index;
 }
 
 /**
@@ -71,12 +123,23 @@ export function mergeConversations(store: Store, ids: string[], primaryId?: stri
     merged.fbUserId = merged.fbUserId || o.fbUserId;
     merged.fbUsername = merged.fbUsername || o.fbUsername;
     merged.chatUrl = merged.chatUrl || o.chatUrl;
+    merged.resolvedThreadId = merged.resolvedThreadId || o.resolvedThreadId;
     if (!looksLikeName(merged.participantName) && looksLikeName(o.participantName)) {
       merged.participantName = o.participantName;
     }
   }
   merged.tags = Array.from(tagSet);
   if (Object.keys(tagStamps).length) merged.tagAddedAt = tagStamps;
+
+  // The keys we're about to drop are real thread ids Facebook still uses — the
+  // Messenger sidebar looks contacts up by them. Losing the numeric one here
+  // would make the merged contact's tags disappear from the message list all
+  // over again, so keep a numeric survivor as the canonical thread id.
+  if (!merged.resolvedThreadId || !/^\d+$/.test(merged.resolvedThreadId)) {
+    const numericOther = others.map((o) => o.id).find((id) => /^\d+$/.test(id));
+    if (numericOther && !/^\d+$/.test(merged.id)) merged.resolvedThreadId = numericOther;
+  }
+  if (!merged.fbUserId && /^\d+$/.test(merged.resolvedThreadId || '')) merged.fbUserId = merged.resolvedThreadId;
 
   const maxOf = (pick: (c: Conversation) => number | undefined) =>
     present.reduce((m, c) => Math.max(m, pick(c) || 0), 0) || undefined;
@@ -147,6 +210,10 @@ export function findDuplicateGroups(conversations: Record<string, Conversation>)
     if (c.fbUsername) link('n:' + c.fbUsername.toLowerCase(), c.id);
     link('t:' + String(c.id).toLowerCase(), c.id);
     if (c.participantId) link('t:' + String(c.participantId).toLowerCase(), c.id);
+    // The canonical thread id when it differs from the store key — this is how a
+    // contact added from a vanity profile (keyed "john.doe") links up with the
+    // copy captured from their Messenger row (keyed on the numeric fbid).
+    if (c.resolvedThreadId) link('t:' + String(c.resolvedThreadId).toLowerCase(), c.id);
     const ct = chatUrlThread(c.chatUrl);
     if (ct) link('t:' + ct, c.id);
   }
