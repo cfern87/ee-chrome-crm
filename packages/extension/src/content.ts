@@ -1655,11 +1655,353 @@ function blockMicAccess(): () => void {
   return () => { md.getUserMedia = original; };
 }
 
-interface SendResult { ok: boolean; error?: string; failureKind?: SendFailureKind; log: string[] }
+// ---- Delivery status of a message we just sent ----
+//
+// A bubble appearing in the thread is NOT proof the message went out. When a
+// conversation's encrypted (e2ee) route no longer resolves — a saved thread URL
+// Messenger has since re-keyed, which is what started all this — Facebook still
+// renders the bubble AND still clears the composer, then prints a small
+// "Couldn't send" under it. Our old confirmation (composer cleared + bubble
+// present) is satisfied by exactly that failure, which is why undelivered
+// messages were being recorded as sent. So after the bubble shows up we read
+// the status line Facebook attaches to it and only accept an explicit "Sent".
+
+type DeliveryStatus = 'sent' | 'failed' | 'pending' | 'unknown';
+
+// Status wording is matched per FRAGMENT (one label, one line, one bullet-
+// separated field) and anchored at the start of it, never as a substring of the
+// row's whole text. Messenger labels an outgoing row something like "You sent:
+// <message>", which a loose /\bsent\b/ would read as delivery confirmation on a
+// message that plainly failed — the exact mistake being fixed here.
+//
+// Failures are checked first: several of them contain the word "sent" ("Not
+// sent") and would otherwise land in the success bucket.
+const DELIVERY_FAILED_PATTERNS: RegExp[] = [
+  /^(?:message\s+)?couldn['’]?t\s+(?:be\s+)?sen[dt]\b/i,
+  /^(?:this\s+)?message\s+(?:wasn['’]?t|was\s+not|not)\s+sent\b/i,
+  /^not\s+sent\b/i,
+  /^(?:message\s+)?failed\s+to\s+send\b/i,
+  /^(?:message\s+)?didn['’]?t\s+send\b/i,
+  /^unable\s+to\s+send\b/i,
+  /^message\s+failed\b/i,
+  /^(?:tap|click)\s+to\s+(?:retry|try\s+again)\b/i,
+];
+
+const DELIVERY_SENT_PATTERNS: RegExp[] = [/^(?:message\s+)?(?:sent|delivered|seen)\b/i];
+
+// Transient — the send is still in flight, so keep polling rather than judging.
+const DELIVERY_PENDING_PATTERNS: RegExp[] = [/^(?:sending|queued)\b/i];
+
+// What we actually search the DOM for. A bubble does not always contain the
+// whole message: Messenger truncates long ones behind a "See more", and the
+// chat drawer is narrow enough to hit that routinely — which is why a drawer
+// send could go out and still fail to confirm. A distinctive prefix is present
+// either way, and is still far too specific to collide with anything else in
+// the conversation.
+const MESSAGE_PROBE_LEN = 60;
+
+function messageProbe(target: string): string {
+  return target.length > MESSAGE_PROBE_LEN ? target.slice(0, MESSAGE_PROBE_LEN) : target;
+}
+
+// Every separately-labelled piece of text attached to `el`, with the message
+// itself removed so words in the message body can never be read as a status.
+// aria-labels count because Messenger renders "Sent"/"Seen" as icons whose only
+// text is an accessible label.
+function statusFragments(el: HTMLElement, target: string): string[] {
+  const out: string[] = [];
+  const probe = messageProbe(target);
+  const push = (raw: string) => {
+    for (const piece of (raw || '').split(/[\n\r·•|]+/)) {
+      const s = normalizeText(target ? piece.split(target).join(' ') : piece);
+      if (!s) continue;
+      // A truncated copy survives the strip above, and left in it would blow
+      // the size cap in statusForMessageNode before the status is ever reached.
+      if (probe && s.includes(probe)) continue;
+      out.push(s);
+    }
+  };
+  // innerText keeps the line structure that separates a status from the bubble;
+  // textContent is the fallback for elements that aren't laid out.
+  push(el.innerText || el.textContent || '');
+  const own = el.getAttribute('aria-label');
+  if (own) push(own);
+  el.querySelectorAll('[aria-label]').forEach((n) => {
+    const l = n.getAttribute('aria-label');
+    if (l) push(l);
+  });
+  return out;
+}
+
+// The innermost elements holding this message — i.e. the message bubbles.
+// Ancestors all "contain" the text too, so anything with a matching descendant
+// is dropped, and anything inside a contenteditable is skipped so text sitting
+// in the composer is never counted as a sent bubble. That exclusion is what
+// makes this usable as the send confirmation itself.
+function findMessageNodes(scope: HTMLElement, target: string): HTMLElement[] {
+  if (!target) return [];
+  const probe = messageProbe(target);
+  const hits: HTMLElement[] = [];
+  for (const el of scope.querySelectorAll<HTMLElement>('div, span, p')) {
+    // Cheap length gate first: this runs over the whole thread pane on a poll,
+    // and normalizing every container's text would dominate the cost.
+    const raw = el.textContent || '';
+    if (raw.length < probe.length || raw.length > target.length * 1.5 + 200) continue;
+    const t = normalizeText(raw);
+    if (!t.includes(probe)) continue;
+    if (t.length > target.length + 60) continue; // a container, not the bubble
+    if (el.closest('[contenteditable="true"]')) continue;
+    hits.push(el);
+  }
+  return hits.filter((el) => !hits.some((other) => other !== el && el.contains(other)));
+}
+
+// Walk out from a bubble looking for its status. The first status found wins
+// and we stop: climbing further would eventually reach a container holding the
+// NEXT message's status and read that instead. The size cap is the same guard
+// for elements that jump straight from the bubble to a big pane.
+function statusForMessageNode(node: HTMLElement, target: string, scope: HTMLElement): DeliveryStatus {
+  let el: HTMLElement | null = node;
+  for (let i = 0; i < 8 && el; i++) {
+    const fragments = statusFragments(el, target);
+    const total = fragments.reduce((n, f) => n + f.length, 0);
+    if (total > 300) break; // dragging in neighbouring messages — stop
+    if (fragments.some((f) => DELIVERY_FAILED_PATTERNS.some((re) => re.test(f)))) return 'failed';
+    if (fragments.some((f) => DELIVERY_SENT_PATTERNS.some((re) => re.test(f)))) return 'sent';
+    if (fragments.some((f) => DELIVERY_PENDING_PATTERNS.some((re) => re.test(f)))) return 'pending';
+    if (el === scope) break;
+    el = el.parentElement;
+  }
+  return 'unknown';
+}
+
+function deliveryStatuses(scope: HTMLElement, target: string): DeliveryStatus[] {
+  return findMessageNodes(scope, target).map((n) => statusForMessageNode(n, target, scope));
+}
+
+// Status of the LAST copy of the message in the thread — the one we just sent.
+// Polls until it settles on a terminal value, since Messenger shows "Sending…"
+// first and only then resolves to Sent or Couldn't send.
+async function pollDeliveryStatus(scope: HTMLElement, target: string, timeoutMs: number): Promise<DeliveryStatus> {
+  const terminal = await pollFor(() => {
+    const all = deliveryStatuses(scope, target);
+    const last = all[all.length - 1];
+    return last === 'sent' || last === 'failed' ? last : null;
+  }, timeoutMs, 500);
+  if (terminal) return terminal;
+  const all = deliveryStatuses(scope, target);
+  return all.length ? all[all.length - 1] : 'unknown';
+}
+
+// Is a copy of this message already sitting in this thread, delivered? Used
+// only on the recovery path: a re-keyed thread id can resolve back to the very
+// same conversation, so without this check a retry would deliver the message
+// twice. The failed bubble from the attempt we're recovering from is sitting
+// right there, which is why it never counts.
+//
+// How much a copy of *unknown* status counts depends on what the failed attempt
+// saw, because that tells us whether status reading works here at all:
+//
+//   'sent-only'  — the first attempt read an explicit "Couldn't send", so our
+//                  status reading is working and the message demonstrably did
+//                  not go out. Only an explicit "Sent" copy blocks the retry;
+//                  anything vaguer would be the same false success all over.
+//   'not-failed' — the first attempt couldn't read a status at all, so we can't
+//                  tell a delivered copy from an unreadable one. Here the worse
+//                  outcome is messaging someone twice, so any copy that isn't
+//                  marked failed blocks the retry.
+type DupGuard = 'sent-only' | 'not-failed';
+
+function hasDeliveredCopy(scope: HTMLElement, target: string, guard: DupGuard): boolean {
+  const all = deliveryStatuses(scope, target);
+  return guard === 'sent-only' ? all.some((s) => s === 'sent') : all.some((s) => s !== 'failed');
+}
+
+interface SendResult {
+  ok: boolean;
+  error?: string;
+  failureKind?: SendFailureKind;
+  deliveryStatus?: DeliveryStatus;
+  log: string[];
+}
+
+interface SendOptions {
+  // Recovery path only: when set, an already-delivered copy of this message in
+  // this thread counts as success instead of being sent again. See DupGuard for
+  // what each mode treats as "delivered".
+  skipIfDelivered?: DupGuard;
+}
+
+// Type into `composer`, send, and confirm delivery by watching `scope` (the
+// thread pane for a full conversation, the chat drawer for a profile popup).
+// Shared by both send paths so they validate identically.
+async function typeSendAndConfirm(
+  composer: HTMLElement,
+  scope: HTMLElement,
+  message: string,
+  dryRun: boolean,
+  stamp: (m: string) => void,
+  opts: SendOptions,
+  // Re-locate the composer inside this same conversation. Messenger can replace
+  // the element on send, and a retry aimed at the detached node does nothing.
+  refind?: () => HTMLElement | null
+): Promise<{ ok: boolean; error?: string; failureKind?: SendFailureKind; deliveryStatus?: DeliveryStatus }> {
+  const target = normalizeText(message);
+
+  // Recovery path: don't send a second copy of something that already landed.
+  if (opts.skipIfDelivered && hasDeliveredCopy(scope, target, opts.skipIfDelivered)) {
+    stamp(`message already present in this thread (guard=${opts.skipIfDelivered}) — treating as delivered, not re-sending`);
+    return { ok: true, deliveryStatus: 'sent' };
+  }
+
+  // Snapshot the thread so we can detect the NEW outgoing bubble afterwards.
+  const beforeCount = findMessageNodes(scope, target).length;
+  stamp(`bubblesBefore=${beforeCount} scopeTextLen=${(scope.innerText || '').length}`);
+
+  // Type the message. execCommand('insertText') fires the beforeinput/input
+  // events Facebook's editor expects, unlike setting textContent directly.
+  // A raw "\n" embedded in that string gets silently dropped by Messenger's
+  // editor, so multi-line messages try a synthetic paste first, then fall
+  // back to typing line-by-line with simulated line breaks (typeMessage).
+  composer.focus();
+  await sleep(80);
+  try { document.execCommand('selectAll', false); } catch { /* ignore */ }
+  let inserted = false;
+  let typed = '';
+
+  // Multi-line messages: try a synthetic paste first. execCommand line-break
+  // tricks and synthetic Shift+Enter keydowns both turned out to still lose
+  // the "\n" characters entirely (Messenger's editor only reacted to the
+  // plain-text insertion, not the line-break signal) — paste is the one path
+  // every rich-text editor has to get right for real multi-line clipboard
+  // content, so it's the best shot at preserving line breaks.
+  if (message.includes('\n')) {
+    dispatchPaste(composer, message);
+    await sleep(150);
+    typed = composerText(composer);
+    stamp(`afterPaste composerLen=${typed.length} html=${composerHtmlSnippet(composer)}`);
+  }
+
+  if (!typed.includes(target)) {
+    try { document.execCommand('selectAll', false); } catch { /* ignore */ }
+    try {
+      inserted = await typeMessage(composer, message);
+    } catch (e) {
+      stamp(`execCommand threw: ${String(e)}`);
+    }
+    await sleep(150);
+    typed = composerText(composer);
+    stamp(`afterInsert execCommandReturned=${inserted} composerLen=${typed.length} html=${composerHtmlSnippet(composer)}`);
+  }
+
+  // Fallback: dispatch a manual beforeinput/input pair if the editor ignored us.
+  if (!typed.includes(target) || typed.length === 0) {
+    stamp('insertText incomplete — trying InputEvent fallback');
+    composer.focus();
+    try {
+      composer.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: message, bubbles: true, cancelable: true }));
+      composer.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: message, bubbles: true }));
+    } catch (e) {
+      stamp(`InputEvent fallback threw: ${String(e)}`);
+    }
+    await sleep(200);
+    typed = composerText(composer);
+    stamp(`afterFallback composerLen=${typed.length}`);
+  }
+
+  if (typed.length === 0) {
+    return { ok: false, error: 'Could not type message into composer' };
+  }
+  if (!typed.includes(target)) {
+    stamp(`WARN composer text does not match target. composer="${typed.slice(0, 120)}"`);
+  }
+
+  // Dry run: stop here — message is sitting in the composer, nothing sent.
+  if (dryRun) {
+    if (!typed.includes(target)) {
+      return { ok: false, error: 'Dry run: typed text did not match the template' };
+    }
+    stamp('DRY RUN OK — message typed into composer but NOT sent (no Enter, no Send click)');
+    return { ok: true };
+  }
+
+  // Send. Block mic access for the whole send+confirm window: we used to
+  // retry by clicking whatever on-screen button looked like "Send" when
+  // confirmation was slow, but Messenger swaps a voice-note/mic control into
+  // that exact same toolbar slot once it considers the composer empty, so
+  // that click could start an actual recording. We now only ever retry via
+  // Enter (see below), never a click — this is just a hard backstop.
+  const restoreMic = blockMicAccess();
+  try {
+    pressEnter(composer);
+    stamp('pressed Enter');
+
+    // The bubble appearing is step one of two: it only means Messenger accepted
+    // the text into the conversation, not that it reached anyone.
+    //
+    // Counted as BUBBLES, not as occurrences of the text in the pane. The pane
+    // text includes the composer, so counting text meant also requiring the
+    // composer to have cleared, to tell "typed but not sent" from "sent" — and
+    // that requirement is what made drawer sends report failure: Messenger
+    // swaps the drawer's composer element out on send, leaving us reading a
+    // detached node that still holds the text, so it never looked cleared.
+    // findMessageNodes ignores anything inside a contenteditable, so a bubble
+    // count can only go up when a message is actually posted.
+    const bubbleCount = () => findMessageNodes(scope, target).length;
+
+    let confirmed = await pollFor(() => bubbleCount() > beforeCount, 10_000, 400);
+    if (!confirmed) {
+      // Retry by pressing Enter again rather than clicking any button — Enter
+      // is the one action we know Facebook's own JS reliably reacts to
+      // (that's how every send here works), and unlike a click it can never
+      // land on the mic. Re-find the composer first for the swap case above.
+      stamp('not confirmed after Enter — retrying Enter once');
+      pressEnter(refind?.() || composer);
+      confirmed = await pollFor(() => bubbleCount() > beforeCount, 8_000, 400);
+    }
+    if (!confirmed) {
+      const live = refind?.() || composer;
+      stamp(
+        `FAILED bubblesAfter=${bubbleCount()} composerLen=${composerText(live).length} ` +
+        `scopeTextLen=${(scope.innerText || '').length} scopeTail="${normalizeText(scope.innerText || '').slice(-160)}"`
+      );
+      return { ok: false, error: 'Could not confirm message was delivered', failureKind: 'unconfirmed' };
+    }
+  } finally {
+    restoreMic();
+  }
+
+  // Step two: Facebook's own verdict on the bubble we just added.
+  const status = await pollDeliveryStatus(scope, target, 15_000);
+  stamp(`deliveryStatus=${status}`);
+  if (status === 'failed') {
+    return {
+      ok: false,
+      error: "Facebook couldn't send the message (the conversation link didn't resolve)",
+      failureKind: 'not-delivered',
+      deliveryStatus: status,
+    };
+  }
+  if (status !== 'sent') {
+    // Never confirmed as sent. Treated as a failure so the caller runs the
+    // profile-resolution recovery, which re-checks this thread before typing
+    // anything (skipIfDelivered) and so can't duplicate a message that did in
+    // fact go out.
+    return {
+      ok: false,
+      error: `Message was not confirmed as sent (status: ${status})`,
+      failureKind: 'unconfirmed',
+      deliveryStatus: status,
+    };
+  }
+
+  stamp('CONFIRMED sent (composer cleared, new bubble present, Facebook reports sent)');
+  return { ok: true, deliveryStatus: status };
+}
 
 // Core send + validate routine. Returns ok only after CONFIRMING the message
-// text appears as a new bubble in the thread and the composer has cleared.
-async function performAutomatedSend(threadId: string, rawMessage: string, dryRun = false): Promise<SendResult> {
+// text appears as a new bubble in the thread AND Facebook reports it as sent.
+async function performAutomatedSend(threadId: string, rawMessage: string, dryRun = false, opts: SendOptions = {}): Promise<SendResult> {
   // Templates typed/pasted from other editors can carry CRLF or the Unicode
   // LINE/PARAGRAPH SEPARATOR characters (U+2028/U+2029) instead of a plain
   // "\n" — textareas preserve whatever the clipboard had verbatim. Every line-
@@ -1743,129 +2085,333 @@ async function performAutomatedSend(threadId: string, rawMessage: string, dryRun
   }
   stamp('composer found');
 
-  // 3. Snapshot the thread so we can detect the NEW outgoing bubble afterwards.
-  const main = document.querySelector('[role="main"]');
-  const beforeText = main ? normalizeText((main as HTMLElement).innerText) : '';
-  const beforeCount = countOccurrences(beforeText, target);
-  stamp(`occurrencesBefore=${beforeCount}`);
-
-  // 4. Type the message. execCommand('insertText') fires the beforeinput/input
-  //    events Facebook's editor expects, unlike setting textContent directly.
-  //    A raw "\n" embedded in that string gets silently dropped by Messenger's
-  //    editor, so multi-line messages try a synthetic paste first, then fall
-  //    back to typing line-by-line with simulated line breaks (typeMessage).
-  composer.focus();
-  await sleep(80);
-  try { document.execCommand('selectAll', false); } catch { /* ignore */ }
-  let inserted = false;
-  let typed = '';
-
-  // Multi-line messages: try a synthetic paste first. execCommand line-break
-  // tricks and synthetic Shift+Enter keydowns both turned out to still lose
-  // the "\n" characters entirely (Messenger's editor only reacted to the
-  // plain-text insertion, not the line-break signal) — paste is the one path
-  // every rich-text editor has to get right for real multi-line clipboard
-  // content, so it's the best shot at preserving line breaks.
-  if (message.includes('\n')) {
-    dispatchPaste(composer, message);
-    await sleep(150);
-    typed = composerText(composer);
-    stamp(`afterPaste composerLen=${typed.length} html=${composerHtmlSnippet(composer)}`);
+  // 3. Type, send, and validate against the conversation pane.
+  const scope = (document.querySelector('[role="main"]') as HTMLElement) || document.body;
+  const res = await typeSendAndConfirm(composer, scope, message, dryRun, stamp, opts, () => findComposer());
+  if (!res.ok) {
+    return { ok: false, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus, log };
   }
-
-  if (!typed.includes(target)) {
-    try { document.execCommand('selectAll', false); } catch { /* ignore */ }
-    try {
-      inserted = await typeMessage(composer, message);
-    } catch (e) {
-      stamp(`execCommand threw: ${String(e)}`);
-    }
-    await sleep(150);
-    typed = composerText(composer);
-    stamp(`afterInsert execCommandReturned=${inserted} composerLen=${typed.length} html=${composerHtmlSnippet(composer)}`);
-  }
-
-  // Fallback: dispatch a manual beforeinput/input pair if the editor ignored us.
-  if (!typed.includes(target) || typed.length === 0) {
-    stamp('insertText incomplete — trying InputEvent fallback');
-    composer.focus();
-    try {
-      composer.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: message, bubbles: true, cancelable: true }));
-      composer.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: message, bubbles: true }));
-    } catch (e) {
-      stamp(`InputEvent fallback threw: ${String(e)}`);
-    }
-    await sleep(200);
-    typed = composerText(composer);
-    stamp(`afterFallback composerLen=${typed.length}`);
-  }
-
-  if (typed.length === 0) {
-    return { ok: false, error: 'Could not type message into composer', log };
-  }
-  if (!typed.includes(target)) {
-    stamp(`WARN composer text does not match target. composer="${typed.slice(0, 120)}"`);
-  }
-
-  // Dry run: stop here — message is sitting in the composer, nothing sent.
-  if (dryRun) {
-    if (!typed.includes(target)) {
-      return { ok: false, error: 'Dry run: typed text did not match the template', log };
-    }
-    stamp('DRY RUN OK — message typed into composer but NOT sent (no Enter, no Send click)');
-    return { ok: true, log };
-  }
-
-  // 5. Send. Block mic access for the whole send+confirm window: we used to
-  // retry by clicking whatever on-screen button looked like "Send" when
-  // confirmation was slow, but Messenger swaps a voice-note/mic control into
-  // that exact same toolbar slot once it considers the composer empty, so
-  // that click could start an actual recording. We now only ever retry via
-  // Enter (see below), never a click — this is just a hard backstop.
-  const restoreMic = blockMicAccess();
-  try {
-    pressEnter(composer);
-    stamp('pressed Enter');
-
-    // 6. Validate: composer clears AND a new bubble containing the text appears.
-    const confirmed = await pollFor(() => {
-      const c = composerText(composer);
-      const m = document.querySelector('[role="main"]');
-      const afterCount = m ? countOccurrences(normalizeText((m as HTMLElement).innerText), target) : 0;
-      return c.length === 0 && afterCount > beforeCount;
-    }, 10_000, 400);
-
-    if (!confirmed) {
-      // Retry by pressing Enter again rather than clicking any button — Enter
-      // is the one action we know Facebook's own JS reliably reacts to
-      // (that's how every send here works), and unlike a click it can never
-      // land on the mic.
-      stamp('not confirmed after Enter — retrying Enter once');
-      pressEnter(composer);
-      const confirmed2 = await pollFor(() => {
-        const c = composerText(composer);
-        const m = document.querySelector('[role="main"]');
-        const afterCount = m ? countOccurrences(normalizeText((m as HTMLElement).innerText), target) : 0;
-        return c.length === 0 && afterCount > beforeCount;
-      }, 8_000, 400);
-      if (!confirmed2) {
-        const finalComposer = composerText(composer);
-        const m = document.querySelector('[role="main"]');
-        const afterCount = m ? countOccurrences(normalizeText((m as HTMLElement).innerText), target) : 0;
-        stamp(`FAILED composerEmpty=${finalComposer.length === 0} occurrencesAfter=${afterCount}`);
-        return { ok: false, error: 'Could not confirm message was delivered', log };
-      }
-    }
-  } finally {
-    restoreMic();
-  }
-
-  stamp('CONFIRMED delivered (composer cleared + new bubble present)');
 
   // Stamp lastContacted on the saved contact, mirroring manual sends.
   try { await markContacted(threadId); } catch { /* non-fatal */ }
 
-  return { ok: true, log };
+  return { ok: true, deliveryStatus: res.deliveryStatus, log };
+}
+
+// ---- Recovery path: send from the contact's profile ----
+//
+// When a thread URL stops resolving, the profile page still knows the truth:
+// its own numeric fbid (getProfilePageThreadId) gives us a fresh thread URL,
+// and its "Message" button opens a chat drawer wired to the CURRENT
+// conversation regardless of what the stored URL says. The background worker
+// drives this: it navigates the sender tab to the profile, asks for the id
+// here, and then either retries the thread or falls back to the drawer.
+
+// Everything we can read as a label for an editable box.
+function editorLabel(el: HTMLElement): string {
+  const parts = [
+    el.getAttribute('aria-label') || '',
+    el.getAttribute('aria-placeholder') || '',
+    el.getAttribute('data-placeholder') || '',
+    el.getAttribute('placeholder') || '',
+  ];
+  const labelledBy = el.getAttribute('aria-labelledby');
+  if (labelledBy) {
+    for (const id of labelledBy.split(/\s+/)) {
+      const n = document.getElementById(id);
+      if (n) parts.push(n.textContent || '');
+    }
+  }
+  return normalizeText(parts.join(' ')).toLowerCase();
+}
+
+// A profile page is full of contenteditable boxes that are NOT chat composers —
+// comment fields, the post box, the search bar. Typing a campaign message into
+// one of those and pressing Enter would publish it publicly, so the drawer
+// composer has to be positively identified (a message-ish label) rather than
+// merely "the contenteditable we found". When nothing matches we report
+// no-composer and the send is logged as an error, which is the right way to be
+// wrong here.
+const NON_MESSAGE_EDITOR_RE = /comment|reply|post|write something|on your mind|search|caption|story|bio|answer|note/i;
+const MESSAGE_EDITOR_RE = /(^|\s)aa(\s|$)|\bmessage\b/i;
+
+// Every chat composer currently on the page, dialogs first. There can be
+// several: Facebook keeps previously-opened drawers docked, so "the composer we
+// found" is emphatically NOT "the person we want" — see verifyDrawer.
+function findDrawerComposers(): HTMLElement[] {
+  const inDialog: HTMLElement[] = [];
+  const loose: HTMLElement[] = [];
+  for (const el of document.querySelectorAll<HTMLElement>('[contenteditable="true"][role="textbox"]')) {
+    if (!isMessageComposer(el) || el.offsetParent === null) continue;
+    const label = editorLabel(el);
+    if (NON_MESSAGE_EDITOR_RE.test(label)) continue;
+    if (!MESSAGE_EDITOR_RE.test(label)) continue;
+    (el.closest('[role="dialog"]') ? inDialog : loose).push(el);
+  }
+  return [...inDialog, ...loose];
+}
+
+function composerCount(root: ParentNode): number {
+  return root.querySelectorAll('[contenteditable="true"][role="textbox"]').length;
+}
+
+// The subtree of ONE chat drawer: the scope for identity, bubble and status
+// checks. Both boundaries matter. Too narrow (a few levels up from the
+// composer) and it misses the message list, so a send that worked can't be
+// confirmed — that was the "could not confirm message was delivered" on drawer
+// sends. Too wide and it swallows the neighbouring docked drawers, which is far
+// worse: a campaign sends the SAME text to everyone, so another drawer's copy
+// of it would read as this one's confirmation.
+//
+// So: take Facebook's own dialog boundary when there is one, otherwise climb as
+// far as possible while the subtree still holds exactly one composer, and never
+// out into the profile page itself.
+function drawerScope(composer: HTMLElement): HTMLElement {
+  const dialog = composer.closest('[role="dialog"]') as HTMLElement | null;
+  // Only when that dialog is one conversation — if Facebook ever docks several
+  // chats inside a single dialog, fall through to the one-composer climb below.
+  if (dialog && composerCount(dialog) === 1) return dialog;
+  const main = document.querySelector('[role="main"]');
+  let el: HTMLElement = composer;
+  while (el.parentElement && el.parentElement !== document.body) {
+    const parent = el.parentElement;
+    if (main && parent.contains(main)) break;   // that's the page, not a drawer
+    if (composerCount(parent) > 1) break;       // would swallow another chat
+    el = parent;
+  }
+  return el;
+}
+
+// ---- Whose drawer is this? ----
+//
+// A docked drawer from an earlier send is indistinguishable from a fresh one by
+// shape alone, so every drawer is checked against the person whose profile we
+// are standing on BEFORE a single character is typed. Identity comes from the
+// conversation links inside the drawer (exact), falling back to the name in its
+// header (Facebook doesn't always link the thread). Unverifiable means we do
+// not send — messaging the wrong person is far worse than a logged failure.
+
+interface DrawerIdentity { threadIds: string[]; text: string }
+
+function drawerIdentity(scope: HTMLElement): DrawerIdentity {
+  const ids = new Set<string>();
+  scope.querySelectorAll<HTMLAnchorElement>('a[href*="/t/"]').forEach((a) => {
+    const id = extractThreadId(a.href);
+    if (id) ids.add(id.toLowerCase());
+  });
+  const labels: string[] = [];
+  const own = scope.getAttribute('aria-label');
+  if (own) labels.push(own);
+  scope.querySelectorAll('h1, h2, h3, h4, [role="heading"]').forEach((n) => labels.push(n.textContent || ''));
+  scope.querySelectorAll<HTMLImageElement>('img[alt]').forEach((n) => labels.push(n.alt || ''));
+  scope.querySelectorAll<HTMLAnchorElement>('a[href*="/t/"]').forEach((n) => labels.push(n.textContent || ''));
+  return { threadIds: [...ids], text: normalizeText(labels.join(' ')).toLowerCase() };
+}
+
+// Three verdicts, not two. 'mismatch' is a hard stop — that drawer is somebody
+// else. 'unknown' means the drawer gave us nothing to check against, which is
+// only acceptable for a drawer our own click just opened (see performDrawerSend)
+// because there its provenance is the evidence.
+type DrawerVerdict = 'match' | 'mismatch' | 'unknown';
+
+// `pageIds` are read off the profile we're standing on and can veto a drawer.
+// `storedIds` are the contact's saved ids, which are exactly what may have gone
+// stale — they can confirm a drawer but must never reject one.
+function verifyDrawer(id: DrawerIdentity, pageIds: string[], storedIds: string[], name: string): { verdict: DrawerVerdict; why: string } {
+  const page = pageIds.filter(Boolean).map((s) => s.toLowerCase());
+  const stored = storedIds.filter(Boolean).map((s) => s.toLowerCase());
+
+  if (id.threadIds.length > 0) {
+    const pageHit = id.threadIds.find((t) => page.includes(t));
+    if (pageHit) return { verdict: 'match', why: `thread id ${pageHit} matches this profile` };
+    if (page.length > 0) {
+      return { verdict: 'mismatch', why: `drawer links thread [${id.threadIds.join(', ')}] but this profile is [${page.join(', ')}]` };
+    }
+    const storedHit = id.threadIds.find((t) => stored.includes(t));
+    if (storedHit) return { verdict: 'match', why: `thread id ${storedHit} matches the saved contact` };
+    return { verdict: 'unknown', why: `drawer links [${id.threadIds.join(', ')}]; nothing authoritative to compare it to` };
+  }
+
+  const n = normalizeText(name).toLowerCase();
+  if (!n) return { verdict: 'unknown', why: 'drawer links no thread and the profile has no readable name' };
+  const parts = n.split(' ').filter((p) => p.length > 1);
+  if (id.text.includes(n) || (parts.length >= 2 && parts.every((p) => id.text.includes(p)))) {
+    return { verdict: 'match', why: `header names "${name}"` };
+  }
+  if (!id.text) return { verdict: 'unknown', why: 'drawer exposes neither a thread link nor a header name' };
+  return { verdict: 'mismatch', why: `drawer header "${id.text.slice(0, 80)}" does not name "${name}"` };
+}
+
+// The profile's own "Message" button. Whole-label matching only ("Message" or
+// "Message <name>") — a substring match would happily hit an ancestor wrapping
+// half the page — and the near-miss labels that share that shape are excluded
+// outright.
+const NOT_THE_MESSAGE_BUTTON_RE = /request|setting|report|block|delete|archive|see\s+all|spam/i;
+
+function findProfileMessageButton(): HTMLElement | null {
+  const root = (document.querySelector('[role="main"]') || document.body) as HTMLElement;
+  for (const el of root.querySelectorAll<HTMLElement>('[role="button"], button, a')) {
+    if (el.offsetParent === null) continue;
+    const label = normalizeText(el.getAttribute('aria-label') || el.innerText || el.textContent || '');
+    if (label.length === 0 || label.length > 40) continue;
+    if (NOT_THE_MESSAGE_BUTTON_RE.test(label)) continue;
+    if (/^message(\s+\S.*)?$/i.test(label)) return el;
+  }
+  return null;
+}
+
+// Send through the chat drawer opened from a profile page. This is the backup
+// when a re-keyed thread URL can't be repaired: the drawer is opened by
+// Facebook itself, so it always points at the live conversation.
+async function performDrawerSend(threadId: string, rawMessage: string, dryRun = false, opts: SendOptions = {}): Promise<SendResult> {
+  // Same separator normalization as performAutomatedSend — see the comment there.
+  const message = rawMessage.replace(/\r\n|\r|\u2028|\u2029/g, '\n');
+  const log: string[] = [];
+  const stamp = (m: string) => log.push(`[${new Date().toISOString()}] ${m}`);
+
+  stamp(`drawer send mode=${dryRun ? 'DRY RUN' : 'live'} url=${window.location.href}`);
+  if (!isProfilePage()) {
+    return { ok: false, error: 'Not on a profile page — cannot open the message drawer', failureKind: 'no-composer', log };
+  }
+
+  // Who this profile belongs to. The page's own fbid and name are authoritative;
+  // the contact's saved ids can only corroborate, never veto — being stale is
+  // the whole reason we are down here in the first place.
+  const profileThread = getProfilePageThreadId();
+  const profileName = extractProfilePageName();
+  const pageIds = [profileThread || ''];
+  const storedIds = [threadId, (await getResolvedThreadId(threadId)) || ''];
+  stamp(`profile identity: name="${profileName}" pageThread=${profileThread || '(none)'} stored=[${storedIds.filter(Boolean).join(', ')}]`);
+
+  // ALWAYS click Message. Docked drawers from earlier sends look identical to a
+  // fresh one, so adopting whichever composer happens to be on the page is how
+  // a message ends up in someone else's chat. Clicking is also what makes
+  // Facebook open the conversation it considers current — the whole point of
+  // this fallback.
+  const btn = await pollFor(() => findProfileMessageButton(), 10_000, 400);
+  if (!btn) {
+    stamp('no Message button on this profile');
+    return { ok: false, error: 'No Message button on this profile', failureKind: 'no-composer', log };
+  }
+  const before = new Set(findDrawerComposers());
+  stamp(`clicking Message (${before.size} chat drawer(s) already open)`);
+  btn.click();
+  const clickedAt = Date.now();
+
+  // Pick the drawer. A positive identity match always wins. Failing that, a
+  // drawer that appeared in response to OUR click on THIS profile's Message
+  // button is acceptable on provenance — but only if it told us nothing either
+  // way. A drawer that names someone else is never used, fresh or not, and
+  // neither is a pre-existing drawer we can't identify.
+  let rejected = '';
+  const picked = await pollFor(() => {
+    const all = findDrawerComposers();
+    const ordered = [...all.filter((c) => !before.has(c)), ...all.filter((c) => before.has(c))];
+    let provisional: { composer: HTMLElement; scope: HTMLElement; ident: DrawerIdentity; why: string; fresh: boolean } | null = null;
+    for (const c of ordered) {
+      const scope = drawerScope(c);
+      const ident = drawerIdentity(scope);
+      const fresh = !before.has(c);
+      const v = verifyDrawer(ident, pageIds, storedIds, profileName);
+      if (v.verdict === 'match') return { composer: c, scope, ident, why: v.why, fresh };
+      // Held back for a few seconds: a drawer that has only just opened often
+      // hasn't rendered its header or thread link yet, and accepting it on
+      // provenance immediately would throw away the identity check that is
+      // about to become available.
+      if (v.verdict === 'unknown' && fresh && !provisional && Date.now() - clickedAt > 5_000) {
+        provisional = { composer: c, scope, ident, why: `opened by our click on this profile's Message button (${v.why})`, fresh };
+      }
+      rejected = `${v.verdict}: ${v.why}`;
+    }
+    return provisional;
+  }, 15_000, 500);
+
+  if (!picked) {
+    const open = findDrawerComposers().length;
+    stamp(`no drawer could be confirmed as this contact (${open} drawer(s) on page; last check: ${rejected || 'none opened'})`);
+    return open === 0
+      ? { ok: false, error: 'Message drawer did not open', failureKind: 'no-composer', log }
+      : { ok: false, error: 'Could not confirm the chat drawer belongs to this contact — nothing was typed', failureKind: 'unconfirmed', log };
+  }
+  stamp(`drawer accepted for this contact: ${picked.why} (freshly opened=${picked.fresh})`);
+
+  // The drawer links the conversation Facebook considers current — that's the
+  // id future sends should use.
+  if (picked.ident.threadIds.length === 1 && picked.ident.threadIds[0] !== threadId) {
+    const saved = await saveResolvedThreadId(threadId, picked.ident.threadIds[0]);
+    stamp(`drawer belongs to thread ${picked.ident.threadIds[0]} (saved for ${threadId}=${saved})`);
+  }
+
+  const composer = picked.composer;
+  const res = await typeSendAndConfirm(composer, picked.scope, message, dryRun, stamp, opts, () => {
+    // Messenger can swap the drawer's composer element on send; re-find it
+    // within this same, already-verified drawer rather than page-wide.
+    const live = picked.scope.querySelector<HTMLElement>('[contenteditable="true"][role="textbox"]');
+    return live && isMessageComposer(live) ? live : null;
+  });
+  if (!res.ok) {
+    return { ok: false, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus, log };
+  }
+  try { await markContacted(threadId); } catch { /* non-fatal */ }
+  return { ok: true, deliveryStatus: res.deliveryStatus, log };
+}
+
+interface ProfileResolveResult {
+  ok: boolean;
+  threadId?: string;
+  chatUrl?: string;
+  name?: string;
+  error?: string;
+  log: string[];
+}
+
+// Read the canonical thread id off the profile page we're sitting on, and
+// record it against the contact whose send failed so the retry (and every
+// later send) targets the URL Facebook actually uses.
+async function resolveProfileThreadFor(requestedThreadId: string): Promise<ProfileResolveResult> {
+  const log: string[] = [];
+  const stamp = (m: string) => log.push(`[${new Date().toISOString()}] ${m}`);
+  stamp(`resolving profile thread id at ${window.location.href}`);
+
+  if (!isProfilePage()) {
+    return { ok: false, error: 'Not on a Facebook profile page', log };
+  }
+  const threadId = await pollFor(() => getProfilePageThreadId(), 12_000, 500);
+  if (!threadId) {
+    stamp('no thread id could be read from this profile');
+    return { ok: false, error: 'Could not read a thread id from the profile page', log };
+  }
+  stamp(`profile thread id = ${threadId}`);
+  if (requestedThreadId && threadId !== requestedThreadId) {
+    const saved = await saveResolvedThreadId(requestedThreadId, threadId);
+    stamp(`recorded ${requestedThreadId} → ${threadId} (saved=${saved})`);
+  }
+  return {
+    ok: true,
+    threadId,
+    chatUrl: `https://www.facebook.com/messages/t/${threadId}/`,
+    name: extractProfilePageName(),
+    log,
+  };
+}
+
+// The long-running requests the background worker can make of this page.
+// Returns a promise for anything it handles, or null when the request isn't
+// ours — so both transports below (one-shot message and Port) can share it.
+function handleCrmRequest(request: any): Promise<unknown> | null {
+  const payload = request?.payload || {};
+  const guard: DupGuard | undefined =
+    payload.skipIfDelivered === 'sent-only' || payload.skipIfDelivered === 'not-failed' ? payload.skipIfDelivered : undefined;
+  switch (request?.type) {
+    case 'CRM_SEND_MESSAGE':
+      return performAutomatedSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard });
+    case 'CRM_SEND_VIA_DRAWER':
+      return performDrawerSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard });
+    case 'CRM_RESOLVE_PROFILE':
+      return resolveProfileThreadFor(String(payload.threadId || ''));
+    default:
+      return null;
+  }
 }
 
 if (isExtensionAlive()) {
@@ -1874,13 +2420,21 @@ if (isExtensionAlive()) {
       if (!request || typeof request.type !== 'string') return;
 
       if (request.type === 'CRM_PING') {
-        sendResponse({ pong: true, threadId: getActiveThreadId(), url: window.location.href, ready: isMessagesPage() });
+        sendResponse({
+          pong: true,
+          threadId: getActiveThreadId(),
+          url: window.location.href,
+          ready: isMessagesPage(),
+          // The recovery path parks the sender tab on a profile page, which is
+          // "ready" for a different set of requests than a thread page.
+          onProfile: isProfilePage(),
+        });
         return; // synchronous
       }
 
-      if (request.type === 'CRM_SEND_MESSAGE') {
-        const { threadId, message, dryRun } = request.payload || {};
-        performAutomatedSend(String(threadId), String(message), !!dryRun)
+      const handled = handleCrmRequest(request);
+      if (handled) {
+        handled
           .then((res) => sendResponse(res))
           .catch((e) => sendResponse({ ok: false, error: 'Exception: ' + String(e), log: [String(e)] }));
         return true; // async response
@@ -1896,16 +2450,17 @@ if (isExtensionAlive()) {
   // sees the callback error out with "message port closed" and reports the
   // send as failed even though we're still typing. An open chrome.runtime
   // Port is treated as ongoing activity and keeps the service worker alive
-  // for as long as it stays connected, so CRM_SEND_MESSAGE is also served
-  // over a port; the one-shot listener above stays for CRM_PING and as a
-  // fallback for older background builds.
+  // for as long as it stays connected, so every long-running request (send,
+  // drawer send, profile resolve) is also served over a port; the one-shot
+  // listener above stays for CRM_PING and as a fallback for older background
+  // builds.
   try {
     chrome.runtime.onConnect.addListener((port) => {
       if (port.name !== 'crm-send') return;
       port.onMessage.addListener((request) => {
-        if (!request || request.type !== 'CRM_SEND_MESSAGE') return;
-        const { threadId, message, dryRun } = request.payload || {};
-        performAutomatedSend(String(threadId), String(message), !!dryRun)
+        const handled = handleCrmRequest(request);
+        if (!handled) return;
+        handled
           .then((res) => { try { port.postMessage(res); } catch { /* port gone */ } })
           .catch((e) => { try { port.postMessage({ ok: false, error: 'Exception: ' + String(e), log: [String(e)] }); } catch { /* port gone */ } });
       });

@@ -9,6 +9,8 @@ import {
   Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS,
   FailedSend, collectUnseenFailures, getFailedNoticeAck, setFailedNoticeAck,
   failureKey, getClearedFailures, setClearedFailures, collectFailureKeys,
+  QueueState, QueueMode, defaultQueueState, activeCampaigns, queueDepth,
+  pendingRecipientIndex, runnableCampaigns,
 } from '../campaigns';
 import {
   parseContactsCsv, applyContacts, contactsToCsv, sampleCsv,
@@ -159,11 +161,13 @@ export default function DashboardApp() {
 
   // Bulk messaging
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [queue, setQueue] = useState<QueueState>(defaultQueueState);
   const [preselectedRecipients, setPreselectedRecipients] = useState<string[]>([]);
 
   const refreshCampaigns = useCallback(async () => {
-    const res = await sendBg<{ campaigns: Campaign[] }>({ type: 'GET_CAMPAIGNS' });
+    const res = await sendBg<{ campaigns: Campaign[]; queue?: QueueState }>({ type: 'GET_CAMPAIGNS' });
     if (res?.campaigns) setCampaigns(res.campaigns);
+    if (res?.queue) setQueue(res.queue);
   }, []);
 
   useEffect(() => {
@@ -1340,6 +1344,7 @@ export default function DashboardApp() {
             tags={tags}
             store={store}
             campaigns={campaigns}
+            queue={queue}
             preselected={preselectedRecipients}
             onConsumePreselected={() => setPreselectedRecipients([])}
             onChanged={refreshCampaigns}
@@ -2958,13 +2963,14 @@ interface MessagingPanelProps {
   tags: Tag[];
   store: Store;
   campaigns: Campaign[];
+  queue: QueueState;
   preselected: string[];
   onConsumePreselected: () => void;
   onChanged: () => void;
   onViewHistory: () => void;
 }
 
-function MessagingPanel({ conversations, tags, store, campaigns, preselected, onConsumePreselected, onChanged, onViewHistory }: MessagingPanelProps) {
+function MessagingPanel({ conversations, tags, store, campaigns, queue, preselected, onConsumePreselected, onChanged, onViewHistory }: MessagingPanelProps) {
   const [template, setTemplate] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState('');
@@ -2987,7 +2993,14 @@ function MessagingPanel({ conversations, tags, store, campaigns, preselected, on
     }
   }, [preselected, onConsumePreselected]);
 
-  const active = campaigns.find((c) => c.status === 'running' || c.status === 'paused') || null;
+  // Everything currently in the queue — several campaigns can be live at once.
+  const active = activeCampaigns(campaigns);
+  const nextUp = runnableCampaigns(campaigns)[0] || null;
+
+  // Contacts already waiting on a message from another live campaign. Queuing
+  // overlapping groups is legitimate (a follow-up to a subset, say) but it's
+  // also the easy way to message somebody twice by accident, so say so.
+  const alreadyQueued = useMemo(() => pendingRecipientIndex(campaigns), [campaigns]);
 
   const sendable = conversations.filter((c) => !c.archived);
   const filtered = sendable.filter((c) => {
@@ -2999,6 +3012,7 @@ function MessagingPanel({ conversations, tags, store, campaigns, preselected, on
   const selectedConvs = conversations.filter((c) => selected.has(c.id));
   const selectedWithUrl = selectedConvs.filter((c) => c.chatUrl);
   const selectedWithoutUrl = selectedConvs.filter((c) => !c.chatUrl);
+  const selectedAlreadyQueued = selectedWithUrl.filter((c) => alreadyQueued.has(c.id));
 
   const toggle = (id: string) => {
     const next = new Set(selected);
@@ -3047,7 +3061,9 @@ function MessagingPanel({ conversations, tags, store, campaigns, preselected, on
       setSelected(new Set());
       setTemplate('');
       onChanged();
-      onViewHistory();
+      // Deliberately stay on the composer rather than jumping to History: the
+      // whole point of the queue is that you can line up the next group
+      // straight away, and the queue card above shows what's in flight.
     } else if (res === null) {
       setError('No response from the extension background. Fully reload the extension at chrome://extensions (Developer mode → ⟳ on this extension), then refresh this page — the messaging feature needs the new "alarms" permission.');
     } else {
@@ -3062,9 +3078,18 @@ function MessagingPanel({ conversations, tags, store, campaigns, preselected, on
     <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' }}>
       {/* Left: composer + config */}
       <div style={{ flex: '1 1 420px', minWidth: 360 }}>
-        {active && (
-          <div style={{ marginBottom: 14 }}>
-            <ActiveCampaignCard campaign={active} onChanged={onChanged} />
+        {active.length > 0 && (
+          <div style={{ marginBottom: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <QueueCard campaigns={campaigns} queue={queue} onChanged={onChanged} onViewHistory={onViewHistory} />
+            {active.map((c) => (
+              <ActiveCampaignCard
+                key={c.id}
+                campaign={c}
+                queue={queue}
+                isNext={nextUp?.id === c.id}
+                onChanged={onChanged}
+              />
+            ))}
           </div>
         )}
 
@@ -3139,9 +3164,19 @@ function MessagingPanel({ conversations, tags, store, campaigns, preselected, on
               {error}
             </div>
           )}
-          {active && (
-            <div style={{ background: '#fff6e5', color: '#b9770e', borderRadius: 6, padding: '8px 12px', fontSize: 12, marginBottom: 10 }}>
-              A campaign is currently {active.status}. Pause or cancel it before starting another.
+          {selectedAlreadyQueued.length > 0 && (
+            <div style={{ background: '#fff6e5', color: '#b9770e', borderRadius: 6, padding: '8px 12px', fontSize: 12, marginBottom: 10, lineHeight: 1.5 }}>
+              <strong>{selectedAlreadyQueued.length}</strong> selected contact{selectedAlreadyQueued.length !== 1 ? 's are' : ' is'} already
+              waiting on a message from another campaign
+              {' '}({selectedAlreadyQueued.slice(0, 3).map((c) => c.participantName).join(', ')}
+              {selectedAlreadyQueued.length > 3 ? `, +${selectedAlreadyQueued.length - 3} more` : ''}).
+              They'll receive both.
+            </div>
+          )}
+          {active.length > 0 && (
+            <div style={{ background: '#eef4ff', color: '#2b5fb8', borderRadius: 6, padding: '8px 12px', fontSize: 12, marginBottom: 10, lineHeight: 1.5 }}>
+              This joins the existing queue ({active.length} campaign{active.length !== 1 ? 's' : ''} in flight).
+              Messages still go out one at a time on the shared pace — nothing sends faster, it just takes turns.
             </div>
           )}
           <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '10px 12px', background: dryRun ? '#fff6e5' : '#f8f8f8', borderRadius: 7, marginBottom: 10, cursor: 'pointer', border: dryRun ? '1px solid #f0d28a' : '1px solid transparent' }}>
@@ -3152,16 +3187,16 @@ function MessagingPanel({ conversations, tags, store, campaigns, preselected, on
           </label>
           <button
             onClick={start}
-            disabled={starting || !!active}
+            disabled={starting}
             style={{
-              width: '100%', background: starting || active ? '#9ec7b3' : dryRun ? '#b9770e' : '#0a7c4a', color: '#fff', border: 'none',
+              width: '100%', background: starting ? '#9ec7b3' : dryRun ? '#b9770e' : '#0a7c4a', color: '#fff', border: 'none',
               padding: '12px 16px', borderRadius: 8, fontWeight: 700, fontSize: 14,
-              cursor: starting || active ? 'not-allowed' : 'pointer',
+              cursor: starting ? 'not-allowed' : 'pointer',
             }}
           >
             {starting
-              ? 'Starting…'
-              : `${dryRun ? 'Start dry run' : 'Start campaign'} → ${selectedWithUrl.length} recipient${selectedWithUrl.length !== 1 ? 's' : ''}`}
+              ? 'Queuing…'
+              : `${dryRun ? 'Queue dry run' : active.length > 0 ? 'Add to queue' : 'Start campaign'} → ${selectedWithUrl.length} recipient${selectedWithUrl.length !== 1 ? 's' : ''}`}
           </button>
         </div>
       </div>
@@ -3200,10 +3235,13 @@ function MessagingPanel({ conversations, tags, store, campaigns, preselected, on
             )}
             {filtered.map((c) => {
               const noUrl = !c.chatUrl;
+              const queuedIn = alreadyQueued.get(c.id);
               return (
                 <label
                   key={c.id}
-                  title={noUrl ? 'No saved chat URL — open this chat once in Messenger to capture it' : ''}
+                  title={noUrl
+                    ? 'No saved chat URL — open this chat once in Messenger to capture it'
+                    : queuedIn ? `Already queued in: ${queuedIn.join(', ')}` : ''}
                   style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 9px', borderRadius: 6, background: selected.has(c.id) ? '#e8f5ee' : '#fafafa', cursor: noUrl ? 'not-allowed' : 'pointer', opacity: noUrl ? 0.55 : 1 }}
                 >
                   <input type="checkbox" disabled={noUrl} checked={selected.has(c.id)} onChange={() => toggle(c.id)} style={{ cursor: noUrl ? 'not-allowed' : 'pointer' }} />
@@ -3211,6 +3249,7 @@ function MessagingPanel({ conversations, tags, store, campaigns, preselected, on
                     {c.participantName || 'Unknown'}
                   </span>
                   {noUrl && <span style={{ fontSize: 10, color: '#b9770e' }}>no URL</span>}
+                  {queuedIn && !noUrl && <span style={{ fontSize: 9, color: '#2b5fb8', background: '#eef4ff', padding: '1px 5px', borderRadius: 7, fontWeight: 600 }}>queued</span>}
                   {c.tags.slice(0, 2).map((tid) => {
                     const tag = store.tags[tid];
                     return tag ? <span key={tid} style={{ background: tag.color, color: '#fff', fontSize: 9, padding: '1px 5px', borderRadius: 7 }}>{tag.name}</span> : null;
@@ -3239,13 +3278,95 @@ function Countdown({ to }: { to?: number }) {
   return <span>{m > 0 ? `${m}m ` : ''}{s}s</span>;
 }
 
-function ActiveCampaignCard({ campaign, onChanged }: { campaign: Campaign; onChanged: () => void }) {
+// The queue header: one processor, one clock, however many campaigns are
+// feeding it. This is where the global controls live, because pausing "the
+// sending" and pausing "this campaign" are genuinely different actions and
+// conflating them is how you accidentally stop the wrong thing.
+function QueueCard({ campaigns, queue, onChanged, onViewHistory }: { campaigns: Campaign[]; queue: QueueState; onChanged: () => void; onViewHistory: () => void }) {
+  const depth = queueDepth(campaigns);
+  const pausing = !!(queue.pausedForBatchUntil && queue.pausedForBatchUntil > Date.now());
+  const inFlight = queue.inFlight
+    ? campaigns.find((c) => c.id === queue.inFlight!.campaignId)
+        ?.recipients.find((r) => r.threadId === queue.inFlight!.threadId)
+    : undefined;
+
+  const control = async (type: string, payload?: unknown) => {
+    await sendBg({ type, payload });
+    onChanged();
+  };
+
+  const modeBtn = (mode: QueueMode, label: string, hint: string): React.ReactElement => (
+    <button
+      key={mode}
+      title={hint}
+      onClick={() => control('SET_QUEUE_MODE', { mode })}
+      style={{
+        padding: '4px 10px', borderRadius: 6, fontSize: 11, fontWeight: 700, cursor: 'pointer',
+        border: '1px solid ' + (queue.mode === mode ? '#2b5fb8' : '#dfe3e8'),
+        background: queue.mode === mode ? '#2b5fb8' : '#fff',
+        color: queue.mode === mode ? '#fff' : '#666',
+      }}
+    >
+      {label}
+    </button>
+  );
+
+  return (
+    <div style={{ background: '#fff', borderRadius: 10, padding: 16, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', border: '1px solid #cfdcf2' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8, flexWrap: 'wrap' }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 14 }}>Send queue</div>
+          <div style={{ marginTop: 4, fontSize: 12, color: '#666' }}>
+            {depth.pending} message{depth.pending !== 1 ? 's' : ''} waiting across {depth.campaigns} campaign{depth.campaigns !== 1 ? 's' : ''}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {modeBtn('interleave', 'Interleave', 'Round-robin: every campaign makes progress, one message each per turn.')}
+          {modeBtn('sequential', 'One at a time', 'Finish the oldest campaign first, then move to the next.')}
+          {queue.paused
+            ? <button onClick={() => control('RESUME_QUEUE')} style={{ background: '#0a7c4a', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Resume sending</button>
+            : <button onClick={() => control('PAUSE_QUEUE')} style={{ background: '#fff', color: '#b9770e', border: '1px solid #f0d28a', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Pause all</button>}
+        </div>
+      </div>
+
+      <div style={{ marginTop: 10, fontSize: 12, color: '#666', display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+        <span>
+          {queue.paused
+            ? <span style={{ color: '#b9770e', fontWeight: 600 }}>❚❚ Sending paused — no campaign will send until you resume.</span>
+            : inFlight
+              ? <>Sending now → <strong>{inFlight.participantName}</strong></>
+              : pausing
+                ? <>Batch pause · sending resumes in <Countdown to={queue.pausedForBatchUntil} /></>
+                : queue.nextSendAt
+                  ? <>Next message in <Countdown to={queue.nextSendAt} /></>
+                  : 'Idle.'}
+        </span>
+        <button onClick={onViewHistory} style={{ marginLeft: 'auto', background: 'none', border: 'none', color: '#065fd4', fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>
+          History &amp; logs →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ActiveCampaignCard({ campaign, queue, isNext, onChanged }: { campaign: Campaign; queue: QueueState; isNext: boolean; onChanged: () => void }) {
   const sum = summarize(campaign);
-  const pausing = !!(campaign.pausedForBatchUntil && campaign.pausedForBatchUntil > Date.now());
+  const pausing = !!(queue.pausedForBatchUntil && queue.pausedForBatchUntil > Date.now());
 
   const control = async (type: string) => {
     await sendBg({ type, payload: { campaignId: campaign.id } });
     onChanged();
+  };
+
+  // The countdown belongs to the queue, so only the campaign that's actually
+  // next says "next send" — the others are waiting their turn behind it.
+  const timing = (): React.ReactNode => {
+    if (campaign.status !== 'running') return null;
+    if (queue.paused) return 'Sending paused';
+    if (pausing) return <>Batch pause · resumes in <Countdown to={queue.pausedForBatchUntil} /></>;
+    if (queue.inFlight?.campaignId === campaign.id) return 'Sending now…';
+    if (isNext) return <>Next send in <Countdown to={queue.nextSendAt} /></>;
+    return 'Waiting its turn';
   };
 
   return (
@@ -3275,11 +3396,7 @@ function ActiveCampaignCard({ campaign, onChanged }: { campaign: Campaign; onCha
         <span>✅ {sum.sent} sent</span>
         <span>❌ {sum.errors} errors</span>
         <span>⏳ {sum.pending} pending</span>
-        <span style={{ marginLeft: 'auto' }}>
-          {campaign.status === 'running' && (pausing
-            ? <>Batch pause · resumes in <Countdown to={campaign.pausedForBatchUntil} /></>
-            : <>Next send in <Countdown to={campaign.nextSendAt} /></>)}
-        </span>
+        <span style={{ marginLeft: 'auto' }}>{timing()}</span>
       </div>
     </div>
   );

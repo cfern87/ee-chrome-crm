@@ -4,11 +4,19 @@
 //   1. CRM store proxy — reads/writes go through the shared storage module so
 //      popup/dashboard changes shard into chrome.storage.sync like everything
 //      else.
-//   2. Bulk-messaging orchestrator — owns the campaign queue and the
+//   2. Bulk-messaging orchestrator — owns the central send queue and the
 //      human-like pacing (random 2-4 min gaps, a 30-45 min pause every ~20
 //      messages). It drives a browser tab to each contact's chat and asks the
 //      content script to type, send, and VALIDATE delivery before a recipient
 //      is marked sent (otherwise it's marked error, with full diagnostics).
+//
+// Any number of campaigns can be running at once and the queue interleaves
+// them, so you never have to wait for one group to finish before queuing the
+// next. What does NOT parallelize is the sending itself: one message goes out
+// at a time, on one shared clock, because the rate limit belongs to the
+// Facebook account rather than to any one campaign. Each tick asks the queue
+// who's next (see pickNext in campaigns.ts), sends exactly one message, writes
+// the outcome back to that campaign, and schedules the next tick.
 //
 // Why chrome.alarms? An MV3 service worker is killed after ~30s idle, so we
 // can't hold a setTimeout across minute-scale gaps. Instead we persist the
@@ -23,13 +31,20 @@ import {
   Campaign,
   createCampaign,
   loadCampaigns,
+  saveCampaigns,
   getCampaign,
-  getActiveCampaign,
   upsertCampaign,
   randMs,
   nextBatchTarget,
   NewCampaignInput,
   SendFailureKind,
+  QueueState,
+  QueueMode,
+  loadQueue,
+  saveQueue,
+  pickNext,
+  nextRecipientIndex,
+  runnableCampaigns,
 } from './campaigns';
 
 const TICK_ALARM = 'crm-campaign-tick';
@@ -222,23 +237,27 @@ function sendViaPort<T = any>(tabId: number, message: unknown, timeoutMs: number
   });
 }
 
-// PING the content script until it answers and reports it's on a Messenger page
-// showing the expected thread. Keeps the worker alive (tab messaging resets the
-// idle timer) while the SPA finishes rendering the conversation.
-async function waitForContentReady(tabId: number, threadId: string, log: string[]): Promise<boolean> {
+// PING the content script until it answers and reports it's on the kind of page
+// we navigated it to — a Messenger thread for a send, a profile page for the
+// recovery path. Keeps the worker alive (tab messaging resets the idle timer)
+// while the SPA finishes rendering.
+async function waitForContentReady(tabId: number, log: string[], expect: 'messages' | 'profile' = 'messages'): Promise<boolean> {
   const deadline = Date.now() + 25_000;
   for (;;) {
-    const res = await sendToTab<{ pong?: boolean; ready?: boolean; threadId?: string | null }>(tabId, { type: 'CRM_PING' });
+    const res = await sendToTab<{ pong?: boolean; ready?: boolean; onProfile?: boolean; threadId?: string | null }>(tabId, { type: 'CRM_PING' });
     if (res?.pong) {
-      if (res.ready) {
+      // Older content builds don't report onProfile at all; treat a plain pong
+      // on the profile path as good enough rather than stalling for 25s.
+      const ready = expect === 'messages' ? !!res.ready : res.onProfile !== false;
+      if (ready) {
         // Don't hard-require thread match here (FB sometimes lags updating the
         // path); the content script re-checks before sending. Just log it.
-        log.push(`content ready (tabThread=${res.threadId || 'none'})`);
+        log.push(`content ready on ${expect} (tabThread=${res.threadId || 'none'})`);
         return true;
       }
     }
     if (Date.now() >= deadline) {
-      log.push('content script not ready within 25s');
+      log.push(`content script not ready (${expect}) within 25s`);
       return false;
     }
     await new Promise((r) => setTimeout(r, 700));
@@ -304,6 +323,185 @@ async function resolveChatUrl(r: Campaign['recipients'][number], log: string[]):
   return r.chatUrl;
 }
 
+// The contact's Facebook PROFILE url, which is what the recovery path needs.
+// A profile outlives the thread link: whatever Messenger has done to the
+// conversation's id, the profile page still carries the account's real fbid and
+// still offers a Message button wired to the live conversation.
+//
+// Preference order is most-explicit-first. The final fallback exploits the fact
+// that a 1:1 thread id IS the other person's account id (see csv.ts), so a
+// contact captured from Messenger — which has no stored profile URL — can still
+// be turned into one.
+async function resolveProfileUrl(r: Campaign['recipients'][number], log: string[]): Promise<string | null> {
+  let conv: Store['conversations'][string] | undefined;
+  try {
+    const store = await loadStore();
+    conv = store.conversations[r.threadId];
+  } catch (e) {
+    log.push(`could not read contact for profile lookup: ${String(e)}`);
+  }
+  if (conv?.profileUrl) return conv.profileUrl;
+  if (conv?.fbUserId) return `https://www.facebook.com/profile.php?id=${conv.fbUserId}`;
+  if (conv?.fbUsername) return `https://www.facebook.com/${conv.fbUsername}`;
+
+  const seg = (conv?.resolvedThreadId || r.threadId || '').trim();
+  if (!seg) return null;
+  return /^\d+$/.test(seg)
+    ? `https://www.facebook.com/profile.php?id=${seg}`
+    : `https://www.facebook.com/${seg}`;
+}
+
+// Persist the thread id the profile page reported, so later sends (and the
+// dashboard's chat links) go straight to the URL that works. The store key
+// stays as the originally captured id — re-keying it would orphan every
+// campaign recipient that references it.
+async function recordResolvedThread(requestedThreadId: string, resolvedThreadId: string, chatUrl: string, log: string[]): Promise<void> {
+  if (!resolvedThreadId || resolvedThreadId === requestedThreadId) return;
+  try {
+    const store = await loadStore();
+    const conv = store.conversations[requestedThreadId];
+    if (!conv) return;
+    if (conv.resolvedThreadId === resolvedThreadId && conv.chatUrl === chatUrl) return;
+    conv.resolvedThreadId = resolvedThreadId;
+    conv.participantId = resolvedThreadId;
+    conv.chatUrl = chatUrl;
+    conv.updatedAt = Date.now();
+    await saveStore(store);
+    log.push(`saved resolved thread id ${requestedThreadId} → ${resolvedThreadId}`);
+  } catch (e) {
+    log.push(`could not save resolved thread id: ${String(e)}`);
+  }
+}
+
+// Outcome of one attempt, minus the log — every step here appends to a single
+// shared log array instead, so the diagnostics stay in chronological order
+// across the first attempt and both recovery paths.
+interface Attempt { ok: boolean; error?: string; failureKind?: SendFailureKind }
+
+// How a retry decides an already-present copy of the message counts as
+// delivered; see the DupGuard comment in content.ts. Only the retries pass one.
+type DupGuard = 'sent-only' | 'not-failed';
+
+// A first attempt that read an explicit "Couldn't send" proves both that the
+// message didn't go out AND that status reading works on this page, so the
+// retry can insist on an explicit "Sent". Any other failure leaves us unable to
+// tell delivered from unreadable, so the retry errs against double-messaging.
+function dupGuardFor(first: Attempt): DupGuard {
+  return first.failureKind === 'not-delivered' ? 'sent-only' : 'not-failed';
+}
+
+// One send attempt against an already-open chat page.
+async function attemptSend(tabId: number, r: Campaign['recipients'][number], dryRun: boolean, skipIfDelivered: DupGuard | undefined, log: string[]): Promise<Attempt> {
+  const res = await sendViaPort<SendResult>(tabId, {
+    type: 'CRM_SEND_MESSAGE',
+    payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered },
+  }, 120_000);
+  if (!res) {
+    log.push('send port closed without a response');
+    return { ok: false, error: 'No response from content script (tab closed or send timed out)' };
+  }
+  log.push(...(res.log || []));
+  return { ok: res.ok, error: res.error, failureKind: res.failureKind };
+}
+
+// ---- Recovery: repair the conversation link via the contact's profile ----
+//
+// A saved thread URL can stop resolving to the live conversation (Messenger
+// re-keys threads, e2ee upgrades change the id). Facebook still accepts the
+// message into the page — bubble renders, composer clears — and then marks it
+// "Couldn't send", which is why these used to be recorded as successes.
+//
+// The profile page is the way back: it carries the account's canonical id, and
+// its Message button opens a drawer on the current conversation whatever the
+// stored id says. So we go there, take the id, retry the thread, and if that
+// still won't send, send through the drawer instead. Both retries pass
+// skipIfDelivered, so a message that did quietly go out is never sent twice.
+async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: boolean, guard: DupGuard, log: string[]): Promise<Attempt | null> {
+  const profileUrl = await resolveProfileUrl(r, log);
+  if (!profileUrl) {
+    log.push('recovery: no profile URL for this contact — cannot recover');
+    return null;
+  }
+
+  log.push(`recovery: opening profile ${profileUrl}`);
+  let tabId = await ensureSenderTab(profileUrl, log);
+  if (tabId == null) return null;
+  if (!(await waitForContentReady(tabId, log, 'profile'))) {
+    log.push('recovery: profile page never became ready');
+    return null;
+  }
+
+  const resolved = await sendViaPort<{ ok: boolean; threadId?: string; chatUrl?: string; error?: string; log?: string[] }>(
+    tabId,
+    { type: 'CRM_RESOLVE_PROFILE', payload: { threadId: r.threadId } },
+    45_000
+  );
+  log.push(...(resolved?.log || []));
+
+  // 1. A different, canonical thread id — retry the conversation at that URL.
+  if (resolved?.ok && resolved.threadId && resolved.chatUrl && resolved.threadId !== r.threadId) {
+    await recordResolvedThread(r.threadId, resolved.threadId, resolved.chatUrl, log);
+    log.push(`recovery: retrying on resolved thread ${resolved.threadId}`);
+    tabId = await ensureSenderTab(resolved.chatUrl, log);
+    if (tabId != null && (await waitForContentReady(tabId, log, 'messages'))) {
+      const retry = await attemptSend(tabId, r, dryRun, guard, log);
+      if (retry.ok) return retry;
+      log.push(`recovery: resolved-thread retry failed (${retry.error || 'unknown'}) — falling back to the profile drawer`);
+    }
+  } else if (!resolved?.ok) {
+    log.push(`recovery: could not resolve a thread id from the profile (${resolved?.error || 'no response'})`);
+  } else {
+    log.push('recovery: profile reports the same thread id — going straight to the drawer');
+  }
+
+  // 2. Drawer fallback: let Facebook open the conversation itself.
+  log.push('recovery: opening the chat drawer from the profile');
+  tabId = await ensureSenderTab(profileUrl, log);
+  if (tabId == null) return null;
+  if (!(await waitForContentReady(tabId, log, 'profile'))) {
+    log.push('recovery: profile page never became ready for the drawer');
+    return null;
+  }
+  const drawerTabId = tabId;
+  const drawer = await sendViaPort<SendResult>(drawerTabId, {
+    type: 'CRM_SEND_VIA_DRAWER',
+    payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered: guard },
+  }, 120_000);
+  if (drawer) log.push(...(drawer.log || []));
+
+  // Some layouts answer the Message button with a navigation to the full
+  // conversation instead of a docked drawer. That tears down the content script
+  // mid-request (so the port dies, or it reports no composer) — but it also
+  // lands us exactly where we wanted to be, on a thread URL Facebook chose
+  // itself. Finish the send there.
+  if (!drawer || (!drawer.ok && drawer.failureKind === 'no-composer')) {
+    const tab = await getTab(drawerTabId);
+    const url = tab?.url || '';
+    if (/\/messages\/t\//.test(url)) {
+      log.push(`recovery: Message opened a full conversation (${url}) — sending there instead`);
+      if (await waitForContentReady(drawerTabId, log, 'messages')) {
+        return await attemptSend(drawerTabId, r, dryRun, guard, log);
+      }
+    }
+  }
+
+  if (!drawer) {
+    log.push('recovery: no response from the drawer send');
+    return null;
+  }
+  return { ok: drawer.ok, error: drawer.error, failureKind: drawer.failureKind };
+}
+
+// A first attempt that ended in anything other than a confirmed "sent" gets the
+// profile recovery — EXCEPT when there was no composer to type into at all
+// ('no-composer', and 'unavailable', which is the diagnosed version of it).
+// Those aren't link problems: the page told us plainly there's nowhere to type,
+// and the profile can't change that.
+function shouldRecover(a: Attempt): boolean {
+  if (a.ok) return false;
+  return a.failureKind !== 'no-composer' && a.failureKind !== 'unavailable';
+}
+
 async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolean): Promise<SendResult> {
   const log: string[] = [];
   const chatUrl = await resolveChatUrl(r, log);
@@ -311,55 +509,107 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
     return { ok: false, error: 'No saved chat URL for this contact', log: [...log, 'missing chatUrl — cannot navigate'] };
   }
   log.push(`navigating to ${chatUrl}`);
+
+  let first: Attempt;
   const tabId = await ensureSenderTab(chatUrl, log);
-  if (tabId == null) return { ok: false, error: 'Could not open/navigate sender tab', log };
+  if (tabId == null) {
+    first = { ok: false, error: 'Could not open/navigate sender tab' };
+  } else if (!(await waitForContentReady(tabId, log, 'messages'))) {
+    first = { ok: false, error: 'Content script not ready on the chat page' };
+  } else {
+    first = await attemptSend(tabId, r, dryRun, undefined, log);
+  }
+  if (first.ok) return { ok: true, log };
+  if (!shouldRecover(first)) return { ok: false, error: first.error, failureKind: first.failureKind, log };
 
-  const ready = await waitForContentReady(tabId, r.threadId, log);
-  if (!ready) return { ok: false, error: 'Content script not ready on the chat page', log };
+  // Not confirmed sent. Try to repair the conversation link via the profile.
+  log.push(`first attempt did not confirm as sent: ${first.error || 'unknown'}`);
+  const recovery = await recoverViaProfile(r, dryRun, dupGuardFor(first), log);
+  if (recovery?.ok) return { ok: true, log };
 
-  const res = await sendViaPort<SendResult>(tabId, {
-    type: 'CRM_SEND_MESSAGE',
-    payload: { threadId: r.threadId, message: r.renderedMessage, dryRun },
-  }, 60_000);
-  if (!res) return { ok: false, error: 'No response from content script (tab closed or send timed out)', log: [...log, 'send port closed without a response'] };
-  return { ok: res.ok, error: res.error, failureKind: res.failureKind, log: [...log, ...(res.log || [])] };
+  // Recovery couldn't run, or ran and also failed — either way this is a real
+  // failure now and is recorded as one, with the whole trail attached.
+  return {
+    ok: false,
+    error: recovery?.error || first.error,
+    failureKind: recovery?.failureKind || first.failureKind || 'unconfirmed',
+    log,
+  };
 }
 
 // ---- the orchestrator step ----
 
 let processing = false;
 
+// Mirror the queue's clock onto every campaign that's waiting on it, so each
+// card in the dashboard can show the countdown without knowing about the queue.
+// Campaigns that aren't waiting on anything get their timers cleared.
+function mirrorQueueClock(all: Campaign[], q: QueueState): void {
+  const waiting = new Set(runnableCampaigns(all).map((c) => c.id));
+  for (const c of all) {
+    if (c.status === 'running' && waiting.has(c.id) && !q.paused) {
+      c.nextSendAt = q.nextSendAt;
+      c.pausedForBatchUntil = q.pausedForBatchUntil;
+    } else {
+      c.nextSendAt = undefined;
+      c.pausedForBatchUntil = undefined;
+    }
+  }
+}
+
+// Mark any running campaign that has nothing left to do as completed. This has
+// to run over ALL campaigns, not just the one that was served: a campaign whose
+// last recipient was removed by hand would otherwise sit "running" forever and
+// keep the queue's campaign count wrong.
+function sweepFinished(all: Campaign[]): boolean {
+  let changed = false;
+  for (const c of all) {
+    if (c.status === 'running' && nextRecipientIndex(c) === -1) {
+      finishCampaign(c);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 async function processTick(): Promise<void> {
   if (processing) return;
   processing = true;
   try {
-    let camp = await getActiveCampaign();
-    if (!camp || camp.status !== 'running') return;
-
+    let q = await loadQueue();
     const now = Date.now();
 
-    // Honour an in-progress inter-batch pause.
-    if (camp.pausedForBatchUntil && camp.pausedForBatchUntil > now) {
-      scheduleTick(camp.pausedForBatchUntil - now);
+    // A globally paused queue stops everything, whatever the campaigns say.
+    if (q.paused) { clearTick(); return; }
+
+    // Honour an in-progress inter-batch pause. It's global: the account needs
+    // the rest, so adding a fresh campaign can't be used to skip it. The 1s
+    // tolerance matters — a tick that fires a hair EARLY would otherwise
+    // reschedule for a few milliseconds, which Chrome clamps up to 30s.
+    if (q.pausedForBatchUntil && q.pausedForBatchUntil > now + 1_000) {
+      scheduleTick(q.pausedForBatchUntil - now);
       return;
     }
-    if (camp.pausedForBatchUntil && camp.pausedForBatchUntil <= now) {
-      camp.pausedForBatchUntil = undefined;
-    }
+    if (q.pausedForBatchUntil) q.pausedForBatchUntil = undefined;
 
-    // Find the next recipient that still needs work.
-    let idx = camp.cursor;
-    while (idx < camp.recipients.length) {
-      const st = camp.recipients[idx].status;
-      if (st === 'pending' || st === 'sending') break;
-      idx++;
-    }
-    if (idx >= camp.recipients.length) {
-      finishCampaign(camp);
-      await upsertCampaign(camp);
+    const all = await loadCampaigns();
+    sweepFinished(all);
+
+    const pick = pickNext(all, q);
+    if (!pick) {
+      // Queue drained. Leave `lastCampaignId` alone so a campaign added later
+      // doesn't jump the round-robin ahead of one that was already waiting.
+      q.nextSendAt = undefined;
+      q.inFlight = undefined;
+      mirrorQueueClock(all, q);
+      await saveCampaigns(all);
+      await saveQueue(q);
+      clearTick();
       return;
     }
 
+    const camp = pick.campaign;
+    const idx = pick.index;
     const r = camp.recipients[idx];
 
     // A recipient stuck 'sending' means a prior step died mid-send; cap retries.
@@ -369,12 +619,15 @@ async function processTick(): Promise<void> {
       r.failedAt = Date.now();
       r.log = [...(r.log || []), `gave up after ${r.attempts} attempts`];
       camp.cursor = idx + 1;
-      await upsertCampaign(camp);
+      sweepFinished(all);
+      await saveCampaigns(all);
       scheduleTick(1_000);
       return;
     }
 
-    // Open (or continue) the current batch.
+    // Open (or continue) this campaign's current batch. Batches stay
+    // per-campaign because they're a reporting device ("these went out
+    // together"); the counter that TRIGGERS a pause is the queue's.
     let batch = camp.batches[camp.batches.length - 1];
     if (!batch || batch.endedAt) {
       batch = { index: camp.batches.length, startedAt: now, count: 0 };
@@ -384,62 +637,91 @@ async function processTick(): Promise<void> {
     r.status = 'sending';
     r.attempts += 1;
     camp.cursor = idx;
-    await upsertCampaign(camp);
+    await saveCampaigns(all);
 
-    // Perform the actual send (navigates a tab, types, validates).
+    // Claim the turn before sending. Writing `lastCampaignId` up front (rather
+    // than after) means a worker killed mid-send still advances the round-robin
+    // on restart, so one campaign can't monopolize the queue by crashing.
+    q.lastCampaignId = camp.id;
+    q.inFlight = { campaignId: camp.id, threadId: r.threadId, startedAt: now };
+    await saveQueue(q);
+
+    // Perform the actual send (navigates a tab, types, validates). Minutes can
+    // pass in here, so everything below re-reads from storage.
     const result = await sendToRecipient(r, camp.dryRun);
 
-    // Reload — the user may have paused/cancelled while we were sending.
-    const after = await getCampaign(camp.id);
-    if (!after || after.status === 'cancelled') return;
+    q = await loadQueue();
+    q.inFlight = undefined;
 
-    const rr = after.recipients[idx];
-    const b = after.batches[after.batches.length - 1] || batch;
+    const all2 = await loadCampaigns();
+    const after = all2.find((c) => c.id === camp.id);
 
-    if (result.ok) {
-      rr.status = 'sent';
-      rr.sentAt = Date.now();
-      rr.batchIndex = b.index;
-      rr.error = undefined;
-      rr.errorKind = undefined;
-      rr.failedAt = undefined;
-      rr.log = result.log;
-      b.count += 1;
-      after.sentSinceBatchPause += 1;
+    // The user may have cancelled this campaign (or removed this recipient)
+    // while we were sending. Either way the result is discarded — but the other
+    // campaigns in the queue still need their turn, so we fall through to
+    // scheduling rather than returning.
+    const rr = after && after.status !== 'cancelled'
+      ? after.recipients.find((x) => x.threadId === r.threadId)
+      : undefined;
+
+    if (after && rr) {
+      const b = after.batches[after.batches.length - 1] || batch;
+      if (result.ok) {
+        rr.status = 'sent';
+        rr.sentAt = Date.now();
+        rr.batchIndex = b.index;
+        rr.error = undefined;
+        rr.errorKind = undefined;
+        rr.failedAt = undefined;
+        rr.log = result.log;
+        b.count += 1;
+        q.sentSinceBatchPause += 1;
+      } else {
+        rr.status = 'error';
+        rr.error = result.error;
+        rr.errorKind = result.failureKind;
+        rr.failedAt = Date.now();
+        rr.batchIndex = b.index;
+        rr.log = result.log;
+        // Errors don't count toward batch pacing — only confirmed sends do.
+      }
+      // The cursor tracks position, and the recipient list can have shifted
+      // under us, so re-derive it from where this recipient actually sits now.
+      after.cursor = after.recipients.indexOf(rr) + 1;
     } else {
-      rr.status = 'error';
-      rr.error = result.error;
-      rr.errorKind = result.failureKind;
-      rr.failedAt = Date.now();
-      rr.batchIndex = b.index;
-      rr.log = result.log;
-      // Errors don't count toward batch pacing — only confirmed sends do.
+      console.log(`[CRM] send finished for a campaign/recipient that is no longer queued — result discarded`);
     }
-    after.cursor = idx + 1;
 
-    // Any more pending recipients?
-    const more = after.recipients.some((x) => x.status === 'pending' || x.status === 'sending');
-    if (!more) {
-      finishCampaign(after);
-      await upsertCampaign(after);
-      return;
-    }
+    sweepFinished(all2);
 
     // Decide the next delay: long pause after ~batchSize sends, else 2-4 min.
+    // The config comes from the campaign that just sent, so each campaign's
+    // pace setting still means something even though the clock is shared.
+    const cfg = (after || camp).config;
     let delay: number;
-    if (after.sentSinceBatchPause >= after.currentBatchTarget) {
-      delay = randMs(after.config.pauseMinMs, after.config.pauseMaxMs);
-      after.sentSinceBatchPause = 0;
-      after.currentBatchTarget = nextBatchTarget(after.config);
-      after.pausedForBatchUntil = Date.now() + delay;
-      if (b && !b.endedAt) b.endedAt = Date.now(); // close the batch
+    if (q.sentSinceBatchPause >= q.currentBatchTarget) {
+      delay = randMs(cfg.pauseMinMs, cfg.pauseMaxMs);
+      q.sentSinceBatchPause = 0;
+      q.currentBatchTarget = nextBatchTarget(cfg);
+      q.pausedForBatchUntil = Date.now() + delay;
+      // The pause is global, so it ends every open batch, not just this one.
+      for (const c of all2) {
+        const ob = c.batches[c.batches.length - 1];
+        if (ob && !ob.endedAt) ob.endedAt = Date.now();
+      }
       console.log(`[CRM] Batch complete — pausing ${Math.round(delay / 60000)} min`);
     } else {
-      delay = randMs(after.config.minDelayMs, after.config.maxDelayMs);
+      delay = randMs(cfg.minDelayMs, cfg.maxDelayMs);
     }
-    after.nextSendAt = Date.now() + delay;
-    await upsertCampaign(after);
-    scheduleTick(delay);
+
+    const stillRunnable = runnableCampaigns(all2).length > 0;
+    q.nextSendAt = stillRunnable ? Date.now() + delay : undefined;
+    mirrorQueueClock(all2, q);
+    await saveCampaigns(all2);
+    await saveQueue(q);
+
+    if (stillRunnable) scheduleTick(delay);
+    else clearTick();
   } catch (e) {
     console.warn('[CRM] processTick error:', e);
   } finally {
@@ -457,13 +739,51 @@ function finishCampaign(c: Campaign): void {
   console.log(`[CRM] Campaign "${c.name}" complete`);
 }
 
+// Before the central queue existed, pacing lived on the campaign itself and
+// only one could run at a time. If we're starting up with no persisted queue
+// but a campaign already in flight, carry that campaign's pacing across so the
+// upgrade is invisible: the batch counter keeps counting, and the gap the user
+// is already waiting out isn't skipped.
+async function seedQueueFromLegacyCampaign(): Promise<void> {
+  const q = await loadQueue();
+  if (q.updatedAt !== 0) return; // queue already established — nothing to do
+
+  const all = await loadCampaigns();
+  // The old model allowed exactly one running campaign, so this is unambiguous.
+  const legacy = all.find((c) => c.status === 'running');
+  if (legacy) {
+    q.sentSinceBatchPause = legacy.sentSinceBatchPause || 0;
+    q.currentBatchTarget = legacy.currentBatchTarget || nextBatchTarget(legacy.config);
+    q.nextSendAt = legacy.nextSendAt;
+    q.pausedForBatchUntil = legacy.pausedForBatchUntil;
+    q.lastCampaignId = legacy.id;
+    console.log(`[CRM] Adopted in-flight campaign "${legacy.name}" into the send queue`);
+  }
+  await saveQueue(q);
+}
+
+// Nudge the queue after something changed (a campaign started, resumed, was
+// paused…). Critically, this RESPECTS the existing clock: if the queue is
+// already waiting out a gap or a batch pause, we re-arm the alarm for that
+// same moment instead of sending now. Otherwise "start another campaign"
+// would be a way to bypass the pacing that protects the account.
+async function kickQueue(): Promise<void> {
+  const q = await loadQueue();
+  if (q.paused) return;
+  ensureWatchdog();
+  const waitUntil = Math.max(q.nextSendAt || 0, q.pausedForBatchUntil || 0);
+  const now = Date.now();
+  if (waitUntil > now) { scheduleTick(waitUntil - now); return; }
+  void processTick();
+}
+
 // ---- campaign control (called from dashboard messages) ----
 
+// Queue a new campaign. There is deliberately no "one at a time" check any
+// more: a campaign started while others are running simply joins the queue and
+// starts taking turns. The pacing is shared, so this adds messages to send
+// without adding to the rate at which they go out.
 async function startCampaign(input: NewCampaignInput): Promise<{ success: boolean; campaignId?: string; error?: string }> {
-  const active = await getActiveCampaign();
-  if (active && active.status === 'running') {
-    return { success: false, error: 'A campaign is already running. Pause or cancel it first.' };
-  }
   if (!input.recipients || input.recipients.length === 0) {
     return { success: false, error: 'No recipients selected.' };
   }
@@ -473,37 +793,30 @@ async function startCampaign(input: NewCampaignInput): Promise<{ success: boolea
 
   const camp = createCampaign(input);
   camp.startedAt = Date.now();
-  camp.nextSendAt = Date.now();
   await upsertCampaign(camp);
-  ensureWatchdog();
-  // Kick off immediately; processTick schedules the next alarm itself.
-  processTick();
+  await kickQueue();
   return { success: true, campaignId: camp.id };
 }
 
+// Pausing/cancelling ONE campaign leaves the rest of the queue running — the
+// tick alarm stays armed, and the next tick just picks somebody else.
 async function pauseCampaign(id: string): Promise<{ success: boolean }> {
   const c = await getCampaign(id);
   if (!c) return { success: false };
   c.status = 'paused';
   c.nextSendAt = undefined;
+  c.pausedForBatchUntil = undefined;
   await upsertCampaign(c);
-  clearTick();
+  await kickQueue();
   return { success: true };
 }
 
 async function resumeCampaign(id: string): Promise<{ success: boolean; error?: string }> {
-  const active = await getActiveCampaign();
-  if (active && active.id !== id && active.status === 'running') {
-    return { success: false, error: 'Another campaign is already running.' };
-  }
   const c = await getCampaign(id);
   if (!c) return { success: false, error: 'Campaign not found.' };
   c.status = 'running';
-  c.pausedForBatchUntil = undefined; // resume promptly
-  c.nextSendAt = Date.now();
   await upsertCampaign(c);
-  ensureWatchdog();
-  processTick();
+  await kickQueue();
   return { success: true };
 }
 
@@ -515,7 +828,47 @@ async function cancelCampaign(id: string): Promise<{ success: boolean }> {
   c.nextSendAt = undefined;
   c.pausedForBatchUntil = undefined;
   await upsertCampaign(c);
+  await kickQueue();
+  return { success: true };
+}
+
+// ---- queue control ----
+//
+// Distinct from pausing a campaign: this stops the processor itself, so
+// nothing goes out from any campaign until it's resumed. Campaign statuses are
+// left untouched, so resuming picks up exactly where it left off.
+async function pauseQueue(): Promise<{ success: boolean }> {
+  const q = await loadQueue();
+  q.paused = true;
+  // `nextSendAt` is deliberately left in place: resuming should serve out
+  // whatever gap was still owed, not restart the clock at zero. Otherwise
+  // pause-then-resume would be a way to send the next message early.
+  await saveQueue(q);
+  const all = await loadCampaigns();
+  mirrorQueueClock(all, q);
+  await saveCampaigns(all);
   clearTick();
+  return { success: true };
+}
+
+async function resumeQueue(): Promise<{ success: boolean }> {
+  const q = await loadQueue();
+  q.paused = false;
+  // Drop a batch pause that expired while the queue was stopped, rather than
+  // making the user wait it out twice.
+  if (q.pausedForBatchUntil && q.pausedForBatchUntil <= Date.now()) q.pausedForBatchUntil = undefined;
+  await saveQueue(q);
+  await kickQueue();
+  return { success: true };
+}
+
+async function setQueueMode(mode: QueueMode): Promise<{ success: boolean; error?: string }> {
+  if (mode !== 'interleave' && mode !== 'sequential') {
+    return { success: false, error: 'Unknown queue mode.' };
+  }
+  const q = await loadQueue();
+  q.mode = mode;
+  await saveQueue(q);
   return { success: true };
 }
 
@@ -565,10 +918,7 @@ async function requeueCampaignRecipient(id: string, threadId: string): Promise<{
   }
 
   await upsertCampaign(c);
-  if (c.status === 'running') {
-    ensureWatchdog();
-    processTick();
-  }
+  if (c.status === 'running') await kickQueue();
   return { success: true };
 }
 
@@ -577,12 +927,19 @@ async function watchdog(): Promise<void> {
   // Reconcile any Drive write that didn't land (offline, worker killed mid-flush).
   void flushDriveIfDirty();
 
-  const c = await getActiveCampaign();
-  if (!c || c.status !== 'running') return;
+  const q = await loadQueue();
+  if (q.paused) return;
   const now = Date.now();
-  if (c.pausedForBatchUntil && c.pausedForBatchUntil > now) return; // legitimately pausing
-  if (c.nextSendAt && c.nextSendAt > now + 5_000) return;          // legitimately waiting
-  processTick();
+  if (q.pausedForBatchUntil && q.pausedForBatchUntil > now) return; // legitimately pausing
+  if (q.nextSendAt && q.nextSendAt > now + 5_000) return;           // legitimately waiting
+
+  // A send that's genuinely in flight can run for minutes; `processing` guards
+  // it within one worker lifetime, and this guards across a restart.
+  if (q.inFlight && now - q.inFlight.startedAt < 5 * 60_000) return;
+
+  const all = await loadCampaigns();
+  if (!pickNext(all, q)) return; // nothing to do — not a stall
+  void processTick();
 }
 
 try {
@@ -594,7 +951,10 @@ try {
   console.warn('[CRM] could not register alarm listener:', e);
 }
 
-// Re-arm the watchdog whenever the worker spins up.
+// Re-arm the watchdog whenever the worker spins up. The queue seed runs first
+// so the watchdog's first pass (a minute out) sees real pacing rather than an
+// empty queue that looks overdue.
+void seedQueueFromLegacyCampaign();
 ensureWatchdog();
 
 // On startup, push up any local edits that didn't reach Drive last session.
@@ -675,7 +1035,25 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           break;
         }
         case 'GET_CAMPAIGNS': {
-          sendResponse({ campaigns: await loadCampaigns() });
+          // The queue rides along: the dashboard polls this on a timer and
+          // needs both to render the queue header and the per-campaign cards.
+          sendResponse({ campaigns: await loadCampaigns(), queue: await loadQueue() });
+          break;
+        }
+        case 'GET_QUEUE': {
+          sendResponse({ queue: await loadQueue() });
+          break;
+        }
+        case 'PAUSE_QUEUE': {
+          sendResponse(await pauseQueue());
+          break;
+        }
+        case 'RESUME_QUEUE': {
+          sendResponse(await resumeQueue());
+          break;
+        }
+        case 'SET_QUEUE_MODE': {
+          sendResponse(await setQueueMode(request.payload.mode as QueueMode));
           break;
         }
         case 'PAUSE_CAMPAIGN': {

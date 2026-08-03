@@ -1,9 +1,12 @@
 // Bulk-messaging campaigns: types, persistence, and small pure helpers.
 //
 // A "campaign" is one bulk send: a template message dispatched to a set of
-// recipients, throttled with human-like delays. Unlike the CRM store (which
-// lives in chrome.storage.sync so it follows you across machines), campaign
-// history is intentionally MACHINE-LOCAL:
+// recipients, throttled with human-like delays. Any number of campaigns can be
+// in flight at once — they all feed ONE central send queue (see QueueState
+// further down), which owns the pacing and decides whose turn it is.
+//
+// Unlike the CRM store (which lives in chrome.storage.sync so it follows you
+// across machines), campaign history is intentionally MACHINE-LOCAL:
 //
 //   * The send actually happens on this machine's browser, so the log of what
 //     happened belongs here.
@@ -17,8 +20,11 @@
 export const CAMPAIGNS_KEY = 'facebook_crm_campaigns';
 
 // Keep storage bounded: cap retained campaigns and log lines per recipient.
+// The line cap has to clear a full failed send PLUS the profile-recovery pass
+// that follows it (see background.ts) — trimming to the last few lines would
+// leave the outcome without the diagnosis that led to it.
 export const MAX_CAMPAIGNS = 50;
-export const MAX_LOG_LINES = 40;
+export const MAX_LOG_LINES = 100;
 
 // Default human-like pacing. All durations in milliseconds.
 export const DEFAULTS = {
@@ -39,7 +45,14 @@ export type CampaignStatus = 'running' | 'paused' | 'completed' | 'cancelled';
 // is pointless, which is worth saying differently in the UI from a generic
 // glitch. 'no-composer' is the undiagnosed case: the thread never rendered a
 // composer and we found no explanation on the page.
-export type SendFailureKind = 'unavailable' | 'no-composer';
+//
+// The last two are about a message that WAS typed and submitted:
+// 'not-delivered' means Facebook itself marked the bubble "Couldn't send"
+// (a stale/re-keyed conversation link is the usual cause), and 'unconfirmed'
+// means it never reported the message as sent either way. Both are only
+// recorded after the profile-resolution recovery has been tried and also
+// failed — see background.ts.
+export type SendFailureKind = 'unavailable' | 'no-composer' | 'not-delivered' | 'unconfirmed';
 
 export interface CampaignRecipient {
   threadId: string;
@@ -84,11 +97,18 @@ export interface Campaign {
   recipients: CampaignRecipient[];
   cursor: number;               // index of the next recipient to process
   config: CampaignConfig;
-  // batch pacing bookkeeping
+  // Batch bookkeeping. `batches` is a per-campaign reporting device — "these
+  // went out together" — and is still maintained. The two counters below are
+  // LEGACY: pacing moved to the shared queue, which is what actually decides
+  // when a pause happens. They're kept only so an upgrade mid-campaign can
+  // seed the queue from them (see background.ts).
   batches: CampaignBatch[];
   sentSinceBatchPause: number;  // count toward the next pause
   currentBatchTarget: number;   // randomized threshold for the next pause
-  // scheduling visibility for the UI
+  // Scheduling visibility for the UI. Pacing is owned by the shared send queue
+  // (see QueueState below), so these are MIRRORS of the queue's clock, written
+  // onto every running campaign — not per-campaign timers. Several campaigns
+  // waiting on the same `nextSendAt` is expected; only one of them is next.
   nextSendAt?: number;          // timestamp the next attempt is scheduled for
   pausedForBatchUntil?: number; // set while in a long inter-batch pause
 }
@@ -242,10 +262,149 @@ export async function getCampaign(id: string): Promise<Campaign | null> {
   return all.find((c) => c.id === id) || null;
 }
 
-// The single campaign currently eligible to run (running or paused).
-export async function getActiveCampaign(): Promise<Campaign | null> {
-  const all = await loadCampaigns();
-  return all.find((c) => c.status === 'running' || c.status === 'paused') || null;
+// Campaigns the user still considers live — running or merely paused. Used by
+// the UI to decide what to surface as "in flight"; the scheduler below only
+// cares about the 'running' subset.
+export function activeCampaigns(all: Campaign[]): Campaign[] {
+  return all.filter((c) => c.status === 'running' || c.status === 'paused');
+}
+
+// =====================================================================
+//  The central send queue
+// =====================================================================
+//
+// Several campaigns can be 'running' at once, but the actual SENDING is still
+// strictly one-at-a-time: there is one sender tab, and — more importantly —
+// Facebook rate-limits the account, not the campaign. Running three campaigns
+// with their own 2-4 minute timers would triple the real send rate and get the
+// account flagged.
+//
+// So pacing lives HERE, on the queue, not on the individual campaign: one gap
+// between sends and one batch counter, shared by everything. A campaign
+// contributes its recipients and its config; the queue decides who goes next
+// and when. Adding a campaign therefore never speeds the account up, it just
+// changes what the next message will be.
+
+export const QUEUE_KEY = 'facebook_crm_send_queue';
+
+// How the queue divides its attention between campaigns.
+//   'interleave' — round-robin, one message per campaign per turn. Every group
+//                  makes progress from the moment it's queued.
+//   'sequential' — oldest campaign first, drain it, then the next one. The
+//                  pre-queue behaviour, minus the babysitting.
+export type QueueMode = 'interleave' | 'sequential';
+
+export interface QueueState {
+  paused: boolean;              // global stop, independent of campaign status
+  mode: QueueMode;
+  nextSendAt?: number;          // when the next message (any campaign) goes out
+  pausedForBatchUntil?: number; // set while in a long inter-batch pause
+  sentSinceBatchPause: number;  // global count toward the next pause
+  currentBatchTarget: number;   // randomized threshold for the next pause
+  lastCampaignId?: string;      // round-robin cursor
+  // Set while a send is actually in flight, so a restarted service worker can
+  // tell "mid-send" from "stalled" and the UI can name who's being messaged.
+  inFlight?: { campaignId: string; threadId: string; startedAt: number };
+  updatedAt: number;
+}
+
+// `updatedAt: 0` marks a queue that has never been persisted, which is how the
+// upgrade path in background.ts recognizes a first run and seeds pacing from a
+// campaign that was already in flight. saveQueue always stamps a real time.
+export function defaultQueueState(): QueueState {
+  return {
+    paused: false,
+    mode: 'interleave',
+    sentSinceBatchPause: 0,
+    currentBatchTarget: nextBatchTarget(defaultConfig()),
+    updatedAt: 0,
+  };
+}
+
+export async function loadQueue(): Promise<QueueState> {
+  const q = await localGet<Partial<QueueState>>(QUEUE_KEY);
+  // Merge over the defaults so a queue persisted by an older build (or a
+  // half-written one) can't leave a required field undefined.
+  return { ...defaultQueueState(), ...(q || {}) };
+}
+
+export async function saveQueue(q: QueueState): Promise<void> {
+  await localSet(QUEUE_KEY, { ...q, updatedAt: Date.now() });
+}
+
+// ---- Selection ----
+
+// Index of the next recipient in this campaign that still needs work, or -1 if
+// it's done. 'sending' counts as needing work: it means a previous step died
+// mid-send, and the attempt cap in background.ts is what stops it looping.
+export function nextRecipientIndex(c: Campaign): number {
+  for (let i = Math.max(0, c.cursor); i < c.recipients.length; i++) {
+    const st = c.recipients[i].status;
+    if (st === 'pending' || st === 'sending') return i;
+  }
+  return -1;
+}
+
+// Campaigns with work left, oldest first. Start order is the tiebreak so the
+// round-robin is stable as campaigns come and go.
+export function runnableCampaigns(all: Campaign[]): Campaign[] {
+  return all
+    .filter((c) => c.status === 'running' && nextRecipientIndex(c) !== -1)
+    .sort((a, b) => (a.startedAt || a.createdAt) - (b.startedAt || b.createdAt));
+}
+
+export interface QueuePick {
+  campaign: Campaign;
+  index: number;
+}
+
+// Who gets the next send. Pure — it reads the queue's cursor and returns the
+// pick, and the caller is responsible for writing `lastCampaignId` back.
+export function pickNext(all: Campaign[], q: QueueState): QueuePick | null {
+  const queue = runnableCampaigns(all);
+  if (queue.length === 0) return null;
+
+  if (q.mode === 'sequential') {
+    return { campaign: queue[0], index: nextRecipientIndex(queue[0]) };
+  }
+
+  // Round-robin: advance past whoever went last. A `lastCampaignId` that's no
+  // longer runnable (finished, paused, cancelled) yields -1, which wraps to the
+  // front of the queue — exactly what we want.
+  const at = q.lastCampaignId ? queue.findIndex((c) => c.id === q.lastCampaignId) : -1;
+  const campaign = queue[(at + 1) % queue.length];
+  return { campaign, index: nextRecipientIndex(campaign) };
+}
+
+// How many messages the queue still has to send, across every live campaign.
+export function queueDepth(all: Campaign[]): { pending: number; campaigns: number } {
+  let pending = 0;
+  let campaigns = 0;
+  for (const c of all) {
+    if (c.status !== 'running' && c.status !== 'paused') continue;
+    const n = c.recipients.filter((r) => r.status === 'pending' || r.status === 'sending').length;
+    if (n > 0) { pending += n; campaigns++; }
+  }
+  return { pending, campaigns };
+}
+
+// Recipients that are already waiting to be messaged by a live campaign, keyed
+// by threadId → the campaigns queuing them. With several groups in flight at
+// once it's easy to include the same person twice without noticing, so the
+// composer warns about the overlap before a campaign is created.
+export function pendingRecipientIndex(all: Campaign[], excludeCampaignId?: string): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  for (const c of all) {
+    if (c.id === excludeCampaignId) continue;
+    if (c.status !== 'running' && c.status !== 'paused') continue;
+    for (const r of c.recipients) {
+      if (r.status !== 'pending' && r.status !== 'sending') continue;
+      const names = map.get(r.threadId);
+      if (names) { if (!names.includes(c.name)) names.push(c.name); }
+      else map.set(r.threadId, [c.name]);
+    }
+  }
+  return map;
 }
 
 // ---- Failed-message notice ----
