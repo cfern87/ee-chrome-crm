@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, addTagsTo, removeTagsFrom, lastTaggedAt } from '../storage';
+import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, addTagsTo, removeTagsFrom, lastTaggedAt, getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES } from '../storage';
+import { BUILD_INFO } from '../buildInfo';
 import {
   QueryGroup, SavedSearch, ArchiveScope, QueryContext,
   emptyQuery, isQueryEmpty, filterByQuery, normalizeQuery, newSavedSearch, sortSavedSearches, describeQuery,
@@ -100,6 +101,30 @@ function formatDateTime(ts?: number): string {
 
 function minutes(ms: number): string {
   return `${Math.round(ms / 60000)}m`;
+}
+
+// "in 3m 12s" style countdown for the next scheduled Drive sync.
+function formatCountdown(ms: number): string {
+  if (ms <= 1000) return 'any moment';
+  const total = Math.ceil(ms / 1000);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+// The background worker owns the periodic Drive sync; read its alarm so the
+// settings panel can show when the next pass is due. Resolves null when alarms
+// aren't available or the worker hasn't scheduled it yet.
+function getNextDriveSyncAt(): Promise<number | null> {
+  return new Promise((resolve) => {
+    try {
+      if (typeof chrome === 'undefined' || !chrome.alarms?.get) { resolve(null); return; }
+      chrome.alarms.get(DRIVE_SYNC_ALARM, (alarm) => {
+        void chrome.runtime.lastError;
+        resolve(alarm?.scheduledTime ?? null);
+      });
+    } catch { resolve(null); }
+  });
 }
 
 function formatRelativeTime(ts: number): string {
@@ -2107,6 +2132,8 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
 
   return (
     <div style={{ maxWidth: 560 }}>
+      <AboutPanel />
+
       <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
         <h3 style={{ margin: '0 0 16px', fontSize: 15, fontWeight: 600 }}>Preferences</h3>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -2227,6 +2254,83 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
   );
 }
 
+// --- About / build identity ---
+//
+// dist/ is gitignored, so pulling source does NOT update the loaded extension —
+// it keeps running the last build until someone runs `npm run build` and
+// reloads. That failure mode is invisible (the feature simply "isn't there"),
+// so the exact build is surfaced here: version, the commit it was built from,
+// and when. If the commit shown doesn't match `git log -1 --format=%h` on this
+// machine, the extension is stale.
+function AboutPanel() {
+  const [copied, setCopied] = useState(false);
+
+  // The manifest is the version Chrome itself reports; BUILD_INFO.version is
+  // what the bundle was stamped with. They can only differ if dist was
+  // assembled from mismatched parts, which is worth seeing.
+  let manifestVersion = '';
+  try { manifestVersion = chrome.runtime.getManifest().version; } catch { /* not in an extension context */ }
+
+  const stale = !!manifestVersion && BUILD_INFO.version !== '0.0.0' && manifestVersion !== BUILD_INFO.version;
+  const unknown = BUILD_INFO.commit === 'unknown';
+  const summary = `v${manifestVersion || BUILD_INFO.version} · ${BUILD_INFO.commit}${BUILD_INFO.dirty ? '+local' : ''}${BUILD_INFO.builtAt ? ` · built ${new Date(BUILD_INFO.builtAt).toLocaleString()}` : ''}`;
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(summary);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard unavailable — the text is on screen anyway */ }
+  };
+
+  const row = (label: string, value: React.ReactNode) => (
+    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, padding: '5px 0' }}>
+      <span style={{ color: '#888' }}>{label}</span>
+      <span style={{ fontWeight: 600, color: '#333', textAlign: 'right', wordBreak: 'break-all' }}>{value}</span>
+    </div>
+  );
+
+  return (
+    <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+        <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600 }}>About this build</h3>
+        <button
+          onClick={copy}
+          style={{ background: 'none', border: '1px solid #e0e0e0', borderRadius: 6, padding: '4px 9px', fontSize: 11, fontWeight: 600, color: '#555', cursor: 'pointer' }}
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+
+      <div style={{ fontSize: 12, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+        {row('Version', manifestVersion || BUILD_INFO.version)}
+        {row('Source commit', unknown ? 'unknown' : (
+          <>
+            {BUILD_INFO.commit}
+            {BUILD_INFO.dirty && <span style={{ color: '#b26a00' }}> +uncommitted</span>}
+          </>
+        ))}
+        {row('Commit date', BUILD_INFO.commitDate ? new Date(BUILD_INFO.commitDate).toLocaleString() : '—')}
+        {row('Built', BUILD_INFO.builtAt ? `${new Date(BUILD_INFO.builtAt).toLocaleString()} (${formatRelativeTime(BUILD_INFO.builtAt)})` : '—')}
+      </div>
+
+      {stale && (
+        <div style={{ marginTop: 10, fontSize: 12, padding: '8px 10px', borderRadius: 6, background: '#fdecea', color: '#c62828', lineHeight: 1.5 }}>
+          The loaded manifest says <strong>v{manifestVersion}</strong> but the bundle was built from <strong>v{BUILD_INFO.version}</strong>.
+          Run <code>npm run build</code> and reload the extension.
+        </div>
+      )}
+
+      <p style={{ margin: '10px 0 0', fontSize: 11, color: '#aaa', lineHeight: 1.6 }}>
+        The version bumps on every commit. <strong>Pulling source does not update the extension</strong> — the loaded code comes from
+        {' '}<code>packages/extension/dist/</code>, which isn't in git. After a <code>git pull</code>, run <code>npm run build</code> and
+        reload at <code>chrome://extensions</code>. If the commit above doesn't match <code>git log -1 --format=%h</code> on this
+        machine, you're running a stale build.
+      </p>
+    </div>
+  );
+}
+
 // --- Google Drive sync ---
 //
 // Connecting makes Drive this machine's canonical store (setDriveEnabled(true)),
@@ -2240,12 +2344,31 @@ function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (
   const [status, setStatus] = useState<{ type: 'success' | 'error' | 'info'; msg: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [pushConfirm, setPushConfirm] = useState(false);
+  // Sync cycle: when Drive last answered, whether anything is still queued, and
+  // when the background worker's next reconcile is due.
+  const [syncInfo, setSyncInfo] = useState<DriveSyncInfo | null>(null);
+  const [nextSyncAt, setNextSyncAt] = useState<number | null>(null);
+  const [now, setNow] = useState(Date.now());
+
+  const refreshSchedule = useCallback(async () => {
+    try { setSyncInfo(await getDriveSyncInfo()); } catch { setSyncInfo(null); }
+    try { setNextSyncAt(await getNextDriveSyncAt()); } catch { setNextSyncAt(null); }
+  }, []);
 
   const refresh = useCallback(async () => {
     try { setDriveStatus(await getDriveStatus()); } catch { setDriveStatus(null); }
     try { setEnabled(await isDriveEnabled()); } catch { setEnabled(false); }
-  }, []);
+    await refreshSchedule();
+  }, [refreshSchedule]);
   useEffect(() => { void refresh(); }, [refresh]);
+
+  // Tick the countdown every second, and re-read the alarm periodically so the
+  // panel picks up the next window after a sync fires.
+  useEffect(() => {
+    const clock = setInterval(() => setNow(Date.now()), 1000);
+    const poll = setInterval(() => { void refreshSchedule(); }, 10_000);
+    return () => { clearInterval(clock); clearInterval(poll); };
+  }, [refreshSchedule]);
 
   const configured = driveStatus?.configured ?? isDriveConfigured();
   const connected = !!driveStatus?.connected;
@@ -2335,12 +2458,38 @@ function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (
             <br />
             <code style={{ wordBreak: 'break-all', color: '#333' }}>{getAuthRedirectUri() || '(unavailable)'}</code>
           </div>
-          <div style={{ fontSize: 12, marginBottom: 12, color: connected ? '#2e7d32' : '#888' }}>
+          <div style={{ fontSize: 12, marginBottom: connected && enabled ? 8 : 12, color: connected ? '#2e7d32' : '#888' }}>
             {connected ? '● Connected to Google Drive' : '○ Not connected'}
             {connected && driveStatus?.file?.modifiedTime && (
               <span style={{ color: '#aaa' }}>{' '}· last backup {new Date(driveStatus.file.modifiedTime).toLocaleString()}</span>
             )}
           </div>
+
+          {/* Sync cycle. Saves upload as they happen; this periodic pass is what
+              pulls down edits made on another machine, so it's the number that
+              answers "when will this machine see the other one's changes?". */}
+          {connected && enabled && (
+            <div style={{ fontSize: 12, marginBottom: 12, padding: '8px 10px', background: '#f8f8f8', borderRadius: 6, lineHeight: 1.7, color: '#555' }}>
+              <div>
+                <strong>Next sync</strong>{' '}
+                {nextSyncAt ? (
+                  <>
+                    in {formatCountdown(nextSyncAt - now)}{' '}
+                    <span style={{ color: '#aaa' }}>({new Date(nextSyncAt).toLocaleTimeString()})</span>
+                  </>
+                ) : (
+                  <span style={{ color: '#aaa' }}>scheduling… (the background worker sets it on wake)</span>
+                )}
+              </div>
+              <div style={{ color: '#888' }}>
+                Last sync {syncInfo?.lastSyncAt ? `${new Date(syncInfo.lastSyncAt).toLocaleTimeString()} (${formatRelativeTime(syncInfo.lastSyncAt)})` : '—'}
+                {' · '}every {DRIVE_SYNC_PERIOD_MINUTES} min
+                {syncInfo?.pendingUpload && (
+                  <span style={{ color: '#b26a00', fontWeight: 600 }}>{' · '}changes waiting to upload</span>
+                )}
+              </div>
+            </div>
+          )}
 
           {!connected ? (
             <button onClick={handleConnect} disabled={busy} style={btn('#065fd4')}>Connect Google Drive</button>

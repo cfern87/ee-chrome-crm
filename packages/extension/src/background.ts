@@ -25,7 +25,7 @@
 // periodic watchdog alarm self-heals any stall (e.g. if the worker was killed
 // mid-step).
 
-import { loadStore, saveStore, flushDriveIfDirty, removeTagsFrom } from './storage';
+import { loadStore, saveStore, flushDriveIfDirty, syncDriveNow, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, removeTagsFrom } from './storage';
 import type { Store } from './storage';
 import {
   Campaign,
@@ -69,6 +69,25 @@ function clearTick(): void {
 function ensureWatchdog(): void {
   try { chrome.alarms?.create(WATCHDOG_ALARM, { periodInMinutes: 1 }); }
   catch (e) { console.warn('[CRM] alarms unavailable (watchdog):', e); }
+}
+
+// Periodic Drive reconcile. Only created when missing: re-creating an alarm
+// resets its countdown, and the service worker restarts often enough that
+// doing so on every startup could starve the sync — and would make the "next
+// sync" time the dashboard shows jump around.
+function ensureDriveSync(): void {
+  try {
+    chrome.alarms?.get(DRIVE_SYNC_ALARM, (existing) => {
+      void chrome.runtime.lastError;
+      if (existing) return;
+      try {
+        chrome.alarms?.create(DRIVE_SYNC_ALARM, {
+          delayInMinutes: DRIVE_SYNC_PERIOD_MINUTES,
+          periodInMinutes: DRIVE_SYNC_PERIOD_MINUTES,
+        });
+      } catch (e) { console.warn('[CRM] alarms unavailable (drive sync):', e); }
+    });
+  } catch (e) { console.warn('[CRM] alarms unavailable (drive sync):', e); }
 }
 
 // ---- sender tab bookkeeping (survives SW restarts) ----
@@ -946,6 +965,7 @@ try {
   chrome.alarms?.onAlarm.addListener((alarm) => {
     if (alarm.name === TICK_ALARM) processTick();
     else if (alarm.name === WATCHDOG_ALARM) watchdog();
+    else if (alarm.name === DRIVE_SYNC_ALARM) void syncDriveNow();
   });
 } catch (e) {
   console.warn('[CRM] could not register alarm listener:', e);
@@ -956,6 +976,7 @@ try {
 // empty queue that looks overdue.
 void seedQueueFromLegacyCampaign();
 ensureWatchdog();
+ensureDriveSync();
 
 // On startup, push up any local edits that didn't reach Drive last session.
 void flushDriveIfDirty();

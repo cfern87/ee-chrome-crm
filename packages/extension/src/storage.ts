@@ -550,6 +550,22 @@ async function syncWriteDelta(store: Store): Promise<SyncWriteResult> {
 const DRIVE_ENABLED_KEY = 'crm_drive_enabled';
 // Set when a save couldn't reach Drive, so a later flush knows to retry.
 const DRIVE_DIRTY_KEY = 'crm_drive_dirty';
+// Epoch ms of the last time Drive was actually reached (read or write).
+const DRIVE_LAST_SYNC_KEY = 'crm_drive_last_sync';
+
+/**
+ * How often the background worker reconciles this machine with Drive. Writes
+ * are already pushed as they happen; this periodic pass is what pulls in edits
+ * made on *other* machines and retries anything that failed while offline.
+ * The dashboard uses it to show when the next sync is due.
+ */
+export const DRIVE_SYNC_PERIOD_MINUTES = 5;
+
+/**
+ * Name of the periodic alarm that drives it. Shared so the dashboard can read
+ * the alarm's `scheduledTime` and show when the next sync is due.
+ */
+export const DRIVE_SYNC_ALARM = 'crm-drive-sync';
 
 function localFlagGet(key: string): Promise<boolean> {
   if (!isExtensionAlive()) return Promise.resolve(false);
@@ -570,6 +586,33 @@ function localFlagSet(key: string, val: boolean): Promise<void> {
       chrome.storage.local.set({ [key]: val }, () => { void chrome.runtime.lastError; resolve(); });
     } catch { resolve(); }
   });
+}
+
+function localNumGet(key: string): Promise<number | null> {
+  if (!isExtensionAlive()) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(key, (res) => {
+        if (chrome.runtime.lastError) { resolve(null); return; }
+        const v = res?.[key];
+        resolve(typeof v === 'number' ? v : null);
+      });
+    } catch { resolve(null); }
+  });
+}
+
+function localNumSet(key: string, val: number): Promise<void> {
+  if (!isExtensionAlive()) return Promise.resolve();
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.set({ [key]: val }, () => { void chrome.runtime.lastError; resolve(); });
+    } catch { resolve(); }
+  });
+}
+
+/** Record that we just talked to Drive successfully (read or write). */
+function markDriveSynced(): Promise<void> {
+  return localNumSet(DRIVE_LAST_SYNC_KEY, Date.now());
 }
 
 /** True when this machine treats Google Drive as the canonical store. */
@@ -602,6 +645,7 @@ function flushDrivePending(): void {
         try {
           await driveWriteStore(s);
           await localFlagSet(DRIVE_DIRTY_KEY, false);
+          await markDriveSynced();
         } catch (e) {
           console.warn('[CRM] Drive write failed — kept local, will retry:', e);
           await localFlagSet(DRIVE_DIRTY_KEY, true);
@@ -631,6 +675,37 @@ export async function flushDriveIfDirty(): Promise<void> {
   if (local) queueDriveWrite(local);
 }
 
+/** What the settings panel shows about the Drive sync cycle. */
+export interface DriveSyncInfo {
+  enabled: boolean;           // Drive is this machine's canonical store
+  lastSyncAt: number | null;  // last successful Drive read/write, epoch ms
+  pendingUpload: boolean;     // local edits still waiting to reach Drive
+}
+
+export async function getDriveSyncInfo(): Promise<DriveSyncInfo> {
+  const [enabled, pendingUpload, lastSyncAt] = await Promise.all([
+    isDriveEnabled(),
+    localFlagGet(DRIVE_DIRTY_KEY),
+    localNumGet(DRIVE_LAST_SYNC_KEY),
+  ]);
+  return { enabled, lastSyncAt, pendingUpload };
+}
+
+/**
+ * One full reconcile pass: retry anything that didn't upload, then re-read the
+ * canonical Drive copy and merge it into the local cache (this is what picks up
+ * edits made on another machine). Driven by a periodic alarm in the background
+ * worker; a no-op when Drive mode is off.
+ */
+export async function syncDriveNow(): Promise<boolean> {
+  if (!(await isDriveEnabled())) return false;
+  await flushDriveIfDirty();
+  // loadStore() in Drive mode reads Drive, merges local edits, refreshes the
+  // cache and stamps the last-sync time on success.
+  await loadStore();
+  return true;
+}
+
 // Drive-mode load: Drive is canonical, but reconcile with any local offline
 // edits and serve the local cache when Drive is unreachable.
 async function loadStoreDrive(): Promise<Store> {
@@ -648,6 +723,7 @@ async function loadStoreDrive(): Promise<Store> {
 
   // Offline / auth failure: fall back to whatever we have locally.
   if (!driveReachable) return local;
+  await markDriveSynced();
 
   // Drive empty (fresh account): seed it from local, or a one-time read of the
   // legacy sync store if this machine is mid-migration.

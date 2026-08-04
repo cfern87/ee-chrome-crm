@@ -119,6 +119,31 @@ The compiled extension will be in `packages/extension/dist/`.
 4. Select `packages/extension/dist/` folder
 5. The extension is now active!
 
+### Updating on another machine
+
+**`git pull` alone does not update the extension.** Chrome loads
+`packages/extension/dist/`, which is gitignored — pulling refreshes the source
+but the browser keeps running the previously built bundle, so new features look
+like they never arrived. After every pull:
+
+```bash
+npm install && npm run build
+```
+
+then hit **Reload** on the extension at `chrome://extensions/`.
+
+Two safeguards make this hard to get wrong:
+
+- **`.githooks/post-merge`** rebuilds the extension automatically whenever a pull
+  touches `packages/extension` or `packages/shared`. It only runs once
+  `npm install` has pointed git at the hooks directory (the root `prepare`
+  script does `git config core.hooksPath .githooks`).
+- **Settings → About this build** shows the version, the commit the loaded
+  bundle was built from, and when it was built. The version bumps on every
+  commit to `main` (`.githooks/pre-commit`). If the commit shown there doesn't
+  match `git log -1 --format=%h`, you're running a stale build — rebuild and
+  reload.
+
 ### Run the Dashboard
 
 ```bash
