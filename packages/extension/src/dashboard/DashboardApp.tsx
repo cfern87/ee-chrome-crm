@@ -2140,8 +2140,8 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
         <h3 style={{ margin: '0 0 16px', fontSize: 15, fontWeight: 600 }}>Preferences</h3>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {[
-            { key: 'autoCapture', label: 'Auto-capture conversations you open', default: true },
-            { key: 'autoTagging', label: 'Auto-tagging', default: true },
+            { key: 'autoCapture', label: 'Auto-capture conversations you open', default: false },
+            { key: 'autoTagging', label: 'Auto-tagging', default: false },
             { key: 'notificationEnabled', label: 'Notifications', default: true },
           ].map(({ key, label, default: def }) => (
             <div key={key} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 14px', background: '#f8f8f8', borderRadius: 8 }}>
