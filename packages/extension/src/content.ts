@@ -23,7 +23,7 @@ import { PLATFORM_URL } from './license';
 import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
 import { buildThreadIndex, isUnboundOrphan, planOrphanBinds, threadAliases } from './contacts';
 import type { ThreadRow } from './contacts';
-import { extractNameFromLink, extractActiveThreadName, extractProfilePageName, looksLikeName } from './names';
+import { extractNameFromLink, extractActiveThreadName, extractProfilePageName } from './names';
 import type { SendFailureKind } from './campaigns';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
@@ -129,33 +129,67 @@ async function getStore(): Promise<Store> {
  * Returns the store as it stands after the mutation, so callers can render from
  * it without a second round trip.
  */
+interface MutateResponse {
+  success?: boolean;
+  changed?: boolean;
+  store?: Store;
+  result?: { planLimitReached?: boolean; signedOut?: boolean };
+}
+
 async function mutate(mutations: Mutation[]): Promise<Store> {
   if (!mutations.length) return getStore();
   lastSelfWriteAt = Date.now();
   invalidateThreadIndex();
 
-  const res = await sendBg<{
-    success?: boolean;
-    changed?: boolean;
-    store?: Store;
-    result?: { planLimitReached?: boolean; signedOut?: boolean };
-  }>({ type: 'MUTATE_STORE', payload: { mutations } });
+  const send = (timeoutMs: number) =>
+    sendBg<MutateResponse>({ type: 'MUTATE_STORE', payload: { mutations } }, timeoutMs);
+
+  // A null response means the worker didn't answer in time — it was asleep, or
+  // busy with a campaign send. Give it one more, longer go before giving up:
+  // dropping the write silently would lose a rename or a delete the user just
+  // made, and applying it locally instead is exactly the whole-store write that
+  // used to clobber other tabs.
+  let res = await send(BG_TIMEOUT_MS);
+  if (!res) res = await send(BG_TIMEOUT_MS * 2);
 
   if (res?.result?.signedOut) showSignedOutNotice();
   else if (res?.result?.planLimitReached) showPlanLimitNotice();
 
+  invalidateThreadIndex();
   if (res?.store) {
     storeCache = res.store;
-    invalidateThreadIndex();
-  } else {
-    // Background unreachable — drop the cache so the next read re-fetches
-    // rather than serving a snapshot that never got the edit applied.
-    storeCache = null;
-    invalidateThreadIndex();
+    // Cover the window until chrome.storage fires onChanged for this write.
+    lastSelfWriteAt = Date.now();
+    return res.store;
   }
-  // Cover the window until chrome.storage fires onChanged for this write.
+
+  // Still nothing. Say so rather than letting the panel re-render as if the
+  // edit had landed, and drop the cache so the next read re-fetches.
+  console.warn('[CRM] store mutation did not reach the background worker', mutations);
+  showSaveFailedNotice();
+  storeCache = null;
   lastSelfWriteAt = Date.now();
-  return storeCache || (await getStore());
+  return getStore();
+}
+
+// The write never reached the service worker. Rare, but silent data loss is
+// worse than an unwelcome toast — the person needs to know their edit didn't
+// take so they can redo it.
+let saveFailedNoticeShownAt = 0;
+function showSaveFailedNotice(): void {
+  if (Date.now() - saveFailedNoticeShownAt < 20_000) return;
+  saveFailedNoticeShownAt = Date.now();
+  const el = document.createElement('div');
+  el.setAttribute('data-crm-savefail-notice', '1');
+  el.style.cssText =
+    'position:fixed;bottom:20px;right:20px;z-index:2147483647;max-width:320px;background:#5c1c1c;' +
+    'color:#fff;font:13px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;padding:14px 16px;' +
+    'border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.28);';
+  el.innerHTML =
+    '<strong style="display:block;margin-bottom:4px;">That change wasn\'t saved</strong>' +
+    'The extension\'s background worker didn\'t respond. Reload this tab and try again.';
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 12_000);
 }
 
 // Nothing works without an account — free or paid. Say so where the person is
@@ -258,22 +292,15 @@ function findConversationForThread(store: Store, threadId: string): Conversation
 }
 
 async function ensureConversation(threadId: string, link?: HTMLAnchorElement): Promise<Conversation | null> {
-  const store = await getStore();
-  const chatUrl = buildChatUrl(threadId, link);
-  const existing = findConversationForThread(store, threadId);
-
-  // A good stored name stands: the profile page a contact was captured from is
-  // a better source than a sidebar row, so only offer a scraped name when the
-  // record is new or what it holds doesn't look like a name.
-  const scraped = link ? getNameFromLink(link) : getActiveThreadName();
-  const offerName = !existing || !looksLikeName(existing.participantName);
-
   const next = await mutate([
     {
       op: 'upsertContact',
       threadId,
-      chatUrl,
-      name: offerName ? scraped : undefined,
+      chatUrl: buildChatUrl(threadId, link),
+      // Offer whatever the page shows; whether it's actually taken depends on
+      // how the record was matched and whether the name was hand-set, and that
+      // rule lives in the mutation so it runs against the real store.
+      name: link ? getNameFromLink(link) : getActiveThreadName(),
       allowCreate: true,
     },
   ]);

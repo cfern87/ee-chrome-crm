@@ -235,8 +235,11 @@ export default function DashboardApp() {
     await setClearedFailures(next);
   };
 
-  const refresh = useCallback(async () => {
-    const s = await loadStore();
+  const refresh = useCallback(async (fresh = false) => {
+    // `fresh` bypasses loadStore's freshness window. Used when something has
+    // told us the store changed — otherwise the refresh could serve the cached
+    // snapshot from just before the change and visibly undo what just happened.
+    const s = await loadStore(fresh ? { maxAgeMs: 0 } : {});
     setStore(s);
     setLoading(false);
     getSyncUsage().then(setSyncUsage).catch(() => setSyncUsage(null));
@@ -255,7 +258,7 @@ export default function DashboardApp() {
           const relevant =
             (area === 'local' && Object.keys(changes).some(isStoreChangeKey)) ||
             (area === 'sync' && Object.keys(changes).some(isCrmSyncKey));
-          if (relevant) refresh();
+          if (relevant) refresh(true);
         };
         chrome.storage.onChanged.addListener(handler);
         return () => chrome.storage.onChanged.removeListener(handler);
@@ -263,13 +266,29 @@ export default function DashboardApp() {
     } catch {}
 
     // Fallback polling when chrome.storage events are unavailable
-    const interval = setInterval(refresh, 3000);
+    const interval = setInterval(() => refresh(true), 3000);
     return () => clearInterval(interval);
   }, [refresh]);
 
+  // Writes go through the background worker, which serializes every store write
+  // in the extension behind one lock. Writing straight from here would race the
+  // content scripts: both sides load, both save the whole store, and the later
+  // save silently discards the earlier one's edits.
   const updateStore = async (next: Store): Promise<SaveResult> => {
-    setStore(next);
-    return saveStore(next);
+    setStore(next); // optimistic — the write is confirmed below
+    const res = await new Promise<{ success?: boolean; result?: SaveResult } | null>((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'SET_STORE', payload: next }, (r) => {
+          if (chrome.runtime.lastError) { resolve(null); return; }
+          resolve(r ?? null);
+        });
+      } catch { resolve(null); }
+    });
+    // Background unreachable (worker restarting). The dashboard is an extension
+    // page with its own Drive access, so it can still write directly — unlike a
+    // content script, it holds a snapshot it loaded itself moments ago.
+    if (!res?.success) return saveStore(next);
+    return res.result ?? { ok: true, pending: 0, itemLimitReached: false };
   };
 
   // --- Conversations ---

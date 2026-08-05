@@ -236,7 +236,10 @@ export function tombstone(store: Store, ids: string[], ts = Date.now()): Store {
     delete conversations[id];
     deleted[id] = ts;
   }
-  return pruneTombstones({ ...store, conversations, deleted });
+  // Prune relative to `ts`, not the wall clock, so the whole operation happens
+  // at one consistent instant — otherwise the tombstone this call just wrote
+  // could be judged against a different "now" than the one that stamped it.
+  return pruneTombstones({ ...store, conversations, deleted }, ts);
 }
 
 /**
