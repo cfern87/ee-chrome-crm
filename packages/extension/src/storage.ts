@@ -22,7 +22,9 @@
 //     person costs a single write.
 
 import { readStore as driveReadStore, writeStore as driveWriteStore, mergeStores } from './drive';
+import { getEntitlement, FREE_CONTACT_LIMIT } from './license';
 import type { SavedSearch } from './search';
+
 
 export const STORAGE_KEY = 'facebook_crm_store';
 
@@ -615,10 +617,25 @@ function markDriveSynced(): Promise<void> {
   return localNumSet(DRIVE_LAST_SYNC_KEY, Date.now());
 }
 
-/** True when this machine treats Google Drive as the canonical store. */
-export function isDriveEnabled(): Promise<boolean> {
+/**
+ * True when this machine treats Google Drive as the canonical store.
+ *
+ * Drive sync is a paid feature, so the flag alone isn't enough: if the plan
+ * lapses we fall back to chrome.storage.sync rather than silently continuing to
+ * write to Drive. The Drive file itself is left untouched — resubscribe and the
+ * next save picks up where it left off.
+ */
+export async function isDriveEnabled(): Promise<boolean> {
+  if (!(await localFlagGet(DRIVE_ENABLED_KEY))) return false;
+  const ent = await getEntitlement();
+  return ent.driveSync;
+}
+
+/** The raw per-machine flag, ignoring plan status (for settings UI). */
+export function isDriveFlagSet(): Promise<boolean> {
   return localFlagGet(DRIVE_ENABLED_KEY);
 }
+
 
 /**
  * Turn Drive mode on/off for this machine. Turning it on seeds Drive from the
@@ -626,8 +643,13 @@ export function isDriveEnabled(): Promise<boolean> {
  * calls this right after a successful Connect.
  */
 export async function setDriveEnabled(enabled: boolean): Promise<void> {
+  if (enabled) {
+    const ent = await getEntitlement(true);
+    if (!ent.driveSync) throw new Error('Google Drive sync is part of the paid plan.');
+  }
   await localFlagSet(DRIVE_ENABLED_KEY, enabled);
 }
+
 
 // Coalesced Drive writer: at most one write in flight; the latest store queued
 // behind it wins, so a burst of saves collapses into one final upload.
@@ -803,7 +825,43 @@ export interface SaveResult {
   ok: boolean;               // fully persisted to the canonical layer
   pending: number;           // shards saved locally but not yet in canonical
   itemLimitReached: boolean; // sync ~500-item ceiling hit → connect Drive
+  // Set when the free-plan contact cap stopped new contacts from being saved.
+  // `blockedContacts` is how many were dropped from this write.
+  planLimitReached?: boolean;
+  blockedContacts?: number;
   reason?: string;
+}
+
+/**
+ * Free plan cap. We never delete contacts that are already stored — an account
+ * that lapses keeps everything it had, it just can't add more until it's back
+ * on the paid plan. So the cap only rejects contacts that are NEW in this write.
+ */
+async function applyContactLimit(store: Store): Promise<{ store: Store; blocked: number }> {
+  const ent = await getEntitlement();
+  if (ent.contactsLimit === null) return { store, blocked: 0 };
+  const limit = ent.contactsLimit ?? FREE_CONTACT_LIMIT;
+
+  const ids = Object.keys(store.conversations);
+  if (ids.length <= limit) return { store, blocked: 0 };
+
+  const previous = (await chromeLocalGet()) || (await idbGet()) || EMPTY_STORE;
+  const existing = new Set(Object.keys(previous.conversations || {}));
+
+  const kept = ids.filter((id) => existing.has(id));
+  const incoming = ids.filter((id) => !existing.has(id));
+  // Fill any remaining headroom with the oldest of the new arrivals so the
+  // outcome is stable rather than dependent on object key order.
+  incoming.sort((a, b) => (store.conversations[a].createdAt || 0) - (store.conversations[b].createdAt || 0));
+  const room = Math.max(0, limit - kept.length);
+  const admitted = new Set([...kept, ...incoming.slice(0, room)]);
+
+  const blocked = ids.length - admitted.size;
+  if (blocked <= 0) return { store, blocked: 0 };
+
+  const conversations: Record<string, Conversation> = {};
+  for (const id of admitted) conversations[id] = store.conversations[id];
+  return { store: { ...store, conversations }, blocked };
 }
 
 /**
@@ -811,7 +869,12 @@ export interface SaveResult {
  * pushes to the canonical layer: a coalesced full-blob upload in Drive mode, or
  * the sharded delta write to chrome.storage.sync in legacy mode.
  */
-export async function saveStore(store: Store): Promise<SaveResult> {
+export async function saveStore(input: Store): Promise<SaveResult> {
+  const { store, blocked } = await applyContactLimit(input);
+  const planLimit = blocked > 0
+    ? { planLimitReached: true, blockedContacts: blocked, reason: `Free plan is limited to ${FREE_CONTACT_LIMIT} contacts.` }
+    : {};
+
   // Local cache first — durable even if the network write below fails.
   await Promise.all([chromeLocalSet(store), idbSet(store)]);
 
@@ -821,11 +884,13 @@ export async function saveStore(store: Store): Promise<SaveResult> {
     // it's durable locally and queued.
     await localFlagSet(DRIVE_DIRTY_KEY, true);
     queueDriveWrite(store);
-    return { ok: true, pending: 0, itemLimitReached: false };
+    return { ok: true, pending: 0, itemLimitReached: false, ...planLimit };
   }
 
+
   const res = await syncWriteDelta(store);
-  return { ok: res.ok, pending: res.failed, itemLimitReached: res.itemLimitReached, reason: res.reason };
+  return { ok: res.ok, pending: res.failed, itemLimitReached: res.itemLimitReached, ...planLimit, reason: planLimit.reason ?? res.reason };
+
 }
 
 export interface SyncUsage {

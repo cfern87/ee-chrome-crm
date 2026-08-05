@@ -259,3 +259,98 @@ loadSettings();
 setInterval(() => {
   loadConversations();
 }, 5000);
+
+// ---- Account / plan ----
+//
+// The popup can't import the license module (it's a plain script), so all
+// account work goes through the background worker.
+
+const PLATFORM_URL = 'https://notanotherfacebookcrm.com';
+
+function setAcctError(msg) {
+  const el = document.getElementById('acctError');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.style.display = msg ? 'block' : 'none';
+}
+
+function renderAccount(info) {
+  const ent = (info && info.entitlement) || { signedIn: false };
+  const out = document.getElementById('accountSignedOut');
+  const inn = document.getElementById('accountSignedIn');
+  if (!out || !inn) return;
+
+  if (!ent.signedIn) {
+    out.style.display = 'block';
+    inn.style.display = 'none';
+    return;
+  }
+
+  out.style.display = 'none';
+  inn.style.display = 'block';
+  document.getElementById('acctEmailLabel').textContent = ent.email || (info && info.email) || 'Signed in';
+
+  let plan;
+  if (ent.isPro) {
+    plan = ent.status === 'trialing' ? 'Pro — free trial' : 'Pro — unlimited contacts + Drive sync';
+  } else {
+    plan = 'Free — up to ' + (ent.contactsLimit == null ? 25 : ent.contactsLimit) + ' contacts, no Drive sync';
+  }
+  if (ent.stale) plan += ' (offline — using last known plan)';
+  document.getElementById('acctPlanLabel').textContent = plan;
+
+  const upgrade = document.getElementById('acctUpgradeBtn');
+  upgrade.textContent = ent.isPro ? 'Manage Subscription' : 'Upgrade to Pro — $20/mo';
+}
+
+function loadAccount() {
+  chrome.runtime.sendMessage({ type: 'GET_ACCOUNT' }, (info) => {
+    if (chrome.runtime.lastError) return;
+    renderAccount(info);
+  });
+}
+
+const signInBtn = document.getElementById('acctSignInBtn');
+if (signInBtn) {
+  signInBtn.addEventListener('click', () => {
+    const email = document.getElementById('acctEmail').value.trim();
+    const password = document.getElementById('acctPassword').value;
+    if (!email || !password) { setAcctError('Enter your email and password.'); return; }
+
+    setAcctError('');
+    signInBtn.disabled = true;
+    signInBtn.textContent = 'Signing in...';
+    chrome.runtime.sendMessage({ type: 'ACCOUNT_SIGN_IN', payload: { email, password } }, (res) => {
+      signInBtn.disabled = false;
+      signInBtn.textContent = 'Sign In';
+      if (chrome.runtime.lastError || !res) { setAcctError('Could not reach the extension worker.'); return; }
+      if (!res.ok) { setAcctError(res.error || 'Sign-in failed.'); return; }
+      document.getElementById('acctPassword').value = '';
+      renderAccount(res);
+    });
+  });
+}
+
+const signOutBtn = document.getElementById('acctSignOutBtn');
+if (signOutBtn) {
+  signOutBtn.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'ACCOUNT_SIGN_OUT' }, () => loadAccount());
+  });
+}
+
+const upgradeBtn = document.getElementById('acctUpgradeBtn');
+if (upgradeBtn) {
+  upgradeBtn.addEventListener('click', () => {
+    chrome.tabs.create({ url: PLATFORM_URL + '/account/billing' });
+  });
+}
+
+const createLink = document.getElementById('acctCreateLink');
+if (createLink) {
+  createLink.addEventListener('click', (e) => {
+    e.preventDefault();
+    chrome.tabs.create({ url: PLATFORM_URL + '/auth' });
+  });
+}
+
+loadAccount();

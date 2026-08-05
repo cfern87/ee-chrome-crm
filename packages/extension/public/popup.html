@@ -291,6 +291,31 @@
     </div>
 
     <div class="tab-content" id="settings">
+      <div class="settings-group" style="margin-bottom:14px;">
+        <div style="font-size:11px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px;">Account</div>
+
+        <div id="accountSignedOut" style="display:none;">
+          <div style="font-size:12px;color:#666;margin-bottom:8px;">Sign in with your notanotherfacebookcrm.com account.</div>
+          <input type="email" id="acctEmail" placeholder="Email"
+            style="width:100%;padding:8px 10px;border:1px solid #e0e0e0;border-radius:6px;font-size:13px;margin-bottom:6px;box-sizing:border-box;" />
+          <input type="password" id="acctPassword" placeholder="Password"
+            style="width:100%;padding:8px 10px;border:1px solid #e0e0e0;border-radius:6px;font-size:13px;margin-bottom:8px;box-sizing:border-box;" />
+          <button class="btn-primary" id="acctSignInBtn">Sign In</button>
+          <div style="font-size:11px;color:#999;margin-top:6px;text-align:center;">
+            <a href="#" id="acctCreateLink" style="color:#667eea;">Create an account</a>
+          </div>
+        </div>
+
+        <div id="accountSignedIn" style="display:none;">
+          <div style="font-size:12px;color:#333;font-weight:600;" id="acctEmailLabel"></div>
+          <div style="font-size:12px;color:#666;margin:4px 0 8px;" id="acctPlanLabel"></div>
+          <button class="btn-primary" style="background:#4ECDC4;" id="acctUpgradeBtn">Upgrade to Pro</button>
+          <button class="btn-primary" style="background:#eee;color:#555;margin-top:6px;" id="acctSignOutBtn">Sign Out</button>
+        </div>
+
+        <div id="acctError" style="display:none;font-size:12px;color:#c0392b;margin-top:6px;"></div>
+      </div>
+
       <div class="settings-group">
         <div class="setting-item">
           <span class="setting-label">Auto-tagging</span>
@@ -312,6 +337,7 @@
         <button class="btn-primary" style="background: #4ECDC4;" id="importBtn">📤 Import Data</button>
       </div>
     </div>
+
   </div>
 
   <script src="popup.js"></script>

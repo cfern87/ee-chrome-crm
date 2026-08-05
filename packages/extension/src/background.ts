@@ -28,6 +28,16 @@
 import { loadStore, saveStore, flushDriveIfDirty, syncDriveNow, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, removeTagsFrom } from './storage';
 import type { Store } from './storage';
 import {
+  getEntitlement,
+  refreshEntitlement,
+  getStoredSession,
+  signIn as accountSignIn,
+  signOut as accountSignOut,
+  ENTITLEMENT_ALARM,
+  ENTITLEMENT_PERIOD_MINUTES,
+} from './license';
+
+import {
   Campaign,
   createCampaign,
   loadCampaigns,
@@ -89,6 +99,24 @@ function ensureDriveSync(): void {
     });
   } catch (e) { console.warn('[CRM] alarms unavailable (drive sync):', e); }
 }
+
+// Periodic entitlement re-check, so a subscription that starts (or lapses) on
+// the website takes effect here without the user doing anything.
+function ensureEntitlementCheck(): void {
+  try {
+    chrome.alarms?.get(ENTITLEMENT_ALARM, (existing) => {
+      void chrome.runtime.lastError;
+      if (existing) return;
+      try {
+        chrome.alarms?.create(ENTITLEMENT_ALARM, {
+          delayInMinutes: ENTITLEMENT_PERIOD_MINUTES,
+          periodInMinutes: ENTITLEMENT_PERIOD_MINUTES,
+        });
+      } catch (e) { console.warn('[CRM] alarms unavailable (entitlement):', e); }
+    });
+  } catch (e) { console.warn('[CRM] alarms unavailable (entitlement):', e); }
+}
+
 
 // ---- sender tab bookkeeping (survives SW restarts) ----
 
@@ -966,6 +994,8 @@ try {
     if (alarm.name === TICK_ALARM) processTick();
     else if (alarm.name === WATCHDOG_ALARM) watchdog();
     else if (alarm.name === DRIVE_SYNC_ALARM) void syncDriveNow();
+    else if (alarm.name === ENTITLEMENT_ALARM) void refreshEntitlement().catch(() => { /* offline — cache stands */ });
+
   });
 } catch (e) {
   console.warn('[CRM] could not register alarm listener:', e);
@@ -977,6 +1007,8 @@ try {
 void seedQueueFromLegacyCampaign();
 ensureWatchdog();
 ensureDriveSync();
+ensureEntitlementCheck();
+
 
 // On startup, push up any local edits that didn't reach Drive last session.
 void flushDriveIfDirty();
@@ -1045,10 +1077,37 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           break;
         }
         case 'SET_STORE': {
-          await saveStore(request.payload as Store);
+          const result = await saveStore(request.payload as Store);
+          sendResponse({ success: true, result });
+          break;
+        }
+
+        // ---- account / plan ----
+        case 'GET_ACCOUNT': {
+          const [entitlement, session] = await Promise.all([getEntitlement(), getStoredSession()]);
+          sendResponse({ entitlement, email: session?.email ?? null });
+          break;
+        }
+        case 'REFRESH_ACCOUNT': {
+          try {
+            sendResponse({ success: true, entitlement: await refreshEntitlement() });
+          } catch (e) {
+            sendResponse({ success: false, error: String(e), entitlement: await getEntitlement() });
+          }
+          break;
+        }
+        case 'ACCOUNT_SIGN_IN': {
+          const res = await accountSignIn(request.payload.email, request.payload.password);
+          sendResponse({ ...res, entitlement: await getEntitlement() });
+          break;
+        }
+        case 'ACCOUNT_SIGN_OUT': {
+          await accountSignOut();
           sendResponse({ success: true });
           break;
         }
+
+
 
         // ---- bulk messaging ----
         case 'START_CAMPAIGN': {

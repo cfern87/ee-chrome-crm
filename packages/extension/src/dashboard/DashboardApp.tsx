@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, addTagsTo, removeTagsFrom, lastTaggedAt, getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES } from '../storage';
 import { BUILD_INFO } from '../buildInfo';
+import { getEntitlement, PLATFORM_URL, FREE_CONTACT_LIMIT, type Entitlement } from '../license';
+
 import {
   QueryGroup, SavedSearch, ArchiveScope, QueryContext,
   emptyQuery, isQueryEmpty, filterByQuery, normalizeQuery, newSavedSearch, sortSavedSearches, describeQuery,
@@ -2232,7 +2234,10 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
         )}
       </div>
 
+      <AccountPanel contactCount={conversations.length} />
+
       <DriveBackupPanel store={store} updateStore={updateStore} />
+
 
       <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
         <h3 style={{ margin: '0 0 16px', fontSize: 15, fontWeight: 600 }}>Data</h3>
@@ -2331,6 +2336,77 @@ function AboutPanel() {
   );
 }
 
+// --- Account / plan ---
+//
+// Sign-in lives in the popup (it's the quick surface); this panel is the status
+// view: which account is in use, which plan it's on, and how much of the free
+// contact allowance is gone. It never blocks anything on its own — the gates
+// live in storage.ts — it just makes the state legible.
+function AccountPanel({ contactCount }: { contactCount: number }) {
+  const [ent, setEnt] = useState<Entitlement | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async (force = false) => {
+    setBusy(true);
+    try { setEnt(await getEntitlement(force)); } catch { /* keep last */ }
+    finally { setBusy(false); }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+
+  const cardStyle: React.CSSProperties = { background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 };
+  const link: React.CSSProperties = { display: 'inline-block', background: '#5b4cc4', color: '#fff', textDecoration: 'none', padding: '8px 14px', borderRadius: 6, fontWeight: 600, fontSize: 13 };
+
+  const limit = ent?.contactsLimit ?? FREE_CONTACT_LIMIT;
+  const overFree = !ent?.isPro && contactCount >= limit;
+
+  return (
+    <div style={cardStyle}>
+      <h3 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>Account</h3>
+
+      {!ent?.signedIn ? (
+        <>
+          <p style={{ margin: '0 0 12px', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
+            You're not signed in. Sign in from the extension popup to sync your plan. Free accounts store up to {FREE_CONTACT_LIMIT} contacts.
+          </p>
+          <a href={`${PLATFORM_URL}/auth`} target="_blank" rel="noopener noreferrer" style={link}>Create an account</a>
+        </>
+      ) : (
+        <>
+          <p style={{ margin: '0 0 10px', fontSize: 12, color: '#666', lineHeight: 1.6 }}>
+            <strong style={{ color: '#333' }}>{ent.email || 'Signed in'}</strong>
+            <br />
+            {ent.isPro
+              ? (ent.status === 'trialing' ? 'Pro — free trial. Unlimited contacts and Drive sync.' : 'Pro — unlimited contacts and Drive sync.')
+              : `Free — ${contactCount} of ${limit} contacts used.`}
+            {ent.stale && <span style={{ color: '#b26a00' }}>{' '}(offline — showing your last known plan)</span>}
+          </p>
+
+          {overFree && (
+            <div style={{ fontSize: 12, padding: '10px 12px', borderRadius: 6, background: '#fff8e1', color: '#8a6d00', lineHeight: 1.6, marginBottom: 12 }}>
+              You've filled the free plan. Everything already saved stays put — new contacts just won't be stored until you upgrade.
+            </div>
+          )}
+
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <a href={`${PLATFORM_URL}/account/billing`} target="_blank" rel="noopener noreferrer" style={link}>
+              {ent.isPro ? 'Manage subscription' : 'Upgrade — $20/mo'}
+            </a>
+            <button
+              onClick={() => void load(true)}
+              disabled={busy}
+              style={{ background: 'none', border: 'none', color: '#065fd4', fontSize: 12, cursor: busy ? 'default' : 'pointer', padding: 0 }}
+            >
+              {busy ? 'Checking…' : 'Refresh plan'}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+
+
 // --- Google Drive sync ---
 //
 // Connecting makes Drive this machine's canonical store (setDriveEnabled(true)),
@@ -2341,6 +2417,8 @@ function AboutPanel() {
 function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (s: Store) => Promise<SaveResult> }) {
   const [driveStatus, setDriveStatus] = useState<DriveStatus | null>(null);
   const [enabled, setEnabled] = useState(false);
+  const [pro, setPro] = useState(true); // assume allowed until we know, to avoid a flash
+  const [signedIn, setSignedIn] = useState(false);
   const [status, setStatus] = useState<{ type: 'success' | 'error' | 'info'; msg: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [pushConfirm, setPushConfirm] = useState(false);
@@ -2358,8 +2436,14 @@ function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (
   const refresh = useCallback(async () => {
     try { setDriveStatus(await getDriveStatus()); } catch { setDriveStatus(null); }
     try { setEnabled(await isDriveEnabled()); } catch { setEnabled(false); }
+    try {
+      const ent = await getEntitlement();
+      setPro(ent.driveSync);
+      setSignedIn(ent.signedIn);
+    } catch { setPro(false); }
     await refreshSchedule();
   }, [refreshSchedule]);
+
   useEffect(() => { void refresh(); }, [refresh]);
 
   // Tick the countdown every second, and re-read the alarm periodically so the
@@ -2445,7 +2529,26 @@ function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (
           : ' Connecting makes Drive this machine\'s canonical store in place of Chrome sync.'}
       </p>
 
-      {!configured ? (
+      {!pro ? (
+        // Drive sync is the paid half of the product. Anything already in Drive
+        // stays there — this just stops the machine from using it until the plan
+        // is active again.
+        <div style={{ fontSize: 12, padding: '12px 14px', borderRadius: 8, background: '#f4f1ff', color: '#4a3f8f', lineHeight: 1.6 }}>
+          <strong>Part of the paid plan ($20/mo, 7-day free trial).</strong>
+          <div style={{ margin: '6px 0 10px' }}>
+            Drive sync and unlimited contacts come with Pro. Everything you've already saved stays exactly where it is.
+          </div>
+          <a
+            href={`${PLATFORM_URL}/account/billing`}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ display: 'inline-block', background: '#5b4cc4', color: '#fff', textDecoration: 'none', padding: '8px 14px', borderRadius: 6, fontWeight: 600 }}
+          >
+            {signedIn ? 'Start free trial' : 'Sign in or start free trial'}
+          </a>
+        </div>
+      ) : !configured ? (
+
         <div style={{ fontSize: 12, padding: '10px 12px', borderRadius: 6, background: '#fff8e1', color: '#8a6d00', lineHeight: 1.6 }}>
           <strong>Setup needed.</strong> A Google OAuth client id hasn't been added to the extension yet. In the Google Cloud Console:
           create a project → enable the <strong>Google Drive API</strong> → create an <strong>OAuth client ID</strong> of type

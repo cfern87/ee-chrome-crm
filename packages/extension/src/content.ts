@@ -21,6 +21,8 @@ import {
   removeTagsFrom,
 } from './storage';
 import type { Store, Tag, Conversation } from './storage';
+import { PLATFORM_URL } from './license';
+
 import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
 import { buildThreadIndex, isUnboundOrphan, planOrphanBinds } from './contacts';
 import type { ThreadRow } from './contacts';
@@ -111,15 +113,40 @@ async function saveStore(store: Store): Promise<void> {
   // built from the previous snapshot is now stale.
   invalidateThreadIndex();
   lastSelfWriteAt = Date.now();
+  let result: { planLimitReached?: boolean } | null = null;
   if (await isDriveEnabled()) {
-    const res = await sendBg<{ success?: boolean }>({ type: 'SET_STORE', payload: store });
-    if (!res || !res.success) await _saveStore(store); // background unreachable — keep it local
+    const res = await sendBg<{ success?: boolean; result?: { planLimitReached?: boolean } }>({ type: 'SET_STORE', payload: store });
+    if (!res || !res.success) result = await _saveStore(store); // background unreachable — keep it local
+    else result = res.result ?? null;
   } else {
-    await _saveStore(store);
+    result = await _saveStore(store);
   }
+  if (result?.planLimitReached) showPlanLimitNotice();
   // Cover the window until chrome.storage fires onChanged for this write.
   lastSelfWriteAt = Date.now();
 }
+
+// The free plan stores 25 contacts. When a save is turned away because of that,
+// say so plainly right where the person is working instead of failing quietly.
+let planNoticeShownAt = 0;
+function showPlanLimitNotice(): void {
+  if (Date.now() - planNoticeShownAt < 60_000) return; // don't nag
+  planNoticeShownAt = Date.now();
+  const el = document.createElement('div');
+  el.setAttribute('data-crm-plan-notice', '1');
+  el.style.cssText =
+    'position:fixed;bottom:20px;right:20px;z-index:2147483647;max-width:320px;background:#1c1c1c;' +
+    'color:#fff;font:13px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;padding:14px 16px;' +
+    'border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.28);';
+  el.innerHTML =
+    '<strong style="display:block;margin-bottom:4px;">Free plan is full (25 contacts)</strong>' +
+    'Your existing contacts are safe — new ones just aren\'t being saved. ' +
+    '<a href="' + PLATFORM_URL + '/account/billing" target="_blank" rel="noopener" ' +
+    'style="color:#7fb3ff;font-weight:600;">Upgrade for unlimited</a>';
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 12_000);
+}
+
 
 function isExtensionAlive(): boolean {
   try {
