@@ -132,17 +132,27 @@ npm install && npm run build
 
 then hit **Reload** on the extension at `chrome://extensions/`.
 
-Two safeguards make this hard to get wrong:
+Three safeguards make this hard to get wrong:
 
 - **`.githooks/post-merge`** rebuilds the extension automatically whenever a pull
-  touches `packages/extension` or `packages/shared`. It only runs once
-  `npm install` has pointed git at the hooks directory (the root `prepare`
-  script does `git config core.hooksPath .githooks`).
+  touches `packages/extension` or `packages/shared`.
+- **`.githooks/post-commit`** does the same after a commit. This matters because
+  `.githooks/pre-commit` bumps the version *during* the commit — without a
+  rebuild, `dist/` would permanently trail source by one version and Settings →
+  About would report the previous number.
+
+  Both hooks only run once `npm install` has pointed git at the hooks directory
+  (the root `prepare` script does `git config core.hooksPath .githooks`).
 - **Settings → About this build** shows the version, the commit the loaded
-  bundle was built from, and when it was built. The version bumps on every
-  commit to `main` (`.githooks/pre-commit`). If the commit shown there doesn't
-  match `git log -1 --format=%h`, you're running a stale build — rebuild and
-  reload.
+  bundle was built from, and when it was built. A red banner appears if the
+  loaded manifest and the bundle disagree, which is what a skipped or failed
+  rebuild looks like. If the commit shown doesn't match `git log -1 --format=%h`
+  and no banner is showing, the hooks aren't installed — run `npm install`.
+
+The version lives in `packages/extension/public/manifest.json` and is bumped by
+`scripts/bump-version.js` on every commit to `main`. That script also mirrors the
+number into the three `package.json` files and into `dist/manifest.json`, so
+every place that records a version moves together.
 
 ### Run the Dashboard
 
@@ -158,8 +168,13 @@ The dashboard will be available at `http://localhost:5173`
 For extension:
 ```bash
 cd packages/extension
-npm run dev  # Requires manual reload in Chrome
+npm run watch  # Rebuilds dist/ on every save; still reload in Chrome
 ```
+
+`npm run watch` runs the same multi-pass build as `npm run build`, restamping the
+version and commit each time, so Settings → About tracks your working tree.
+(`npm run dev` starts a plain Vite server instead — it doesn't produce a loadable
+`dist/`, and the About panel reports `0.0.0 / unknown` under it.)
 
 For dashboard:
 ```bash

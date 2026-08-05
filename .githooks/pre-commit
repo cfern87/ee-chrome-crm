@@ -4,7 +4,11 @@ branch="$(git symbolic-ref --short HEAD 2>/dev/null)"
 
 if [ "$branch" = "main" ]; then
   node "$(git rev-parse --show-toplevel)/scripts/bump-version.js" || exit 1
-  git add packages/extension/public/manifest.json
+  # dist/manifest.json is bumped too, but it's gitignored — don't stage it.
+  git add packages/extension/public/manifest.json \
+          package.json \
+          packages/extension/package.json \
+          packages/dashboard/package.json
 fi
 
 exit 0

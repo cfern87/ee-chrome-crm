@@ -20,7 +20,7 @@ import { build } from 'vite';
 import react from '@vitejs/plugin-react';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { readFileSync } from 'fs';
+import { readFileSync, watch as watchDir } from 'fs';
 import { execSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -49,15 +49,23 @@ function buildInfo() {
   };
 }
 
-const BUILD_INFO = buildInfo();
-// Vite splices `define` values in as raw source text, so the replacement has to
-// be a JS string *literal* — hence the double stringify.
-const define = { __BUILD_INFO__: JSON.stringify(JSON.stringify(BUILD_INFO)) };
-
 async function run() {
+  // Restamped on every run, not once at module load: under --watch the process
+  // outlives commits, so a stamp captured at startup would report the SHA the
+  // watcher started at rather than the one the bundle was built from.
+  const BUILD_INFO = buildInfo();
+  // Vite splices `define` values in as raw source text, so the replacement has
+  // to be a JS string *literal* — hence the double stringify.
+  const define = { __BUILD_INFO__: JSON.stringify(JSON.stringify(BUILD_INFO)) };
+
   // 1. Dashboard — ES module. This pass clears dist and copies public/ assets.
   await build({
     configFile: false,
+    // Vite resolves outDir and publicDir against `root`, which defaults to
+    // process.cwd(). Pinning it to this file's directory means the build lands
+    // in packages/extension/dist no matter where it was invoked from — the git
+    // hooks and the watcher shouldn't depend on the caller's cwd.
+    root: r('.'),
     plugins: [react()],
     define,
     build: {
@@ -79,6 +87,7 @@ async function run() {
   for (const name of ['content', 'background']) {
     await build({
       configFile: false,
+      root: r('.'),
       define,
       build: {
         outDir: 'dist',
@@ -103,7 +112,49 @@ async function run() {
   );
 }
 
-run().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+// Rebuild on every source change, so dist/ (and therefore Settings → About)
+// tracks the working tree instead of whenever someone last remembered to build.
+// Chrome still needs a manual reload to pick up the new dist.
+function watch() {
+  let building = false;
+  let pending = false;
+  let timer = null;
+
+  const rebuild = async () => {
+    if (building) { pending = true; return; }
+    building = true;
+    try {
+      await run();
+    } catch (e) {
+      // Keep watching — a syntax error mid-edit shouldn't end the session.
+      console.error('\n✗ Build failed — dist/ still holds the previous build.\n', e);
+    } finally {
+      building = false;
+      if (pending) { pending = false; rebuild(); }
+    }
+  };
+
+  const onChange = (_event, file) => {
+    // dist/ isn't watched, but editors drop temp files next to the originals.
+    if (file && /(^|[\\/])(dist|node_modules)[\\/]/.test(file)) return;
+    clearTimeout(timer);
+    timer = setTimeout(rebuild, 150); // coalesce the burst a single save emits
+  };
+
+  for (const dir of ['src', 'public']) {
+    watchDir(r(dir), { recursive: true }, onChange);
+  }
+  console.log('\n  Watching src/ and public/ — every save rebuilds dist/. Ctrl+C to stop.');
+}
+
+const watching = process.argv.includes('--watch');
+
+run()
+  .then(() => { if (watching) watch(); })
+  .catch((e) => {
+    console.error(e);
+    // Under --watch the first build failing is recoverable: start the watcher
+    // anyway so saving the fix rebuilds instead of requiring a restart.
+    if (!watching) process.exit(1);
+    watch();
+  });

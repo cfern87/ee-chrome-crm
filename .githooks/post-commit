@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Rebuild the extension after a commit.
+#
+# WHY: the pre-commit hook bumps packages/extension/public/manifest.json, but
+# dist/ is gitignored and only changes when something builds it. Without this
+# hook dist/ trails source by at least one version after every commit, so
+# Settings → About reports the *previous* version — which reads as "the version
+# number is wrong" rather than "you haven't rebuilt". This closes that gap the
+# same way post-merge closes it for pulls.
+#
+# Requires `git config core.hooksPath .githooks` — `npm install` does that via
+# the root "prepare" script.
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root" || exit 0
+
+# A rebase replays commits one at a time; rebuilding on each would be slow and
+# pointless, since the final commit triggers this hook anyway.
+if [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]; then
+  exit 0
+fi
+
+# Nothing to rebuild if this commit didn't touch the extension. On main the
+# version bump always does, which is the case this hook exists for.
+if ! git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null | grep -qE '^packages/(extension|shared)/'; then
+  exit 0
+fi
+
+if [ ! -d "$root/node_modules" ]; then
+  echo ""
+  echo "  ! Extension source changed but node_modules is missing."
+  echo "  ! Run: npm install && npm run build   (then reload at chrome://extensions)"
+  echo ""
+  exit 0
+fi
+
+echo ""
+echo "  Extension source changed — rebuilding packages/extension/dist ..."
+if npm run build --workspace packages/extension --silent; then
+  echo "  ✔ Rebuilt. Reload the extension at chrome://extensions to pick it up."
+else
+  echo ""
+  echo "  ! BUILD FAILED — Chrome is still running the OLD build."
+  echo "  ! Settings → About will flag the version mismatch until you fix this."
+  echo "  ! Fix the error above, then: npm run build"
+fi
+echo ""
+
+exit 0

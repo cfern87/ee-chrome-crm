@@ -2261,18 +2261,30 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
 
 // --- About / build identity ---
 //
-// dist/ is gitignored, so pulling source does NOT update the loaded extension —
-// it keeps running the last build until someone runs `npm run build` and
-// reloads. That failure mode is invisible (the feature simply "isn't there"),
-// so the exact build is surfaced here: version, the commit it was built from,
-// and when. If the commit shown doesn't match `git log -1 --format=%h` on this
-// machine, the extension is stale.
+// dist/ is gitignored, so changing source does NOT update the loaded extension —
+// it keeps running the last build until something rebuilds it. That failure mode
+// is invisible (the feature simply "isn't there"), so the exact build is
+// surfaced here: version, the commit it was built from, and when.
+//
+// The .githooks post-commit and post-merge hooks now rebuild automatically, so
+// these values stay current on their own. The banner below covers the remaining
+// cases — hooks not installed, or a build that failed.
 function AboutPanel() {
   const [copied, setCopied] = useState(false);
 
+  // "Built 3h ago" would otherwise freeze at whatever it read when the panel
+  // mounted; this is the only row whose value moves on its own.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
   // The manifest is the version Chrome itself reports; BUILD_INFO.version is
-  // what the bundle was stamped with. They can only differ if dist was
-  // assembled from mismatched parts, which is worth seeing.
+  // what the bundle was stamped with. scripts/bump-version.js writes the new
+  // version into dist/manifest.json as soon as it bumps source, so these two
+  // diverge exactly when the rebuild that should have followed didn't happen
+  // (or failed) — see the staleness banner below.
   let manifestVersion = '';
   try { manifestVersion = chrome.runtime.getManifest().version; } catch { /* not in an extension context */ }
 
@@ -2322,15 +2334,16 @@ function AboutPanel() {
       {stale && (
         <div style={{ marginTop: 10, fontSize: 12, padding: '8px 10px', borderRadius: 6, background: '#fdecea', color: '#c62828', lineHeight: 1.5 }}>
           The loaded manifest says <strong>v{manifestVersion}</strong> but the bundle was built from <strong>v{BUILD_INFO.version}</strong>.
-          Run <code>npm run build</code> and reload the extension.
+          The automatic rebuild didn't run or didn't finish — run <code>npm run build</code> and reload the extension.
         </div>
       )}
 
       <p style={{ margin: '10px 0 0', fontSize: 11, color: '#aaa', lineHeight: 1.6 }}>
-        The version bumps on every commit. <strong>Pulling source does not update the extension</strong> — the loaded code comes from
-        {' '}<code>packages/extension/dist/</code>, which isn't in git. After a <code>git pull</code>, run <code>npm run build</code> and
-        reload at <code>chrome://extensions</code>. If the commit above doesn't match <code>git log -1 --format=%h</code> on this
-        machine, you're running a stale build.
+        The version bumps on every commit to <code>main</code>, and the <code>post-commit</code> and <code>post-merge</code> hooks rebuild
+        {' '}<code>packages/extension/dist/</code> for you — so these values keep themselves current. You still have to reload at
+        {' '}<code>chrome://extensions</code> for a new build to take effect. While actively editing, <code>npm run watch</code> rebuilds
+        on every save. If the commit above doesn't match <code>git log -1 --format=%h</code> and no banner is showing, the hooks aren't
+        installed: run <code>npm install</code>.
       </p>
     </div>
   );
