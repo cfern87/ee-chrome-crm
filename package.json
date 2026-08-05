@@ -1,7 +1,7 @@
 {
-  "name": "facebook-crm",
+  "name": "not-another-social-crm",
   "version": "1.0.0",
-  "description": "Facebook Messenger CRM with tagging and dashboard",
+  "description": "Not Another Social CRM with tagging and dashboard",
   "private": true,
   "workspaces": [
     "packages/extension",

@@ -113,17 +113,39 @@ async function saveStore(store: Store): Promise<void> {
   // built from the previous snapshot is now stale.
   invalidateThreadIndex();
   lastSelfWriteAt = Date.now();
-  let result: { planLimitReached?: boolean } | null = null;
+  let result: { planLimitReached?: boolean; signedOut?: boolean } | null = null;
   if (await isDriveEnabled()) {
-    const res = await sendBg<{ success?: boolean; result?: { planLimitReached?: boolean } }>({ type: 'SET_STORE', payload: store });
+    const res = await sendBg<{ success?: boolean; result?: { planLimitReached?: boolean; signedOut?: boolean } }>({ type: 'SET_STORE', payload: store });
     if (!res || !res.success) result = await _saveStore(store); // background unreachable — keep it local
     else result = res.result ?? null;
   } else {
     result = await _saveStore(store);
   }
-  if (result?.planLimitReached) showPlanLimitNotice();
+  if ((result as { signedOut?: boolean } | null)?.signedOut) showSignedOutNotice();
+  else if (result?.planLimitReached) showPlanLimitNotice();
   // Cover the window until chrome.storage fires onChanged for this write.
   lastSelfWriteAt = Date.now();
+}
+
+// Nothing works without an account — free or paid. Say so where the person is
+// working, with a one-click way to fix it, rather than failing silently.
+let signedOutNoticeShownAt = 0;
+function showSignedOutNotice(): void {
+  if (Date.now() - signedOutNoticeShownAt < 30_000) return;
+  signedOutNoticeShownAt = Date.now();
+  const el = document.createElement('div');
+  el.setAttribute('data-crm-signedout-notice', '1');
+  el.style.cssText =
+    'position:fixed;bottom:20px;right:20px;z-index:2147483647;max-width:320px;background:#1c1c1c;' +
+    'color:#fff;font:13px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;padding:14px 16px;' +
+    'border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.28);';
+  el.innerHTML =
+    '<strong style="display:block;margin-bottom:4px;">Sign in to use Social CRM</strong>' +
+    'Nothing was saved. Sign in with Google or email to unlock the extension — free accounts store up to 25 contacts. ' +
+    '<a href="' + PLATFORM_URL + '/extension-auth" target="_blank" rel="noopener" ' +
+    'style="color:#7fb3ff;font-weight:600;">Sign in</a>';
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 15_000);
 }
 
 // The free plan stores 25 contacts. When a save is turned away because of that,

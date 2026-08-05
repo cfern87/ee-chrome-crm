@@ -1,4 +1,4 @@
-// Account + entitlement client for Not Another Facebook CRM.
+// Account + entitlement client for Not Another Social CRM.
 //
 // The extension itself stays local-first: nothing about your contacts ever
 // leaves the machine. What this module does is answer one question — "is this
@@ -18,7 +18,7 @@ const SUPABASE_URL = 'https://jivkzbtqnepzjgwzycjw.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_Lem1Q30_kVgPt0jO3kU5dQ_Wa906jkN';
 
 /** The web platform (sign-up, billing, support). */
-export const PLATFORM_URL = 'https://notanotherfacebookcrm.com';
+export const PLATFORM_URL = 'https://notanothersocialcrm.com';
 
 /** How many contacts a free account may store. */
 export const FREE_CONTACT_LIMIT = 25;
@@ -274,3 +274,59 @@ export async function contactLimit(): Promise<number> {
 /** How often the background worker re-checks entitlement. */
 export const ENTITLEMENT_ALARM = 'crm-entitlement-check';
 export const ENTITLEMENT_PERIOD_MINUTES = 60;
+
+// ---- Google / browser sign-in handoff ----
+//
+// Chrome extensions can't run the platform's Google OAuth flow directly, so we
+// borrow the website's: open a small page on the platform, let the person sign
+// in there however they like (Google or email), and the page hands the session
+// back to this extension over chrome.runtime.sendMessage. Nothing but the
+// session tokens crosses that bridge.
+
+export const EXTENSION_AUTH_PATH = '/extension-auth';
+
+export interface ExternalSessionPayload {
+  accessToken?: string;
+  access_token?: string;
+  refreshToken?: string;
+  refresh_token?: string;
+  expiresAt?: number;
+  expires_at?: number;
+  expiresIn?: number;
+  expires_in?: number;
+  email?: string;
+  userId?: string;
+  user_id?: string;
+}
+
+/** Accept a session handed over by the platform page. */
+export async function adoptExternalSession(p: ExternalSessionPayload): Promise<{ ok: boolean; error?: string }> {
+  const accessToken = p.accessToken || p.access_token;
+  const refreshToken = p.refreshToken || p.refresh_token;
+  if (!accessToken || !refreshToken) return { ok: false, error: 'Incomplete session.' };
+
+  const expiresAt =
+    p.expiresAt ??
+    (p.expires_at ? p.expires_at * 1000 : undefined) ??
+    Date.now() + (p.expiresIn ?? p.expires_in ?? 3600) * 1000;
+
+  await storeSession({
+    accessToken,
+    refreshToken,
+    expiresAt,
+    email: p.email ?? '',
+    userId: p.userId ?? p.user_id ?? '',
+  });
+  try { await refreshEntitlement(); } catch { /* offline — cache stands */ }
+  return { ok: true };
+}
+
+/** Open the platform sign-in page (Google or email) in a new tab. */
+export function openWebSignIn(): void {
+  try { chrome.tabs.create({ url: `${PLATFORM_URL}${EXTENSION_AUTH_PATH}` }); } catch { /* no tabs API */ }
+}
+
+/** Is anyone signed in on this machine? Everything is gated on this. */
+export async function isSignedIn(): Promise<boolean> {
+  return !!(await getStoredSession());
+}

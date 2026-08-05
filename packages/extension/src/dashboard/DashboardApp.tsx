@@ -2366,9 +2366,9 @@ function AccountPanel({ contactCount }: { contactCount: number }) {
       {!ent?.signedIn ? (
         <>
           <p style={{ margin: '0 0 12px', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
-            You're not signed in. Sign in from the extension popup to sync your plan. Free accounts store up to {FREE_CONTACT_LIMIT} contacts.
+            You're not signed in, so saving is turned off. Sign in with Google or email — free accounts store up to {FREE_CONTACT_LIMIT} contacts.
           </p>
-          <a href={`${PLATFORM_URL}/auth`} target="_blank" rel="noopener noreferrer" style={link}>Create an account</a>
+          <a href={`${PLATFORM_URL}/extension-auth`} target="_blank" rel="noopener noreferrer" style={link}>Sign in / create account</a>
         </>
       ) : (
         <>

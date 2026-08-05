@@ -1,4 +1,4 @@
-// Cross-machine storage for the Facebook CRM.
+// Cross-machine storage for the Social CRM.
 //
 // Two canonical modes, chosen per-machine by whether the user has connected
 // Google Drive (isDriveEnabled — a flag in chrome.storage.local set when they
@@ -22,7 +22,7 @@
 //     person costs a single write.
 
 import { readStore as driveReadStore, writeStore as driveWriteStore, mergeStores } from './drive';
-import { getEntitlement, FREE_CONTACT_LIMIT } from './license';
+import { getEntitlement, isSignedIn, FREE_CONTACT_LIMIT } from './license';
 import type { SavedSearch } from './search';
 
 
@@ -829,8 +829,11 @@ export interface SaveResult {
   // `blockedContacts` is how many were dropped from this write.
   planLimitReached?: boolean;
   blockedContacts?: number;
+  // Set when nothing was saved because no account is signed in on this machine.
+  signedOut?: boolean;
   reason?: string;
 }
+
 
 /**
  * Free plan cap. We never delete contacts that are already stored — an account
@@ -870,7 +873,20 @@ async function applyContactLimit(store: Store): Promise<{ store: Store; blocked:
  * the sharded delta write to chrome.storage.sync in legacy mode.
  */
 export async function saveStore(input: Store): Promise<SaveResult> {
+  // An account is required for every plan, free included: without one we can't
+  // tell which entitlements apply, so nothing is written at all.
+  if (!(await isSignedIn())) {
+    return {
+      ok: false,
+      pending: 0,
+      itemLimitReached: false,
+      signedOut: true,
+      reason: 'Sign in to your Not Another Social CRM account to save contacts.',
+    };
+  }
+
   const { store, blocked } = await applyContactLimit(input);
+
   const planLimit = blocked > 0
     ? { planLimitReached: true, blockedContacts: blocked, reason: `Free plan is limited to ${FREE_CONTACT_LIMIT} contacts.` }
     : {};

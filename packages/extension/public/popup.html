@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Facebook CRM</title>
+  <title>Social CRM</title>
   <style>
     * {
       margin: 0;
@@ -295,7 +295,9 @@
         <div style="font-size:11px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px;">Account</div>
 
         <div id="accountSignedOut" style="display:none;">
-          <div style="font-size:12px;color:#666;margin-bottom:8px;">Sign in with your notanotherfacebookcrm.com account.</div>
+          <div style="font-size:12px;color:#666;margin-bottom:8px;">An account is required — the extension stays locked until you sign in.</div>
+          <button class="btn-primary" id="acctGoogleBtn" style="margin-bottom:8px;">Continue with Google</button>
+          <div style="font-size:11px;color:#999;text-align:center;margin-bottom:8px;">or use your email and password</div>
           <input type="email" id="acctEmail" placeholder="Email"
             style="width:100%;padding:8px 10px;border:1px solid #e0e0e0;border-radius:6px;font-size:13px;margin-bottom:6px;box-sizing:border-box;" />
           <input type="password" id="acctPassword" placeholder="Password"

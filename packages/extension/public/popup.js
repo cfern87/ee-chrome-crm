@@ -265,7 +265,7 @@ setInterval(() => {
 // The popup can't import the license module (it's a plain script), so all
 // account work goes through the background worker.
 
-const PLATFORM_URL = 'https://notanotherfacebookcrm.com';
+const PLATFORM_URL = 'https://notanothersocialcrm.com';
 
 function setAcctError(msg) {
   const el = document.getElementById('acctError');
@@ -342,6 +342,18 @@ const upgradeBtn = document.getElementById('acctUpgradeBtn');
 if (upgradeBtn) {
   upgradeBtn.addEventListener('click', () => {
     chrome.tabs.create({ url: PLATFORM_URL + '/account/billing' });
+  });
+}
+
+const googleBtn = document.getElementById('acctGoogleBtn');
+if (googleBtn) {
+  googleBtn.addEventListener('click', () => {
+    // Google sign-in runs on the website; it hands the session back to the
+    // extension when it completes. Close the popup so the tab has focus.
+    chrome.runtime.sendMessage({ type: 'ACCOUNT_SIGN_IN_WEB' }, () => {
+      void chrome.runtime.lastError;
+      window.close();
+    });
   });
 }
 

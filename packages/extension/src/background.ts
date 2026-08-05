@@ -1,4 +1,4 @@
-// Service Worker for Facebook CRM Extension.
+// Service Worker for Social CRM Extension.
 //
 // Two responsibilities:
 //   1. CRM store proxy — reads/writes go through the shared storage module so
@@ -33,6 +33,9 @@ import {
   getStoredSession,
   signIn as accountSignIn,
   signOut as accountSignOut,
+  adoptExternalSession,
+  openWebSignIn,
+  isSignedIn,
   ENTITLEMENT_ALARM,
   ENTITLEMENT_PERIOD_MINUTES,
 } from './license';
@@ -1077,6 +1080,10 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           break;
         }
         case 'SET_STORE': {
+          if (!(await isSignedIn())) {
+            sendResponse({ success: false, result: { ok: false, pending: 0, itemLimitReached: false, signedOut: true, reason: 'Sign in to save contacts.' } });
+            break;
+          }
           const result = await saveStore(request.payload as Store);
           sendResponse({ success: true, result });
           break;
@@ -1101,6 +1108,12 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           sendResponse({ ...res, entitlement: await getEntitlement() });
           break;
         }
+        case 'ACCOUNT_SIGN_IN_WEB': {
+          // Google (and email) sign-in happens on the website; we just open it.
+          openWebSignIn();
+          sendResponse({ ok: true });
+          break;
+        }
         case 'ACCOUNT_SIGN_OUT': {
           await accountSignOut();
           sendResponse({ success: true });
@@ -1111,6 +1124,10 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
 
         // ---- bulk messaging ----
         case 'START_CAMPAIGN': {
+          if (!(await isSignedIn())) {
+            sendResponse({ success: false, error: 'Sign in to your Not Another Social CRM account to run campaigns.' });
+            break;
+          }
           sendResponse(await startCampaign(request.payload as NewCampaignInput));
           break;
         }
@@ -1169,3 +1186,19 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   // Keep the message channel open for the async response.
   return true;
 });
+
+
+// ---- sign-in handoff from the website ----
+//
+// notanothersocialcrm.com/extension-auth posts the signed-in session here after
+// the person authenticates on the site (Google or email/password). Only the
+// origins listed in manifest externally_connectable can reach this.
+try {
+  chrome.runtime.onMessageExternal.addListener((message, _sender, sendResponse) => {
+    if (!message || message.type !== 'CRM_EXTENSION_SESSION') return;
+    void adoptExternalSession(message.payload || {}).then((res) => sendResponse(res));
+    return true;
+  });
+} catch (e) {
+  console.warn('[CRM] external messaging unavailable:', e);
+}

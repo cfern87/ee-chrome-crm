@@ -36,7 +36,7 @@ Drop these files into your working copy of `ee-chrome-crm` and commit.
 ## Configuration
 
 `PLATFORM_URL` in `packages/extension/src/license.ts` points at
-`https://notanotherfacebookcrm.com`. Change it if you test against the
+`https://notanothersocialcrm.com`. Change it if you test against the
 preview URL — entitlement calls only succeed against a deployed origin
 that is listed in the manifest's `host_permissions`.
 
