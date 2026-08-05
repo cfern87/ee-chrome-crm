@@ -41,6 +41,7 @@ const FIELD_PREFIX = 'f:';
 const SEARCH_PREFIX = 'q:';
 const SETTINGS_KEY = 's';
 const NOTES_KEY = 'n';
+const DELETED_KEY = 'd';
 
 // Stay safely under the 8 KB per-item limit.
 const MAX_ITEM_BYTES = 7800;
@@ -137,6 +138,17 @@ export interface Store {
   savedSearches: Record<string, SavedSearch>;
   notes: Record<string, unknown>;
   settings: Record<string, unknown>;
+  // DELETION TOMBSTONES: conversation id → when it was deleted (epoch ms).
+  //
+  // Without these a delete cannot survive a merge. mergeStores is a union, so
+  // reconciling a local store that has dropped a contact against a Drive copy
+  // that still has it would simply put the contact back — which is exactly what
+  // used to happen ~2s after every delete, when the sidebar's next store read
+  // merged against a Drive file the delete hadn't been uploaded to yet.
+  //
+  // A tombstone outranks any copy of the record that is older than it, so the
+  // delete wins until every replica has seen it. Pruned after TOMBSTONE_TTL_MS.
+  deleted: Record<string, number>;
 }
 
 export const EMPTY_STORE: Store = {
@@ -147,7 +159,16 @@ export const EMPTY_STORE: Store = {
   savedSearches: {},
   notes: {},
   settings: {},
+  deleted: {},
 };
+
+// How long a tombstone is honoured. Long enough that a machine which has been
+// offline for a while still learns about the delete when it comes back; short
+// enough that the map stays small. Also capped by TOMBSTONE_MAX below.
+const TOMBSTONE_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+// Hard ceiling on retained tombstones (newest kept). Bounds both the Drive blob
+// and the single 8 KB chrome.storage.sync item they share.
+const TOMBSTONE_MAX = 150;
 
 // ---- Tag helpers ----
 //
@@ -196,7 +217,57 @@ function normalize(s: Partial<Store>): Store {
     savedSearches: s.savedSearches || {},
     notes: s.notes || {},
     settings: s.settings || {},
+    deleted: s.deleted || {},
   };
+}
+
+// ---- Tombstones ----
+
+/**
+ * Record `ids` as deleted and drop them from `conversations`. The tombstone is
+ * what makes the delete survive a later merge against a replica that still has
+ * the record — see the `deleted` field on Store.
+ */
+export function tombstone(store: Store, ids: string[], ts = Date.now()): Store {
+  if (!ids.length) return store;
+  const conversations = { ...store.conversations };
+  const deleted = { ...(store.deleted || {}) };
+  for (const id of ids) {
+    delete conversations[id];
+    deleted[id] = ts;
+  }
+  return pruneTombstones({ ...store, conversations, deleted });
+}
+
+/**
+ * Drop expired and excess tombstones, and any tombstone whose conversation has
+ * legitimately come back (re-added after the delete — the live record's
+ * `updatedAt` is newer, so it outranks the tombstone and the marker is spent).
+ */
+export function pruneTombstones(store: Store, now = Date.now()): Store {
+  const raw = store.deleted || {};
+  const entries = Object.entries(raw).filter(([id, at]) => {
+    if (typeof at !== 'number' || now - at > TOMBSTONE_TTL_MS) return false;
+    const live = store.conversations[id];
+    return !live || (live.updatedAt || 0) <= at;
+  });
+  entries.sort((a, b) => b[1] - a[1]); // newest first
+  const kept = entries.slice(0, TOMBSTONE_MAX);
+  if (kept.length === entries.length && entries.length === Object.keys(raw).length) return store;
+  return { ...store, deleted: Object.fromEntries(kept) };
+}
+
+/**
+ * Conversations that `previous` had and `next` does not — i.e. what this write
+ * deleted. Used to tombstone automatically on whole-store saves (the dashboard
+ * and popup still write the store wholesale), so callers can't forget to.
+ */
+function removedConversationIds(previous: Store, next: Store): string[] {
+  const out: string[] = [];
+  for (const id of Object.keys(previous.conversations)) {
+    if (!next.conversations[id]) out.push(id);
+  }
+  return out;
 }
 
 function clone<T>(v: T): T {
@@ -209,7 +280,7 @@ function hasData(s: Store | null | undefined): s is Store {
 
 // Keys our sync shards use — lets listeners tell our changes from others'.
 export function isCrmSyncKey(key: string): boolean {
-  return key === SETTINGS_KEY || key === NOTES_KEY ||
+  return key === SETTINGS_KEY || key === NOTES_KEY || key === DELETED_KEY ||
     key.startsWith(CONV_PREFIX) || key.startsWith(TAG_PREFIX) ||
     key.startsWith(GROUP_PREFIX) || key.startsWith(FIELD_PREFIX) ||
     key.startsWith(SEARCH_PREFIX);
@@ -311,6 +382,19 @@ function chromeLocalSet(store: Store): Promise<void> {
 
 // ---- chrome.storage.sync (canonical, sharded) ----
 
+// All tombstones share ONE sync item, so unlike a conversation they can't be
+// trimmed individually — drop the oldest until the whole map fits under the
+// 8 KB per-item limit. Losing the oldest tombstone is safe: it only means a
+// long-offline replica could resurrect a very old delete, which is the same
+// bound TOMBSTONE_TTL_MS already sets.
+function shardTombstones(deleted: Record<string, number>): Record<string, number> {
+  const entries = Object.entries(deleted).sort((a, b) => b[1] - a[1]); // newest first
+  while (entries.length && JSON.stringify(Object.fromEntries(entries)).length > MAX_ITEM_BYTES) {
+    entries.pop();
+  }
+  return Object.fromEntries(entries);
+}
+
 // Trim a conversation so a single shard never exceeds the 8 KB item limit.
 function shardConv(conv: Conversation): Conversation {
   const c = clone(conv);
@@ -328,7 +412,7 @@ function syncGetAll(): Promise<Store | null> {
     try {
       chrome.storage.sync.get(null, (items) => {
         if (!isExtensionAlive() || chrome.runtime.lastError || !items) { resolve(null); return; }
-        const store: Store = { conversations: {}, tags: {}, tagGroups: {}, fieldDefs: {}, savedSearches: {}, notes: {}, settings: {} };
+        const store: Store = { conversations: {}, tags: {}, tagGroups: {}, fieldDefs: {}, savedSearches: {}, notes: {}, settings: {}, deleted: {} };
         let found = false;
         for (const [key, val] of Object.entries(items)) {
           if (key.startsWith(CONV_PREFIX)) {
@@ -352,6 +436,11 @@ function syncGetAll(): Promise<Store | null> {
           } else if (key === NOTES_KEY) {
             store.notes = (val as Record<string, unknown>) || {};
             found = true;
+          } else if (key === DELETED_KEY) {
+            // Deliberately does NOT set `found`: a store holding nothing but
+            // tombstones has no data, and treating it as data would block the
+            // one-time migration of local/IDB contacts up into sync.
+            store.deleted = (val as Record<string, number>) || {};
           }
         }
         resolve(found ? store : null);
@@ -501,12 +590,16 @@ async function syncWriteDelta(store: Store): Promise<SyncWriteResult> {
     if (!store.savedSearches[id]) toRemove.push(SEARCH_PREFIX + id);
   }
 
-  // Settings / notes (single items)
+  // Settings / notes / tombstones (single items)
   if (JSON.stringify(prev.settings) !== JSON.stringify(store.settings)) {
     toSet[SETTINGS_KEY] = store.settings;
   }
   if (JSON.stringify(prev.notes) !== JSON.stringify(store.notes)) {
     toSet[NOTES_KEY] = store.notes;
+  }
+  const tombs = shardTombstones(store.deleted || {});
+  if (JSON.stringify(prev.deleted || {}) !== JSON.stringify(tombs)) {
+    toSet[DELETED_KEY] = tombs;
   }
 
   // Write in batches to respect the per-minute write-op limit.
@@ -546,6 +639,47 @@ async function syncWriteDelta(store: Store): Promise<SyncWriteResult> {
 }
 
 // ---- Drive mode (canonical when the user has connected Google Drive) ----
+
+// ---- Store revision (change notification) ----
+//
+// STORAGE_KEY is written on every *cache refresh*, not just on every edit — so
+// listeners keyed on it fire constantly for changes that aren't changes. In
+// Drive mode that was a self-sustaining loop: a sidebar repaint read the store,
+// the read wrote the cache, the write notified every tab, every tab repainted,
+// and each repaint started another Drive round-trip. With several tabs open the
+// work grew with the square of the tab count until the service worker stalled.
+//
+// This counter is the fix. It is bumped ONLY when the store's contents actually
+// changed, so it is the key everything listens on (see isStoreChangeKey). A
+// cache refresh that merged to the same bytes notifies nobody.
+export const STORE_REV_KEY = 'crm_store_rev';
+
+/** True for a storage key that signals a real change to the CRM store. */
+export function isStoreChangeKey(key: string): boolean {
+  return key === STORE_REV_KEY;
+}
+
+let lastKnownRev = 0;
+
+/** Announce a genuine change to the store. No-op if the extension is gone. */
+function bumpStoreRev(): Promise<void> {
+  if (!isExtensionAlive()) return Promise.resolve();
+  lastKnownRev = Math.max(lastKnownRev + 1, Date.now());
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.set({ [STORE_REV_KEY]: lastKnownRev }, () => { void chrome.runtime.lastError; resolve(); });
+    } catch { resolve(); }
+  });
+}
+
+// Cheap structural comparison. Both sides come from JSON round-trips or plain
+// object literals, so key order is stable enough for this to be reliable — and
+// a false "changed" only costs one redundant write, never correctness.
+function sameStore(a: Store | null, b: Store | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
 
 // Persisted in chrome.storage.local so both the dashboard and the service worker
 // agree on the mode without a network call.
@@ -723,9 +857,20 @@ export async function syncDriveNow(): Promise<boolean> {
   if (!(await isDriveEnabled())) return false;
   await flushDriveIfDirty();
   // loadStore() in Drive mode reads Drive, merges local edits, refreshes the
-  // cache and stamps the last-sync time on success.
-  await loadStore();
+  // cache and stamps the last-sync time on success. This is the pass that pulls
+  // in other machines' edits, so it must bypass the freshness window.
+  await loadStore({ maxAgeMs: 0 });
   return true;
+}
+
+// Refresh the local cache from a reconcile, but ONLY when the result actually
+// differs from what the cache already holds. Skipping the no-op write is what
+// stops a read from looking like an edit to every listener — see STORE_REV_KEY.
+async function updateLocalCache(next: Store, previous: Store | null): Promise<void> {
+  if (sameStore(next, previous)) return;
+  await chromeLocalSet(next);
+  idbSet(next);
+  await bumpStoreRev();
 }
 
 // Drive-mode load: Drive is canonical, but reconcile with any local offline
@@ -756,21 +901,50 @@ async function loadStoreDrive(): Promise<Store> {
       if (hasData(legacy)) seed = legacy;
     }
     if (hasData(seed)) queueDriveWrite(seed);
-    await chromeLocalSet(seed);
-    idbSet(seed);
+    await updateLocalCache(seed, local);
     return seed;
   }
 
   // Merge canonical remote with local edits (last-write-wins per record via the
-  // stores' own timestamps). If local contributed anything newer, push it back.
-  const merged = mergeStores(remote, local);
-  if (JSON.stringify(merged) !== JSON.stringify(remote)) queueDriveWrite(merged);
-  await chromeLocalSet(merged);
-  idbSet(merged);
+  // stores' own timestamps, with tombstones carrying deletes). If local
+  // contributed anything newer, push it back.
+  const merged = pruneTombstones(mergeStores(remote, local));
+  if (!sameStore(merged, remote)) queueDriveWrite(merged);
+  await updateLocalCache(merged, local);
   return merged;
 }
 
 // ---- Public API ----
+
+// ---- Load coalescing + freshness ----
+//
+// Every sidebar repaint calls loadStore, and in Drive mode each call was two
+// HTTPS round-trips plus a full-store merge. Three separate callers in one tab
+// (the 2s safety interval, the scroll handler, the MutationObserver) could each
+// have one in flight at once, and every open tab multiplied that again.
+//
+// Two cheap defences:
+//   * one shared in-flight promise — concurrent callers await the same load;
+//   * a short freshness window — a repaint serves the just-loaded store instead
+//     of going back to Drive. Cross-machine edits still arrive on time: the
+//     DRIVE_SYNC_ALARM reconcile (every DRIVE_SYNC_PERIOD_MINUTES) forces a
+//     fresh read, and any local edit bumps STORE_REV_KEY immediately.
+const LOAD_FRESH_MS = 15_000;
+
+let loadInFlight: Promise<Store> | null = null;
+let loadedStore: Store | null = null;
+let loadedAt = 0;
+
+/** Drop the freshness window so the next loadStore really re-reads. */
+export function invalidateLoadCache(): void {
+  loadedStore = null;
+  loadedAt = 0;
+}
+
+export interface LoadOptions {
+  /** Serve the cached store if it was loaded within this many ms. 0 = always re-read. */
+  maxAgeMs?: number;
+}
 
 /**
  * Load the store. In Drive mode, Drive is canonical (reconciled with the local
@@ -780,7 +954,18 @@ async function loadStoreDrive(): Promise<Store> {
  *   3. Fall back to whatever local/IDB has (or an empty store).
  * Always refreshes the in-memory sync snapshot and local backups.
  */
-export async function loadStore(): Promise<Store> {
+export function loadStore(opts: LoadOptions = {}): Promise<Store> {
+  const maxAge = opts.maxAgeMs ?? LOAD_FRESH_MS;
+  if (loadedStore && Date.now() - loadedAt < maxAge) return Promise.resolve(loadedStore);
+  if (loadInFlight) return loadInFlight;
+
+  loadInFlight = loadStoreUncached()
+    .then((s) => { loadedStore = s; loadedAt = Date.now(); return s; })
+    .finally(() => { loadInFlight = null; });
+  return loadInFlight;
+}
+
+async function loadStoreUncached(): Promise<Store> {
   if (await isDriveEnabled()) return loadStoreDrive();
 
   // 1. Canonical: chrome.storage.sync
@@ -885,7 +1070,17 @@ export async function saveStore(input: Store): Promise<SaveResult> {
     };
   }
 
-  const { store, blocked } = await applyContactLimit(input);
+  // Auto-tombstone whatever this write dropped. The dashboard and popup still
+  // write the store wholesale, so without this a delete made there would carry
+  // no tombstone and would be resurrected by the next merge. Computed against
+  // the cache BEFORE the plan limit runs — applyContactLimit also removes
+  // conversations, and those are refusals to store, not deletions.
+  const previous = (await chromeLocalGet()) || (await idbGet());
+  const withTombstones = previous
+    ? tombstone(normalize(input), removedConversationIds(previous, input))
+    : pruneTombstones(normalize(input));
+
+  const { store, blocked } = await applyContactLimit(withTombstones);
 
   const planLimit = blocked > 0
     ? { planLimitReached: true, blockedContacts: blocked, reason: `Free plan is limited to ${FREE_CONTACT_LIMIT} contacts.` }
@@ -893,6 +1088,11 @@ export async function saveStore(input: Store): Promise<SaveResult> {
 
   // Local cache first — durable even if the network write below fails.
   await Promise.all([chromeLocalSet(store), idbSet(store)]);
+  // This context's own view is now authoritative; serve it to callers inside
+  // the freshness window rather than re-reading what we just wrote.
+  loadedStore = store;
+  loadedAt = Date.now();
+  await bumpStoreRev();
 
   if (await isDriveEnabled()) {
     // Mark dirty up front; queueDriveWrite clears it once the upload lands.
@@ -930,8 +1130,9 @@ export async function forcePullFromSync(): Promise<Store | null> {
   const fromSync = await syncGetAll();
   if (!fromSync) return null;
   lastSyncSnapshot = clone(fromSync);
-  chromeLocalSet(fromSync);
-  idbSet(fromSync);
+  await Promise.all([chromeLocalSet(fromSync), idbSet(fromSync)]);
+  invalidateLoadCache();
+  await bumpStoreRev();
   return fromSync;
 }
 
@@ -947,6 +1148,8 @@ export async function forcePushToSync(store: Store): Promise<void> {
   lastSyncSnapshot = clone(EMPTY_STORE); // forces full delta
   await syncWriteDelta(store);
   await Promise.all([chromeLocalSet(store), idbSet(store)]);
+  invalidateLoadCache();
+  await bumpStoreRev();
 
   // Verify the write actually landed: read sync back and confirm it now holds
   // data when the store we pushed had some. Catches silently-dropped writes

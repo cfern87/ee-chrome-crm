@@ -364,15 +364,28 @@ function normalizeStore(s: Partial<Store>): Store {
     savedSearches: s.savedSearches || {},
     notes: s.notes || {},
     settings: s.settings || {},
+    deleted: s.deleted || {},
   };
 }
 
 /**
  * Merge two stores last-write-wins per record, using the timestamps the store
- * already tracks. Not used by Phase 1's manual Push/Pull, but Phase 2 needs it
- * to reconcile concurrent edits from two machines, so it lives here now.
+ * already tracks. Used to reconcile concurrent edits from two machines.
+ *
+ * DELETES: a union merge cannot express a deletion — whichever side still holds
+ * the record would always win, so a deleted contact came straight back on the
+ * next reconcile. The `deleted` tombstone map is what fixes that: the two maps
+ * are unioned (newest stamp wins), and any conversation whose tombstone is at
+ * least as new as the record itself is dropped from the result. A contact
+ * deliberately re-added after a delete has a newer `updatedAt`, so it outranks
+ * its own tombstone and survives.
  */
 export function mergeStores(a: Store, b: Store): Store {
+  const deleted: Record<string, number> = { ...(a.deleted || {}) };
+  for (const [id, at] of Object.entries(b.deleted || {})) {
+    if (!deleted[id] || at > deleted[id]) deleted[id] = at;
+  }
+
   const out: Store = {
     conversations: { ...a.conversations },
     tags: { ...a.tags },
@@ -381,10 +394,17 @@ export function mergeStores(a: Store, b: Store): Store {
     savedSearches: { ...a.savedSearches },
     notes: { ...a.notes, ...b.notes },
     settings: { ...a.settings, ...b.settings },
+    deleted,
   };
   for (const [id, conv] of Object.entries(b.conversations)) {
     const cur = out.conversations[id];
     if (!cur || (conv.updatedAt || 0) >= (cur.updatedAt || 0)) out.conversations[id] = conv;
+  }
+  // Apply the tombstones last, so it doesn't matter which side contributed the
+  // surviving copy of a deleted record.
+  for (const [id, at] of Object.entries(deleted)) {
+    const conv = out.conversations[id];
+    if (conv && (conv.updatedAt || 0) <= at) delete out.conversations[id];
   }
   for (const [id, tag] of Object.entries(b.tags)) {
     const cur = out.tags[id];

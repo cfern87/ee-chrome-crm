@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, addTagsTo, removeTagsFrom, lastTaggedAt, getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES } from '../storage';
+import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, addTagsTo, removeTagsFrom, lastTaggedAt, getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, isStoreChangeKey, isCrmSyncKey } from '../storage';
 import { BUILD_INFO } from '../buildInfo';
 import { getEntitlement, PLATFORM_URL, FREE_CONTACT_LIMIT, type Entitlement } from '../license';
 
@@ -247,7 +247,16 @@ export default function DashboardApp() {
 
     try {
       if (typeof chrome !== 'undefined' && chrome.storage) {
-        const handler = () => refresh();
+        // Only react to real store changes. This used to refresh on ANY key in
+        // any area — including the Drive last-sync stamp and the local cache,
+        // both of which are written by a store *read*. That made every refresh
+        // schedule another one.
+        const handler = (changes: Record<string, unknown>, area: string) => {
+          const relevant =
+            (area === 'local' && Object.keys(changes).some(isStoreChangeKey)) ||
+            (area === 'sync' && Object.keys(changes).some(isCrmSyncKey));
+          if (relevant) refresh();
+        };
         chrome.storage.onChanged.addListener(handler);
         return () => chrome.storage.onChanged.removeListener(handler);
       }

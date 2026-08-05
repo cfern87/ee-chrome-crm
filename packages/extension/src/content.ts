@@ -12,19 +12,16 @@
 //   "current" conversation for the panel when the URL-based detection fails.
 
 import {
-  STORAGE_KEY,
   isCrmSyncKey,
+  isStoreChangeKey,
   loadStore as _loadStore,
-  saveStore as _saveStore,
-  isDriveEnabled,
-  addTagsTo,
-  removeTagsFrom,
 } from './storage';
 import type { Store, Tag, Conversation } from './storage';
+import type { Mutation } from './mutations';
 import { PLATFORM_URL } from './license';
 
 import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
-import { buildThreadIndex, isUnboundOrphan, planOrphanBinds } from './contacts';
+import { buildThreadIndex, isUnboundOrphan, planOrphanBinds, threadAliases } from './contacts';
 import type { ThreadRow } from './contacts';
 import { extractNameFromLink, extractActiveThreadName, extractProfilePageName, looksLikeName } from './names';
 import type { SendFailureKind } from './campaigns';
@@ -71,6 +68,11 @@ function getNameFromLink(link: HTMLAnchorElement): string {
 // every sidebar render cycle.
 
 let storeCache: Store | null = null;
+// Shared in-flight read. injectSidebarTags runs from three independent triggers
+// (the 2s safety interval, the scroll handler, the MutationObserver) and each
+// used to fire its own GET_STORE; with several tabs open that multiplied into
+// enough concurrent Drive round-trips to stall the service worker.
+let storeInFlight: Promise<Store> | null = null;
 
 // Timestamp of our own most recent write. The storage onChanged listener uses
 // this to tell "we just saved this" apart from "another tab/device changed
@@ -78,53 +80,82 @@ let storeCache: Store | null = null;
 // steal focus from — and wipe — the new-tag inputs while the user is typing).
 let lastSelfWriteAt = 0;
 
-// Round-trip a message to the background service worker.
-function sendBg<T>(message: unknown): Promise<T | null> {
+// A background round trip that cannot hang forever. Without the timeout, a
+// saturated or restarting service worker leaves `await getStore()` pending
+// indefinitely — the sidebar never repaints and the panel never opens, which is
+// what the "extension froze" reports actually looked like. On timeout we fall
+// back to the local cache: stale-but-rendered beats frozen.
+const BG_TIMEOUT_MS = 8_000;
+
+function sendBg<T>(message: unknown, timeoutMs = BG_TIMEOUT_MS): Promise<T | null> {
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v: T | null) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } };
+    const timer = setTimeout(() => finish(null), timeoutMs);
     try {
       chrome.runtime.sendMessage(message, (res) => {
-        if (chrome.runtime.lastError) { resolve(null); return; }
-        resolve((res as T) ?? null);
+        if (chrome.runtime.lastError) { finish(null); return; }
+        finish((res as T) ?? null);
       });
-    } catch { resolve(null); }
+    } catch { finish(null); }
   });
 }
 
-// In Drive mode the content script can't reach Drive itself (content scripts
-// have no chrome.identity), so it routes reads/writes through the background —
-// which holds the OAuth token and treats Drive as canonical. This keeps the
-// content view fresh instead of serving a possibly-stale local cache. If the
-// background is unreachable, fall back to the direct local path (which the
-// background's dirty-flush will later reconcile to Drive).
+// The background owns the store: it holds the Drive OAuth token (content
+// scripts have no chrome.identity) and it serializes every write, so reads go
+// through it too and everyone sees the same snapshot. If it can't be reached,
+// fall back to reading the local cache directly rather than blocking the UI.
 async function getStore(): Promise<Store> {
   if (storeCache) return storeCache;
-  if (await isDriveEnabled()) {
+  if (storeInFlight) return storeInFlight;
+
+  storeInFlight = (async () => {
     const res = await sendBg<Store>({ type: 'GET_STORE' });
-    if (res && res.conversations) { storeCache = res; return res; }
-  }
-  const store = await _loadStore();
-  storeCache = store;
-  return store;
+    if (res && res.conversations) return res;
+    return _loadStore();
+  })()
+    .then((s) => { storeCache = s; return s; })
+    .finally(() => { storeInFlight = null; });
+
+  return storeInFlight;
 }
 
-async function saveStore(store: Store): Promise<void> {
-  storeCache = store;
-  // Callers mutate conversations in place before saving, so the alias index
-  // built from the previous snapshot is now stale.
-  invalidateThreadIndex();
+/**
+ * Apply store changes. Content scripts describe INTENT rather than writing a
+ * store: several tabs each saving their own whole-store snapshot is what was
+ * undoing renames and deletes (see mutations.ts). The background applies these
+ * against a freshly loaded store, under a lock.
+ *
+ * Returns the store as it stands after the mutation, so callers can render from
+ * it without a second round trip.
+ */
+async function mutate(mutations: Mutation[]): Promise<Store> {
+  if (!mutations.length) return getStore();
   lastSelfWriteAt = Date.now();
-  let result: { planLimitReached?: boolean; signedOut?: boolean } | null = null;
-  if (await isDriveEnabled()) {
-    const res = await sendBg<{ success?: boolean; result?: { planLimitReached?: boolean; signedOut?: boolean } }>({ type: 'SET_STORE', payload: store });
-    if (!res || !res.success) result = await _saveStore(store); // background unreachable — keep it local
-    else result = res.result ?? null;
+  invalidateThreadIndex();
+
+  const res = await sendBg<{
+    success?: boolean;
+    changed?: boolean;
+    store?: Store;
+    result?: { planLimitReached?: boolean; signedOut?: boolean };
+  }>({ type: 'MUTATE_STORE', payload: { mutations } });
+
+  if (res?.result?.signedOut) showSignedOutNotice();
+  else if (res?.result?.planLimitReached) showPlanLimitNotice();
+
+  if (res?.store) {
+    storeCache = res.store;
+    invalidateThreadIndex();
   } else {
-    result = await _saveStore(store);
+    // Background unreachable — drop the cache so the next read re-fetches
+    // rather than serving a snapshot that never got the edit applied.
+    storeCache = null;
+    invalidateThreadIndex();
   }
-  if ((result as { signedOut?: boolean } | null)?.signedOut) showSignedOutNotice();
-  else if (result?.planLimitReached) showPlanLimitNotice();
   // Cover the window until chrome.storage fires onChanged for this write.
   lastSelfWriteAt = Date.now();
+  return storeCache || (await getStore());
 }
 
 // Nothing works without an account — free or paid. Say so where the person is
@@ -226,69 +257,27 @@ function findConversationForThread(store: Store, threadId: string): Conversation
   return threadIndex.get(threadId.toLowerCase()) || null;
 }
 
-async function ensureConversation(threadId: string, link?: HTMLAnchorElement): Promise<Conversation> {
+async function ensureConversation(threadId: string, link?: HTMLAnchorElement): Promise<Conversation | null> {
   const store = await getStore();
   const chatUrl = buildChatUrl(threadId, link);
-  let dirty = false;
+  const existing = findConversationForThread(store, threadId);
 
-  // Someone already in the CRM under a different id (a vanity profile key, a
-  // legacy thread) — adopt this sidebar thread id onto that record instead of
-  // creating a duplicate.
-  const aliased = !store.conversations[threadId] ? findConversationForThread(store, threadId) : null;
-  if (aliased) {
-    if (aliased.resolvedThreadId !== threadId && aliased.id !== threadId) {
-      aliased.resolvedThreadId = threadId;
-      aliased.participantId = threadId;
-      dirty = true;
-    }
-    if (chatUrl !== aliased.chatUrl) {
-      aliased.chatUrl = chatUrl;
-      dirty = true;
-    }
-    // Only fill in a name here — the profile page we captured this contact from
-    // is a better name source than a sidebar row, so a good stored name stands.
-    if (link && !aliased.nameManual && !looksLikeName(aliased.participantName)) {
-      const name = getNameFromLink(link);
-      if (name !== 'Unknown' && aliased.participantName !== name) {
-        aliased.participantName = name;
-        dirty = true;
-      }
-    }
-    if (dirty) await saveStore(store);
-    return aliased;
-  }
+  // A good stored name stands: the profile page a contact was captured from is
+  // a better source than a sidebar row, so only offer a scraped name when the
+  // record is new or what it holds doesn't look like a name.
+  const scraped = link ? getNameFromLink(link) : getActiveThreadName();
+  const offerName = !existing || !looksLikeName(existing.participantName);
 
-  if (!store.conversations[threadId]) {
-    const name = link ? getNameFromLink(link) : getActiveThreadName();
-    const now = Date.now();
-    store.conversations[threadId] = {
-      id: threadId, participantName: name, participantId: threadId,
-      lastMessage: '', lastMessageTime: now, tags: [],
-      archived: false, createdAt: now, updatedAt: now,
-      chatUrl
-    };
-    dirty = true;
-  } else {
-    const conv = store.conversations[threadId];
-    // Refresh name if we got a better one from the sidebar link — unless the
-    // user has manually renamed this contact, in which case their name wins.
-    if (link && !conv.nameManual) {
-      const name = getNameFromLink(link);
-      if (name !== 'Unknown' && conv.participantName !== name) {
-        conv.participantName = name;
-        dirty = true;
-      }
-    }
-    // Always update chatUrl when we have a real link href or are on the page
-    const betterUrl = buildChatUrl(threadId, link);
-    if (betterUrl !== conv.chatUrl) {
-      conv.chatUrl = betterUrl;
-      dirty = true;
-    }
-  }
-
-  if (dirty) await saveStore(store);
-  return store.conversations[threadId];
+  const next = await mutate([
+    {
+      op: 'upsertContact',
+      threadId,
+      chatUrl,
+      name: offerName ? scraped : undefined,
+      allowCreate: true,
+    },
+  ]);
+  return findConversationForThread(next, threadId);
 }
 
 // Find an already-saved contact that matches a profile page, by profile URL
@@ -322,8 +311,7 @@ function findConversationForProfile(store: Store, profileUrl: string): Conversat
 // Create a new contact directly from a profile page (no Messenger thread
 // required yet). Mirrors the CSV-import identity resolution so the contact
 // lines up with any Messenger-captured or imported copy of the same person.
-async function addProfileContact(profileUrl: string, name: string): Promise<Conversation> {
-  const store = await getStore();
+async function addProfileContact(profileUrl: string, name: string): Promise<Conversation | null> {
   const norm = normalizeProfileUrl(profileUrl) || profileUrl;
   const thread = extractThreadFromProfileUrl(profileUrl);
   // The numeric fbid read off the page. This is the id the Messenger sidebar
@@ -331,47 +319,17 @@ async function addProfileContact(profileUrl: string, name: string): Promise<Conv
   // contact and their message-list row the same person from the start.
   const pageThread = isProfilePage() ? getProfilePageThreadId() : null;
 
-  const existing = findConversationForProfile(store, profileUrl);
-  if (existing) {
-    // Backfill the identity facets we can see from this page so the match is
-    // direct next time — and so the dashboard's duplicate finder links them.
-    let dirty = false;
-    if (!existing.profileUrl) { existing.profileUrl = norm; dirty = true; }
-    if (pageThread && existing.id !== pageThread && existing.resolvedThreadId !== pageThread) {
-      existing.resolvedThreadId = pageThread;
-      dirty = true;
-    }
-    if (pageThread && /^\d+$/.test(pageThread) && !existing.fbUserId) { existing.fbUserId = pageThread; dirty = true; }
-    if (thread && !thread.numeric && !existing.fbUsername) { existing.fbUsername = thread.threadId; dirty = true; }
-    if (dirty) {
-      existing.updatedAt = Date.now();
-      await saveStore(store);
-    }
-    return existing;
-  }
-
-  const pk = profileKey(profileUrl) || Math.random().toString(36).slice(2);
-  const id = pageThread || thread?.threadId || `imp_${pk.replace(/[^a-z0-9]+/gi, '_').slice(0, 40)}_${Math.random().toString(36).slice(2, 6)}`;
-  const now = Date.now();
-  const conv: Conversation = {
-    id,
-    participantName: name || 'Unknown',
-    participantId: id,
-    lastMessage: '',
-    lastMessageTime: now,
-    tags: [],
-    profileUrl: norm,
-    chatUrl: pageThread ? `https://www.facebook.com/messages/t/${pageThread}/` : thread?.chatUrl,
-    fbUserId: pageThread && /^\d+$/.test(pageThread) ? pageThread : undefined,
-    fbUsername: thread && !thread.numeric ? thread.threadId : undefined,
-    source: 'import',
-    archived: false,
-    createdAt: now,
-    updatedAt: now,
-  };
-  store.conversations[id] = conv;
-  await saveStore(store);
-  return conv;
+  const next = await mutate([
+    {
+      op: 'addProfileContact',
+      profileUrl: norm,
+      name,
+      pageThreadId: pageThread,
+      urlThreadId: thread?.threadId ?? null,
+      urlThreadNumeric: thread?.numeric,
+    },
+  ]);
+  return findConversationForProfile(next, profileUrl);
 }
 
 // ---- Sidebar tag injection ----
@@ -433,7 +391,28 @@ function ensureAddTagButton(link: HTMLAnchorElement) {
   link.appendChild(btn);
 }
 
-async function injectSidebarTags() {
+// One injection pass at a time. The three triggers (2s safety interval, scroll,
+// MutationObserver) fire independently and each pass awaits a store read, so
+// without this they pile up — several passes in flight at once, all doing the
+// same work against the same DOM. A trailing re-run keeps the last request from
+// being dropped.
+let injectInFlight = false;
+let injectQueued = false;
+
+async function injectSidebarTags(): Promise<void> {
+  if (injectInFlight) { injectQueued = true; return; }
+  injectInFlight = true;
+  try {
+    do {
+      injectQueued = false;
+      await injectSidebarTagsOnce();
+    } while (injectQueued);
+  } finally {
+    injectInFlight = false;
+  }
+}
+
+async function injectSidebarTagsOnce() {
   lastInjectAt = Date.now();
   const store = await getStore();
   const links = document.querySelectorAll<HTMLAnchorElement>('a[href*="/t/"]');
@@ -522,18 +501,23 @@ async function bindOrphansByName(store: Store, links: HTMLAnchorElement[]): Prom
   if (!rows.length) return 0;
 
   const binds = planOrphanBinds(store, rows);
+  if (!binds.length) return 0;
+
+  const mutations: Mutation[] = [];
   for (const { conversationId, threadId } of binds) {
     const conv = store.conversations[conversationId];
     if (!conv) continue;
-    conv.resolvedThreadId = threadId;
-    conv.participantId = threadId;
-    conv.chatUrl = buildChatUrl(threadId, byThread.get(threadId));
-    conv.updatedAt = Date.now();
+    mutations.push({
+      op: 'bindThread',
+      conversationId,
+      threadId,
+      chatUrl: buildChatUrl(threadId, byThread.get(threadId)),
+    });
     console.log(`[CRM] Linked "${conv.participantName}" (${conv.id}) to thread ${threadId} by name`);
   }
 
-  if (binds.length) await saveStore(store);
-  return binds.length;
+  if (mutations.length) await mutate(mutations);
+  return mutations.length;
 }
 
 // ---- Diagnostic: how well do sidebar rows line up with the CRM? ----
@@ -604,14 +588,20 @@ function startSidebarObserver() {
 }
 
 // Re-inject whenever the store changes. Two sources:
-//   * local namespace, STORAGE_KEY  → same-machine writes (panel/popup mirror)
+//   * local namespace, STORE_REV_KEY  → same-machine writes (panel/popup mirror)
 //   * sync  namespace, crm shard keys → updates arriving from ANOTHER machine
 // Both just invalidate the cache and re-render; injection is idempotent.
+//
+// Deliberately NOT keyed on STORAGE_KEY: that is the local cache, rewritten by
+// every store *read* as well as every write. Listening on it meant a read
+// notified every tab, every tab re-read, and each of those reads notified
+// again — a loop that saturated the service worker once more than one tab was
+// open. STORE_REV_KEY only moves when the contents genuinely changed.
 if (isExtensionAlive()) {
   try {
     chrome.storage.onChanged.addListener((changes, area) => {
       const relevant =
-        (area === 'local' && !!changes[STORAGE_KEY]) ||
+        (area === 'local' && Object.keys(changes).some(isStoreChangeKey)) ||
         (area === 'sync' && Object.keys(changes).some(isCrmSyncKey));
       if (!relevant) return;
       storeCache = null;
@@ -824,7 +814,10 @@ async function renderPanel() {
       wireClose();
       panelEl.querySelector('#fb-crm-add-profile')?.addEventListener('click', async () => {
         const conv = await addProfileContact(profileUrl, guessName);
-        currentPanelThreadId = conv.id;
+        // A null result means the write couldn't reach the background. Re-render
+        // either way: the panel then reflects whatever actually got saved rather
+        // than claiming success.
+        if (conv) currentPanelThreadId = conv.id;
         await renderPanel();
         await injectSidebarTags();
       });
@@ -875,6 +868,22 @@ async function renderPanel() {
   }
 
   const conv = await ensureConversation(threadId);
+  if (!conv) {
+    // The contact couldn't be created or read back — the background is
+    // unreachable, or the save was refused (signed out, free plan full; both
+    // already surface their own notice). Say so instead of rendering an empty
+    // panel that looks like the contact has no tags.
+    panelEl.innerHTML = `
+      <div class="fb-crm-header">
+        <span>Messenger CRM</span>
+        <button class="fb-crm-close">✕</button>
+      </div>
+      <div class="fb-crm-body">
+        <div class="fb-crm-empty">Couldn't load this contact. Check your connection and try again.</div>
+      </div>`;
+    wireClose();
+    return;
+  }
   const store = await getStore();
   const convTags = conv.tags.map(tid => store.tags[tid]).filter(Boolean) as Tag[];
   const availableTags = Object.values(store.tags).filter(t => !conv.tags.includes(t.id));
@@ -934,7 +943,10 @@ async function renderPanel() {
 
   wireClose();
   panelEl.querySelector('.fb-crm-pick-btn')?.addEventListener('click', enterPickMode);
-  wirePanelActions(threadId);
+  // Bind to the record's own store key, not the id in the URL. ensureConversation
+  // may have adopted this thread onto an existing contact keyed under one of its
+  // aliases, and every action below addresses the contact by key.
+  wirePanelActions(conv.id);
 
   // If the user was typing a tag name when a re-render happened, restore focus
   // and place the caret at the end so their typing isn't interrupted.
@@ -960,11 +972,7 @@ function wirePanelActions(threadId: string) {
 
   panelEl.querySelectorAll<HTMLElement>('[data-remove]').forEach(btn => {
     btn.addEventListener('click', async () => {
-      const store = await getStore();
-      const conv = store.conversations[threadId];
-      if (!conv) return;
-      store.conversations[threadId] = removeTagsFrom(conv, [btn.dataset.remove!]);
-      await saveStore(store);
+      await mutate([{ op: 'removeTags', conversationId: threadId, tagIds: [btn.dataset.remove!] }]);
       await renderPanel();
       await injectSidebarTags();
     });
@@ -972,11 +980,7 @@ function wirePanelActions(threadId: string) {
 
   panelEl.querySelectorAll<HTMLElement>('[data-add]').forEach(btn => {
     btn.addEventListener('click', async () => {
-      const store = await getStore();
-      const conv = store.conversations[threadId];
-      if (!conv || conv.tags.includes(btn.dataset.add!)) return;
-      store.conversations[threadId] = addTagsTo(conv, [btn.dataset.add!]);
-      await saveStore(store);
+      await mutate([{ op: 'addTags', conversationId: threadId, tagIds: [btn.dataset.add!] }]);
       await renderPanel();
       await injectSidebarTags();
     });
@@ -988,16 +992,12 @@ function wirePanelActions(threadId: string) {
     const name = nameEl?.value.trim();
     if (!name) { nameEl?.focus(); return; }
 
-    const store = await getStore();
     const tag: Tag = { id: genId(), name, color: colorEl?.value || randomColor(), createdAt: Date.now() };
-    store.tags[tag.id] = tag;
-    const conv = store.conversations[threadId];
-    if (conv) store.conversations[threadId] = addTagsTo(conv, [tag.id]);
     // Reset the draft for the next tag (fresh random color, empty name).
     newTagDraft.name = '';
     newTagDraft.color = randomColor();
     newTagNameFocused = false;
-    await saveStore(store);
+    await mutate([{ op: 'createTag', tag, attachTo: threadId }]);
     await renderPanel();
     await injectSidebarTags();
   });
@@ -1030,12 +1030,24 @@ function wirePanelActions(threadId: string) {
 
   panelEl.querySelector('#fb-crm-delete-confirm')?.addEventListener('click', async () => {
     const store = await getStore();
-    const name = store.conversations[threadId]?.participantName || threadId;
-    delete store.conversations[threadId];
-    await saveStore(store);
-    deleteArmed = false;
-    // Keep auto-capture from immediately re-adding the person we just deleted.
+    const conv = store.conversations[threadId];
+    const name = conv?.participantName || threadId;
+    // Mark the thread removed BEFORE the write. renderPanel and the sidebar
+    // pass both run again as soon as the mutation resolves, and auto-capture
+    // would otherwise re-create the contact we just deleted.
+    //
+    // Every id this contact answers to has to be marked, not just the store
+    // key: once the record is gone nothing resolves the URL's thread id back to
+    // it, so a contact keyed under an alias would be re-captured under the id
+    // in the address bar a moment later.
     removedThreads.add(threadId);
+    if (conv) for (const alias of threadAliases(conv)) removedThreads.add(alias);
+    const active = getActiveThreadId();
+    if (active) removedThreads.add(active);
+    deleteArmed = false;
+    // The mutation records a tombstone, which is what makes the delete survive
+    // the next reconcile against Drive (see storage.ts `deleted`).
+    await mutate([{ op: 'deleteContact', conversationId: threadId }]);
     console.info(`[CRM] Removed contact ${threadId} ("${name}") from the CRM`);
     await renderPanel();
     await injectSidebarTags();
@@ -1050,17 +1062,10 @@ function wirePanelActions(threadId: string) {
 
     const newName = prompt('Enter conversation name:', editingName);
     if (newName !== null && newName.trim()) {
-      const store = await getStore();
-      const conv = store.conversations[threadId];
-      if (conv) {
-        conv.participantName = newName.trim();
-        conv.nameManual = true; // user-set name — don't let DOM scraping override it
-        conv.updatedAt = Date.now();
-        await saveStore(store);
-        editingName = null;
-        await renderPanel();
-        await injectSidebarTags();
-      }
+      await mutate([{ op: 'renameContact', conversationId: threadId, name: newName.trim() }]);
+      editingName = null;
+      await renderPanel();
+      await injectSidebarTags();
     }
   });
 }
@@ -1124,14 +1129,13 @@ function resolveSendThreadId(composer: Element): string | null {
 // Stamp lastContactedAt — but only for an already-saved contact.
 async function markContacted(threadId: string): Promise<void> {
   const store = await getStore();
-  const conv = store.conversations[threadId];
-  if (!conv) return; // saved contacts only — never auto-create on send
-  const now = Date.now();
-  // Coalesce rapid repeat sends so we don't write on every keystroke-send burst
-  if (conv.lastContactedAt && now - conv.lastContactedAt < 1500) return;
-  conv.lastContactedAt = now;
-  conv.updatedAt = now;
-  await saveStore(store);
+  // Saved contacts only — never auto-create one just because a message went
+  // out. Resolve through aliases so a profile-added contact still counts.
+  const conv = findConversationForThread(store, threadId);
+  if (!conv) return;
+  // The coalescing window for rapid repeat sends lives in the mutation, so it
+  // applies whichever tab the send came from.
+  await mutate([{ op: 'markContacted', conversationId: conv.id }]);
   console.log('[CRM] Recorded lastContacted for', conv.participantName || threadId);
   if (panelEl && panelEl.style.display !== 'none') renderPanel();
 }
@@ -1295,24 +1299,19 @@ async function resolveImportedProfileOnThisPage(): Promise<void> {
   const chatUrl = `https://www.facebook.com/messages/t/${threadId}/`;
 
   const store = await getStore();
-  let dirty = false;
-  for (const conv of Object.values(store.conversations)) {
-    if (profileKey(conv.profileUrl) !== pageKey) continue;
-    // Upgrade when there's no chat URL yet, or when we found the more reliable
-    // numeric id and the stored one differs (e.g. an earlier vanity guess).
-    if (!conv.chatUrl || (numeric && conv.chatUrl !== chatUrl)) {
-      conv.chatUrl = chatUrl;
-      conv.participantId = threadId;
-      // Record the canonical id separately when it differs from the key we
-      // captured (a vanity profile key). This is what lets the Messenger
-      // sidebar — which only ever sees the numeric id — find this contact.
-      if (threadId !== conv.id) conv.resolvedThreadId = threadId;
-      conv.updatedAt = Date.now();
-      dirty = true;
-      console.log('[CRM] Resolved imported contact thread id from profile:', conv.participantName, '→', threadId);
-    }
+  // Nothing to do unless this page matches a stored contact — checked here so
+  // the common case costs no background round trip. The mutation re-derives the
+  // same set against the authoritative store before writing. It upgrades a
+  // contact when there's no chat URL yet, or when the more reliable numeric id
+  // disagrees with an earlier vanity guess.
+  const affected = Object.values(store.conversations).filter(
+    (conv) => profileKey(conv.profileUrl) === pageKey && (!conv.chatUrl || (numeric && conv.chatUrl !== chatUrl)),
+  );
+  if (!affected.length) return;
+  for (const conv of affected) {
+    console.log('[CRM] Resolved imported contact thread id from profile:', conv.participantName, '→', threadId);
   }
-  if (dirty) await saveStore(store);
+  await mutate([{ op: 'resolveProfileThread', profileKey: pageKey, threadId, chatUrl }]);
 }
 
 // ---- Init ----
@@ -1533,11 +1532,9 @@ async function saveResolvedThreadId(requestedThreadId: string, resolvedThreadId:
   const conv = store.conversations[requestedThreadId];
   if (!conv) return false;
   if (conv.resolvedThreadId === resolvedThreadId) return true; // already recorded
-  conv.resolvedThreadId = resolvedThreadId;
-  conv.participantId = resolvedThreadId;
-  conv.chatUrl = `https://www.facebook.com/messages/t/${resolvedThreadId}/`;
-  conv.updatedAt = Date.now();
-  await saveStore(store);
+  await mutate([
+    { op: 'setResolvedThread', conversationId: requestedThreadId, threadId: resolvedThreadId },
+  ]);
   return true;
 }
 

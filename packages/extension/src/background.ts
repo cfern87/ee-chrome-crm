@@ -26,7 +26,9 @@
 // mid-step).
 
 import { loadStore, saveStore, flushDriveIfDirty, syncDriveNow, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, removeTagsFrom } from './storage';
-import type { Store } from './storage';
+import type { Store, SaveResult } from './storage';
+import { applyMutations } from './mutations';
+import type { Mutation } from './mutations';
 import {
   getEntitlement,
   refreshEntitlement,
@@ -120,6 +122,53 @@ function ensureEntitlementCheck(): void {
   } catch (e) { console.warn('[CRM] alarms unavailable (entitlement):', e); }
 }
 
+
+// ---- store mutation lock ----
+//
+// Every CRM edit from every tab funnels through here, and each one is a
+// read-modify-write. Run two concurrently and the second overwrites the first:
+// both loaded the same store, and the later save wins wholesale. That is not
+// hypothetical — the sidebar in each open tab emits mutations on its own timer,
+// so with several tabs the interleaving is the normal case, and it is how
+// renames and deletes were getting undone.
+//
+// So mutations are serialized: each waits for the previous one to finish before
+// it loads. The lock is per-worker, which is the whole story for edits made on
+// this machine; edits from other machines are still reconciled by mergeStores.
+let storeLock: Promise<unknown> = Promise.resolve();
+
+function withStoreLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = storeLock.then(fn, fn);
+  // Keep the chain alive after a rejection so one failed mutation can't wedge
+  // every later one.
+  storeLock = run.catch(() => { /* swallowed; the caller still sees it */ });
+  return run;
+}
+
+interface MutateResponse {
+  success: boolean;
+  changed: boolean;
+  store: Store;
+  conversationId?: string;
+  result?: SaveResult;
+  error?: string;
+}
+
+/**
+ * Apply mutations against a freshly loaded store and persist the result. Skips
+ * the write entirely when nothing changed, which is the common case: the
+ * sidebar re-asserts a contact's chat URL on every repaint and almost never has
+ * anything new to say.
+ */
+async function mutateStore(mutations: Mutation[]): Promise<MutateResponse> {
+  return withStoreLock(async () => {
+    const store = await loadStore();
+    const { store: next, changed, conversationId } = applyMutations(store, mutations);
+    if (!changed) return { success: true, changed: false, store, conversationId };
+    const result = await saveStore(next);
+    return { success: true, changed: true, store: next, conversationId, result };
+  });
+}
 
 // ---- sender tab bookkeeping (survives SW restarts) ----
 
@@ -408,16 +457,10 @@ async function resolveProfileUrl(r: Campaign['recipients'][number], log: string[
 async function recordResolvedThread(requestedThreadId: string, resolvedThreadId: string, chatUrl: string, log: string[]): Promise<void> {
   if (!resolvedThreadId || resolvedThreadId === requestedThreadId) return;
   try {
-    const store = await loadStore();
-    const conv = store.conversations[requestedThreadId];
-    if (!conv) return;
-    if (conv.resolvedThreadId === resolvedThreadId && conv.chatUrl === chatUrl) return;
-    conv.resolvedThreadId = resolvedThreadId;
-    conv.participantId = resolvedThreadId;
-    conv.chatUrl = chatUrl;
-    conv.updatedAt = Date.now();
-    await saveStore(store);
-    log.push(`saved resolved thread id ${requestedThreadId} → ${resolvedThreadId}`);
+    const res = await mutateStore([
+      { op: 'setResolvedThread', conversationId: requestedThreadId, threadId: resolvedThreadId, chatUrl },
+    ]);
+    if (res.changed) log.push(`saved resolved thread id ${requestedThreadId} → ${resolvedThreadId}`);
   } catch (e) {
     log.push(`could not save resolved thread id: ${String(e)}`);
   }
@@ -1034,49 +1077,67 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           break;
         }
         case 'ADD_CONVERSATION': {
-          const store = await loadStore();
-          store.conversations[request.payload.id] = request.payload;
-          await saveStore(store);
+          await withStoreLock(async () => {
+            const store = await loadStore();
+            store.conversations[request.payload.id] = request.payload;
+            await saveStore(store);
+          });
           sendResponse({ success: true });
           break;
         }
         case 'UPDATE_CONVERSATION': {
-          const store = await loadStore();
-          const existing = store.conversations[request.payload.id];
-          if (existing) {
+          const ok = await withStoreLock(async () => {
+            const store = await loadStore();
+            const existing = store.conversations[request.payload.id];
+            if (!existing) return false;
             store.conversations[request.payload.id] = {
               ...existing,
               ...request.payload.updates,
               updatedAt: Date.now(),
             };
             await saveStore(store);
-            sendResponse({ success: true });
-          } else {
-            sendResponse({ success: false, error: 'Conversation not found' });
-          }
+            return true;
+          });
+          sendResponse(ok ? { success: true } : { success: false, error: 'Conversation not found' });
           break;
         }
         case 'ADD_TAG': {
-          const store = await loadStore();
-          store.tags[request.payload.id] = request.payload;
-          await saveStore(store);
+          await withStoreLock(async () => {
+            const store = await loadStore();
+            store.tags[request.payload.id] = request.payload;
+            await saveStore(store);
+          });
           sendResponse({ success: true });
           break;
         }
         case 'DELETE_TAG': {
-          const store = await loadStore();
-          delete store.tags[request.payload.tagId];
-          const ts = Date.now();
-          for (const convId of Object.keys(store.conversations)) {
-            store.conversations[convId] = removeTagsFrom(store.conversations[convId], [request.payload.tagId], ts);
-          }
-          await saveStore(store);
+          await withStoreLock(async () => {
+            const store = await loadStore();
+            delete store.tags[request.payload.tagId];
+            const ts = Date.now();
+            for (const convId of Object.keys(store.conversations)) {
+              store.conversations[convId] = removeTagsFrom(store.conversations[convId], [request.payload.tagId], ts);
+            }
+            await saveStore(store);
+          });
           sendResponse({ success: true });
           break;
         }
         case 'GET_STORE': {
+          // Coalesced and briefly cached in storage.ts, so the several tabs that
+          // ask on their own repaint timers share one underlying read.
           const store = await loadStore();
           sendResponse(store);
+          break;
+        }
+        // The single write path for content scripts. See mutations.ts for why
+        // they no longer hand over whole stores.
+        case 'MUTATE_STORE': {
+          if (!(await isSignedIn())) {
+            sendResponse({ success: false, changed: false, error: 'Signed out', result: { ok: false, pending: 0, itemLimitReached: false, signedOut: true, reason: 'Sign in to save contacts.' } });
+            break;
+          }
+          sendResponse(await mutateStore((request.payload?.mutations || []) as Mutation[]));
           break;
         }
         case 'SET_STORE': {
@@ -1084,7 +1145,9 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
             sendResponse({ success: false, result: { ok: false, pending: 0, itemLimitReached: false, signedOut: true, reason: 'Sign in to save contacts.' } });
             break;
           }
-          const result = await saveStore(request.payload as Store);
+          // Whole-store replace (dashboard/popup import). Takes the same lock so
+          // it can't interleave with a content script's mutation.
+          const result = await withStoreLock(() => saveStore(request.payload as Store));
           sendResponse({ success: true, result });
           break;
         }
