@@ -23,7 +23,7 @@ import { PLATFORM_URL } from './license';
 import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
 import { buildThreadIndex, isUnboundOrphan, planOrphanBinds, threadAliases } from './contacts';
 import type { ThreadRow } from './contacts';
-import { extractNameFromLink, extractActiveThreadName, extractProfilePageName } from './names';
+import { extractNameFromLink, extractActiveThreadName, extractProfilePageName, looksLikeName, isDamagedName } from './names';
 import type { SendFailureKind } from './campaigns';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
@@ -476,6 +476,13 @@ async function injectSidebarTagsOnce() {
       container.addEventListener('click', e => e.stopPropagation());
       container.addEventListener('mousedown', e => e.stopPropagation());
       link.appendChild(container);
+    } else if (container.getAttribute('data-crm-chips') !== threadId) {
+      // Facebook virtualizes the message list and recycles row nodes, so this
+      // container can still be showing the row's PREVIOUS occupant's tags.
+      // Clear it and retarget it now rather than leaving one person's chips
+      // sitting under another person's name until the repaint below.
+      container.innerHTML = '';
+      container.setAttribute('data-crm-chips', threadId);
     }
 
     if (tags.length === 0) {
@@ -840,7 +847,18 @@ async function renderPanel() {
         </div>`;
       wireClose();
       panelEl.querySelector('#fb-crm-add-profile')?.addEventListener('click', async () => {
-        const conv = await addProfileContact(profileUrl, guessName);
+        // Re-read the name at click time instead of saving the one rendered
+        // above, and wait for the profile header if it isn't there yet. The
+        // rendered guess is whatever was on the page when the panel last
+        // painted; a person clicking has already waited for the page, but an
+        // automated click lands milliseconds after navigation, before the header
+        // exists. readProfileNameToSave is what stops a section heading from
+        // being saved as someone's name — and it's the same read the later
+        // repair pass does, so the two can't drift apart.
+        const btn = panelEl?.querySelector<HTMLButtonElement>('#fb-crm-add-profile');
+        if (btn) { btn.disabled = true; btn.textContent = '⏳ Reading name…'; }
+        const name = await readProfileNameToSave();
+        const conv = await addProfileContact(profileUrl, name || 'Unknown');
         // A null result means the write couldn't reach the background. Re-render
         // either way: the panel then reflects whatever actually got saved rather
         // than claiming success.
@@ -1341,6 +1359,86 @@ async function resolveImportedProfileOnThisPage(): Promise<void> {
   await mutate([{ op: 'resolveProfileThread', profileKey: pageKey, threadId, chatUrl }]);
 }
 
+/**
+ * A profile name we are prepared to WRITE to the CRM — as opposed to one we
+ * merely display in the panel, where being wrong for a moment costs nothing.
+ *
+ * Reading the page once, at whatever instant we happen to look, is what put
+ * "Personal details" and "Pinned post" into the CRM as people. Facebook streams
+ * a profile in pieces, and the timeline can be there before the header is: an
+ * early read sees only page chrome, and chrome that survives cleanName is
+ * name-shaped enough to be saved. Blocklisting each label as it turns up is a
+ * race we lose one label at a time — the part that actually generalizes is WHEN
+ * we read, not what we reject afterwards.
+ *
+ * So every write goes through here, and it does two things a single read can't:
+ *   * polls until the page offers a real name at all, rather than accepting
+ *     whatever is on screen the moment we asked; and
+ *   * requires two consecutive reads, CONFIRM_MS apart, to agree. A name still
+ *     standing a beat later came from a settled header, not from markup
+ *     Facebook was still swapping out underneath us.
+ */
+async function readProfileNameToSave(timeoutMs = 8_000): Promise<string | null> {
+  const CONFIRM_MS = 400;
+  const sample = () => {
+    const n = extractProfilePageName();
+    // extractProfilePageName reports failure as 'Unknown', which is itself
+    // name-shaped — keep looking rather than accepting it.
+    return n && n !== 'Unknown' && looksLikeName(n) ? n : null;
+  };
+
+  const deadline = Date.now() + timeoutMs;
+  let previous: string | null = null;
+  for (;;) {
+    const name = sample();
+    if (name && name === previous) return name;
+    previous = name;
+    if (Date.now() >= deadline) return null;
+    await sleep(CONFIRM_MS);
+  }
+}
+
+// Repair contacts that were saved with a name that isn't one — page chrome read
+// before the profile header rendered, the 'Unknown' sentinel, or one of the
+// user's own tag names scraped off our injected sidebar chips. Any of those
+// sits in the CRM until someone edits it by hand, so whenever we're on a
+// profile page that matches such a contact, re-read the page properly and take
+// the real name. A correction overwrites stored data, so it reads at least as
+// carefully as the first capture did — never less (readProfileNameToSave).
+let repairInFlight = false;
+let repairRetryAfter = 0;
+async function repairProfileNameOnThisPage(): Promise<void> {
+  if (!isProfilePage() || repairInFlight || Date.now() < repairRetryAfter) return;
+
+  // Identify the damaged contact BEFORE reading the DOM, so the polling read
+  // only runs when there is something to fix. getStore is memory-cached, so a
+  // pass with nothing to repair — the overwhelming majority — stays cheap.
+  const profileUrl = normalizeProfileUrl(window.location.href) || window.location.href;
+  const store = await getStore();
+  const conv = findConversationForProfile(store, profileUrl);
+  // The mutation re-checks all of this against the authoritative store; this is
+  // just to avoid a pointless round trip on every pass.
+  if (!conv || conv.nameManual) return;
+  if (!isDamagedName(conv.participantName, Object.values(store.tags).map((t) => t.name))) return;
+
+  repairInFlight = true;
+  try {
+    const name = await readProfileNameToSave();
+    if (!name) {
+      // The page never settled on a name. Back off rather than re-polling every
+      // interval tick for as long as this profile is open.
+      repairRetryAfter = Date.now() + 30_000;
+      return;
+    }
+    if (name === conv.participantName) return;
+    console.log('[CRM] Repaired contact name from profile page:', conv.participantName, '→', name);
+    await mutate([{ op: 'repairName', conversationId: conv.id, name }]);
+    if (panelEl && panelEl.style.display !== 'none') await renderPanel();
+  } finally {
+    repairInFlight = false;
+  }
+}
+
 // ---- Init ----
 
 function init() {
@@ -1358,6 +1456,8 @@ function init() {
   // cheap to poll. Runs once shortly after load, then periodically.
   setTimeout(resolveImportedProfileOnThisPage, 2000);
   setInterval(resolveImportedProfileOnThisPage, 2500);
+  setTimeout(repairProfileNameOnThisPage, 2000);
+  setInterval(repairProfileNameOnThisPage, 2500);
 
   // Finish a legacy-link thread-id resolution that a page load interrupted
   // (see applyPendingThreadResolve). No-op unless a marker is waiting.

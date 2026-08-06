@@ -17,6 +17,97 @@ const STATUS_WORDS = /\b(active now|active|online|offline|sent|seen|delivered|ty
 // whole-string match lets extraction fall through to the next (real) source.
 const SITE_NAMES = /^(facebook|messenger|meta|marketplace|notifications?|home|friends|watch|groups|gaming|reels?)$/i;
 
+// Facebook's own section headings, tab labels and button text. Same problem as
+// SITE_NAMES, one level down: these are letters-only strings that sail straight
+// through the checks in looksLikeName, so when a name is read before the profile
+// header has rendered, the extractor accepts whatever chrome is on the page and
+// saves it as the contact. "Personal details" (the About tab's heading) is the
+// one that keeps landing in the CRM, because it sits near the friends/followers
+// counters that extractProfileNameByStats anchors on.
+//
+// This is mostly invisible when a human browses — by the time you click, the
+// header is there — and near-guaranteed under automation, where the capture
+// happens milliseconds after navigation.
+//
+// Matched against the WHOLE string only. These are exact labels, and real names
+// that merely contain one of these words ("Grace Story", "See Yong Lim") have to
+// keep passing.
+const UI_CHROME = new Set([
+  // Profile "About" sections and their tab labels
+  'about', 'overview', 'personal details', 'details about you', 'details',
+  'basic info', 'contact and basic info', 'contact info', 'work and education',
+  'work', 'education', 'places lived', 'family and relationships',
+  'life events', 'edit details',
+  // Profile tabs and cards
+  'intro', 'posts', 'timeline', 'photos', 'videos', 'check ins', 'sports',
+  'music', 'movies', 'books', 'likes', 'followers', 'following',
+  'mutual friends', 'more', 'featured', 'links', 'communities',
+  // Buttons and menu items
+  'add friend', 'add to story', 'edit profile', 'message', 'follow', 'following',
+  'block', 'report profile', 'report', 'see all', 'see more', 'see all photos',
+  'create post', 'live video', 'manage posts', 'activity log', 'search',
+  'settings and privacy', 'help and support', 'display and accessibility',
+  'give feedback', 'log out',
+  // Feed chrome
+  'sponsored', 'suggested for you', 'people you may know', 'story', 'stories',
+  "what's on your mind",
+  // Post-card chrome. These sit in the timeline BELOW the profile header, and
+  // the ancestor climb in extractProfileNameByStats can reach a container that
+  // includes the first post — so on a page whose header hasn't rendered yet,
+  // the card's own labels are the only name-shaped text there is.
+  'pinned post', 'pinned', 'follows you', 'like', 'comment', 'comments',
+  'write a comment', 'view more comments', 'most relevant', 'top comments',
+  'all reactions', 'reels', 'tagged',
+  // Left rail / main navigation. Facebook keeps adding to this rail, and each
+  // new label is another letters-only string that reads as a plausible name to
+  // everything above — "Work", "Links" and "Communities" each turned up in the
+  // CRM as a contact before they were listed here. Entries are deliberately the
+  // exact plural/label form Facebook renders: "pages" and "feeds" are chrome,
+  // while the singular "Page" and "Feed" are real surnames and must keep
+  // passing. (Omitted here because SITE_NAMES already rejects them: friends,
+  // groups, home, marketplace, watch, gaming, reels, notifications.)
+  'events', 'saved', 'memories', 'pages', 'feeds', 'birthdays',
+  'friend requests', 'find friends', 'ads', 'orders and payments',
+]);
+
+// Normalize a candidate for the UI_CHROME lookup: case, hyphen/en-dash spelling
+// ("Check-ins" vs "Check ins") and stray spacing all vary by layout.
+function chromeKey(s: string): string {
+  return s.toLowerCase().replace(/[-–—]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// The extension's OWN injected DOM, which must never be read as page content.
+//
+// The content script appends its tag chips and the "+" add-tags button INSIDE
+// each Messenger conversation link — the very element the extractor scrapes
+// names from. A tag name cleans down to something short and name-shaped ("FU-
+// Active" loses its trailing status word and becomes "FU"), and being short is
+// exactly what wins the shortest-candidate tiebreak in extractNameFromLink,
+// so our own chip beats the person's real name.
+//
+// Facebook virtualizes the message list and recycles row nodes, so the chips
+// sitting in a row at any moment can still belong to its PREVIOUS occupant —
+// which is how one contact's tag ends up saved as the next contact's name.
+//
+// NOT included: [data-crm-pick], which pick mode sets on Facebook's own links
+// (matching it would make every conversation row look like ours).
+const CRM_UI_SELECTOR =
+  '[data-crm-chips],[data-crm-add-tag],[id^="fb-crm-"],[class*="fb-crm-"]';
+
+/** Is this element part of the extension's own UI (so: not page content)? */
+function isOwnUi(el: Element): boolean {
+  return !!el.closest?.(CRM_UI_SELECTOR);
+}
+
+/** `el`'s text with the extension's own injected nodes removed. */
+function pageTextOf(el: Element | null | undefined): string {
+  if (!el) return '';
+  if (!el.querySelector?.(CRM_UI_SELECTOR)) return el.textContent || '';
+  const clone = el.cloneNode(true) as Element;
+  clone.querySelectorAll(CRM_UI_SELECTOR).forEach((n) => n.remove());
+  return clone.textContent || '';
+}
+
 // A trailing relative timestamp like "3h", "2 m", "5 mins", "1 day", optionally
 // preceded by a separator: "Name · 3h", "Name - 2m", "Name, 1d".
 const TRAILING_TIME =
@@ -35,6 +126,12 @@ const VERIFIED_BADGE = /[\s,·•|–—-]*verified(?:\s+(?:account|page))?\.?/g
 export function cleanName(raw: string | null | undefined): string {
   let s = (raw || '').replace(/\s+/g, ' ').trim();
   if (!s) return '';
+
+  // Reject Facebook's own labels before anything below rewrites them. Has to
+  // happen first: the trailing-status-word rule cuts "Details about you" down to
+  // "Details about" and "People you may know" to "People", and neither stub is
+  // recognizable as chrome afterwards.
+  if (UI_CHROME.has(chromeKey(s))) return '';
 
   // "Conversation with X" / "Chat with X" / "Message X".
   s = s.replace(/^(?:conversation|chat|message|messages)\s+with\s+/i, '');
@@ -81,6 +178,7 @@ export function looksLikeName(s: string | null | undefined): boolean {
   const v = (s || '').trim();
   if (v.length < 2 || v.length > 60) return false;
   if (SITE_NAMES.test(v)) return false;         // "Facebook"/"Messenger"/nav chrome, not a person
+  if (UI_CHROME.has(chromeKey(v))) return false; // a section heading or button label, not a person
   if (/\d/.test(v)) return false;               // names rarely contain digits
   if (/[:?!@#/\\_=+*]/.test(v)) return false;   // previews/handles/urls
   if (STATUS_WORDS.test(v) && /^(you|active|online|sent|seen)$/i.test(v)) return false;
@@ -92,8 +190,12 @@ export function looksLikeName(s: string | null | undefined): boolean {
 
 /** Pick the best name out of a Messenger sidebar conversation row (an <a>). */
 export function extractNameFromLink(link: Element): string {
+  // Every read below skips the extension's own injected nodes (see
+  // CRM_UI_SELECTOR): our tag chips live inside this link, and a chip's text is
+  // short and name-shaped enough to beat the real name at step 3.
+
   // 1. The profile photo's alt text is almost always exactly the name.
-  const img = link.querySelector('img[alt]');
+  const img = Array.from(link.querySelectorAll('img[alt]')).find((el) => !isOwnUi(el));
   const alt = cleanName(img?.getAttribute('alt'));
   if (looksLikeName(alt)) return alt;
 
@@ -105,14 +207,15 @@ export function extractNameFromLink(link: Element): string {
   //    usually appears more than once in the nested markup. Prefer the shortest
   //    plausible candidate (the tightest name span beats a longer preview).
   const cands = Array.from(link.querySelectorAll('span, div'))
-    .map((el) => cleanName(el.textContent))
+    .filter((el) => !isOwnUi(el))
+    .map((el) => cleanName(pageTextOf(el)))
     .filter((t) => looksLikeName(t));
   if (cands.length) {
     cands.sort((a, b) => a.length - b.length);
     return cands[0];
   }
 
-  const whole = cleanName(link.textContent);
+  const whole = cleanName(pageTextOf(link));
   return looksLikeName(whole) ? whole : 'Unknown';
 }
 
@@ -130,13 +233,14 @@ export function extractActiveThreadName(threadId: string | null, doc: Document =
   const main = doc.querySelector('[role="main"]');
   if (main) {
     // 2. The conversation header's profile photo alt.
-    const img = main.querySelector('img[alt]');
+    const img = Array.from(main.querySelectorAll('img[alt]')).find((el) => !isOwnUi(el));
     const alt = cleanName(img?.getAttribute('alt'));
     if (looksLikeName(alt)) return alt;
 
     // 3. The header heading / title.
     for (const el of Array.from(main.querySelectorAll('h1, h2, h3, [role="heading"]'))) {
-      const n = cleanName(el.textContent);
+      if (isOwnUi(el)) continue;
+      const n = cleanName(pageTextOf(el));
       if (looksLikeName(n)) return n;
     }
   }
@@ -170,25 +274,61 @@ function elementDepth(el: Element | null): number {
 // The best name-shaped string found anywhere inside `container`, used to read
 // the profile owner's name out of the header block around the stat counters.
 function bestNameIn(container: Element): string {
-  // 1. A heading — the profile name is normally an <h1>.
-  for (const el of Array.from(container.querySelectorAll('h1, h2, [role="heading"]'))) {
-    const n = cleanName(el.textContent);
+  // Our own panel shows a contact's name too, and the climb in
+  // extractProfileNameByStats can reach an ancestor that contains it — so every
+  // scan here skips the extension's injected UI, same as extractNameFromLink.
+
+  // 1. The <h1>. On a profile page there is exactly one, and it is the owner's
+  //    name. Checked on its own, ahead of the weaker heading levels: those were
+  //    once searched together in document order, so a post card's "Pinned post"
+  //    heading sitting above the name in the climbed container won the scan.
+  //    The name is never an h2 and a card label is never an h1, so splitting
+  //    them is what settles that contest correctly rather than by position.
+  for (const el of Array.from(container.querySelectorAll('h1'))) {
+    if (isOwnUi(el)) continue;
+    const n = cleanName(pageTextOf(el));
     if (looksLikeName(n)) return n;
   }
   // 2. The profile photo's alt text is usually exactly the name.
   for (const img of Array.from(container.querySelectorAll('img[alt]'))) {
+    if (isOwnUi(img)) continue;
     const n = cleanName(img.getAttribute('alt'));
     if (looksLikeName(n)) return n;
   }
-  // 3. Fallback: the EARLIEST name-shaped text block in document order. The name
+  // 3. Lower-level headings, which carry the name only on layouts with no h1.
+  for (const el of Array.from(container.querySelectorAll('h2, [role="heading"]'))) {
+    if (isOwnUi(el)) continue;
+    const n = cleanName(pageTextOf(el));
+    if (looksLikeName(n)) return n;
+  }
+  // 4. Fallback: the EARLIEST name-shaped text block in document order. The name
   //    leads the profile header, ahead of the friends/education/location lines —
   //    so position beats the shortest-string heuristic, which would otherwise
   //    grab a short school or place name ("Texas State") over the real name.
+  //
+  //    Leaves only. A wrapper's textContent is its children stitched together,
+  //    and a stitched string escapes every whole-string check above: "Comments"
+  //    and "Most relevant" are both rejected as chrome, but the div holding
+  //    them reads as "CommentsMost relevant" — letters and a space, i.e. a
+  //    name. Descending instead costs nothing (the children are visited by this
+  //    same loop) and it is what makes a half-rendered page return no name
+  //    rather than a plausible-looking fabrication.
   for (const el of Array.from(container.querySelectorAll('span, div, a'))) {
-    const n = cleanName(el.textContent);
+    if (isOwnUi(el) || !isTextLeaf(el)) continue;
+    const n = cleanName(pageTextOf(el));
     if (looksLikeName(n)) return n;
   }
   return '';
+}
+
+// Does this element's text come from its own text nodes, rather than being the
+// concatenation of several text-bearing children? See bestNameIn step 4.
+function isTextLeaf(el: Element): boolean {
+  for (const child of Array.from(el.children)) {
+    if (isOwnUi(child)) continue; // our injected nodes aren't page text at all
+    if ((child.textContent || '').trim()) return false;
+  }
+  return true;
 }
 
 // A "<count> <statword>" fragment: "4.2K followers", "342 friends", "131 mutual",
@@ -214,7 +354,8 @@ function collectStatEls(doc: Document): Element[] {
   // the counter line itself, not a big wrapper that merely contains it.
   const raw: Element[] = [];
   doc.querySelectorAll('a, span, div').forEach((el) => {
-    const t = (el.textContent || '').trim();
+    if (isOwnUi(el)) return;
+    const t = pageTextOf(el).trim();
     if (t.length > 0 && t.length <= 80 && STAT_COUNT.test(t)) raw.push(el);
   });
   // Keep only the tightest matches: drop an element if one of its descendants
@@ -300,7 +441,8 @@ export function extractProfilePageName(doc: Document = document): string {
   const main = doc.querySelector('[role="main"]');
   if (main) {
     for (const el of Array.from(main.querySelectorAll('h1'))) {
-      const n = cleanName(el.textContent);
+      if (isOwnUi(el)) continue;
+      const n = cleanName(pageTextOf(el));
       if (looksLikeName(n)) return n;
     }
   }
@@ -322,4 +464,43 @@ export function extractProfilePageName(doc: Document = document): string {
 export function nameKey(name: string | null | undefined): string {
   const stripped = (name || '').normalize('NFKD').replace(/[̀-ͯ]/g, ''); // strip accents
   return stripped.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+/**
+ * Is a STORED contact name damaged — something the extractor picked up that was
+ * never a person's name? Decides whether a repair pass may overwrite it.
+ *
+ * Three kinds of damage:
+ *   * empty, or the 'Unknown' sentinel;
+ *   * a string that doesn't look like a name at all (a section heading such as
+ *     "Personal details", read before the profile header rendered);
+ *   * one of the user's own TAG names. The sidebar chips are injected inside the
+ *     conversation link the extractor scrapes, so before that was fixed a chip
+ *     could win the name candidate sort and be saved as the contact — "FU-
+ *     Active" arriving as "FU". Those names look perfectly name-shaped, so
+ *     nothing else here catches them; matching them against the live tag list is
+ *     what makes the damage recognizable after the fact.
+ *
+ * Tag names are compared BOTH raw and cleaned, because what got stored is the
+ * chip text after cleanName ("FU- Active" → "FU"), not the tag as the user typed
+ * it. Matching is via nameKey, so case and punctuation don't matter.
+ *
+ * A contact who genuinely shares a name with one of your tags is only ever
+ * "repaired" to the name on their own profile page — i.e. back to itself.
+ */
+export function isDamagedName(
+  stored: string | null | undefined,
+  tagNames: Iterable<string> = [],
+): boolean {
+  const v = (stored || '').trim();
+  if (!v || v === 'Unknown') return true;
+  if (!looksLikeName(v)) return true;
+
+  const key = nameKey(v);
+  if (!key) return true;
+  for (const tag of tagNames) {
+    if (nameKey(tag) === key) return true;
+    if (nameKey(cleanName(tag)) === key) return true;
+  }
+  return false;
 }

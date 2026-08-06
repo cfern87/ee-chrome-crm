@@ -26,7 +26,7 @@
 import type { Store, Conversation, Tag } from './storage';
 import { addTagsTo, removeTagsFrom, tombstone } from './storage';
 import { buildThreadIndex } from './contacts';
-import { looksLikeName } from './names';
+import { looksLikeName, isDamagedName } from './names';
 import { profileKey } from './csv';
 
 export type Mutation =
@@ -55,6 +55,9 @@ export type Mutation =
   | { op: 'removeTags'; conversationId: string; tagIds: string[] }
   | { op: 'createTag'; tag: Tag; attachTo?: string }
   | { op: 'renameContact'; conversationId: string; name: string }
+  // Replace a stored name that isn't a name (a heading scraped before the
+  // profile header rendered, or the 'Unknown' sentinel) with a real one.
+  | { op: 'repairName'; conversationId: string; name: string }
   | { op: 'deleteContact'; conversationId: string }
   | { op: 'markContacted'; conversationId: string }
   | { op: 'setResolvedThread'; conversationId: string; threadId: string; chatUrl?: string }
@@ -133,10 +136,16 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
         //   * direct hit on the store key — this row IS the contact, so keep the
         //     name in step with what Messenger currently shows;
         //   * alias hit — the record was captured somewhere better (a profile
-        //     page, a CSV import), so a sidebar row only fills in a name that
-        //     doesn't already look like one.
+        //     page, a CSV import), so a sidebar row only overwrites a name that
+        //     is damaged (see isDamagedName: chrome, 'Unknown', or one of the
+        //     user's own tag names scraped off our injected chips). Damaged
+        //     names that are name-SHAPED are why this isn't just looksLikeName —
+        //     "FU" would otherwise be defended as a real name forever.
         const aliasMatch = ownerId !== m.threadId;
-        const mayTakeName = !conv.nameManual && (!aliasMatch || !looksLikeName(conv.participantName));
+        const mayTakeName =
+          !conv.nameManual &&
+          (!aliasMatch ||
+            isDamagedName(conv.participantName, Object.values(store.tags).map((t) => t.name)));
         if (m.name && m.name !== 'Unknown' && mayTakeName && conv.participantName !== m.name) {
           conv.participantName = m.name;
           changed = true;
@@ -302,6 +311,30 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
         nameManual: true, // don't let DOM scraping override a hand-set name
         updatedAt: now,
       };
+      return { store: next, changed: true, conversationId: m.conversationId };
+    }
+
+    case 'repairName': {
+      const conv = store.conversations[m.conversationId];
+      if (!conv) return { store, changed: false };
+      const name = m.name.trim();
+      // Only ever replaces a name that isn't one: a section heading the
+      // extractor took off the page before the profile header rendered, the
+      // 'Unknown' sentinel, or one of the user's own tag names scraped off our
+      // injected sidebar chips (isDamagedName has the full account). A hand-set
+      // name is untouchable, and an undamaged stored name is left alone — this
+      // repairs damage, it doesn't chase Facebook's spelling of someone fine.
+      if (!looksLikeName(name)) return { store, changed: false, conversationId: m.conversationId };
+      const tagNames = Object.values(store.tags).map((t) => t.name);
+      if (conv.nameManual || !isDamagedName(conv.participantName, tagNames)) {
+        return { store, changed: false, conversationId: m.conversationId };
+      }
+      // Already correct — don't burn a write (and a Drive sync) on a no-op.
+      if (conv.participantName === name) {
+        return { store, changed: false, conversationId: m.conversationId };
+      }
+      const next = copy(store);
+      next.conversations[m.conversationId] = { ...conv, participantName: name, updatedAt: now };
       return { store: next, changed: true, conversationId: m.conversationId };
     }
 
