@@ -41,7 +41,7 @@ const UI_CHROME = new Set([
   // Profile tabs and cards
   'intro', 'posts', 'timeline', 'photos', 'videos', 'check ins', 'sports',
   'music', 'movies', 'books', 'likes', 'followers', 'following',
-  'mutual friends', 'more', 'featured', 'links', 'communities',
+  'mutual friends', 'more', 'featured', 'links', 'communities', 'highlights',
   // Buttons and menu items
   'add friend', 'add to story', 'edit profile', 'message', 'follow', 'following',
   'block', 'report profile', 'report', 'see all', 'see more', 'see all photos',
@@ -68,6 +68,12 @@ const UI_CHROME = new Set([
   // groups, home, marketplace, watch, gaming, reels, notifications.)
   'events', 'saved', 'memories', 'pages', 'feeds', 'birthdays',
   'friend requests', 'find friends', 'ads', 'orders and payments',
+  // Page-style profiles (a business/creator page rather than a person) carry a
+  // second row of tabs of their own. Same story again: single capitalized words
+  // that read as perfectly good names — "Offers" was saved as a contact off a
+  // page whose header had already scrolled out of the extractor's reach.
+  // Deliberately not listed: 'jobs', which is a real surname.
+  'offers', 'reviews', 'mentions', 'services', 'shop', 'page transparency',
 ]);
 
 // Normalize a candidate for the UI_CHROME lookup: case, hyphen/en-dash spelling

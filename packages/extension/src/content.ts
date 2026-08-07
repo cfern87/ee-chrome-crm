@@ -62,6 +62,50 @@ function getNameFromLink(link: HTMLAnchorElement): string {
   return extractNameFromLink(link);
 }
 
+// The first real name we managed to read off the profile page we are on.
+//
+// Every profile-page name — the one the panel shows, and the one a save
+// writes — comes from here, so the two cannot disagree. They used to: both
+// called extractProfilePageName, but at different moments, and a Facebook
+// profile gets HARDER to read as it hydrates, not easier. The extractor's
+// structural fallback anchors on the profile's follower/friend counters, and
+// once the timeline and the left rail have streamed in there are counters all
+// over the page — so the climb from the tightest pair can land in page chrome
+// rather than in the header. That is how a panel showing "Michelina Aichele"
+// went on to save a contact called "Offers": the panel read the page while the
+// header was the only name-shaped thing on it, and the save re-read it after
+// the rest of the page had arrived.
+//
+// An early read is the trustworthy one, so the first person-shaped answer for a
+// profile is remembered and reused for as long as we are on that profile. Keyed
+// on the profile URL, so an SPA navigation to somebody else starts fresh.
+let firstProfileName: { key: string; name: string } | null = null;
+
+function currentProfileKey(): string {
+  return profileKey(window.location.href) || window.location.href;
+}
+
+// Is `n` an answer worth keeping? extractProfilePageName reports failure as the
+// 'Unknown' sentinel, which is itself name-shaped, and this is a profile page,
+// so a real answer has to look like a PERSON (not like the sentence a post
+// header is) — the same bar a write has always had to clear.
+function isUsableProfileName(n: string | null | undefined): n is string {
+  return !!n && n !== 'Unknown' && looksLikePersonName(n);
+}
+
+/**
+ * The profile page's name: whatever we first read for this profile, or a fresh
+ * read while we haven't got one yet. Returns 'Unknown' — same as
+ * extractProfilePageName — when the page has nothing to offer.
+ */
+function getProfilePageName(): string {
+  const key = currentProfileKey();
+  if (firstProfileName && firstProfileName.key === key) return firstProfileName.name;
+  const n = extractProfilePageName();
+  if (isUsableProfileName(n)) firstProfileName = { key, name: n };
+  return n;
+}
+
 // ---- Storage ----
 // Delegates to shared storage module (chrome.storage.local + IndexedDB mirror).
 // In-memory cache keeps repeated reads fast without hitting async storage on
@@ -834,7 +878,7 @@ async function renderPanel() {
   if (!threadId) {
     if (isProfilePage()) {
       const profileUrl = normalizeProfileUrl(window.location.href) || window.location.href;
-      const guessName = extractProfilePageName();
+      const guessName = getProfilePageName();
       panelEl.innerHTML = `
         <div class="fb-crm-header">
           <span>Messenger CRM</span>
@@ -847,16 +891,21 @@ async function renderPanel() {
         </div>`;
       wireClose();
       panelEl.querySelector('#fb-crm-add-profile')?.addEventListener('click', async () => {
-        // Re-read the name at click time instead of saving the one rendered
-        // above, and wait for the profile header if it isn't there yet. The
-        // rendered guess is whatever was on the page when the panel last
-        // painted; a person clicking has already waited for the page, but an
-        // automated click lands milliseconds after navigation, before the header
-        // exists. readProfileNameToSave is what stops a section heading from
-        // being saved as someone's name — and it's the same read the later
-        // repair pass does, so the two can't drift apart.
+        // Save the name the panel is SHOWING. It came from getProfilePageName,
+        // so readProfileNameToSave below returns that same remembered read
+        // rather than a second, later look at a page that has since filled up
+        // with things that read like names (see firstProfileName). What the user
+        // saw in the panel is what lands in the CRM.
+        //
+        // The polling read still matters when the panel had nothing real to show
+        // — an automated click lands milliseconds after navigation, before the
+        // profile header exists — which is the case it waits for. It's also the
+        // same read the later repair pass does, so the two can't drift apart.
         const btn = panelEl?.querySelector<HTMLButtonElement>('#fb-crm-add-profile');
-        if (btn) { btn.disabled = true; btn.textContent = '⏳ Reading name…'; }
+        if (btn) {
+          btn.disabled = true;
+          if (!isUsableProfileName(guessName)) btn.textContent = '⏳ Reading name…';
+        }
         const name = await readProfileNameToSave();
         const conv = await addProfileContact(profileUrl, name || 'Unknown');
         // A null result means the write couldn't reach the background. Re-render
@@ -891,7 +940,7 @@ async function renderPanel() {
   const autoCapture = (preStore.settings as Record<string, unknown>)?.autoCapture !== false;
   const wasRemoved = removedThreads.has(threadId);
   if ((!autoCapture || wasRemoved) && !preStore.conversations[threadId]) {
-    const guessName = isProfilePage() ? extractProfilePageName() : getActiveThreadName();
+    const guessName = isProfilePage() ? getProfilePageName() : getActiveThreadName();
     panelEl.innerHTML = `
       <div class="fb-crm-header">
         <span>Messenger CRM</span>
@@ -1377,25 +1426,30 @@ async function resolveImportedProfileOnThisPage(): Promise<void> {
  *   * requires two consecutive reads, CONFIRM_MS apart, to agree. A name still
  *     standing a beat later came from a settled header, not from markup
  *     Facebook was still swapping out underneath us.
+ *
+ * Both of those are about a page that hasn't finished arriving. Once a name HAS
+ * been read for this profile it is the answer and we stop looking: reading again
+ * later is not a second opinion, it is a worse one (see firstProfileName), and
+ * it was re-reading that let a save disagree with the name the panel had already
+ * shown the user.
  */
 async function readProfileNameToSave(timeoutMs = 8_000): Promise<string | null> {
   const CONFIRM_MS = 400;
-  const sample = () => {
-    const n = extractProfilePageName();
-    // extractProfilePageName reports failure as 'Unknown', which is itself
-    // name-shaped — keep looking rather than accepting it. The person-name check
-    // (not the looser looksLikeName) is the one that matters on a write: this is
-    // a profile page, so the answer must look like a PERSON, not like the
-    // sentence a post header is.
-    return n && n !== 'Unknown' && looksLikePersonName(n) ? n : null;
-  };
-
   const deadline = Date.now() + timeoutMs;
   let previous: string | null = null;
   for (;;) {
-    const name = sample();
-    if (name && name === previous) return name;
-    previous = name;
+    // The name already read for this profile — by the panel, by an earlier
+    // repair pass, or by the loop below.
+    const key = currentProfileKey();
+    if (firstProfileName && firstProfileName.key === key) return firstProfileName.name;
+
+    // Nothing read yet: this is a cold page, so confirm before committing.
+    const name = extractProfilePageName();
+    if (isUsableProfileName(name) && name === previous) {
+      firstProfileName = { key, name };
+      return name;
+    }
+    previous = isUsableProfileName(name) ? name : null;
     if (Date.now() >= deadline) return null;
     await sleep(CONFIRM_MS);
   }
@@ -2454,7 +2508,7 @@ async function performDrawerSend(threadId: string, rawMessage: string, dryRun = 
   // the contact's saved ids can only corroborate, never veto — being stale is
   // the whole reason we are down here in the first place.
   const profileThread = getProfilePageThreadId();
-  const profileName = extractProfilePageName();
+  const profileName = getProfilePageName();
   const pageIds = [profileThread || ''];
   const storedIds = [threadId, (await getResolvedThreadId(threadId)) || ''];
   stamp(`profile identity: name="${profileName}" pageThread=${profileThread || '(none)'} stored=[${storedIds.filter(Boolean).join(', ')}]`);
@@ -2566,7 +2620,7 @@ async function resolveProfileThreadFor(requestedThreadId: string): Promise<Profi
     ok: true,
     threadId,
     chatUrl: `https://www.facebook.com/messages/t/${threadId}/`,
-    name: extractProfilePageName(),
+    name: getProfilePageName(),
     log,
   };
 }
