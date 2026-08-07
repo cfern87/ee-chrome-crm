@@ -169,6 +169,99 @@ export function cleanName(raw: string | null | undefined): string {
   return s;
 }
 
+// Facebook's post headers are a SENTENCE that starts with the author's name:
+// "Ariel Wright is feeling motivated.", "Ariel Wright shared a post.", "Ariel
+// Wright updated his profile picture." Every one of those is letters, spaces and
+// a full stop — which is to say it sails straight through looksLikeName and gets
+// saved as somebody called "Ariel Wright is feeling motivated."
+//
+// The author's name is right there at the front, so we cut rather than reject:
+// the verb is where the name ends. Matching is deliberately CASE-SENSITIVE and
+// lowercase-only — that is what makes this safe. Facebook renders these verbs in
+// lower case and a real name's words are capitalized, so "Wade Hunt" and "Faith
+// Sharer" can't be truncated by their own surnames.
+const POST_ACTIVITY = new RegExp(
+  '\\s+(?:' + [
+    'is', 'was', 'are', 'were', 'has', 'had',
+    'shared', 'shares', 'sharing', 'posted', 'posts', 'added', 'adds',
+    'updated', 'updates', 'changed', 'changes', 'created', 'creates',
+    'commented', 'replied', 'reacted', 'liked', 'likes', 'loves',
+    'joined', 'celebrated', 'celebrating', 'attended', 'attending',
+    'went', 'going', 'feeling', 'uploaded', 'tagged', 'mentioned',
+    'recommends', 'recommended', 'reviewed', 'answered', 'asked',
+    'and', 'with', 'at', 'in', 'to', 'via',
+  ].join('|') + ')\\b.*$'
+);
+
+/**
+ * Cut a Facebook post-header activity phrase off a candidate name, leaving the
+ * author: "Ariel Wright is feeling motivated." → "Ariel Wright".
+ *
+ * Only used on the profile-page paths. Messenger group threads are named by
+ * their members and a group really can be called "The girls are back", so this
+ * must not run over sidebar rows.
+ */
+export function stripActivityPhrase(raw: string | null | undefined): string {
+  const s = (raw || '').trim();
+  const cut = s.replace(POST_ACTIVITY, '').trim();
+  // Refuse to cut a name down to nothing or to a single leading fragment that
+  // can't be a name on its own — better to reject the whole string upstream than
+  // to invent a one-word contact out of a sentence.
+  return cut.length >= 2 ? cut : s;
+}
+
+// Lowercase words that legitimately appear inside a person's name. Everything
+// else lowercase, mid-name, means we are looking at a sentence.
+const NAME_PARTICLES = new Set([
+  'van', 'von', 'der', 'den', 'de', 'del', 'della', 'di', 'da', 'das', 'dos',
+  'du', 'la', 'le', 'el', 'al', 'bin', 'ibn', 'ter', 'ten', 'af', 'av',
+  'mac', 'mc', 'y', 'e', 'i', 'san', 'santa', 'st', 'ka', 'na',
+]);
+
+/**
+ * Stricter than looksLikeName: does `s` look like a PERSON's name specifically?
+ *
+ * The extra rule is capitalization. A person's name has every word capitalized
+ * (bar the particles above); a Facebook post header — the thing that keeps being
+ * mistaken for a name on profile pages — has a capitalized name followed by
+ * lower-case prose. That distinction generalizes, which enumerating Facebook's
+ * activity verbs one at a time does not.
+ *
+ * Deliberately NOT used for Messenger threads: group chats are named freely
+ * ("Weekend trip crew") and would fail this test for good reason.
+ */
+export function looksLikePersonName(s: string | null | undefined): boolean {
+  const v = (s || '').trim();
+  if (!looksLikeName(v)) return false;
+
+  const words = v.split(/\s+/);
+  if (words.length < 2) return true;             // one word can't be a sentence
+  // An all-lower-case name is a stylization ("bell hooks"), not a post header:
+  // those always LEAD with the capitalized author name.
+  if (v === v.toLowerCase()) return true;
+
+  for (const w of words) {
+    const first = w[0];
+    // Scripts without letter case (CJK, Arabic, Hebrew…) have nothing to check.
+    if (first.toLowerCase() === first.toUpperCase()) continue;
+    if (first === first.toUpperCase()) continue;
+    if (NAME_PARTICLES.has(w.toLowerCase().replace(/[.'’\-]/g, ''))) continue;
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Clean a raw string into a person's name, or '' if it isn't one. The single
+ * entry point for every profile-page candidate below, so the activity-phrase
+ * trim and the capitalization check can't be applied to some sources and
+ * forgotten on others.
+ */
+function personNameFrom(raw: string | null | undefined): string {
+  const n = stripActivityPhrase(cleanName(raw));
+  return looksLikePersonName(n) ? n : '';
+}
+
 /**
  * Does `s` look like a real person/group name rather than a timestamp, status,
  * or message preview? Conservative: rejects digits, colons, and sentence
@@ -286,20 +379,23 @@ function bestNameIn(container: Element): string {
   //    them is what settles that contest correctly rather than by position.
   for (const el of Array.from(container.querySelectorAll('h1'))) {
     if (isOwnUi(el)) continue;
-    const n = cleanName(pageTextOf(el));
-    if (looksLikeName(n)) return n;
+    const n = personNameFrom(pageTextOf(el));
+    if (n) return n;
   }
   // 2. The profile photo's alt text is usually exactly the name.
   for (const img of Array.from(container.querySelectorAll('img[alt]'))) {
     if (isOwnUi(img)) continue;
-    const n = cleanName(img.getAttribute('alt'));
-    if (looksLikeName(n)) return n;
+    const n = personNameFrom(img.getAttribute('alt'));
+    if (n) return n;
   }
   // 3. Lower-level headings, which carry the name only on layouts with no h1.
+  //    This is also where a post card's author line lives once the timeline has
+  //    rendered — "Ariel Wright is feeling motivated." — so personNameFrom
+  //    earning its keep here is what stops the timeline winning over the header.
   for (const el of Array.from(container.querySelectorAll('h2, [role="heading"]'))) {
     if (isOwnUi(el)) continue;
-    const n = cleanName(pageTextOf(el));
-    if (looksLikeName(n)) return n;
+    const n = personNameFrom(pageTextOf(el));
+    if (n) return n;
   }
   // 4. Fallback: the EARLIEST name-shaped text block in document order. The name
   //    leads the profile header, ahead of the friends/education/location lines —
@@ -315,8 +411,8 @@ function bestNameIn(container: Element): string {
   //    rather than a plausible-looking fabrication.
   for (const el of Array.from(container.querySelectorAll('span, div, a'))) {
     if (isOwnUi(el) || !isTextLeaf(el)) continue;
-    const n = cleanName(pageTextOf(el));
-    if (looksLikeName(n)) return n;
+    const n = personNameFrom(pageTextOf(el));
+    if (n) return n;
   }
   return '';
 }
@@ -432,30 +528,45 @@ export function extractProfileNameByStats(doc: Document = document): string {
  * aren't present.
  */
 export function extractProfilePageName(doc: Document = document): string {
-  // 1. Structural scan anchored on the profile's stat counters.
-  const byStats = extractProfileNameByStats(doc);
-  if (looksLikeName(byStats)) return byStats;
-
-  // 2. The heading inside the main content region (excludes the nav bar, where
-  //    misleading "Notifications" etc. headings live).
+  // 1. The <h1> inside the main content region. A profile page has exactly one
+  //    and it is the owner's name; scoping to [role="main"] keeps the nav bar's
+  //    headings out of it.
+  //
+  //    This runs BEFORE the stat-counter scan, which is a change worth being
+  //    explicit about. The scan anchors on the tightest pair of follower/friend
+  //    counters — and a profile timeline contains counters of its own (the
+  //    Friends card, and posts that say "with 3 friends"), so once the timeline
+  //    renders, the tightest pair can sit down IN the timeline rather than in the
+  //    header. The climb from there reaches a post card, and the post's author
+  //    line gets read as the name. That is why the panel showed the right name
+  //    and then saved the wrong one: the first paint happened before the timeline
+  //    existed, the click happened after.
+  //
+  //    The scan is still valuable — it is what handles a page whose header hasn't
+  //    rendered — but it is a fallback for when the h1 is absent, not a better
+  //    source than the h1 itself.
   const main = doc.querySelector('[role="main"]');
   if (main) {
     for (const el of Array.from(main.querySelectorAll('h1'))) {
       if (isOwnUi(el)) continue;
-      const n = cleanName(pageTextOf(el));
-      if (looksLikeName(n)) return n;
+      const n = personNameFrom(pageTextOf(el));
+      if (n) return n;
     }
   }
+
+  // 2. Structural scan anchored on the profile's stat counters.
+  const byStats = extractProfileNameByStats(doc);
+  if (looksLikePersonName(byStats)) return byStats;
 
   // 3. og:title — historically the profile owner's name; now often the generic
   //    "Facebook" (rejected by looksLikeName), but harmless to try.
   const og = doc.querySelector('meta[property="og:title"]') as HTMLMetaElement | null;
-  const ogName = cleanName(og?.content);
-  if (looksLikeName(ogName)) return ogName;
+  const ogName = personNameFrom(og?.content);
+  if (ogName) return ogName;
 
   // 4. Page title fallback: "Jane Doe | Facebook" / "Jane Doe - Facebook".
-  const title = cleanName(doc.title.replace(/\s*[|·-]\s*Facebook.*$/i, ''));
-  if (looksLikeName(title)) return title;
+  const title = personNameFrom(doc.title.replace(/\s*[|·-]\s*Facebook.*$/i, ''));
+  if (title) return title;
 
   return 'Unknown';
 }
@@ -470,10 +581,15 @@ export function nameKey(name: string | null | undefined): string {
  * Is a STORED contact name damaged — something the extractor picked up that was
  * never a person's name? Decides whether a repair pass may overwrite it.
  *
- * Three kinds of damage:
+ * Four kinds of damage:
  *   * empty, or the 'Unknown' sentinel;
  *   * a string that doesn't look like a name at all (a section heading such as
  *     "Personal details", read before the profile header rendered);
+ *   * a Facebook post header saved whole — "Ariel Wright is feeling motivated."
+ *     Name-shaped by every other test here, and the author's name is sitting
+ *     right at the front of it, so the repair pass can put it back. Detected by
+ *     the activity phrase rather than by capitalization, so a Messenger GROUP
+ *     named "The girls are back" isn't declared damaged for having a verb in it;
  *   * one of the user's own TAG names. The sidebar chips are injected inside the
  *     conversation link the extractor scrapes, so before that was fixed a chip
  *     could win the name candidate sort and be saved as the contact — "FU-
@@ -495,6 +611,11 @@ export function isDamagedName(
   const v = (stored || '').trim();
   if (!v || v === 'Unknown') return true;
   if (!looksLikeName(v)) return true;
+  // A post header that got saved as the contact. Only meaningful when the trim
+  // leaves a plausible name behind — otherwise the verb was part of whatever
+  // this string legitimately is.
+  const trimmed = stripActivityPhrase(v);
+  if (trimmed !== v && looksLikePersonName(trimmed)) return true;
 
   const key = nameKey(v);
   if (!key) return true;

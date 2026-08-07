@@ -23,6 +23,14 @@ import {
 } from '../csv';
 import { mergeConversations, findDuplicateGroups, cleanStoredNames, pickPrimary, DuplicateGroup } from '../contacts';
 import { isDriveConfigured, getDriveStatus, connectDrive, disconnectDrive, getAuthRedirectUri, readStore as driveReadStore, writeStore as driveWriteStore, DriveStatus } from '../drive';
+import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo, type DeviceOverview } from '../devices';
+
+// What GET_DEVICES answers with: the machine roster and lease from devices.ts,
+// plus the two things only the background worker knows.
+interface MachineView extends DeviceOverview {
+  lastSyncAt: number | null;
+  syncEnabled: boolean;   // false when Drive sync is off — then there's one machine and no lease
+}
 
 // Trigger a client-side file download of text content.
 function downloadText(filename: string, mime: string, content: string) {
@@ -202,6 +210,32 @@ export default function DashboardApp() {
     const interval = setInterval(refreshCampaigns, 3000);
     return () => clearInterval(interval);
   }, [refreshCampaigns]);
+
+  // Which machines have the extension, and which of them is draining the queue.
+  const [machines, setMachines] = useState<MachineView | null>(null);
+  const refreshMachines = useCallback(async () => {
+    const res = await sendBg<MachineView>({ type: 'GET_DEVICES' });
+    if (res) setMachines(res);
+  }, []);
+
+  useEffect(() => {
+    refreshMachines();
+    const interval = setInterval(refreshMachines, 5000);
+    return () => clearInterval(interval);
+  }, [refreshMachines]);
+
+  // The background worker reconciles the shared queue on a one-minute watchdog,
+  // which is the right cadence for a machine nobody is looking at. It is far too
+  // slow for one somebody IS looking at — so while a queue-facing tab is open,
+  // ask for a reconcile on a much shorter timer. Each pass is a small Drive read
+  // and only downloads the campaign document when it has actually changed.
+  useEffect(() => {
+    if (activeTab !== 'messaging' && activeTab !== 'history') return;
+    const tick = () => { void sendBg({ type: 'SYNC_QUEUE_NOW' }, 30_000); };
+    tick();
+    const interval = setInterval(tick, 15_000);
+    return () => clearInterval(interval);
+  }, [activeTab]);
 
   // Failed-message notice. Campaigns run unattended in a background window, so
   // failures that happened while this dashboard was closed get surfaced here on
@@ -1400,6 +1434,7 @@ export default function DashboardApp() {
             store={store}
             campaigns={campaigns}
             queue={queue}
+            machines={machines}
             preselected={preselectedRecipients}
             onConsumePreselected={() => setPreselectedRecipients([])}
             onChanged={refreshCampaigns}
@@ -2266,6 +2301,8 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
 
       <DriveBackupPanel store={store} updateStore={updateStore} />
 
+      <MachinesPanel />
+
 
       <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
         <h3 style={{ margin: '0 0 16px', fontSize: 15, fontWeight: 600 }}>Data</h3>
@@ -2447,6 +2484,137 @@ function AccountPanel({ contactCount }: { contactCount: number }) {
 }
 
 
+
+// --- Machines ---
+//
+// The roster behind the "Sending from" row in the queue card. Lives in Settings
+// because that's where you go to name a machine or clear out one you've retired
+// — the queue card only needs to answer "who's sending, and can I change it?".
+function MachinesPanel() {
+  const [machines, setMachines] = useState<MachineView | null>(null);
+  const [renaming, setRenaming] = useState(false);
+  const [name, setName] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    const res = await sendBg<MachineView>({ type: 'GET_DEVICES' });
+    if (res) setMachines(res);
+  }, []);
+
+  useEffect(() => { void refresh(); const i = setInterval(refresh, 10_000); return () => clearInterval(i); }, [refresh]);
+
+  const cardStyle: React.CSSProperties = { background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 };
+  const self = machines?.devices.find((d) => d.id === machines.selfId);
+
+  const saveName = async () => {
+    setBusy(true);
+    await sendBg({ type: 'RENAME_DEVICE', payload: { name } }, 30_000);
+    setBusy(false);
+    setRenaming(false);
+    await refresh();
+  };
+
+  const forget = async (deviceId: string) => {
+    setBusy(true);
+    await sendBg({ type: 'FORGET_DEVICE', payload: { deviceId } }, 30_000);
+    setBusy(false);
+    await refresh();
+  };
+
+  const switchTo = async (deviceId: string) => {
+    setBusy(true);
+    await sendBg({ type: 'SET_SENDING_DEVICE', payload: { deviceId } }, 30_000);
+    setBusy(false);
+    await refresh();
+  };
+
+  return (
+    <div style={cardStyle}>
+      <h3 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>Machines</h3>
+      <p style={{ margin: '0 0 14px', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
+        With Drive sync on, your send queue and message history follow you between machines. The sending itself
+        doesn&apos;t: one machine drains the queue at a time, because Facebook rate-limits the account rather than the
+        browser. If that machine stops running, another takes over automatically after about {Math.round(LEASE_TTL_MS / 60000)} minutes.
+      </p>
+
+      {!machines?.syncEnabled ? (
+        <div style={{ fontSize: 12, color: '#888', background: '#fafbfc', border: '1px solid #eef1f5', borderRadius: 8, padding: '12px 14px' }}>
+          Google Drive sync is off, so this machine works on its own — its queue and history stay here.
+        </div>
+      ) : (
+        <>
+          <div style={{ border: '1px solid #e3e8ef', borderRadius: 8, overflow: 'hidden' }}>
+            {machines.devices.map((d) => {
+              const online = isDeviceOnline(d);
+              const isSelf = d.id === machines.selfId;
+              const sending = d.id === machines.senderId;
+              return (
+                <div key={d.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderTop: '1px solid #f0f3f7', background: sending ? '#f5f9ff' : '#fff' }}>
+                  <OnlineDot online={online} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: '#2c3e50' }}>
+                      {d.name}
+                      {isSelf && <span style={{ marginLeft: 6, fontSize: 11, fontWeight: 600, color: '#065fd4' }}>this machine</span>}
+                      {sending && <span style={{ marginLeft: 6, fontSize: 11, fontWeight: 700, color: '#0a7c4a' }}>· sending</span>}
+                      {machines.pinnedDeviceId === d.id && <span title="Preferred sending machine" style={{ marginLeft: 6, fontSize: 11 }}>📌</span>}
+                    </div>
+                    <div style={{ fontSize: 11, color: '#999', marginTop: 2 }}>
+                      {online ? 'Running now' : `Last seen ${formatRelativeTime(d.lastSeenAt)}`}
+                      {d.platform ? ` · ${d.platform}` : ''}
+                      {d.version ? ` · v${d.version}` : ''}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    {!sending && (
+                      <button disabled={busy} onClick={() => switchTo(d.id)} style={{ background: '#fff', color: '#065fd4', border: '1px solid #cfdcf2', padding: '5px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: busy ? 'default' : 'pointer' }}>
+                        Send from here
+                      </button>
+                    )}
+                    {!isSelf && !online && (
+                      <button disabled={busy} onClick={() => forget(d.id)} title="Remove this machine from the list. It reappears if you use the extension there again." style={{ background: '#fff0f0', color: '#e53e3e', border: '1px solid #fecaca', padding: '5px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: busy ? 'default' : 'pointer' }}>
+                        Forget
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {machines.devices.length === 0 && (
+              <div style={{ padding: '12px 14px', fontSize: 12, color: '#999' }}>No machines have checked in yet.</div>
+            )}
+          </div>
+
+          <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            {renaming ? (
+              <>
+                <input
+                  value={name}
+                  autoFocus
+                  maxLength={40}
+                  onChange={(e) => setName(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') void saveName(); if (e.key === 'Escape') setRenaming(false); }}
+                  style={{ padding: '6px 10px', border: '1px solid #dfe3e8', borderRadius: 6, fontSize: 12, minWidth: 180 }}
+                />
+                <button disabled={busy} onClick={saveName} style={{ background: '#065fd4', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Save</button>
+                <button onClick={() => setRenaming(false)} style={{ background: 'none', border: 'none', color: '#888', fontSize: 12, cursor: 'pointer' }}>Cancel</button>
+              </>
+            ) : (
+              <button
+                onClick={() => { setName(self?.name || ''); setRenaming(true); }}
+                style={{ background: '#fff', color: '#065fd4', border: '1px solid #cfdcf2', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+              >
+                Rename this machine
+              </button>
+            )}
+            <span style={{ fontSize: 11, color: '#aaa' }}>
+              Queue last synced {machines.lastSyncAt ? formatRelativeTime(machines.lastSyncAt) : 'never'}
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 
 // --- Google Drive sync ---
 //
@@ -3257,13 +3425,14 @@ interface MessagingPanelProps {
   store: Store;
   campaigns: Campaign[];
   queue: QueueState;
+  machines: MachineView | null;
   preselected: string[];
   onConsumePreselected: () => void;
   onChanged: () => void;
   onViewHistory: () => void;
 }
 
-function MessagingPanel({ conversations, tags, store, campaigns, queue, preselected, onConsumePreselected, onChanged, onViewHistory }: MessagingPanelProps) {
+function MessagingPanel({ conversations, tags, store, campaigns, queue, machines, preselected, onConsumePreselected, onChanged, onViewHistory }: MessagingPanelProps) {
   const [template, setTemplate] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState('');
@@ -3373,7 +3542,7 @@ function MessagingPanel({ conversations, tags, store, campaigns, queue, preselec
       <div style={{ flex: '1 1 420px', minWidth: 360 }}>
         {active.length > 0 && (
           <div style={{ marginBottom: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <QueueCard campaigns={campaigns} queue={queue} onChanged={onChanged} onViewHistory={onViewHistory} />
+            <QueueCard campaigns={campaigns} queue={queue} machines={machines} onChanged={onChanged} onViewHistory={onViewHistory} />
             {active.map((c) => (
               <ActiveCampaignCard
                 key={c.id}
@@ -3571,11 +3740,157 @@ function Countdown({ to }: { to?: number }) {
   return <span>{m > 0 ? `${m}m ` : ''}{s}s</span>;
 }
 
+// ---- which machine is doing the sending ----
+//
+// The queue is shared across machines but only one of them sends from it (see
+// devices.ts). That is invisible unless we say so — and "why has nothing gone
+// out for an hour?" is exactly the question this row exists to answer, whether
+// the reason is that the sending machine is asleep or simply that it's a
+// different one from the machine you're looking at.
+
+function OnlineDot({ online }: { online: boolean }) {
+  return (
+    <span
+      title={online ? 'Online' : 'Not running'}
+      style={{
+        display: 'inline-block', width: 8, height: 8, borderRadius: 4, flexShrink: 0,
+        background: online ? '#0a7c4a' : '#c4c8cc',
+      }}
+    />
+  );
+}
+
+function machineLabel(d: DeviceInfo, selfId: string): string {
+  return d.id === selfId ? `${d.name} (this machine)` : d.name;
+}
+
+function SendingFrom({ machines, onChanged }: { machines: MachineView | null; onChanged: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // With Drive sync off there is exactly one machine and nothing to coordinate,
+  // so the whole concept would be noise. Say nothing.
+  if (!machines?.syncEnabled) return null;
+  // Likewise before the first heartbeat has landed.
+  if (machines.devices.length === 0) return null;
+
+  const sender = machines.devices.find((d) => d.id === machines.senderId) || null;
+  const isSelf = !!sender && sender.id === machines.selfId;
+  const stalled = !!sender && !machines.senderOnline;
+  // This machine holds the queue but can't reach Drive to say so. It keeps
+  // sending for a few more minutes and then stands down, so another machine can
+  // take over without the two of them overlapping — worth saying out loud,
+  // because from here it just looks like sending stopped for no reason.
+  const unreachable = isSelf && machines.publishedAgeMs > LEASE_TTL_MS / 2;
+
+  const switchTo = async (deviceId: string) => {
+    setBusy(deviceId);
+    setError(null);
+    const res = await sendBg<{ success: boolean; error?: string }>({ type: 'SET_SENDING_DEVICE', payload: { deviceId } }, 30_000);
+    setBusy(null);
+    if (!res?.success) { setError(res?.error || 'Could not hand the queue over — check your connection.'); return; }
+    setOpen(false);
+    onChanged();
+  };
+
+  return (
+    <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #eef1f5', fontSize: 12, color: '#666' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <span>Sending from</span>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontWeight: 700, color: '#2c3e50' }}>
+          <OnlineDot online={machines.senderOnline} />
+          {sender ? machineLabel(sender, machines.selfId) : 'no machine yet'}
+        </span>
+        {machines.pinnedDeviceId === machines.senderId && sender && (
+          <span title="You chose this machine — it takes the queue back whenever it's running." style={{ fontSize: 11 }}>📌</span>
+        )}
+        <button
+          onClick={() => setOpen((v) => !v)}
+          style={{ background: 'none', border: 'none', color: '#065fd4', fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', padding: 0 }}
+        >
+          {open ? 'Close' : 'Switch'}
+        </button>
+      </div>
+
+      {!isSelf && sender && !stalled && (
+        <div style={{ marginTop: 4, fontSize: 11 }}>
+          This machine is showing the queue; <strong>{sender.name}</strong> is the one sending.
+        </div>
+      )}
+      {stalled && (
+        <div style={{ marginTop: 4, fontSize: 11, color: '#b9770e' }}>
+          ⚠ {sender?.name} hasn&apos;t checked in since {formatRelativeTime(sender!.lastSeenAt)}. Another running machine
+          takes over automatically within a few minutes — or switch now.
+        </div>
+      )}
+      {unreachable && (
+        <div style={{ marginTop: 4, fontSize: 11, color: '#b9770e' }}>
+          ⚠ Can&apos;t reach Google Drive from this machine, so the other machines can&apos;t see that it&apos;s still here.
+          Sending continues for a few more minutes, then hands over rather than risk two machines sending at once.
+        </div>
+      )}
+      {machines.senderReason === 'takeover' && machines.previousSenderName && !stalled && (
+        <div style={{ marginTop: 4, fontSize: 11 }}>
+          Took over automatically because <strong>{machines.previousSenderName}</strong> stopped running.
+        </div>
+      )}
+      {error && <div style={{ marginTop: 4, fontSize: 11, color: '#e53e3e' }}>{error}</div>}
+
+      {open && (
+        <div style={{ marginTop: 8, border: '1px solid #e3e8ef', borderRadius: 8, overflow: 'hidden' }}>
+          {machines.devices.map((d) => {
+            const online = isDeviceOnline(d);
+            const current = d.id === machines.senderId;
+            return (
+              <div
+                key={d.id}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px',
+                  borderTop: '1px solid #f0f3f7', background: current ? '#f5f9ff' : '#fff',
+                }}
+              >
+                <OnlineDot online={online} />
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontWeight: 600, color: '#2c3e50', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {machineLabel(d, machines.selfId)}
+                  </div>
+                  <div style={{ fontSize: 11 }}>
+                    {online ? 'Running now' : `Last seen ${formatRelativeTime(d.lastSeenAt)}`}
+                    {d.platform ? ` · ${d.platform}` : ''}
+                  </div>
+                </div>
+                {current
+                  ? <span style={{ fontSize: 11, fontWeight: 700, color: '#0a7c4a' }}>Sending</span>
+                  : (
+                    <button
+                      disabled={busy === d.id}
+                      title={online ? undefined : 'This machine isn’t running — the queue will wait for it, then move on automatically.'}
+                      onClick={() => switchTo(d.id)}
+                      style={{
+                        background: '#fff', color: online ? '#065fd4' : '#b9770e',
+                        border: '1px solid ' + (online ? '#cfdcf2' : '#f0d28a'),
+                        padding: '4px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600,
+                        cursor: busy === d.id ? 'default' : 'pointer', opacity: busy === d.id ? 0.6 : 1,
+                      }}
+                    >
+                      {busy === d.id ? 'Switching…' : 'Send from here'}
+                    </button>
+                  )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // The queue header: one processor, one clock, however many campaigns are
 // feeding it. This is where the global controls live, because pausing "the
 // sending" and pausing "this campaign" are genuinely different actions and
 // conflating them is how you accidentally stop the wrong thing.
-function QueueCard({ campaigns, queue, onChanged, onViewHistory }: { campaigns: Campaign[]; queue: QueueState; onChanged: () => void; onViewHistory: () => void }) {
+function QueueCard({ campaigns, queue, machines, onChanged, onViewHistory }: { campaigns: Campaign[]; queue: QueueState; machines: MachineView | null; onChanged: () => void; onViewHistory: () => void }) {
   const depth = queueDepth(campaigns);
   const pausing = !!(queue.pausedForBatchUntil && queue.pausedForBatchUntil > Date.now());
   const inFlight = queue.inFlight
@@ -3638,6 +3953,8 @@ function QueueCard({ campaigns, queue, onChanged, onViewHistory }: { campaigns: 
           History &amp; logs →
         </button>
       </div>
+
+      <SendingFrom machines={machines} onChanged={onChanged} />
     </div>
   );
 }

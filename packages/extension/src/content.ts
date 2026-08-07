@@ -23,7 +23,7 @@ import { PLATFORM_URL } from './license';
 import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
 import { buildThreadIndex, isUnboundOrphan, planOrphanBinds, threadAliases } from './contacts';
 import type { ThreadRow } from './contacts';
-import { extractNameFromLink, extractActiveThreadName, extractProfilePageName, looksLikeName, isDamagedName } from './names';
+import { extractNameFromLink, extractActiveThreadName, extractProfilePageName, looksLikePersonName, isDamagedName } from './names';
 import type { SendFailureKind } from './campaigns';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
@@ -1383,8 +1383,11 @@ async function readProfileNameToSave(timeoutMs = 8_000): Promise<string | null> 
   const sample = () => {
     const n = extractProfilePageName();
     // extractProfilePageName reports failure as 'Unknown', which is itself
-    // name-shaped — keep looking rather than accepting it.
-    return n && n !== 'Unknown' && looksLikeName(n) ? n : null;
+    // name-shaped — keep looking rather than accepting it. The person-name check
+    // (not the looser looksLikeName) is the one that matters on a write: this is
+    // a profile page, so the answer must look like a PERSON, not like the
+    // sentence a post header is.
+    return n && n !== 'Unknown' && looksLikePersonName(n) ? n : null;
   };
 
   const deadline = Date.now() + timeoutMs;

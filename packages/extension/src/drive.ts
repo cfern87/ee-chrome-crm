@@ -19,8 +19,18 @@
 
 import type { Store } from './storage';
 
-// The single file we keep in the app-data folder.
+// Files we keep in the app-data folder.
+//
+//   crm-store.json      — the CRM itself (contacts, tags, notes…).
+//   crm-campaigns.json  — the send queue + campaign history (see queueSync.ts).
+//   crm-presence.json   — which machines are online and which one is currently
+//                         processing the queue (see devices.ts). Deliberately
+//                         separate from, and far smaller than, the campaign doc:
+//                         it is rewritten on every heartbeat, and we do not want
+//                         to re-upload megabytes of history once a minute.
 const STORE_FILE_NAME = 'crm-store.json';
+export const CAMPAIGNS_FILE_NAME = 'crm-campaigns.json';
+export const PRESENCE_FILE_NAME = 'crm-presence.json';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const DRIVE_UPLOAD = 'https://www.googleapis.com/upload/drive/v3';
@@ -233,10 +243,16 @@ async function driveFetch(url: string, init: RequestInit, interactive: boolean):
 
 // ---- file discovery ----
 
-async function findStoreFile(interactive: boolean): Promise<DriveFileMeta | null> {
+// Drive gives no way to address a file by name, so every read and write would
+// otherwise cost an extra "list" round trip. File ids are stable for the life of
+// the file, so remember them per name; a 404 clears the entry and the next call
+// re-discovers (or re-creates) the file.
+const fileIdCache = new Map<string, string>();
+
+async function findFile(name: string, interactive: boolean): Promise<DriveFileMeta | null> {
   const params = new URLSearchParams({
     spaces: 'appDataFolder',
-    q: `name='${STORE_FILE_NAME}' and trashed=false`,
+    q: `name='${name}' and trashed=false`,
     fields: 'files(id,modifiedTime,size)',
     pageSize: '1',
   });
@@ -244,59 +260,75 @@ async function findStoreFile(interactive: boolean): Promise<DriveFileMeta | null
   if (!res.ok) throw new Error(`Drive list failed (${res.status}): ${await safeText(res)}`);
   const data = (await res.json()) as { files?: DriveFileMeta[] };
   const f = data.files?.[0];
-  return f ? { id: f.id, modifiedTime: f.modifiedTime, size: f.size ? Number(f.size) : undefined } : null;
+  if (!f) { fileIdCache.delete(name); return null; }
+  fileIdCache.set(name, f.id);
+  return { id: f.id, modifiedTime: f.modifiedTime, size: f.size ? Number(f.size) : undefined };
+}
+
+function findStoreFile(interactive: boolean): Promise<DriveFileMeta | null> {
+  return findFile(STORE_FILE_NAME, interactive);
 }
 
 async function safeText(res: Response): Promise<string> {
   try { return (await res.text()).slice(0, 300); } catch { return ''; }
 }
 
-// ---- read ----
+// ---- generic JSON documents ----
 
-export interface DriveReadResult {
-  store: Store;
+export interface DriveDoc<T> {
+  data: T;
   file: DriveFileMeta;
 }
 
 /**
- * Read the store blob from Drive. Returns null when no file exists yet (a fresh
- * account) so the caller can decide whether to seed it from local data.
+ * Read one JSON document out of the app-data folder, or null when it doesn't
+ * exist yet. Uses the cached file id when we have one and falls back to a
+ * lookup if that id has gone stale.
  */
-export async function readStore(interactive = false): Promise<DriveReadResult | null> {
-  const meta = await findStoreFile(interactive);
+export async function readJsonDoc<T>(name: string, interactive = false): Promise<DriveDoc<T> | null> {
+  const cachedId = fileIdCache.get(name);
+  if (cachedId) {
+    const res = await driveFetch(`${DRIVE_API}/files/${cachedId}?alt=media`, { method: 'GET' }, interactive);
+    if (res.ok) return { data: await parseJson<T>(res, name), file: { id: cachedId } };
+    if (res.status !== 404) throw new Error(`Drive read failed (${res.status}): ${await safeText(res)}`);
+    fileIdCache.delete(name); // deleted elsewhere — fall through and re-discover
+  }
+
+  const meta = await findFile(name, interactive);
   if (!meta) return null;
   const res = await driveFetch(`${DRIVE_API}/files/${meta.id}?alt=media`, { method: 'GET' }, interactive);
   if (!res.ok) throw new Error(`Drive read failed (${res.status}): ${await safeText(res)}`);
-  const text = await res.text();
-  let parsed: Partial<Store>;
-  try { parsed = JSON.parse(text) as Partial<Store>; }
-  catch { throw new Error('Drive store file is corrupt (invalid JSON).'); }
-  return { store: normalizeStore(parsed), file: meta };
+  return { data: await parseJson<T>(res, name), file: meta };
 }
 
-// ---- write ----
+async function parseJson<T>(res: Response, name: string): Promise<T> {
+  const text = await res.text();
+  try { return JSON.parse(text) as T; }
+  catch { throw new Error(`Drive file ${name} is corrupt (invalid JSON).`); }
+}
 
-/**
- * Write the whole store to Drive, creating the app-data file on first use and
- * overwriting its contents thereafter. Returns the file's fresh metadata.
- */
-export async function writeStore(store: Store, interactive = false): Promise<DriveFileMeta> {
-  const body = JSON.stringify(store);
-  const existing = await findStoreFile(interactive);
+/** Write (creating if needed) one JSON document in the app-data folder. */
+export async function writeJsonDoc(name: string, data: unknown, interactive = false): Promise<DriveFileMeta> {
+  const body = JSON.stringify(data);
+  const id = fileIdCache.get(name) || (await findFile(name, interactive))?.id;
 
   let res: Response;
-  if (existing) {
+  if (id) {
     // Update media in place — keeps the same file id, name and parent.
     res = await driveFetch(
-      `${DRIVE_UPLOAD}/files/${existing.id}?uploadType=media&fields=id,modifiedTime,size`,
+      `${DRIVE_UPLOAD}/files/${id}?uploadType=media&fields=id,modifiedTime,size`,
       { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body },
       interactive,
     );
+    if (res.status === 404) {
+      fileIdCache.delete(name);
+      return writeJsonDoc(name, data, interactive); // recreate it
+    }
   } else {
     // Create it inside the hidden app-data folder via a multipart upload
     // (metadata part + media part).
     const boundary = `crm${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
-    const metadata = { name: STORE_FILE_NAME, parents: ['appDataFolder'] };
+    const metadata = { name, parents: ['appDataFolder'] };
     const multipart =
       `--${boundary}\r\n` +
       'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
@@ -314,7 +346,35 @@ export async function writeStore(store: Store, interactive = false): Promise<Dri
 
   if (!res.ok) throw new Error(`Drive write failed (${res.status}): ${await safeText(res)}`);
   const f = (await res.json()) as DriveFileMeta;
+  fileIdCache.set(name, f.id);
   return { id: f.id, modifiedTime: f.modifiedTime, size: f.size ? Number(f.size) : undefined };
+}
+
+// ---- read ----
+
+export interface DriveReadResult {
+  store: Store;
+  file: DriveFileMeta;
+}
+
+/**
+ * Read the store blob from Drive. Returns null when no file exists yet (a fresh
+ * account) so the caller can decide whether to seed it from local data.
+ */
+export async function readStore(interactive = false): Promise<DriveReadResult | null> {
+  const doc = await readJsonDoc<Partial<Store>>(STORE_FILE_NAME, interactive);
+  if (!doc) return null;
+  return { store: normalizeStore(doc.data), file: doc.file };
+}
+
+// ---- write ----
+
+/**
+ * Write the whole store to Drive, creating the app-data file on first use and
+ * overwriting its contents thereafter. Returns the file's fresh metadata.
+ */
+export function writeStore(store: Store, interactive = false): Promise<DriveFileMeta> {
+  return writeJsonDoc(STORE_FILE_NAME, store, interactive);
 }
 
 // ---- connect / disconnect / status ----

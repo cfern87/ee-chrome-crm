@@ -5,17 +5,26 @@
 // in flight at once — they all feed ONE central send queue (see QueueState
 // further down), which owns the pacing and decides whose turn it is.
 //
-// Unlike the CRM store (which lives in chrome.storage.sync so it follows you
-// across machines), campaign history is intentionally MACHINE-LOCAL:
+// STORAGE: chrome.storage.local under a single key, which has a much larger
+// quota (~5 MB) than chrome.storage.sync and comfortably holds message history
+// plus per-recipient error logs.
 //
-//   * The send actually happens on this machine's browser, so the log of what
-//     happened belongs here.
-//   * Per-recipient diagnostic logs are verbose and would blow the tiny
-//     chrome.storage.sync per-item (8 KB) / total (100 KB) quotas.
+// That local copy is the fast path, not the whole story. When Google Drive sync
+// is on, the queue and the history are ALSO mirrored to Drive so they follow the
+// user between machines — see queueSync.ts for the mirroring and devices.ts for
+// how the machines agree on which one is actually doing the sending. The types
+// below carry the timestamps that merge depends on:
 //
-// So we persist to chrome.storage.local under a single key. That has a much
-// larger quota (~5 MB, effectively unlimited with the "unlimitedStorage"
-// permission) which is plenty for message history + error logs.
+//   * Campaign.updatedAt          — last change to the campaign's own fields
+//   * CampaignRecipient.updatedAt — last change to that one recipient
+//   * Campaign.removedRecipients  — tombstones, so a recipient removed on one
+//                                   machine doesn't come back from another
+//   * QueueState control/pacing stamps — see QueueState
+//
+// Nothing stamps these by hand: saveCampaigns/saveQueue diff against what is
+// already persisted and stamp whatever actually changed (see stampCampaigns).
+
+import { getDeviceId } from './devices';
 
 export const CAMPAIGNS_KEY = 'facebook_crm_campaigns';
 
@@ -67,6 +76,9 @@ export interface CampaignRecipient {
   errorKind?: SendFailureKind;  // machine-readable classification of `error`
   failedAt?: number;            // when it was marked failed (drives the dashboard notice)
   log?: string[];               // detailed diagnostics (esp. for failures)
+  // Last change to THIS recipient, for cross-machine merge. Stamped by
+  // saveCampaigns, never by hand.
+  updatedAt?: number;
 }
 
 export interface CampaignBatch {
@@ -111,6 +123,14 @@ export interface Campaign {
   // waiting on the same `nextSendAt` is expected; only one of them is next.
   nextSendAt?: number;          // timestamp the next attempt is scheduled for
   pausedForBatchUntil?: number; // set while in a long inter-batch pause
+  // ---- cross-machine sync bookkeeping (see the module header) ----
+  // Last change to the campaign's own fields — status, name, template, config,
+  // cursor. Recipients carry their own stamps.
+  updatedAt?: number;
+  // Recipients removed by hand, threadId → when. A union merge can't express a
+  // removal, so without this a recipient dropped on the laptop reappears from
+  // the desktop's copy on the next sync.
+  removedRecipients?: Record<string, number>;
 }
 
 // ---- Pure helpers ----
@@ -231,11 +251,84 @@ export async function loadCampaigns(): Promise<Campaign[]> {
   return Array.isArray(list) ? list : [];
 }
 
+/**
+ * Set when this machine has queue changes the others haven't seen yet, cleared
+ * once they reach Drive (see queueSync.ts). Marked HERE rather than at each call
+ * site so no local write can forget to — and deliberately not marked by
+ * replaceCampaigns/replaceQueue, which is the sync writing a merged result back
+ * and has nothing new to say.
+ */
+export const QUEUE_DIRTY_KEY = 'crm_queue_dirty';
+
+function markDirty(): Promise<void> {
+  return localSet(QUEUE_DIRTY_KEY, true);
+}
+
+// ---- change stamping ----
+//
+// Cross-machine merge needs to know WHEN each campaign and each recipient last
+// changed. Asking every mutation site in background.ts to remember to stamp
+// would be a standing invitation to forget one — and a missing stamp doesn't
+// fail loudly, it silently loses that edit on the next sync.
+//
+// So the stamps are derived instead: on every save we diff against what is
+// already persisted and stamp exactly what moved. The comparison ignores the
+// stamps themselves, so re-saving unchanged data doesn't churn them (which
+// matters — a bumped stamp is a claim to win a merge).
+
+function withoutStamp<T extends { updatedAt?: number }>(v: T): string {
+  const { updatedAt: _ignored, ...rest } = v;
+  return JSON.stringify(rest);
+}
+
+/** Stamp `next` against the previously persisted `prev`. Pure; returns new objects. */
+export function stampCampaigns(prev: Campaign[], next: Campaign[], now = Date.now()): Campaign[] {
+  const prevById = new Map(prev.map((c) => [c.id, c]));
+
+  return next.map((c) => {
+    const before = prevById.get(c.id);
+    const prevRecipients = new Map((before?.recipients || []).map((r) => [r.threadId, r]));
+
+    const recipients = c.recipients.map((r) => {
+      const pr = prevRecipients.get(r.threadId);
+      if (pr && withoutStamp(pr) === withoutStamp(r)) return { ...r, updatedAt: pr.updatedAt ?? r.updatedAt };
+      return { ...r, updatedAt: now };
+    });
+
+    // Tombstone anything this write dropped, so the removal survives a merge
+    // with a machine that still has it.
+    const removedRecipients = { ...(c.removedRecipients || {}) };
+    const stillHere = new Set(c.recipients.map((r) => r.threadId));
+    for (const threadId of prevRecipients.keys()) {
+      if (!stillHere.has(threadId)) removedRecipients[threadId] = now;
+    }
+
+    const stamped: Campaign = { ...c, recipients, removedRecipients };
+    // Campaign-level fields only: recipients carry their own stamps, and a send
+    // outcome shouldn't look like a change to the campaign's settings.
+    const scalarsChanged = !before || campaignScalars(before) !== campaignScalars(stamped);
+    stamped.updatedAt = scalarsChanged ? now : (before.updatedAt ?? now);
+    return stamped;
+  });
+}
+
+function campaignScalars(c: Campaign): string {
+  return JSON.stringify({
+    name: c.name, template: c.template, dryRun: c.dryRun, status: c.status,
+    cursor: c.cursor, config: c.config, startedAt: c.startedAt, completedAt: c.completedAt,
+    removedRecipients: c.removedRecipients || {},
+  });
+}
+
 // Persist the full list, newest first, trimmed to MAX_CAMPAIGNS. Also bounds
 // each recipient's diagnostic log so history can't grow without limit.
+//
+// The trim is deterministic (sort by createdAt, keep the newest MAX_CAMPAIGNS)
+// so every machine drops the same campaigns and ageing out of history doesn't
+// become a source of cross-machine churn.
 export async function saveCampaigns(campaigns: Campaign[]): Promise<void> {
-  const trimmed = campaigns
-    .slice()
+  const previous = await loadCampaigns();
+  const trimmed = stampCampaigns(previous, campaigns)
     .sort((a, b) => b.createdAt - a.createdAt)
     .slice(0, MAX_CAMPAIGNS)
     .map((c) => ({
@@ -247,6 +340,17 @@ export async function saveCampaigns(campaigns: Campaign[]): Promise<void> {
       ),
     }));
   await localSet(CAMPAIGNS_KEY, trimmed);
+  await markDirty();
+}
+
+/**
+ * Replace the local campaign list wholesale, WITHOUT re-stamping. Used by the
+ * Drive sync when it writes back a merged result: those stamps came from the
+ * merge and re-deriving them here would restamp every record that arrived from
+ * another machine as if this one had just edited it.
+ */
+export async function replaceCampaigns(campaigns: Campaign[]): Promise<void> {
+  await localSet(CAMPAIGNS_KEY, campaigns.slice().sort((a, b) => b.createdAt - a.createdAt).slice(0, MAX_CAMPAIGNS));
 }
 
 export async function upsertCampaign(campaign: Campaign): Promise<void> {
@@ -306,6 +410,24 @@ export interface QueueState {
   // tell "mid-send" from "stalled" and the UI can name who's being messaged.
   inFlight?: { campaignId: string; threadId: string; startedAt: number };
   updatedAt: number;
+  // ---- cross-machine sync bookkeeping ----
+  //
+  // The queue's fields fall into two groups that must merge by different rules,
+  // because they have different authors:
+  //
+  //   CONTROL (paused, mode) is user intent. Any machine can change it — you
+  //   should be able to hit "Pause all" from the laptop while the desktop is the
+  //   one sending — so it merges last-write-wins on `controlUpdatedAt`.
+  //
+  //   PACING (nextSendAt, pausedForBatchUntil, sentSinceBatchPause,
+  //   currentBatchTarget, lastCampaignId, inFlight) belongs to whichever machine
+  //   holds the sender lease. Only it writes them, and on merge the sending
+  //   machine's copy wins outright — a non-sender's stale clock must never be
+  //   able to move the next send earlier.
+  controlUpdatedAt?: number;
+  pacingUpdatedAt?: number;
+  /** Device id of the machine that last wrote the pacing fields. */
+  ownerDeviceId?: string;
 }
 
 // `updatedAt: 0` marks a queue that has never been persisted, which is how the
@@ -328,8 +450,49 @@ export async function loadQueue(): Promise<QueueState> {
   return { ...defaultQueueState(), ...(q || {}) };
 }
 
+function queueControl(q: QueueState): string {
+  return JSON.stringify({ paused: q.paused, mode: q.mode });
+}
+
+function queuePacing(q: QueueState): string {
+  return JSON.stringify({
+    nextSendAt: q.nextSendAt, pausedForBatchUntil: q.pausedForBatchUntil,
+    sentSinceBatchPause: q.sentSinceBatchPause, currentBatchTarget: q.currentBatchTarget,
+    lastCampaignId: q.lastCampaignId, inFlight: q.inFlight,
+  });
+}
+
 export async function saveQueue(q: QueueState): Promise<void> {
-  await localSet(QUEUE_KEY, { ...q, updatedAt: Date.now() });
+  const now = Date.now();
+  const prev = await loadQueue();
+  const next: QueueState = { ...q, updatedAt: now };
+
+  if (queueControl(prev) !== queueControl(next)) next.controlUpdatedAt = now;
+  else next.controlUpdatedAt = prev.controlUpdatedAt ?? next.controlUpdatedAt;
+
+  if (queuePacing(prev) !== queuePacing(next)) {
+    next.pacingUpdatedAt = now;
+    // Whoever moved the clock owns it. Recorded so a merge can tell the sending
+    // machine's pacing from a bystander's stale copy.
+    next.ownerDeviceId = await currentDeviceId();
+  }
+
+  await localSet(QUEUE_KEY, next);
+  await markDirty();
+}
+
+async function currentDeviceId(): Promise<string | undefined> {
+  try { return await getDeviceId(); } catch { return undefined; }
+}
+
+/**
+ * Replace the queue wholesale WITHOUT re-stamping, for the Drive sync writing
+ * back a merged result. Same reasoning as replaceCampaigns: the stamps came out
+ * of the merge and re-deriving them would make another machine's edit look like
+ * one this machine had just made.
+ */
+export async function replaceQueue(q: QueueState): Promise<void> {
+  await localSet(QUEUE_KEY, q);
 }
 
 // ---- Selection ----
@@ -405,6 +568,136 @@ export function pendingRecipientIndex(all: Campaign[], excludeCampaignId?: strin
     }
   }
   return map;
+}
+
+// =====================================================================
+//  Cross-machine merge
+// =====================================================================
+//
+// Pure reconciliation of two copies of the same campaign list / queue, one from
+// this machine and one from Drive. Kept here (rather than in queueSync.ts) so
+// the rules sit next to the types they interpret and stay easy to reason about
+// on their own.
+
+// How far a recipient has got. Used only as a TIE-BREAK, when two machines
+// stamped the same recipient at the same millisecond — but it encodes the one
+// asymmetry that matters: a terminal outcome ('sent' above all) must never be
+// undone by a copy that still thinks the message is queued.
+const STATUS_RANK: Record<RecipientStatus, number> = { sent: 3, error: 2, sending: 1, pending: 0 };
+
+function pickRecipient(a: CampaignRecipient, b: CampaignRecipient): CampaignRecipient {
+  const winner = electRecipient(a, b);
+  const loser = winner === a ? b : a;
+  // The copy that goes to Drive has the logs of successful sends stripped out
+  // (they're bulky and only interesting when something failed — see
+  // stripForUpload in queueSync.ts). So a winner that arrived from Drive can be
+  // the right record with the log missing: keep the local one's log rather than
+  // letting a sync erase diagnostics on the machine that produced them.
+  if (!winner.log?.length && loser.log?.length && winner.status === loser.status) {
+    return { ...winner, log: loser.log };
+  }
+  return winner;
+}
+
+function electRecipient(a: CampaignRecipient, b: CampaignRecipient): CampaignRecipient {
+  // 'sent' is final and irreversible — a recipient that has been messaged must
+  // never revert to pending just because another machine's copy is newer. That
+  // would send the same person the same message twice, which is the single worst
+  // thing this whole system can do.
+  if (a.status === 'sent' && b.status !== 'sent') return a;
+  if (b.status === 'sent' && a.status !== 'sent') return b;
+
+  const at = a.updatedAt ?? 0;
+  const bt = b.updatedAt ?? 0;
+  if (at !== bt) return at > bt ? a : b;
+  return STATUS_RANK[a.status] >= STATUS_RANK[b.status] ? a : b;
+}
+
+function mergeCampaign(a: Campaign, b: Campaign): Campaign {
+  // Campaign-level fields (status, config, cursor…) travel together, so the
+  // whole set comes from whichever side changed them last. Splitting them would
+  // let a "cancelled" status land on top of another machine's cursor.
+  const base = (a.updatedAt ?? 0) >= (b.updatedAt ?? 0) ? a : b;
+
+  const removedRecipients: Record<string, number> = { ...(a.removedRecipients || {}) };
+  for (const [id, at] of Object.entries(b.removedRecipients || {})) {
+    if (!removedRecipients[id] || at > removedRecipients[id]) removedRecipients[id] = at;
+  }
+
+  // Recipient ORDER is the send order, so it has to survive the merge. Take the
+  // side that changed last as the spine and append anything only the other side
+  // knows about — a campaign created on one machine and extended on another.
+  const spine = base === a ? a : b;
+  const other = base === a ? b : a;
+  const otherById = new Map(other.recipients.map((r) => [r.threadId, r]));
+
+  const recipients: CampaignRecipient[] = [];
+  for (const r of spine.recipients) {
+    const o = otherById.get(r.threadId);
+    recipients.push(o ? pickRecipient(r, o) : r);
+    otherById.delete(r.threadId);
+  }
+  for (const r of other.recipients) {
+    if (otherById.has(r.threadId)) recipients.push(r);
+  }
+
+  // Apply removals last, so it doesn't matter which side contributed the copy.
+  // A recipient re-added after a removal has the newer stamp and survives.
+  const kept = recipients.filter((r) => {
+    const removedAt = removedRecipients[r.threadId];
+    return !removedAt || (r.updatedAt ?? 0) > removedAt;
+  });
+
+  return { ...base, recipients: kept, removedRecipients };
+}
+
+/** Reconcile two campaign lists. Order-independent: merge(a,b) === merge(b,a). */
+export function mergeCampaignLists(a: Campaign[], b: Campaign[]): Campaign[] {
+  const byId = new Map<string, Campaign>();
+  for (const c of a) byId.set(c.id, c);
+  for (const c of b) {
+    const cur = byId.get(c.id);
+    byId.set(c.id, cur ? mergeCampaign(cur, c) : c);
+  }
+  // Same deterministic trim as saveCampaigns, so every machine keeps the same
+  // window of history rather than reviving each other's aged-out campaigns.
+  return Array.from(byId.values())
+    .sort((x, y) => y.createdAt - x.createdAt)
+    .slice(0, MAX_CAMPAIGNS);
+}
+
+/**
+ * Reconcile two queue states. Control (what the user asked for) merges
+ * last-write-wins; pacing (the shared clock) comes from whichever side the
+ * sending machine wrote — see the comments on QueueState.
+ *
+ * `senderDeviceId` is the machine that currently holds the sender lease. When
+ * neither side was written by it (a lease that has just moved), the newer pacing
+ * stamp wins, which is the same rule with less information.
+ */
+export function mergeQueueStates(a: QueueState, b: QueueState, senderDeviceId: string | null): QueueState {
+  const control = (a.controlUpdatedAt ?? a.updatedAt ?? 0) >= (b.controlUpdatedAt ?? b.updatedAt ?? 0) ? a : b;
+
+  let pacing: QueueState;
+  const aOwns = !!senderDeviceId && a.ownerDeviceId === senderDeviceId;
+  const bOwns = !!senderDeviceId && b.ownerDeviceId === senderDeviceId;
+  if (aOwns !== bOwns) pacing = aOwns ? a : b;
+  else pacing = (a.pacingUpdatedAt ?? a.updatedAt ?? 0) >= (b.pacingUpdatedAt ?? b.updatedAt ?? 0) ? a : b;
+
+  return {
+    paused: control.paused,
+    mode: control.mode,
+    controlUpdatedAt: control.controlUpdatedAt,
+    nextSendAt: pacing.nextSendAt,
+    pausedForBatchUntil: pacing.pausedForBatchUntil,
+    sentSinceBatchPause: pacing.sentSinceBatchPause,
+    currentBatchTarget: pacing.currentBatchTarget,
+    lastCampaignId: pacing.lastCampaignId,
+    inFlight: pacing.inFlight,
+    pacingUpdatedAt: pacing.pacingUpdatedAt,
+    ownerDeviceId: pacing.ownerDeviceId,
+    updatedAt: Math.max(a.updatedAt || 0, b.updatedAt || 0),
+  };
 }
 
 // ---- Failed-message notice ----

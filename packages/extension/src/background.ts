@@ -25,7 +25,7 @@
 // periodic watchdog alarm self-heals any stall (e.g. if the worker was killed
 // mid-step).
 
-import { loadStore, saveStore, flushDriveIfDirty, syncDriveNow, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, removeTagsFrom } from './storage';
+import { loadStore, saveStore, flushDriveIfDirty, syncDriveNow, isDriveEnabled, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, removeTagsFrom } from './storage';
 import type { Store, SaveResult } from './storage';
 import { applyMutations } from './mutations';
 import type { Mutation } from './mutations';
@@ -61,6 +61,19 @@ import {
   nextRecipientIndex,
   runnableCampaigns,
 } from './campaigns';
+import {
+  heartbeat,
+  isSendingDevice,
+  getDeviceOverview,
+  getDeviceId,
+  getDeviceName,
+  setDeviceName,
+  pinSendingDevice,
+  forgetDevice,
+  CLAIM_SETTLE_MS,
+  type HeartbeatResult,
+} from './devices';
+import { maybeSyncQueue, syncQueueNow, getQueueLastSync } from './queueSync';
 
 const TICK_ALARM = 'crm-campaign-tick';
 const WATCHDOG_ALARM = 'crm-campaign-watchdog';
@@ -630,6 +643,70 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
   };
 }
 
+// ---- multi-machine coordination ----
+//
+// The queue and its history are shared across machines (queueSync.ts), but the
+// SENDING is not: one machine holds the sender lease and drains the queue, the
+// rest sync it, display it, and take control actions. Without that, two browsers
+// signed into the same account would each run their own 2-4 minute clock against
+// one Facebook account and double the real send rate — the exact thing the
+// pacing exists to prevent.
+//
+// The lease election lives in devices.ts. Everything here needs to know is:
+// am I the one sending right now?
+
+// When this machine last took the lease from someone else. A takeover is the one
+// moment two machines can briefly both believe they hold it (there is no
+// compare-and-swap on a Drive blob), so the first send after one is deliberately
+// delayed and re-verified — see settleLease.
+let leaseTakenAt = 0;
+
+/**
+ * May this machine send right now? With Drive sync off there is only one machine
+ * in the picture and the answer is always yes, which keeps single-machine
+ * behaviour exactly as it was.
+ */
+async function canSendFromThisMachine(): Promise<boolean> {
+  if (!(await isDriveEnabled())) return true;
+  return isSendingDevice();
+}
+
+/**
+ * Hold off the first send after a takeover until the claim has had time to
+ * settle, then confirm we still hold the lease. This is what turns a contended
+ * takeover into "one machine waits 8 seconds" instead of "two machines each send
+ * a message".
+ */
+async function settleLease(): Promise<boolean> {
+  if (!(await isDriveEnabled())) return true;
+  const since = Date.now() - leaseTakenAt;
+  if (since >= CLAIM_SETTLE_MS) return true;
+  await new Promise((r) => setTimeout(r, CLAIM_SETTLE_MS - since));
+  const res = await heartbeat();
+  return res.isSender;
+}
+
+/** Publish presence and run the election. Resolves null when Drive sync is off. */
+async function heartbeatIfSynced(): Promise<HeartbeatResult | null> {
+  if (!(await isDriveEnabled())) return null;
+  try {
+    const res = await heartbeat();
+    if (res.tookOver) {
+      leaseTakenAt = Date.now();
+      console.log('[CRM] this machine has taken over the send queue');
+    }
+    return res;
+  } catch (e) {
+    console.warn('[CRM] heartbeat failed:', e);
+    return null;
+  }
+}
+
+/** Push local queue changes to the other machines without blocking the caller. */
+function pushQueueSoon(): void {
+  void syncQueueNow().catch(() => { /* the watchdog retries */ });
+}
+
 // ---- the orchestrator step ----
 
 let processing = false;
@@ -669,6 +746,18 @@ async function processTick(): Promise<void> {
   if (processing) return;
   processing = true;
   try {
+    // Only the machine holding the sender lease drains the queue. The others
+    // still keep their copy current so their dashboard shows what's happening.
+    if (!(await canSendFromThisMachine())) {
+      clearTick();
+      await maybeSyncQueue();
+      return;
+    }
+    // Pull first: another machine may have queued a campaign, paused everything,
+    // or requeued a failure since the last pass, and all of that has to be in
+    // hand before we decide who goes next.
+    await maybeSyncQueue();
+
     let q = await loadQueue();
     const now = Date.now();
 
@@ -727,10 +816,23 @@ async function processTick(): Promise<void> {
       camp.batches.push(batch);
     }
 
+    // Last check before anything goes out: if this machine only just took the
+    // lease, let the claim settle and confirm it still holds. Everything above
+    // this line is reversible; the send is not.
+    if (!(await settleLease())) {
+      console.log('[CRM] lost the send lease while settling — standing down');
+      clearTick();
+      return;
+    }
+
     r.status = 'sending';
     r.attempts += 1;
     camp.cursor = idx;
     await saveCampaigns(all);
+    // Tell the other machines this person is being messaged NOW, before it
+    // happens rather than after: it's what stops a machine that takes over
+    // mid-send from picking the same recipient up again.
+    pushQueueSoon();
 
     // Claim the turn before sending. Writing `lastCampaignId` up front (rather
     // than after) means a worker killed mid-send still advances the round-robin
@@ -812,6 +914,9 @@ async function processTick(): Promise<void> {
     mirrorQueueClock(all2, q);
     await saveCampaigns(all2);
     await saveQueue(q);
+    // Publish the outcome and the new clock. There are minutes before the next
+    // send, so the other machines are up to date well before it matters.
+    pushQueueSoon();
 
     if (stillRunnable) scheduleTick(delay);
     else clearTick();
@@ -864,6 +969,9 @@ async function kickQueue(): Promise<void> {
   const q = await loadQueue();
   if (q.paused) return;
   ensureWatchdog();
+  // Nothing to arm on a machine that isn't the sender — the control action that
+  // led here has already been pushed to the one that is (see the callers).
+  if (!(await canSendFromThisMachine())) return;
   const waitUntil = Math.max(q.nextSendAt || 0, q.pausedForBatchUntil || 0);
   const now = Date.now();
   if (waitUntil > now) { scheduleTick(waitUntil - now); return; }
@@ -1015,13 +1123,28 @@ async function requeueCampaignRecipient(id: string, threadId: string): Promise<{
   return { success: true };
 }
 
-// Watchdog: catch stalls (worker killed mid-step, missed alarm, etc.).
+// Watchdog: catch stalls (worker killed mid-step, missed alarm, etc.) and keep
+// this machine's place in the multi-machine picture.
+//
+// This is also the heartbeat: every pass republishes this machine's presence and
+// re-runs the sender election, which is what makes the switchover automatic. A
+// machine that sleeps, quits the browser, or loses its network stops
+// heartbeating, its lease lapses after LEASE_TTL_MS, and the next machine to run
+// this function elects itself and picks the queue up where it was left.
 async function watchdog(): Promise<void> {
   // Reconcile any Drive write that didn't land (offline, worker killed mid-flush).
   void flushDriveIfDirty();
 
+  const hb = await heartbeatIfSynced();
+  await maybeSyncQueue(hb?.presence);
+
+  // A machine that has just inherited the queue shouldn't sit out the rest of
+  // this pass waiting for a tick alarm the previous holder was going to fire.
+  if (hb?.tookOver) { void kickQueue(); return; }
+
   const q = await loadQueue();
   if (q.paused) return;
+  if (!(await canSendFromThisMachine())) return;
   const now = Date.now();
   if (q.pausedForBatchUntil && q.pausedForBatchUntil > now) return; // legitimately pausing
   if (q.nextSendAt && q.nextSendAt > now + 5_000) return;           // legitimately waiting
@@ -1059,6 +1182,16 @@ ensureEntitlementCheck();
 // On startup, push up any local edits that didn't reach Drive last session.
 void flushDriveIfDirty();
 
+// Announce this machine and reconcile the shared queue immediately, rather than
+// waiting up to a minute for the first watchdog pass. This is what makes opening
+// the browser on a second machine show the real queue straight away — and what
+// lets it take over promptly if the machine that was sending is gone.
+void (async () => {
+  const hb = await heartbeatIfSynced();
+  await maybeSyncQueue(hb?.presence);
+  if (hb?.isSender) void kickQueue();
+})();
+
 // If the sender tab is closed, forget it so the next send opens a fresh one.
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   const stored = await getStoredSenderTab();
@@ -1066,6 +1199,16 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 });
 
 // ---- message router ----
+
+// Control actions that change the shared queue. Whichever machine the user did
+// it on has to get the change out to the others — above all to the one actually
+// sending, which is the machine that has to act on it. Handled in one place so a
+// new control action can't quietly end up local-only.
+const QUEUE_MUTATING = new Set([
+  'START_CAMPAIGN', 'PAUSE_CAMPAIGN', 'RESUME_CAMPAIGN', 'CANCEL_CAMPAIGN',
+  'PAUSE_QUEUE', 'RESUME_QUEUE', 'SET_QUEUE_MODE',
+  'REMOVE_CAMPAIGN_RECIPIENT', 'REQUEUE_CAMPAIGN_RECIPIENT',
+]);
 
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   (async () => {
@@ -1204,6 +1347,57 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           sendResponse({ queue: await loadQueue() });
           break;
         }
+
+        // ---- machines / sender lease ----
+        case 'GET_DEVICES': {
+          const [overview, lastSync, driveOn] = await Promise.all([
+            getDeviceOverview(), getQueueLastSync(), isDriveEnabled(),
+          ]);
+          sendResponse({ ...overview, lastSyncAt: lastSync, syncEnabled: driveOn });
+          break;
+        }
+        // The dashboard calls this on a short timer while it's open, so the
+        // queue on a machine somebody is actually looking at stays close to live
+        // instead of moving on the one-minute watchdog cadence.
+        case 'SYNC_QUEUE_NOW': {
+          if (!(await isDriveEnabled())) { sendResponse({ ok: false, syncEnabled: false }); break; }
+          const hb = await heartbeatIfSynced();
+          await maybeSyncQueue(hb?.presence);
+          sendResponse({ ok: true, syncEnabled: true });
+          break;
+        }
+        case 'SET_SENDING_DEVICE': {
+          if (!(await isDriveEnabled())) {
+            sendResponse({ success: false, error: 'Turn on Google Drive sync to send from another machine.' });
+            break;
+          }
+          const res = await pinSendingDevice(request.payload?.deviceId ?? null);
+          if (!res.online) {
+            sendResponse({ success: false, error: 'Could not reach Google Drive to hand the queue over.' });
+            break;
+          }
+          // If we just gave the queue to ourselves, start draining it now.
+          if (res.isSender) { leaseTakenAt = Date.now(); void kickQueue(); }
+          else clearTick();
+          sendResponse({ success: true, senderId: res.presence.sender?.deviceId ?? null });
+          break;
+        }
+        case 'RENAME_DEVICE': {
+          await setDeviceName(String(request.payload?.name || ''));
+          await heartbeatIfSynced(); // republish under the new name
+          sendResponse({ success: true, name: await getDeviceName() });
+          break;
+        }
+        case 'FORGET_DEVICE': {
+          const selfId = await getDeviceId();
+          if (request.payload?.deviceId === selfId) {
+            sendResponse({ success: false, error: "This is the machine you're using." });
+            break;
+          }
+          await forgetDevice(String(request.payload?.deviceId || ''));
+          sendResponse({ success: true });
+          break;
+        }
         case 'PAUSE_QUEUE': {
           sendResponse(await pauseQueue());
           break;
@@ -1243,6 +1437,10 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     } catch (e) {
       console.warn('[CRM] background handler error:', e);
       try { sendResponse({ success: false, error: String(e) }); } catch { /* channel closed */ }
+    } finally {
+      // Fire-and-forget: the UI shouldn't wait on a Drive round trip, and the
+      // dirty flag means the watchdog retries anything this push doesn't land.
+      if (QUEUE_MUTATING.has(request.type)) pushQueueSoon();
     }
   })();
 
