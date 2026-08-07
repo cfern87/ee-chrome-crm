@@ -533,7 +533,21 @@ export function extractProfileNameByStats(doc: Document = document): string {
  * sources remain only as last-ditch fallbacks for layouts where the counters
  * aren't present.
  */
-export function extractProfilePageName(doc: Document = document): string {
+export interface ProfileNameOptions {
+  /**
+   * Read only the page's OWN header (the h1 and the stat-counter scan), never
+   * the og:title / document.title fallbacks.
+   *
+   * Those two are document-level, and during an SPA navigation they can still
+   * describe the PREVIOUS page — a stale title is perfectly name-shaped and it
+   * holds still, so a caller confirming a name across two reads would confirm
+   * the wrong person rather than catch them. The profile header is never wrong
+   * about whose page this is: it either says the name or it isn't there yet.
+   */
+  domOnly?: boolean;
+}
+
+export function extractProfilePageName(doc: Document = document, opts: ProfileNameOptions = {}): string {
   // 1. The <h1> inside the main content region. A profile page has exactly one
   //    and it is the owner's name; scoping to [role="main"] keeps the nav bar's
   //    headings out of it.
@@ -563,6 +577,10 @@ export function extractProfilePageName(doc: Document = document): string {
   // 2. Structural scan anchored on the profile's stat counters.
   const byStats = extractProfileNameByStats(doc);
   if (looksLikePersonName(byStats)) return byStats;
+
+  // Everything below reads the DOCUMENT rather than this profile's header, and
+  // a document that is mid-navigation still describes the last page.
+  if (opts.domOnly) return '';
 
   // 3. og:title — historically the profile owner's name; now often the generic
   //    "Facebook" (rejected by looksLikeName), but harmless to try.
