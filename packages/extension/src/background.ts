@@ -73,12 +73,16 @@ import {
   CLAIM_SETTLE_MS,
   type HeartbeatResult,
 } from './devices';
-import { maybeSyncQueue, syncQueueNow, getQueueLastSync } from './queueSync';
+import { maybeSyncQueue, syncQueueNow, announceQueueNow, getQueueLastSync } from './queueSync';
+import {
+  getSendHold, holdSending, releaseSending, getSyncStatus,
+  type SendHoldReason,
+} from './syncHealth';
+import { ensureFreshToken } from './drive';
 
 const TICK_ALARM = 'crm-campaign-tick';
 const WATCHDOG_ALARM = 'crm-campaign-watchdog';
 const SENDER_TAB_KEY = 'facebook_crm_sender_tab';
-const MAX_ATTEMPTS = 3; // give up on a recipient after this many tries
 
 // Chrome clamps one-shot alarms to a 30s floor; our real gaps are minutes.
 // All alarm calls are guarded: if the "alarms" permission isn't active yet
@@ -665,10 +669,55 @@ let leaseTakenAt = 0;
  * May this machine send right now? With Drive sync off there is only one machine
  * in the picture and the answer is always yes, which keeps single-machine
  * behaviour exactly as it was.
+ *
+ * With sync on there are now TWO conditions, and the second is new: holding the
+ * lease is not enough if we can't currently tell anyone what we're doing. See
+ * the hold section below.
  */
 async function canSendFromThisMachine(): Promise<boolean> {
   if (!(await isDriveEnabled())) return true;
+  if (await getSendHold()) return false;
   return isSendingDevice();
+}
+
+// ---- the send hold ----
+//
+// The lease alone was never enough. isSendingDevice gives a machine a
+// LEASE_TTL_MS (5 minute) grace period after its last successful heartbeat, on
+// the reasoning that a brief Drive hiccup shouldn't interrupt a campaign. But a
+// machine that keeps sending through that window publishes nothing, and the
+// machine that inherits the lease at the end of it reads a campaign document
+// that predates every one of those sends — and sends them all again.
+//
+// At a 2-4 minute gap that is one or two real people messaged twice per
+// outage. So sending now requires proof, not grace: if the outcome of a send
+// cannot be published, the send does not happen.
+
+/** Stop sending on this machine and stand down until sync is demonstrably back. */
+async function holdQueue(reason: SendHoldReason, detail: string): Promise<void> {
+  await holdSending(reason, detail);
+  clearTick();
+}
+
+/**
+ * Release the hold, but only on evidence: a complete sync round trip AND a lease
+ * this machine can still verify. Called from the watchdog, so recovery takes at
+ * most one minute after Drive comes back.
+ */
+async function tryReleaseHold(): Promise<boolean> {
+  if (!(await getSendHold())) return false;
+
+  const synced = await announceQueueNow();
+  if (!synced.ok) return false;
+  // Sync is back. Whether we still get to send is a separate question — the
+  // lease may well have moved to another machine while we were held, and that
+  // machine is now the authority on what has already gone out.
+  if (!(await isSendingDevice())) {
+    await releaseSending();
+    return false;
+  }
+  await releaseSending();
+  return true;
 }
 
 /**
@@ -742,6 +791,26 @@ function sweepFinished(all: Campaign[]): boolean {
   return changed;
 }
 
+/**
+ * Give back a recipient we claimed but never actually messaged.
+ *
+ * Re-reads from storage rather than editing the in-memory copy: the announce
+ * that just failed may still have PULLED a merged list down first, so the array
+ * we were holding is no longer the one that's persisted.
+ */
+async function unmarkSending(campaignId: string, threadId: string): Promise<void> {
+  const all = await loadCampaigns();
+  const c = all.find((x) => x.id === campaignId);
+  const r = c?.recipients.find((x) => x.threadId === threadId);
+  if (!c || !r || r.status !== 'sending') return;
+  r.status = 'pending';
+  r.attempts = Math.max(0, r.attempts - 1);
+  // The cursor was moved onto this recipient in anticipation of the send; rewind
+  // it so the next pass picks them up again rather than stepping over them.
+  c.cursor = Math.min(c.cursor, c.recipients.indexOf(r));
+  await saveCampaigns(all);
+}
+
 async function processTick(): Promise<void> {
   if (processing) return;
   processing = true;
@@ -756,7 +825,15 @@ async function processTick(): Promise<void> {
     // Pull first: another machine may have queued a campaign, paused everything,
     // or requeued a failure since the last pass, and all of that has to be in
     // hand before we decide who goes next.
-    await maybeSyncQueue();
+    //
+    // This result used to be discarded, which quietly downgraded "pull first" to
+    // "pull if convenient" — a failed pull left us choosing who to message from a
+    // local copy that could be minutes behind the machine that had been sending.
+    const pulled = await maybeSyncQueue();
+    if (pulled.error) {
+      await holdQueue('sync-lost', pulled.error);
+      return;
+    }
 
     let q = await loadQueue();
     const now = Date.now();
@@ -794,15 +871,27 @@ async function processTick(): Promise<void> {
     const idx = pick.index;
     const r = camp.recipients[idx];
 
-    // A recipient stuck 'sending' means a prior step died mid-send; cap retries.
-    if (r.status === 'sending' && r.attempts >= MAX_ATTEMPTS) {
+    // A recipient still marked 'sending' means a previous attempt died somewhere
+    // between "about to type" and "confirmed sent" — a worker killed by an
+    // extension update, a browser quit, a crashed tab.
+    //
+    // This used to be retried up to MAX_ATTEMPTS, which is the wrong default.
+    // The attempt that died may well have delivered the message, and Facebook
+    // will not tell us either way. Retrying trades a possible missed send for a
+    // possible duplicate, and for this product a duplicate is much the more
+    // expensive mistake. So it becomes an explicit decision instead: park it as
+    // an unconfirmed failure and let the user hit Requeue once they have looked
+    // at the thread.
+    if (r.status === 'sending') {
       r.status = 'error';
-      r.error = 'Aborted after repeated interrupted attempts';
+      r.error = 'Interrupted mid-send — delivery unconfirmed';
+      r.errorKind = 'unconfirmed';
       r.failedAt = Date.now();
-      r.log = [...(r.log || []), `gave up after ${r.attempts} attempts`];
+      r.log = [...(r.log || []), `interrupted after ${r.attempts} attempt(s); not retried automatically`];
       camp.cursor = idx + 1;
       sweepFinished(all);
       await saveCampaigns(all);
+      pushQueueSoon();
       scheduleTick(1_000);
       return;
     }
@@ -829,10 +918,37 @@ async function processTick(): Promise<void> {
     r.attempts += 1;
     camp.cursor = idx;
     await saveCampaigns(all);
+
     // Tell the other machines this person is being messaged NOW, before it
-    // happens rather than after: it's what stops a machine that takes over
-    // mid-send from picking the same recipient up again.
-    pushQueueSoon();
+    // happens rather than after — and WAIT for that to land.
+    //
+    // Fire-and-forget here was the single biggest source of duplicates: when the
+    // push failed we sent anyway, and the machine that inherited the lease five
+    // minutes later had no idea this recipient had ever been touched. Failing
+    // closed costs a delayed campaign; failing open costs somebody a message
+    // they have already had.
+    if (await isDriveEnabled()) {
+      const announced = await announceQueueNow();
+      if (!announced.ok) {
+        await unmarkSending(camp.id, r.threadId);
+        await holdQueue('announce-failed', announced.error || 'Could not publish the queue before sending.');
+        return;
+      }
+
+      // The announce PULLED as well as pushed. If it brought back a 'sent' for
+      // this recipient from another machine — and the merge always lets 'sent'
+      // win — then they have already been messaged and this attempt has to be
+      // abandoned. Cheap check, and it closes the last window in which two
+      // machines mid-handover could both reach the same person.
+      const afterAnnounce = await loadCampaigns();
+      const claim = afterAnnounce.find((c) => c.id === camp.id)
+        ?.recipients.find((x) => x.threadId === r.threadId);
+      if (!claim || claim.status !== 'sending') {
+        console.log(`[CRM] ${r.participantName} was resolved elsewhere while announcing — not sending`);
+        scheduleTick(1_000);
+        return;
+      }
+    }
 
     // Claim the turn before sending. Writing `lastCampaignId` up front (rather
     // than after) means a worker killed mid-send still advances the round-robin
@@ -914,9 +1030,19 @@ async function processTick(): Promise<void> {
     mirrorQueueClock(all2, q);
     await saveCampaigns(all2);
     await saveQueue(q);
-    // Publish the outcome and the new clock. There are minutes before the next
-    // send, so the other machines are up to date well before it matters.
-    pushQueueSoon();
+
+    // Publish the outcome and the new clock — blocking, for the same reason the
+    // pre-send announce is. An unpublished 'sent' is exactly the record another
+    // machine will fail to see, and then act on: the merge in campaigns.ts
+    // protects a 'sent' recipient from being un-sent, but only once it has
+    // actually reached Drive.
+    if (await isDriveEnabled()) {
+      const published = await announceQueueNow();
+      if (!published.ok) {
+        await holdQueue('sync-lost', published.error || 'The send outcome could not be published to Drive.');
+        return;
+      }
+    }
 
     if (stillRunnable) scheduleTick(delay);
     else clearTick();
@@ -1052,13 +1178,30 @@ async function pauseQueue(): Promise<{ success: boolean }> {
   return { success: true };
 }
 
-async function resumeQueue(): Promise<{ success: boolean }> {
+async function resumeQueue(): Promise<{ success: boolean; error?: string }> {
   const q = await loadQueue();
   q.paused = false;
   // Drop a batch pause that expired while the queue was stopped, rather than
   // making the user wait it out twice.
   if (q.pausedForBatchUntil && q.pausedForBatchUntil <= Date.now()) q.pausedForBatchUntil = undefined;
   await saveQueue(q);
+
+  // Resume is also the natural "try again now" button when the queue is held on
+  // a sync failure, so take the opportunity rather than making the user wait for
+  // the watchdog. It still only clears against a real round trip — pressing
+  // Resume cannot talk this machine into sending blind.
+  if (await getSendHold()) {
+    if (!(await tryReleaseHold())) {
+      const hold = await getSendHold();
+      return {
+        success: false,
+        error: hold
+          ? `Still can't reach Google Drive — the queue stays held so nobody gets messaged twice. (${hold.detail})`
+          : 'The send queue moved to another machine while this one was held.',
+      };
+    }
+  }
+
   await kickQueue();
   return { success: true };
 }
@@ -1134,6 +1277,19 @@ async function requeueCampaignRecipient(id: string, threadId: string): Promise<{
 async function watchdog(): Promise<void> {
   // Reconcile any Drive write that didn't land (offline, worker killed mid-flush).
   void flushDriveIfDirty();
+
+  // Renew the Google access token on a schedule, from a worker that is awake and
+  // has a minute to spare, rather than lazily at the moment a send needs it.
+  // Renewal happening on the send path is how an ordinary hourly token rollover
+  // used to turn into a stalled campaign.
+  if (await isDriveEnabled()) void ensureFreshToken();
+
+  // If this machine is holding the queue because sync broke, this is where it
+  // gets to come back — but only against evidence, and at most a minute late.
+  if (await getSendHold()) {
+    if (await tryReleaseHold()) void kickQueue();
+    return;
+  }
 
   const hb = await heartbeatIfSynced();
   await maybeSyncQueue(hb?.presence);
@@ -1350,10 +1506,16 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
 
         // ---- machines / sender lease ----
         case 'GET_DEVICES': {
-          const [overview, lastSync, driveOn] = await Promise.all([
-            getDeviceOverview(), getQueueLastSync(), isDriveEnabled(),
+          const [overview, lastSync, driveOn, sync] = await Promise.all([
+            getDeviceOverview(), getQueueLastSync(), isDriveEnabled(), getSyncStatus(),
           ]);
-          sendResponse({ ...overview, lastSyncAt: lastSync, syncEnabled: driveOn });
+          sendResponse({ ...overview, lastSyncAt: lastSync, syncEnabled: driveOn, sync });
+          break;
+        }
+        // Sync health and the send hold, for the queue header. Cheap and local —
+        // no Drive round trip — so the dashboard can poll it freely.
+        case 'GET_SYNC_STATUS': {
+          sendResponse(await getSyncStatus());
           break;
         }
         // The dashboard calls this on a short timer while it's open, so the

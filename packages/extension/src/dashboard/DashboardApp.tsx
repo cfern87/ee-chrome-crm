@@ -22,14 +22,33 @@ import {
   normalizeProfileUrl, extractThreadFromProfileUrl,
 } from '../csv';
 import { mergeConversations, findDuplicateGroups, cleanStoredNames, pickPrimary, DuplicateGroup } from '../contacts';
-import { isDriveConfigured, getDriveStatus, connectDrive, disconnectDrive, getAuthRedirectUri, readStore as driveReadStore, writeStore as driveWriteStore, DriveStatus } from '../drive';
+import { isDriveConfigured, getDriveStatus, getDriveAuthState, connectDrive, disconnectDrive, getAuthRedirectUri, readStore as driveReadStore, writeStore as driveWriteStore, DriveStatus, DriveAuthState } from '../drive';
 import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo, type DeviceOverview } from '../devices';
+import { isDisconnected, type SyncStatusView, type SendHoldReason } from '../syncHealth';
 
 // What GET_DEVICES answers with: the machine roster and lease from devices.ts,
-// plus the two things only the background worker knows.
+// plus the things only the background worker knows.
 interface MachineView extends DeviceOverview {
   lastSyncAt: number | null;
   syncEnabled: boolean;   // false when Drive sync is off — then there's one machine and no lease
+  // Drive health and whether the queue is held because of it. Optional because a
+  // worker from before this field existed may still be the one answering during
+  // an update, and the queue card must not blow up on that.
+  sync?: SyncStatusView;
+}
+
+// Why the queue is held, in the user's terms. The distinction that matters is
+// that this is NOT a pause they asked for and NOT something they can override —
+// it clears itself the moment sync works again.
+function describeHold(reason: SendHoldReason): string {
+  switch (reason) {
+    case 'announce-failed':
+      return "Sending is on hold: this machine couldn't tell the others who it was about to message.";
+    case 'lease-unverifiable':
+      return "Sending is on hold: this machine can't confirm it's still the one that should be sending.";
+    default:
+      return 'Sending is on hold: this machine lost contact with Google Drive.';
+  }
 }
 
 // Trigger a client-side file download of text content.
@@ -2666,6 +2685,7 @@ function MachinesPanel() {
 // machine to Chrome sync (the Drive file is left intact).
 function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (s: Store) => Promise<SaveResult> }) {
   const [driveStatus, setDriveStatus] = useState<DriveStatus | null>(null);
+  const [authState, setAuthState] = useState<DriveAuthState | null>(null);
   const [enabled, setEnabled] = useState(false);
   const [pro, setPro] = useState(true); // assume allowed until we know, to avoid a flash
   const [signedIn, setSignedIn] = useState(false);
@@ -2685,6 +2705,7 @@ function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (
 
   const refresh = useCallback(async () => {
     try { setDriveStatus(await getDriveStatus()); } catch { setDriveStatus(null); }
+    try { setAuthState(await getDriveAuthState()); } catch { setAuthState(null); }
     try { setEnabled(await isDriveEnabled()); } catch { setEnabled(false); }
     try {
       const ent = await getEntitlement();
@@ -2802,21 +2823,72 @@ function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (
         <div style={{ fontSize: 12, padding: '10px 12px', borderRadius: 6, background: '#fff8e1', color: '#8a6d00', lineHeight: 1.6 }}>
           <strong>Setup needed.</strong> A Google OAuth client id hasn't been added to the extension yet. In the Google Cloud Console:
           create a project → enable the <strong>Google Drive API</strong> → create an <strong>OAuth client ID</strong> of type
-          <strong>“Web application”</strong> → add the redirect URI below → paste the client id into <code>manifest.json</code> under <code>oauth2.client_id</code>, then rebuild.
+          <strong>“Web application”</strong> → add the redirect URI below to its Authorized redirect URIs → paste the client id
+          into <code>manifest.json</code> under <code>oauth2.client_id</code>, then rebuild.
         </div>
       ) : (
         <>
           <div style={{ fontSize: 11, color: '#888', marginBottom: 12, lineHeight: 1.6, background: '#f8f8f8', borderRadius: 6, padding: '8px 10px' }}>
-            Uses a <strong>“Web application”</strong> OAuth client (works in Edge &amp; Chrome). This exact redirect URI must be listed under the client's <strong>Authorized redirect URIs</strong>:
+            Two OAuth clients are used, from the same Cloud project. Chrome uses the <strong>“Chrome Extension”</strong>
+            client in <code>manifest.json</code> (its Item ID must be this extension's id). Edge falls back to a
+            <strong> “Web application”</strong> client, which must list this exact URI — trailing slash included — under
+            its <strong>Authorized redirect URIs</strong>:
             <br />
             <code style={{ wordBreak: 'break-all', color: '#333' }}>{getAuthRedirectUri() || '(unavailable)'}</code>
           </div>
+
+          {/* Which flow this machine ended up on. This is the difference between
+              renewing silently in the background forever and needing a fresh
+              Google session every hour, so it's worth showing rather than
+              leaving the user to infer it from mystery disconnections. */}
+          {authState && (
+            <div style={{
+              fontSize: 11, marginBottom: 12, lineHeight: 1.6, borderRadius: 6, padding: '8px 10px',
+              background: authState.silentRenewal ? '#f2f9f4' : '#fff8e1',
+              color: authState.silentRenewal ? '#2e6b45' : '#8a6d00',
+            }}>
+              {authState.silentRenewal ? (
+                <>
+                  <strong>Renews itself.</strong> Chrome holds the Google authorisation for this extension and
+                  re-issues it on demand, so nothing expires and nothing opens a window — including overnight while
+                  a campaign is running.
+                </>
+              ) : authState.brokerCapable ? (
+                <>
+                  <strong>Hourly re-authorisation.</strong> Chrome couldn't hand out the token itself, which almost
+                  always means this browser profile isn't signed into Chrome. Access is instead renewed about once
+                  an hour against your Google session in a tab. Sign into Chrome and press Reconnect to switch to
+                  the version that never expires.
+                </>
+              ) : (
+                <>
+                  <strong>Hourly re-authorisation.</strong> This browser can't have Chrome broker the token
+                  (Edge wires that API to Microsoft accounts), so access is renewed about once an hour against
+                  your Google session. That renewal is now much more reliable — it knows which account to use and
+                  gives up rather than hanging — and if it ever fails, campaign sending pauses rather than risking
+                  duplicate messages.
+                </>
+              )}
+              {!!authState.email && <div style={{ marginTop: 4, color: '#888' }}>Account: {authState.email}</div>}
+            </div>
+          )}
+
           <div style={{ fontSize: 12, marginBottom: connected && enabled ? 8 : 12, color: connected ? '#2e7d32' : '#888' }}>
             {connected ? '● Connected to Google Drive' : '○ Not connected'}
             {connected && driveStatus?.file?.modifiedTime && (
               <span style={{ color: '#aaa' }}>{' '}· last backup {new Date(driveStatus.file.modifiedTime).toLocaleString()}</span>
             )}
           </div>
+
+          {!connected && enabled && (
+            <div style={{ fontSize: 12, marginBottom: 12, padding: '8px 10px', borderRadius: 6, background: '#fdecea', color: '#c62828', lineHeight: 1.6 }}>
+              <strong>Sync is on but this machine isn't authorised.</strong> Campaign sending is held here until
+              it is, so nobody gets messaged twice.
+              {!!authState?.lastError && (
+                <div style={{ marginTop: 4, fontFamily: 'monospace', fontSize: 11, wordBreak: 'break-word' }}>{authState.lastError}</div>
+              )}
+            </div>
+          )}
 
           {/* Sync cycle. Saves upload as they happen; this periodic pass is what
               pulls down edits made on another machine, so it's the number that
@@ -2845,9 +2917,24 @@ function DriveBackupPanel({ store, updateStore }: { store: Store; updateStore: (
           )}
 
           {!connected ? (
-            <button onClick={handleConnect} disabled={busy} style={btn('#065fd4')}>Connect Google Drive</button>
+            <button onClick={handleConnect} disabled={busy} style={btn('#065fd4')}>
+              {enabled ? 'Reconnect Google Drive' : 'Connect Google Drive'}
+            </button>
           ) : (
             <>
+              {/* Reconnecting while already connected is not a no-op: only a fresh
+                  consent issues a refresh token, and it re-probes the code flow
+                  against whatever OAuth client is in the manifest now. This is the
+                  button you press after swapping the client id in the Console. */}
+              {/* Only worth offering where reconnecting could actually change the
+                  outcome — i.e. Chrome, where signing into the profile promotes
+                  this machine off the hourly flow. On Edge it would just re-run
+                  the same flow to the same result. */}
+              {authState && !authState.silentRenewal && authState.brokerCapable && (
+                <button onClick={handleConnect} disabled={busy} style={{ ...btn('#065fd4'), marginBottom: 10 }}>
+                  Reconnect
+                </button>
+              )}
               <div style={{ display: 'flex', gap: 10, marginBottom: 10 }}>
                 <button onClick={handlePull} disabled={busy} style={btn('#4ECDC4')}>Pull from Drive</button>
                 {!pushConfirm ? (
@@ -3927,6 +4014,58 @@ function SendingFrom({ machines, onChanged }: { machines: MachineView | null; on
   );
 }
 
+/**
+ * Shown when this machine has stopped sending because it can't reach Drive.
+ *
+ * Worth its own banner rather than a line of grey text: from the user's side an
+ * automatic hold is indistinguishable from the queue silently dying, and the
+ * previous behaviour in this situation — carrying on and messaging people twice
+ * — at least looked like it was working.
+ */
+function SyncHoldBanner({ machines }: { machines: MachineView | null }) {
+  // With sync off there is one machine, nothing to lose contact with, and any
+  // hold left over from when it was on is meaningless.
+  if (!machines?.syncEnabled) return null;
+
+  const hold = machines.sync?.hold;
+  const health = machines.sync?.health;
+  if (!hold) {
+    // Not held yet, but the connection is already gone: say so now rather than
+    // waiting for the hold, because at a 2-4 minute gap the hold may be several
+    // minutes away and the queue looks fine in the meantime.
+    if (!health || !isDisconnected(health)) return null;
+    return (
+      <div style={{ marginTop: 10, background: '#fffaf0', border: '1px solid #f0d28a', borderRadius: 8, padding: '10px 12px', fontSize: 12, color: '#8a6410' }}>
+        <strong>Google Drive is unreachable.</strong> Sending will pause automatically rather than risk
+        messaging anybody twice. Retrying every minute.
+      </div>
+    );
+  }
+
+  const heldMinutes = Math.max(1, Math.round((Date.now() - hold.since) / 60_000));
+  const authProblem = health?.kind === 'auth';
+
+  return (
+    <div style={{ marginTop: 10, background: '#fdf3f3', border: '1px solid #f2c4c4', borderRadius: 8, padding: '10px 12px', fontSize: 12, color: '#8a2b2b' }}>
+      <div style={{ fontWeight: 700 }}>❚❚ {describeHold(hold.reason)}</div>
+      <div style={{ marginTop: 4 }}>
+        Held for {heldMinutes} min. Nothing is lost — the queue picks up where it left off as soon as
+        sync is working, and it re-checks every minute.
+      </div>
+      {authProblem && (
+        <div style={{ marginTop: 6, fontWeight: 600 }}>
+          This one needs you: reconnect Google Drive in Settings → Google Drive sync.
+        </div>
+      )}
+      {!!hold.detail && (
+        <div style={{ marginTop: 6, color: '#a06a6a', fontFamily: 'monospace', fontSize: 11, wordBreak: 'break-word' }}>
+          {hold.detail}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // The queue header: one processor, one clock, however many campaigns are
 // feeding it. This is where the global controls live, because pausing "the
 // sending" and pausing "this campaign" are genuinely different actions and
@@ -3977,6 +4116,8 @@ function QueueCard({ campaigns, queue, machines, onChanged, onViewHistory }: { c
             : <button onClick={() => control('PAUSE_QUEUE')} style={{ background: '#fff', color: '#b9770e', border: '1px solid #f0d28a', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Pause all</button>}
         </div>
       </div>
+
+      <SyncHoldBanner machines={machines} />
 
       <div style={{ marginTop: 10, fontSize: 12, color: '#666', display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
         <span>

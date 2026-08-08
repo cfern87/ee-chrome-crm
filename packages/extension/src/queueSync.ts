@@ -136,8 +136,10 @@ async function syncQueueUncached(): Promise<SyncQueueResult> {
 
   // Nothing up there yet: this machine seeds it.
   if (!remote) {
-    await push(localCampaigns, localQueue, 1, selfId);
-    return { ran: true, pushed: true, pulled: false };
+    const seeded = await push(localCampaigns, localQueue, 1, selfId);
+    return seeded.ok
+      ? { ran: true, pushed: true, pulled: false }
+      : { ran: false, pushed: false, pulled: false, error: seeded.error };
   }
 
   const senderId = (await getCachedPresence()).sender?.deviceId ?? null;
@@ -158,17 +160,24 @@ async function syncQueueUncached(): Promise<SyncQueueResult> {
   }
 
   if (remoteMissing) {
-    await push(mergedCampaigns, mergedQueue, remote.rev + 1, selfId);
-  } else {
-    await localSet(QUEUE_DIRTY_KEY, false);
-    await localSet(REV_SEEN_KEY, remote.rev);
-    await localSet(QUEUE_LAST_SYNC_KEY, Date.now());
+    const pushed = await push(mergedCampaigns, mergedQueue, remote.rev + 1, selfId);
+    // A failed push is NOT a successful sync pass, however much of the pull
+    // worked. The send gate reads `ran` to decide whether it is safe to message
+    // somebody, and a machine whose outcomes aren't reaching Drive is precisely
+    // the machine that must not keep sending.
+    if (!pushed.ok) return { ran: false, pushed: false, pulled: localGained, error: pushed.error };
+    return { ran: true, pushed: true, pulled: localGained };
   }
 
-  return { ran: true, pushed: remoteMissing, pulled: localGained };
+  await localSet(QUEUE_DIRTY_KEY, false);
+  await localSet(REV_SEEN_KEY, remote.rev);
+  await localSet(QUEUE_LAST_SYNC_KEY, Date.now());
+  return { ran: true, pushed: false, pulled: localGained };
 }
 
-async function push(campaigns: Campaign[], queue: QueueState, rev: number, selfId: string): Promise<void> {
+async function push(
+  campaigns: Campaign[], queue: QueueState, rev: number, selfId: string,
+): Promise<{ ok: boolean; error?: string }> {
   const doc: CampaignDoc = {
     campaigns: stripForUpload(campaigns),
     queue,
@@ -181,7 +190,7 @@ async function push(campaigns: Campaign[], queue: QueueState, rev: number, selfI
   } catch (e) {
     console.warn('[CRM] queue sync: Drive write failed — will retry:', e);
     await markQueueDirty();
-    return;
+    return { ok: false, error: String(e) };
   }
   await localSet(QUEUE_DIRTY_KEY, false);
   await localSet(REV_SEEN_KEY, rev);
@@ -190,6 +199,7 @@ async function push(campaigns: Campaign[], queue: QueueState, rev: number, selfI
   // heartbeat so it costs no extra Drive round trip.
   try { await heartbeat((p) => { p.campaignsRev = Math.max(p.campaignsRev || 0, rev); }); }
   catch { /* the next heartbeat republishes it */ }
+  return { ok: true };
 }
 
 function normalizeDoc(d: Partial<CampaignDoc> | null): CampaignDoc {
@@ -206,6 +216,21 @@ function normalizeDoc(d: Partial<CampaignDoc> | null): CampaignDoc {
 
 function same(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * Reconcile, and report whether Drive is now known to hold this machine's
+ * current queue state.
+ *
+ * This is the check the send path makes before messaging anybody: `ran` is only
+ * true when the pass either pushed successfully or found Drive already up to
+ * date, so a true answer means the other machines can see what we are about to
+ * do. See the pre-send announce in background.ts.
+ */
+export async function announceQueueNow(): Promise<{ ok: boolean; error?: string }> {
+  const res = await syncQueueNow();
+  if (res.ran && !res.error) return { ok: true };
+  return { ok: false, error: res.error || 'The queue could not be published to Drive.' };
 }
 
 /**

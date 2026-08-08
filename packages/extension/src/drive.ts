@@ -13,11 +13,12 @@
 // chrome.storage.local + IndexedDB cache as the offline write buffer.
 //
 // AUTH: chrome.identity.launchWebAuthFlow (cross-browser — works in Edge AND
-// Chrome, unlike the Chrome-only getAuthToken). OAuth 2.0 implicit flow; needs a
-// "Web application" OAuth client whose Authorized redirect URIs include
-// getAuthRedirectUri(), plus the Drive API enabled.
+// Chrome, unlike the Chrome-only getAuthToken), running OAuth 2.0 authorization
+// code + PKCE. See the long note above the auth section for why that replaced
+// the implicit flow, and for the fallback that keeps older OAuth clients working.
 
 import type { Store } from './storage';
+import { DriveError, recordSyncOk, recordSyncFailure } from './syncHealth';
 
 // Files we keep in the app-data folder.
 //
@@ -71,34 +72,97 @@ export function isDriveConfigured(): boolean {
 
 function identityAvailable(): boolean {
   try {
-    // launchWebAuthFlow (NOT getAuthToken) — the former is the cross-browser
-    // OAuth flow supported by both Chrome and Edge. getAuthToken is a
-    // Chrome-only API that Edge explicitly disables.
-    return typeof chrome !== 'undefined' && !!chrome.identity && !!chrome.identity.launchWebAuthFlow;
+    if (typeof chrome === 'undefined' || !chrome.identity) return false;
+    // Either path is enough. getAuthToken is the good one but is Chrome-only;
+    // launchWebAuthFlow is the cross-browser fallback that Edge does support.
+    return !!chrome.identity.getAuthToken || !!chrome.identity.launchWebAuthFlow;
   } catch {
     return false;
   }
 }
 
-// ---- OAuth token (cross-browser: chrome.identity.launchWebAuthFlow) ----
+// ---- OAuth: two paths, because no single one covers both browsers ----
 //
-// We run the OAuth 2.0 *implicit* flow: open Google's consent page in a popup,
-// let it redirect to https://<extension-id>.chromiumapp.org/#access_token=…, and
-// read the token out of the fragment. This works in Edge and Chrome alike and
-// needs no backend/client-secret. Access tokens last ~1h; there is no refresh
-// token in the implicit flow, so we silently re-run the flow (prompt=none) when
-// the cached token nears expiry — which succeeds without UI while the user's
-// Google session is alive and consent still stands.
+// THE PROBLEM. Access tokens last about an hour. Renewing one without bothering
+// the user needs either a refresh token or somebody else holding the credential.
+// Getting a refresh token from inside an extension turns out to be impossible
+// with Google's client types, and this was established by trying it:
 //
-// IMPORTANT: this requires a "Web application" OAuth client whose Authorized
-// redirect URIs include the value getAuthRedirectUri() returns (shown in the
-// dashboard) — NOT a "Chrome Extension"/"Chrome App" client.
+//   * application type "Chrome Extension" has NO registered redirect URIs — it
+//     exists to serve chrome.identity.getAuthToken(), where Chrome brokers the
+//     token internally and no redirect_uri is ever sent. Handing it the explicit
+//     https://<id>.chromiumapp.org/ that launchWebAuthFlow requires produces
+//     Error 400: redirect_uri_mismatch no matter how correct the Item ID is.
+//   * application type "Web application" is the only one that accepts that
+//     redirect URI — and Google demands a client_secret from it at the token
+//     endpoint. A secret shipped inside an extension is not a secret, so the
+//     authorization-code flow is closed off too.
+//
+// Left alone, that forces the implicit flow and an hourly silent re-consent that
+// depends on a live Google SSO cookie — the thing that kept "disconnecting" every
+// couple of hours.
+//
+// THE WAY OUT, on Chrome: don't hold the credential at all. chrome.identity
+// .getAuthToken() has the BROWSER own the grant and the renewal. There is no
+// refresh token in our code, no popup, no redirect URI, and no dependence on a
+// session cookie in a tab — Chrome mints a fresh token whenever we ask, whether
+// or not a window is open. That is precisely the property a campaign running
+// unattended overnight needs. It reads oauth2.client_id from the manifest, which
+// is therefore the "Chrome Extension" type client.
+//
+// EDGE, and Chrome profiles that aren't signed in, still need the old path. So
+// launchWebAuthFlow's implicit flow remains as the fallback, using the "Web
+// application" client id below — hardened since, with login_hint, a timeout and
+// proactive renewal, which fixes the ways it used to fail even though it can't
+// stop being hourly. Which path a machine ended up on is visible in Settings.
 
 const AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
-const SCOPES = 'https://www.googleapis.com/auth/drive.appdata';
+const REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke';
+const USERINFO_ENDPOINT = 'https://www.googleapis.com/oauth2/v3/userinfo';
+
+/**
+ * The "Web application" OAuth client, used ONLY by the launchWebAuthFlow
+ * fallback. It cannot live in the manifest because oauth2.client_id is read by
+ * chrome.identity.getAuthToken, which needs the "Chrome Extension" client
+ * instead — the two paths genuinely require two different clients from the same
+ * Cloud project. This one must list https://<extension-id>.chromiumapp.org/
+ * (trailing slash included) under its Authorized redirect URIs.
+ */
+const WEB_APP_CLIENT_ID = '280559630109-495ir27lgbd07qeu8vcki1n914ocfbf6.apps.googleusercontent.com';
+
+// `openid email` is not vanity: knowing which account is connected is what lets
+// us pass login_hint, and login_hint is what stops a silent renewal failing on a
+// browser with several Google accounts signed in.
+const SCOPES = 'https://www.googleapis.com/auth/drive.appdata openid email';
+
 const TOKEN_CACHE_KEY = 'crm_drive_token';
+const ACCOUNT_EMAIL_KEY = 'crm_drive_account_email';
+const AUTH_MODE_KEY = 'crm_drive_auth_mode';
+
 // Refresh a little early so a token doesn't expire mid-request.
 const TOKEN_SKEW_MS = 90_000;
+/** How far ahead of expiry the watchdog renews. See ensureFreshToken. */
+const PROACTIVE_REFRESH_MS = 5 * 60_000;
+/**
+ * launchWebAuthFlow's callback is not guaranteed to fire — a service worker torn
+ * down mid-flow, or no window available to host the auth page, and it simply
+ * never comes back. Without this bound the promise never settles, and because
+ * queueSync and devices both serialize their Drive work behind a single promise
+ * chain, one such call wedges ALL sync and heartbeats for the life of the
+ * worker. That is a permanent-looking outage caused by a missing timeout.
+ */
+const AUTH_FLOW_TIMEOUT_MS = 30_000;
+const TOKEN_REQUEST_TIMEOUT_MS = 20_000;
+
+/**
+ * How this machine gets its tokens.
+ *
+ * 'browser'  — chrome.identity.getAuthToken. Chrome owns the grant and renews
+ *              silently forever. What we want everywhere we can have it.
+ * 'implicit' — launchWebAuthFlow, re-consented hourly against a live Google
+ *              session. Edge, and Chrome profiles that aren't signed in.
+ */
+type AuthMode = 'browser' | 'implicit';
 
 interface CachedToken { token: string; expiresAt: number; }
 
@@ -132,113 +196,422 @@ function cacheGet(): Promise<CachedToken | null> {
   });
 }
 
-function cacheSet(t: CachedToken | null): Promise<void> {
+function localPut(key: string, value: unknown): Promise<void> {
   return new Promise((resolve) => {
     try {
-      if (t) chrome.storage.local.set({ [TOKEN_CACHE_KEY]: t }, () => { void chrome.runtime.lastError; resolve(); });
-      else chrome.storage.local.remove(TOKEN_CACHE_KEY, () => { void chrome.runtime.lastError; resolve(); });
+      if (value === null || value === undefined) {
+        chrome.storage.local.remove(key, () => { void chrome.runtime.lastError; resolve(); });
+      } else {
+        chrome.storage.local.set({ [key]: value }, () => { void chrome.runtime.lastError; resolve(); });
+      }
     } catch { resolve(); }
   });
 }
 
-function buildAuthUrl(silent: boolean): string {
-  const params = new URLSearchParams({
-    client_id: manifestClientId(),
-    response_type: 'token',
-    redirect_uri: getAuthRedirectUri(),
-    scope: SCOPES,
-    // Silent refreshes must not surface UI; interactive lets Google decide
-    // whether to show the account chooser / consent.
-    ...(silent ? { prompt: 'none' } : {}),
-  });
-  return `${AUTH_ENDPOINT}?${params.toString()}`;
-}
-
-function parseRedirect(redirect: string): { token: string; expiresIn: number } | null {
-  // The token comes back in the URL fragment; errors may be in either fragment
-  // or query.
-  const frag = redirect.split('#')[1] || '';
-  const query = redirect.split('?')[1]?.split('#')[0] || '';
-  const fp = new URLSearchParams(frag);
-  const qp = new URLSearchParams(query);
-  const err = fp.get('error') || qp.get('error');
-  if (err) { lastAuthError = `Google returned "${err}".`; return null; }
-  const token = fp.get('access_token');
-  if (!token) return null;
-  return { token, expiresIn: Number(fp.get('expires_in') || '3600') };
-}
-
-function launchFlow(silent: boolean): Promise<{ token: string; expiresIn: number } | null> {
+function localTake<T>(key: string): Promise<T | null> {
   return new Promise((resolve) => {
     try {
-      chrome.identity.launchWebAuthFlow({ url: buildAuthUrl(silent), interactive: !silent }, (redirect) => {
+      chrome.storage.local.get(key, (res) => {
+        if (chrome.runtime.lastError) { resolve(null); return; }
+        resolve((res?.[key] as T) ?? null);
+      });
+    } catch { resolve(null); }
+  });
+}
+
+function cacheSet(t: CachedToken | null): Promise<void> {
+  return localPut(TOKEN_CACHE_KEY, t);
+}
+
+const accountEmailGet = () => localTake<string>(ACCOUNT_EMAIL_KEY);
+const accountEmailSet = (e: string | null) => localPut(ACCOUNT_EMAIL_KEY, e);
+
+/**
+ * Which path last worked, remembered WITH the client id it was learned for.
+ *
+ * Tying the two together matters: swapping the OAuth client in the manifest is
+ * exactly how you change which path is possible, so a verdict recorded against
+ * the old client must not outlive it. A bare stored mode made the fallback a
+ * one-way door — the new client would be ignored and the extension would keep
+ * re-authorising hourly against a client that no longer needed to.
+ */
+interface AuthModeRecord { mode: AuthMode; clientId: string; }
+
+async function authModeGet(): Promise<AuthMode> {
+  const rec = await localTake<AuthModeRecord>(AUTH_MODE_KEY);
+  // A record from a different client id — or from an older build that stored a
+  // bare string — tells us nothing about the client we're using now.
+  if (rec && rec.clientId === manifestClientId() && (rec.mode === 'browser' || rec.mode === 'implicit')) {
+    return rec.mode;
+  }
+  return browserBrokerAvailable() ? 'browser' : 'implicit';
+}
+
+const authModeSet = (mode: AuthMode) =>
+  localPut(AUTH_MODE_KEY, { mode, clientId: manifestClientId() } satisfies AuthModeRecord);
+
+/** Forget what we learned, so the next attempt re-probes from scratch. */
+const authModeReset = () => localPut(AUTH_MODE_KEY, null);
+
+// ---- path 1: let the browser broker it (chrome.identity.getAuthToken) ----
+
+/**
+ * Can this browser hand us a Google token itself?
+ *
+ * Edge ships the getAuthToken API surface but wires it to Microsoft identities,
+ * not Google, so it is present and useless there. Sniffing the user agent is
+ * crude, but it is far more deterministic than trying to classify the error
+ * strings Edge returns — and getting that classification wrong would mean
+ * permanently recording the wrong path for a machine.
+ */
+function browserBrokerAvailable(): boolean {
+  try {
+    if (typeof chrome === 'undefined' || !chrome.identity?.getAuthToken) return false;
+    const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+    if (/Edg\//i.test(ua) || /OPR\//i.test(ua)) return false;
+    return true;
+  } catch { return false; }
+}
+
+/**
+ * Ask Chrome for a token. Chrome keeps its own cache and renews behind our back,
+ * so this is cheap to call and always returns something currently valid.
+ */
+function browserGetToken(interactive: boolean): Promise<string | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: string | null, why?: string) => {
+      if (settled) return;
+      settled = true;
+      if (!value && why && interactive) lastAuthError = why;
+      resolve(value);
+    };
+    const timer = setTimeout(
+      () => finish(null, 'Chrome did not answer the token request in time.'),
+      AUTH_FLOW_TIMEOUT_MS,
+    );
+
+    try {
+      chrome.identity.getAuthToken({ interactive }, (result) => {
+        clearTimeout(timer);
         const e = chrome.runtime.lastError;
-        if (e || !redirect) {
-          // A failed silent attempt is expected (no error to surface); only keep
-          // the message for interactive failures.
-          if (!silent) lastAuthError = e?.message || 'No redirect returned.';
-          resolve(null);
-          return;
-        }
-        const parsed = parseRedirect(redirect);
-        if (parsed) lastAuthError = '';
-        resolve(parsed);
+        // Older signatures resolve a bare string; newer ones an object.
+        const token = typeof result === 'string'
+          ? result
+          : (result as { token?: string } | undefined)?.token;
+        if (e || !token) { finish(null, e?.message || 'Chrome returned no token.'); return; }
+        lastAuthError = '';
+        finish(token);
       });
     } catch (err) {
-      if (!silent) lastAuthError = String(err);
-      resolve(null);
+      clearTimeout(timer);
+      finish(null, String(err));
     }
   });
 }
 
+/** Drop a token Chrome still believes in, so the next ask mints a new one. */
+function browserForgetToken(token: string): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      chrome.identity.removeCachedAuthToken({ token }, () => { void chrome.runtime.lastError; resolve(); });
+    } catch { resolve(); }
+  });
+}
+
+// ---- path 2: the auth-window flow (Edge, and Chrome profiles not signed in) ----
+
 /**
- * Return a valid access token, or null. Uses the cache, then a silent flow,
- * then (only if interactive) an interactive flow. Caches whatever it obtains.
+ * Run launchWebAuthFlow and return the redirect URL, or null. Bounded by
+ * AUTH_FLOW_TIMEOUT_MS — see the constant for why that bound is load-bearing.
  */
-async function getAuthToken(interactive: boolean): Promise<string | null> {
+function launchFlow(url: string, interactive: boolean): Promise<string | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: string | null, why?: string) => {
+      if (settled) return;
+      settled = true;
+      if (!value && interactive && why) lastAuthError = why;
+      resolve(value);
+    };
+
+    const timer = setTimeout(
+      () => finish(null, `Google sign-in did not respond within ${AUTH_FLOW_TIMEOUT_MS / 1000}s.`),
+      AUTH_FLOW_TIMEOUT_MS,
+    );
+
+    try {
+      chrome.identity.launchWebAuthFlow({ url, interactive }, (redirect) => {
+        clearTimeout(timer);
+        const e = chrome.runtime.lastError;
+        // A failed SILENT attempt is routine (that is what prompt=none means),
+        // so it isn't worth surfacing; an interactive one is a real failure.
+        if (e || !redirect) { finish(null, e?.message || 'No redirect returned.'); return; }
+        finish(redirect);
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      finish(null, String(err));
+    }
+  });
+}
+
+function queryOf(redirect: string): URLSearchParams {
+  return new URLSearchParams(redirect.split('?')[1]?.split('#')[0] || '');
+}
+
+function fetchWithTimeout(url: string, init: RequestInit, ms: number): Promise<Response> {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  return fetch(url, { ...init, signal: ctl.signal }).finally(() => clearTimeout(timer));
+}
+
+async function runImplicitFlow(interactive: boolean): Promise<CachedToken | null> {
+  const params = new URLSearchParams({
+    client_id: WEB_APP_CLIENT_ID,
+    response_type: 'token',
+    redirect_uri: getAuthRedirectUri(),
+    scope: SCOPES,
+  });
+  if (interactive) {
+    params.set('prompt', 'select_account');
+  } else {
+    params.set('prompt', 'none');
+    // The single most valuable line in this function: without it, prompt=none
+    // fails with account_selection_required on any browser signed into more
+    // than one Google account.
+    const hint = await accountEmailGet();
+    if (hint) params.set('login_hint', hint);
+  }
+
+  const redirect = await launchFlow(`${AUTH_ENDPOINT}?${params.toString()}`, interactive);
+  if (!redirect) return null;
+
+  const frag = new URLSearchParams(redirect.split('#')[1] || '');
+  const err = frag.get('error') || queryOf(redirect).get('error');
+  if (err) {
+    if (interactive) lastAuthError = `Google returned "${err}".`;
+    return null;
+  }
+  const token = frag.get('access_token');
+  if (!token) return null;
+
+  const set: CachedToken = { token, expiresAt: Date.now() + Number(frag.get('expires_in') || '3600') * 1000 };
+  await cacheSet(set);
+  lastAuthError = '';
+  // No id_token in this flow, so learn the account the long way — once, so the
+  // next silent renewal has a login_hint to offer.
+  if (!(await accountEmailGet())) void learnAccountEmail(token);
+  return set;
+}
+
+async function learnAccountEmail(token: string): Promise<void> {
+  try {
+    const res = await fetchWithTimeout(
+      USERINFO_ENDPOINT,
+      { headers: { Authorization: `Bearer ${token}` } },
+      TOKEN_REQUEST_TIMEOUT_MS,
+    );
+    if (!res.ok) return;
+    const json = (await res.json()) as { email?: string };
+    if (json.email) await accountEmailSet(json.email);
+  } catch { /* best effort — login_hint is an optimisation, not a requirement */ }
+}
+
+// ---- the token everything else asks for ----
+
+// Concurrent callers must not each start their own auth flow: the watchdog, a
+// queue sync and a dashboard repaint can all want a token in the same tick, and
+// three simultaneous popups (or three refresh-token redemptions, which Google
+// rate-limits) is not what any of them wanted.
+let tokenInFlight: Promise<string | null> | null = null;
+
+async function obtainToken(interactive: boolean): Promise<string | null> {
   if (!identityAvailable()) {
-    lastAuthError = 'chrome.identity.launchWebAuthFlow is unavailable in this context.';
+    lastAuthError = 'chrome.identity is unavailable in this context.';
     return null;
   }
 
-  const cached = await cacheGet();
-  if (cached && cached.expiresAt > Date.now() + TOKEN_SKEW_MS) return cached.token;
+  // 1. Let Chrome broker it. This is the path that makes renewal a non-event:
+  //    Chrome already holds the grant, so a silent ask succeeds indefinitely
+  //    with no window, no cookie and no prompt.
+  if (browserBrokerAvailable()) {
+    const silent = await browserGetToken(false);
+    if (silent) { await authModeSet('browser'); return silent; }
+    if (interactive) {
+      const prompted = await browserGetToken(true);
+      if (prompted) { await authModeSet('browser'); return prompted; }
+    }
+    // Chrome couldn't broker it — overwhelmingly because the profile isn't
+    // signed into Chrome itself. Rather than leave Drive dead on an otherwise
+    // capable browser, fall through to the flow that only needs a Google
+    // session in a tab. Deliberately NOT recorded as a permanent verdict: the
+    // user may sign into Chrome tomorrow and should be promoted back.
+  }
 
-  let result = await launchFlow(true);           // silent
-  if (!result && interactive) result = await launchFlow(false); // interactive
-  if (!result) return null;
-
-  await cacheSet({ token: result.token, expiresAt: Date.now() + result.expiresIn * 1000 });
-  return result.token;
-}
-
-/** Forget the cached token (used on 401 and on disconnect). */
-function clearToken(): Promise<void> {
-  return cacheSet(null);
+  // 2. The auth-window flow. Edge always lands here.
+  const silent = await runImplicitFlow(false);
+  if (silent) { await authModeSet('implicit'); return silent.token; }
+  if (interactive) {
+    const prompted = await runImplicitFlow(true);
+    if (prompted) { await authModeSet('implicit'); return prompted.token; }
+  }
+  return null;
 }
 
 /**
- * Fetch against a Drive endpoint with the current token, transparently
- * refreshing once on a 401 (the cached token can expire server-side even while
- * Chrome still considers it valid).
+ * Return a valid access token, or null.
+ *
+ * In 'browser' mode we deliberately do NOT consult our own cache: Chrome keeps
+ * one, renews behind our back, and can invalidate a token we still believe in.
+ * Reading through to Chrome every time is a cheap in-process call and is the
+ * only way to be sure the token is current.
  */
-async function driveFetch(url: string, init: RequestInit, interactive: boolean): Promise<Response> {
-  let token = await getAuthToken(interactive);
-  if (!token) throw new Error('Not signed in to Google (no auth token).');
-
-  const withAuth = (t: string): RequestInit => ({
-    ...init,
-    headers: { ...(init.headers || {}), Authorization: `Bearer ${t}` },
-  });
-
-  let res = await fetch(url, withAuth(token));
-  if (res.status === 401) {
-    await clearToken();
-    token = await getAuthToken(interactive);
-    if (!token) throw new Error('Google session expired and could not be refreshed.');
-    res = await fetch(url, withAuth(token));
+async function getAuthToken(interactive: boolean): Promise<string | null> {
+  if ((await authModeGet()) !== 'browser') {
+    const cached = await cacheGet();
+    if (cached && cached.expiresAt > Date.now() + TOKEN_SKEW_MS) return cached.token;
   }
-  return res;
+
+  if (tokenInFlight) {
+    const shared = await tokenInFlight;
+    // A silent attempt that failed shouldn't stop an interactive caller from
+    // escalating to a real prompt — it should just not have to wait twice.
+    if (shared || !interactive) return shared;
+  }
+
+  const run = obtainToken(interactive);
+  tokenInFlight = run;
+  try { return await run; }
+  finally { if (tokenInFlight === run) tokenInFlight = null; }
+}
+
+/**
+ * Renew BEFORE something needs it. Called from the one-minute watchdog, so
+ * renewal happens on a schedule in a healthy worker rather than inside a send
+ * path where a failure has consequences.
+ *
+ * A no-op in 'browser' mode beyond a liveness check — Chrome does the renewing,
+ * and there is no expiry for us to race.
+ */
+export async function ensureFreshToken(): Promise<boolean> {
+  if (!isDriveConfigured() || !identityAvailable()) return false;
+  if ((await authModeGet()) === 'browser') return !!(await browserGetToken(false));
+  const cached = await cacheGet();
+  if (cached && cached.expiresAt > Date.now() + PROACTIVE_REFRESH_MS) return true;
+  return !!(await getAuthToken(false));
+}
+
+/**
+ * Invalidate the token a request just had rejected, so the next ask mints a new
+ * one. Which cache to poke depends on who is holding it.
+ */
+async function invalidateToken(token: string): Promise<void> {
+  if ((await authModeGet()) === 'browser') { await browserForgetToken(token); return; }
+  await cacheSet(null);
+}
+
+// ---- Drive requests ----
+
+const MAX_TRANSIENT_RETRIES = 3;
+
+function backoffMs(attempt: number): number {
+  // 0.5s, 1s, 2s, plus jitter so several machines that hit the same rate limit
+  // don't march back in lockstep.
+  return 500 * 2 ** attempt + Math.floor(Math.random() * 250);
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Dig Google's machine-readable reason out of an error body. */
+async function failureReason(res: Response): Promise<string> {
+  const text = await safeText(res);
+  try {
+    const json = JSON.parse(text) as { error?: { errors?: { reason?: string }[]; status?: string; message?: string } };
+    return json.error?.errors?.[0]?.reason || json.error?.status || json.error?.message || text;
+  } catch { return text; }
+}
+
+interface DriveFetchOptions {
+  /**
+   * Safe to send again if the answer never arrived. True for everything except
+   * the multipart CREATE, where a blind retry could leave two files with the
+   * same name in the app-data folder and split the store in half.
+   */
+  idempotent?: boolean;
+}
+
+/**
+ * Fetch against a Drive endpoint with the current token.
+ *
+ * Everything that talks to Drive goes through here, which makes it the one
+ * place that can honestly answer "is the sync working?" — so it is also where
+ * success and failure are recorded for the send gate (see syncHealth.ts).
+ *
+ * Failures that mean "the round trip did not happen" (no token, network error,
+ * throttling, 5xx) are thrown as DriveError after retries are exhausted.
+ * Ordinary HTTP answers — including a 404 for a file that doesn't exist yet —
+ * are returned to the caller, because they prove the connection works.
+ */
+async function driveFetch(
+  url: string,
+  init: RequestInit,
+  interactive: boolean,
+  opts: DriveFetchOptions = {},
+): Promise<Response> {
+  const idempotent = opts.idempotent !== false;
+  let authRetried = false;
+  let transient = 0;
+
+  for (;;) {
+    const token = await getAuthToken(interactive);
+    if (!token) {
+      const err = new DriveError(
+        lastAuthError || 'Not signed in to Google (no auth token).', 401, 'no_token',
+      );
+      await recordSyncFailure(err);
+      throw err;
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        ...init,
+        headers: { ...(init.headers || {}), Authorization: `Bearer ${token}` },
+      });
+    } catch (e) {
+      const err = new DriveError(`Drive unreachable: ${String(e)}`, 0, 'network');
+      if (idempotent && transient < MAX_TRANSIENT_RETRIES) { await sleep(backoffMs(transient++)); continue; }
+      await recordSyncFailure(err);
+      throw err;
+    }
+
+    if (res.status === 401) {
+      // The cached token can be rejected server-side even while whoever holds it
+      // still thinks it's valid. Drop it and let the loop mint another.
+      if (!authRetried) { authRetried = true; await invalidateToken(token); continue; }
+      const err = new DriveError('Google rejected the access token.', 401, 'unauthorized');
+      await recordSyncFailure(err);
+      throw err;
+    }
+
+    if (res.status === 403 || res.status === 429 || res.status >= 500) {
+      const reason = await failureReason(res);
+      // A bare 403 from Drive here is almost always throttling; the exception is
+      // a genuine permission problem, which retrying will not fix.
+      const retryable = res.status !== 403 || /rateLimit|userRateLimit|quota|backendError/i.test(reason);
+      const err = new DriveError(`Drive request failed (${res.status}): ${reason}`, res.status, reason);
+      if (retryable && idempotent && transient < MAX_TRANSIENT_RETRIES) {
+        await sleep(backoffMs(transient++));
+        continue;
+      }
+      await recordSyncFailure(err);
+      throw err;
+    }
+
+    await recordSyncOk();
+    return res;
+  }
 }
 
 // ---- file discovery ----
@@ -341,6 +714,10 @@ export async function writeJsonDoc(name: string, data: unknown, interactive = fa
       `${DRIVE_UPLOAD}/files?uploadType=multipart&fields=id,modifiedTime,size`,
       { method: 'POST', headers: { 'Content-Type': `multipart/related; boundary=${boundary}` }, body: multipart },
       interactive,
+      // A create that times out may still have landed. Retrying blind would put
+      // a second file of the same name in the folder, and findFile takes the
+      // first — so half the machines would end up on a different document.
+      { idempotent: false },
     );
   }
 
@@ -382,18 +759,95 @@ export function writeStore(store: Store, interactive = false): Promise<DriveFile
 /**
  * Trigger the interactive Google consent flow. Resolves true once we hold a
  * token (i.e. the user granted access), false if they dismissed it.
+ *
+ * Also the "Reconnect" action: after a revoked or expired grant this is the one
+ * path that can get a NEW refresh token, because only a consent issues one.
  */
 export async function connectDrive(): Promise<{ ok: boolean; error?: string }> {
+  // Start clean. A stale token would short-circuit getAuthToken and hand back
+  // the very credential the user is trying to replace.
+  const existing = await cacheGet();
+  if (existing) await cacheSet(null);
+  // Re-probe from scratch. Connecting again is usually a response to something
+  // having changed — the OAuth client, or signing into Chrome — and a verdict
+  // recorded before that change is exactly what must not be carried forward.
+  await authModeReset();
+
   const token = await getAuthToken(true);
-  return token ? { ok: true } : { ok: false, error: getLastAuthError() || 'Sign-in was cancelled or denied.' };
+  if (!token) return { ok: false, error: getLastAuthError() || 'Sign-in was cancelled or denied.' };
+
+  // Learn the account once, so the fallback flow has a login_hint if it is ever
+  // needed on this machine.
+  if (!(await accountEmailGet())) await learnAccountEmail(token);
+
+  if ((await authModeGet()) !== 'browser' && browserBrokerAvailable()) {
+    console.warn('[CRM] Chrome could not broker the Drive token (is this profile signed into Chrome?) — using the hourly fallback flow.');
+  }
+  return { ok: true };
 }
 
 /**
- * Drop the cached token so the extension no longer talks to Drive until the
- * user reconnects. Does NOT delete the Drive file (the user's data stays put).
+ * Drop this machine's credentials so the extension no longer talks to Drive
+ * until the user reconnects. Does NOT delete the Drive file (the user's data
+ * stays put), and best-effort revokes the grant with Google so a disconnect
+ * actually means something.
  */
 export async function disconnectDrive(): Promise<void> {
-  await clearToken();
+  // Grab whatever token is live before tearing down, so we can revoke it.
+  let live: string | null = null;
+  try { live = await getAuthToken(false); } catch { /* nothing to revoke */ }
+
+  if ((await authModeGet()) === 'browser') {
+    if (live) await browserForgetToken(live);
+    // Chrome caches per scope set; clear the lot so a reconnect really re-asks.
+    await new Promise<void>((resolve) => {
+      try { chrome.identity.clearAllCachedAuthTokens(() => { void chrome.runtime.lastError; resolve(); }); }
+      catch { resolve(); }
+    });
+  }
+
+  await cacheSet(null);
+  await accountEmailSet(null);
+  await authModeReset();
+
+  if (live) {
+    try {
+      await fetchWithTimeout(
+        REVOKE_ENDPOINT,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ token: live }).toString(),
+        },
+        TOKEN_REQUEST_TIMEOUT_MS,
+      );
+    } catch { /* best effort — the local credentials are gone either way */ }
+  }
+}
+
+/** How this machine is authenticating, for the settings UI and diagnostics. */
+export interface DriveAuthState {
+  mode: AuthMode;
+  /**
+   * True when renewal needs nothing from the user, ever. False means the token
+   * is re-consented roughly hourly against a live Google session.
+   */
+  silentRenewal: boolean;
+  /** True when this browser could broker tokens, whether or not it currently is. */
+  brokerCapable: boolean;
+  email: string;
+  lastError: string;
+}
+
+export async function getDriveAuthState(): Promise<DriveAuthState> {
+  const [mode, email] = await Promise.all([authModeGet(), accountEmailGet()]);
+  return {
+    mode,
+    silentRenewal: mode === 'browser',
+    brokerCapable: browserBrokerAvailable(),
+    email: email || '',
+    lastError: lastAuthError,
+  };
 }
 
 /** Snapshot of the current Drive integration state, for the settings UI. */
@@ -402,14 +856,15 @@ export async function getDriveStatus(): Promise<DriveStatus> {
   if (!configured || !identityAvailable()) {
     return { configured, connected: false, file: null };
   }
+  const email = (await accountEmailGet()) || undefined;
   // Non-interactive: only "connected" if we can get a token silently.
   const token = await getAuthToken(false);
-  if (!token) return { configured, connected: false, file: null };
+  if (!token) return { configured, connected: false, file: null, email };
   try {
     const file = await findStoreFile(false);
-    return { configured, connected: true, file };
+    return { configured, connected: true, file, email };
   } catch {
-    return { configured, connected: true, file: null };
+    return { configured, connected: true, file: null, email };
   }
 }
 
