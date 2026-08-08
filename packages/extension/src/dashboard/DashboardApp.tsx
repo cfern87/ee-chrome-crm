@@ -774,7 +774,7 @@ export default function DashboardApp() {
   // --- Custom fields ---
   const fieldDefs = Object.values(store.fieldDefs).sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
 
-  const addField = async (name: string, type: CustomFieldType, options: string[]) => {
+  const addField = async (name: string, type: CustomFieldType, options: string[], showInPanel: boolean) => {
     const trimmed = name.trim();
     if (!trimmed) return;
     const id = `fld_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
@@ -784,9 +784,22 @@ export default function DashboardApp() {
       type,
       ...(type === 'select' ? { options } : {}),
       order: fieldDefs.length,
+      ...(showInPanel ? { showInPanel: true } : {}),
       createdAt: Date.now(),
     };
     await updateStore({ ...store, fieldDefs: { ...store.fieldDefs, [id]: def } });
+  };
+
+  // Show/hide a field in the in-page CRM panel. Note this leaves createdAt
+  // alone: fieldDefs merge last-write-wins on createdAt with local edits
+  // winning ties, so the toggle still propagates to other machines.
+  const setFieldInPanel = async (fieldId: string, showInPanel: boolean) => {
+    const def = store.fieldDefs[fieldId];
+    if (!def) return;
+    const next = { ...def };
+    if (showInPanel) next.showInPanel = true;
+    else delete next.showInPanel;
+    await updateStore({ ...store, fieldDefs: { ...store.fieldDefs, [fieldId]: next } });
   };
 
   const deleteField = async (fieldId: string) => {
@@ -1423,6 +1436,7 @@ export default function DashboardApp() {
             conversations={conversations}
             onAddField={addField}
             onDeleteField={deleteField}
+            onSetFieldInPanel={setFieldInPanel}
           />
         )}
 
@@ -2011,23 +2025,26 @@ function TagsPanel(props: TagsPanelProps) {
 interface FieldsPanelProps {
   fieldDefs: CustomFieldDef[];
   conversations: Conversation[];
-  onAddField: (name: string, type: CustomFieldType, options: string[]) => void;
+  onAddField: (name: string, type: CustomFieldType, options: string[], showInPanel: boolean) => void;
   onDeleteField: (id: string) => void;
+  onSetFieldInPanel: (id: string, showInPanel: boolean) => void;
 }
 
-function FieldsPanel({ fieldDefs, conversations, onAddField, onDeleteField }: FieldsPanelProps) {
+function FieldsPanel({ fieldDefs, conversations, onAddField, onDeleteField, onSetFieldInPanel }: FieldsPanelProps) {
   const [name, setName] = useState('');
   const [type, setType] = useState<CustomFieldType>('text');
   const [optionsText, setOptionsText] = useState('');
+  const [showInPanel, setShowInPanel] = useState(false);
 
   const submit = () => {
     if (!name.trim()) return;
     const options = optionsText.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
     if (type === 'select' && options.length === 0) return;
-    onAddField(name, type, options);
+    onAddField(name, type, options, showInPanel);
     setName('');
     setOptionsText('');
     setType('text');
+    setShowInPanel(false);
   };
 
   const filledCount = (fieldId: string) => conversations.filter((c) => (c.customFields?.[fieldId] ?? '') !== '').length;
@@ -2079,6 +2096,15 @@ function FieldsPanel({ fieldDefs, conversations, onAddField, onDeleteField }: Fi
             />
           </div>
         )}
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, fontSize: 12, color: '#666', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={showInPanel}
+            onChange={(e) => setShowInPanel(e.target.checked)}
+            style={{ cursor: 'pointer' }}
+          />
+          Show in the CRM panel on Messenger — editable above the tags
+        </label>
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -2095,12 +2121,27 @@ function FieldsPanel({ fieldDefs, conversations, onAddField, onDeleteField }: Fi
                 <div style={{ fontWeight: 600, fontSize: 14 }}>
                   {def.name}
                   <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 600, color: '#065fd4', background: '#eaf2fd', padding: '2px 8px', borderRadius: 8 }}>{typeLabel[def.type]}</span>
+                  {def.showInPanel && (
+                    <span style={{ marginLeft: 6, fontSize: 11, fontWeight: 600, color: '#0a7c42', background: '#e6f5ec', padding: '2px 8px', borderRadius: 8 }}>In panel</span>
+                  )}
                 </div>
                 <div style={{ fontSize: 12, color: '#aaa', marginTop: 2 }}>
                   {def.type === 'select' && def.options?.length ? `${def.options.join(', ')} · ` : ''}
                   set on {filled} contact{filled !== 1 ? 's' : ''}
                 </div>
               </div>
+              <label
+                title="Show this field in the CRM panel on Messenger, above the tags"
+                style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#666', cursor: 'pointer', flexShrink: 0 }}
+              >
+                <input
+                  type="checkbox"
+                  checked={!!def.showInPanel}
+                  onChange={(e) => onSetFieldInPanel(def.id, e.target.checked)}
+                  style={{ cursor: 'pointer' }}
+                />
+                In panel
+              </label>
               <button
                 onClick={() => onDeleteField(def.id)}
                 title="Delete this field and clear its values from all contacts"

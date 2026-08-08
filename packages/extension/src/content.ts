@@ -16,7 +16,7 @@ import {
   isStoreChangeKey,
   loadStore as _loadStore,
 } from './storage';
-import type { Store, Tag, Conversation } from './storage';
+import type { Store, Tag, Conversation, CustomFieldDef } from './storage';
 import type { Mutation } from './mutations';
 import { PLATFORM_URL } from './license';
 
@@ -814,6 +814,14 @@ let editingName: string | null = null;
 const newTagDraft: { name: string; color: string } = { name: '', color: randomColor() };
 let newTagNameFocused = false;
 
+// In-progress custom-field edits, keyed by field id, for the same reason as
+// newTagDraft: any storage change rebuilds the panel, and without this a
+// half-typed value would be replaced by the stored one mid-keystroke. An entry
+// is dropped once its value is committed, and the whole map is cleared when the
+// panel moves to another contact — a draft must never leak onto someone else.
+const fieldDrafts = new Map<string, string>();
+let focusedFieldId: string | null = null;
+
 // Threads the user has explicitly removed from the CRM on this page. Without
 // it, auto-capture would re-create the contact on the very next panel render —
 // you'd delete someone and watch them walk straight back in. Cleared whenever
@@ -903,8 +911,13 @@ async function renderPanel() {
     }
   }
   // Moving to a different contact always disarms a pending delete — an armed
-  // confirmation must never carry over onto someone else.
-  if (threadId !== lastRenderedThread) deleteArmed = false;
+  // confirmation must never carry over onto someone else. Uncommitted field
+  // edits go with it, for the same reason.
+  if (threadId !== lastRenderedThread) {
+    deleteArmed = false;
+    fieldDrafts.clear();
+    focusedFieldId = null;
+  }
   currentPanelThreadId = threadId;
   lastRenderedThread = threadId;
 
@@ -1015,6 +1028,11 @@ async function renderPanel() {
   const store = await getStore();
   const convTags = conv.tags.map(tid => store.tags[tid]).filter(Boolean) as Tag[];
   const availableTags = Object.values(store.tags).filter(t => !conv.tags.includes(t.id));
+  // Custom fields the user opted into showing here (dashboard → Fields → "In
+  // panel"). Same order as the dashboard's detail view.
+  const panelFields = Object.values(store.fieldDefs)
+    .filter(f => f.showInPanel)
+    .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
 
   panelEl.innerHTML = `
     <div class="fb-crm-header">
@@ -1028,6 +1046,12 @@ async function renderPanel() {
       </div>
       <div class="fb-crm-meta">📨 Last contacted: <strong>${formatRelative(conv.lastContactedAt)}</strong></div>
       ${isProfilePage() ? '' : '<button class="fb-crm-pick-btn">🎯 Select different conversation</button>'}
+
+      ${panelFields.length > 0 ? `
+        <div class="fb-crm-section-title">Details</div>
+        <div class="fb-crm-fields">
+          ${panelFields.map(fieldRowHtml).join('')}
+        </div>` : ''}
 
       <div class="fb-crm-section-title">Tags on this conversation</div>
       <div class="fb-crm-chips">
@@ -1075,11 +1099,78 @@ async function renderPanel() {
   // may have adopted this thread onto an existing contact keyed under one of its
   // aliases, and every action below addresses the contact by key.
   wirePanelActions(conv.id);
+  wirePanelFields(conv.id, conv, panelFields);
 
   // If the user was typing a tag name when a re-render happened, restore focus
   // and place the caret at the end so their typing isn't interrupted.
   if (newTagNameFocused) {
     const el = panelEl.querySelector<HTMLInputElement>('#fb-crm-new-name');
+    if (el) {
+      el.focus();
+      const v = el.value;
+      try { el.setSelectionRange(v.length, v.length); } catch { /* ignore */ }
+    }
+  }
+}
+
+// One row of the panel's "Details" section. Values are deliberately NOT baked
+// into the markup: escapeHtml escapes text, not attribute quotes, so a stored
+// value containing a double quote would break out of value="…". wirePanelFields
+// sets .value on the live element instead. Select options carry no value
+// attribute either — an <option> without one takes its (escaped) text as the
+// value, which is exactly what we want.
+function fieldRowHtml(def: CustomFieldDef): string {
+  const label = `<label class="fb-crm-field-label" for="fb-crm-field-${def.id}">${escapeHtml(def.name)}</label>`;
+  const attrs = `class="fb-crm-field-input" id="fb-crm-field-${def.id}" data-field="${def.id}"`;
+
+  if (def.type === 'select') {
+    const options = ['<option value="">—</option>']
+      .concat((def.options || []).map(o => `<option>${escapeHtml(o)}</option>`))
+      .join('');
+    return `<div class="fb-crm-field-row">${label}<select ${attrs}>${options}</select></div>`;
+  }
+
+  const inputType = def.type === 'number' ? 'number' : def.type === 'date' ? 'date' : 'text';
+  const placeholder = def.type === 'text' ? ' placeholder="Add value…"' : '';
+  return `<div class="fb-crm-field-row">${label}<input type="${inputType}" ${attrs}${placeholder} /></div>`;
+}
+
+// Fill in the Details inputs and commit edits. Free text and numbers commit on
+// blur or Enter (so we don't write — and sync — on every keystroke); dropdowns
+// and dates commit as soon as they change, since there's nothing to finish
+// typing.
+function wirePanelFields(threadId: string, conv: Conversation, defs: CustomFieldDef[]) {
+  if (!panelEl) return;
+
+  for (const def of defs) {
+    const el = panelEl.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-field="${def.id}"]`);
+    if (!el) continue;
+    const stored = conv.customFields?.[def.id] ?? '';
+    el.value = fieldDrafts.get(def.id) ?? stored;
+
+    const commit = async () => {
+      const value = el.value.trim();
+      fieldDrafts.delete(def.id);
+      if (focusedFieldId === def.id) focusedFieldId = null;
+      if (value === stored) return;
+      await mutate([{ op: 'setCustomField', conversationId: threadId, fieldId: def.id, value }]);
+      await renderPanel();
+    };
+
+    if (def.type === 'select' || def.type === 'date') {
+      el.addEventListener('change', commit);
+      continue;
+    }
+    el.addEventListener('input', () => { fieldDrafts.set(def.id, el.value); });
+    el.addEventListener('focus', () => { focusedFieldId = def.id; });
+    el.addEventListener('blur', commit);
+    el.addEventListener('keydown', e => { if ((e as KeyboardEvent).key === 'Enter') el.blur(); });
+  }
+
+  // A re-render that lands mid-edit rebuilt the input the user was typing in;
+  // put the caret back where they left it.
+  if (focusedFieldId) {
+    const el = panelEl.querySelector<HTMLInputElement>(`input[data-field="${focusedFieldId}"]`);
     if (el) {
       el.focus();
       const v = el.value;

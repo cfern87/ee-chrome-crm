@@ -79,6 +79,10 @@ export interface CustomFieldDef {
   type: CustomFieldType;
   options?: string[];
   order: number;    // display order among fields
+  // When true, this field is editable from the in-page CRM panel (above the
+  // tag sections), not just the dashboard's contact detail. Absent = false, so
+  // fields created before this existed stay dashboard-only until opted in.
+  showInPanel?: boolean;
   createdAt: number;
 }
 

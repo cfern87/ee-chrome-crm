@@ -55,6 +55,8 @@ export type Mutation =
   | { op: 'removeTags'; conversationId: string; tagIds: string[] }
   | { op: 'createTag'; tag: Tag; attachTo?: string }
   | { op: 'renameContact'; conversationId: string; name: string }
+  // Set (or clear, when value is '') one custom field on a contact.
+  | { op: 'setCustomField'; conversationId: string; fieldId: string; value: string }
   // Replace a stored name that isn't a name (a heading scraped before the
   // profile header rendered, or the 'Unknown' sentinel) with a real one.
   | { op: 'repairName'; conversationId: string; name: string }
@@ -311,6 +313,24 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
         nameManual: true, // don't let DOM scraping override a hand-set name
         updatedAt: now,
       };
+      return { store: next, changed: true, conversationId: m.conversationId };
+    }
+
+    case 'setCustomField': {
+      const conv = store.conversations[m.conversationId];
+      if (!conv) return { store, changed: false };
+      // Only fields that still exist can hold a value — a def deleted on
+      // another machine must not be resurrected by a stale panel.
+      if (!store.fieldDefs[m.fieldId]) return { store, changed: false, conversationId: m.conversationId };
+      const value = m.value.trim();
+      const current = conv.customFields?.[m.fieldId] ?? '';
+      // Don't burn a write (and a Drive sync) on a blur that changed nothing.
+      if (value === current) return { store, changed: false, conversationId: m.conversationId };
+      const nextFields = { ...(conv.customFields || {}) };
+      if (value === '') delete nextFields[m.fieldId];
+      else nextFields[m.fieldId] = value;
+      const next = copy(store);
+      next.conversations[m.conversationId] = { ...conv, customFields: nextFields, updatedAt: now };
       return { store: next, changed: true, conversationId: m.conversationId };
     }
 

@@ -158,6 +158,45 @@
   align-items: center;
 }
 
+/* ---- Custom fields ("Details", above the tag sections) ---- */
+
+.fb-crm-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.fb-crm-field-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fb-crm-field-label {
+  font-size: 12px;
+  color: #65676b;
+  width: 84px;
+  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fb-crm-field-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid #ccd0d5;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+  color: #050505;
+  background: #fff;
+  outline: none;
+}
+.fb-crm-field-input:focus { border-color: #065fd4; }
+select.fb-crm-field-input { cursor: pointer; }
+
 .fb-crm-muted { color: #8a8d91; font-size: 12px; }
 
 .fb-crm-chip {
