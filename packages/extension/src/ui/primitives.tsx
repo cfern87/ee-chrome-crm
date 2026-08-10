@@ -20,6 +20,39 @@ function cx(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(' ');
 }
 
+// --- Icon -----------------------------------------------------------------
+
+export interface IconProps {
+  /** Inner markup from ui/icons.ts. */
+  paths: string;
+  size?: number;
+  className?: string;
+  style?: React.CSSProperties;
+}
+
+/**
+ * Renders one of the shared icon geometries. Always `aria-hidden` — an icon
+ * never carries meaning on its own here; whatever it stands for is also in a
+ * label, an accessible name, or visually-hidden text next to it.
+ */
+export function Icon({ paths, size = 16, className, style }: IconProps) {
+  return (
+    <svg
+      className={className}
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.6}
+      aria-hidden="true"
+      style={{ flex: '0 0 auto', ...style }}
+      // Static, developer-authored geometry from ui/icons.ts. No user data.
+      dangerouslySetInnerHTML={{ __html: paths }}
+    />
+  );
+}
+
 // --- Card -----------------------------------------------------------------
 
 export interface CardProps extends React.HTMLAttributes<HTMLDivElement> {
@@ -48,7 +81,7 @@ export function SectionTitle({ className, ...rest }: React.HTMLAttributes<HTMLDi
 }
 
 export interface TextProps extends React.HTMLAttributes<HTMLElement> {
-  as?: 'span' | 'div' | 'p' | 'label';
+  as?: 'span' | 'div' | 'p' | 'label' | 'h1' | 'h2' | 'h3' | 'h4';
   size?: keyof typeof fontSize;
   weight?: keyof typeof fontWeight;
   tone?: 'primary' | 'secondary' | 'muted' | 'accent' | 'success' | 'warning' | 'danger';
@@ -276,20 +309,7 @@ export function Toggle({ label, labelFirst = true, className, ...rest }: ToggleP
  * better against that fill, so it reads the same on every tag.
  */
 function EyeOffIcon() {
-  return (
-    <svg
-      className="crm-chip__icon"
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.6"
-      aria-hidden="true"
-      // Static, developer-authored geometry from ui/icons.ts — shared with the
-      // Messenger panel, which builds its markup as strings. No user data ever
-      // reaches this.
-      dangerouslySetInnerHTML={{ __html: EYE_OFF_INNER }}
-    />
-  );
+  return <Icon paths={EYE_OFF_INNER} size={12} className="crm-chip__icon" />;
 }
 
 interface ChipVisuals {

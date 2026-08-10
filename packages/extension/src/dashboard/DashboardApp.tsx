@@ -25,6 +25,10 @@ import { mergeConversations, findDuplicateGroups, cleanStoredNames, pickPrimary,
 import { isDriveConfigured, getDriveStatus, getDriveAuthState, connectDrive, disconnectDrive, getAuthRedirectUri, readStore as driveReadStore, writeStore as driveWriteStore, DriveStatus, DriveAuthState } from '../drive';
 import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo, type DeviceOverview } from '../devices';
 import { isDisconnected, type SyncStatusView, type SendHoldReason } from '../syncHealth';
+import { AppShell, type NavItem } from '../ui/AppShell';
+import { Button, Card, EmptyState, Stack, Text, color, fontSize, fontWeight, radius, space } from '../ui/primitives';
+import { elevation } from '../ui/tokens';
+import { ICON_CONTACTS, ICON_CAMPAIGNS, ICON_TAGS, ICON_SETTINGS } from '../ui/icons';
 
 // What GET_DEVICES answers with: the machine roster and lease from devices.ts,
 // plus the things only the background worker knows.
@@ -280,7 +284,19 @@ function formatRelativeTime(ts: number): string {
   return new Date(ts).toLocaleDateString();
 }
 
-type Tab = 'conversations' | 'messaging' | 'history' | 'tags' | 'fields' | 'settings';
+/**
+ * Where you can be in the app. Four destinations, not six tabs.
+ *
+ * `campaigns` absorbed the old Messaging and History tabs — they were one job
+ * split in two, and each linked to the other to get its work done. `tags`
+ * absorbed the old Fields tab: both define the shape of a contact rather than
+ * being places you work.
+ */
+type Route = 'contacts' | 'campaigns' | 'tags' | 'settings';
+
+/** Sub-views inside Campaigns. */
+type CampaignView = 'compose' | 'active' | 'past';
+
 type DateFilter = 'all' | 'today' | 'week' | 'month';
 type SortBy = 'recent' | 'lastContacted' | 'lastOpened' | 'dateAdded' | 'lastTagged' | 'tagCount' | 'name';
 
@@ -292,7 +308,18 @@ function viewSignature(query: QueryGroup, sortBy: SortBy, sortDir: 'asc' | 'desc
 
 export default function DashboardApp() {
   const [store, setStore] = useState<Store>(EMPTY_STORE);
-  const [activeTab, setActiveTab] = useState<Tab>('conversations');
+  const [route, setRoute] = useState<Route>('contacts');
+  const [campaignView, setCampaignView] = useState<CampaignView>('compose');
+  const [railCollapsed, setRailCollapsed] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+
+  /** Go to a destination, optionally landing on a specific sub-view. */
+  const go = useCallback((next: Route, view?: CampaignView) => {
+    setRoute(next);
+    if (view) setCampaignView(view);
+    setDrawerOpen(false);
+  }, []);
+
   const [search, setSearch] = useState('');
   const [selectedConv, setSelectedConv] = useState<Conversation | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
@@ -389,12 +416,14 @@ export default function DashboardApp() {
   // ask for a reconcile on a much shorter timer. Each pass is a small Drive read
   // and only downloads the campaign document when it has actually changed.
   useEffect(() => {
-    if (activeTab !== 'messaging' && activeTab !== 'history') return;
+    // Campaigns is now the single queue-facing destination, so this is one
+    // condition where it used to be two tabs.
+    if (route !== 'campaigns') return;
     const tick = () => { void sendBg({ type: 'SYNC_QUEUE_NOW' }, 30_000); };
     tick();
     const interval = setInterval(tick, 15_000);
     return () => clearInterval(interval);
-  }, [activeTab]);
+  }, [route]);
 
   // Failed-message notice. Campaigns run unattended in a background window, so
   // failures that happened while this dashboard was closed get surfaced here on
@@ -1031,87 +1060,69 @@ export default function DashboardApp() {
   // it can read or write without an account.
   if (!signedIn) return <SignInGate onRecheck={refreshSignedIn} />;
 
+  const NAV: NavItem<Route>[] = [
+    { id: 'contacts', label: 'Contacts', icon: ICON_CONTACTS, count: totalConvs },
+    { id: 'campaigns', label: 'Campaigns', icon: ICON_CAMPAIGNS, count: campaigns.length },
+    { id: 'tags', label: 'Tags & fields', icon: ICON_TAGS, count: totalTags + fieldDefs.length },
+    { id: 'settings', label: 'Settings', icon: ICON_SETTINGS },
+  ];
+
+  const ROUTE_TITLE: Record<Route, string> = {
+    contacts: 'Contacts',
+    campaigns: 'Campaigns',
+    tags: 'Tags & fields',
+    settings: 'Settings',
+  };
+
+  // The counts that used to occupy four stat tiles above the workspace. They
+  // were read once and then cost ~90px of vertical space on every visit.
+  // Drives the bell badge. Kept next to the drawer's own reading of the same
+  // state (holdOf) so the count and the contents can't disagree.
+  const holdReason = holdOf(machines);
+
+  const contactsMeta = route === 'contacts' && (
+    <>
+      <Text size="small" tone="muted">
+        {filtered.length === totalConvs
+          ? `${totalConvs} contacts`
+          : `${filtered.length} of ${totalConvs} contacts`}
+      </Text>
+      <Text size="small" tone="muted">{totalTagged} tagged</Text>
+      <Text size="small" tone="muted">{recentConvs} active this week</Text>
+      {archived.length > 0 && <Text size="small" tone="muted">{archived.length} archived</Text>}
+    </>
+  );
+
   return (
-    <div style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', minHeight: '100vh', background: '#f5f5f5', color: '#222' }}>
-      {/* Header */}
-      <div style={{ background: 'linear-gradient(135deg, #065fd4 0%, #0a7ef5 100%)', color: '#fff', padding: '20px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <div>
-          <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0 }}>Messenger CRM</h1>
-          <p style={{ fontSize: 13, opacity: 0.85, margin: '4px 0 0' }}>Manage conversations & contacts</p>
-        </div>
-        <div style={{ fontSize: 13, opacity: 0.8 }}>
-          {totalConvs} contacts · {totalTags} tags
-        </div>
-      </div>
-
-      {/* Tabs */}
-      <div style={{ display: 'flex', background: '#fff', borderBottom: '1px solid #e0e0e0' }}>
-        {(['conversations', 'messaging', 'history', 'tags', 'fields', 'settings'] as Tab[]).map((tab) => (
-          <button
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            style={{
-              flex: 1,
-              padding: '13px 8px',
-              border: 'none',
-              background: 'none',
-              cursor: 'pointer',
-              fontSize: 13,
-              fontWeight: 600,
-              color: activeTab === tab ? '#065fd4' : '#666',
-              borderBottom: activeTab === tab ? '3px solid #065fd4' : '3px solid transparent',
-              textTransform: 'capitalize',
-              transition: 'color 0.2s',
-            }}
-          >
-            {tab === 'conversations'
-              ? `Conversations (${filtered.length})`
-              : tab === 'messaging'
-              ? 'Messaging'
-              : tab === 'history'
-              ? `History (${campaigns.length})`
-              : tab === 'tags'
-              ? `Tags (${totalTags})`
-              : tab === 'fields'
-              ? `Fields (${fieldDefs.length})`
-              : 'Settings'}
-          </button>
-        ))}
-      </div>
-
-      {/* Content */}
-      <div style={{ maxWidth: 1100, margin: '0 auto', padding: '20px 16px' }}>
-
-        {/* Failed messages since this was last acknowledged */}
-        {unseenFailures.length > 0 && (
-          <FailedSendsNotice
-            failures={unseenFailures}
-            onDismiss={dismissFailures}
-            onClear={clearFailure}
-            onReview={() => setActiveTab('history')}
-          />
-        )}
-
-        {/* Stats row */}
-        {activeTab === 'conversations' && (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 16 }}>
-            {[
-              { label: 'Total Contacts', value: totalConvs },
-              { label: 'Tagged', value: totalTagged },
-              { label: 'Active This Week', value: recentConvs },
-              { label: 'Archived', value: archived.length },
-            ].map(({ label, value }) => (
-              <div key={label} style={{ background: '#fff', padding: '14px 16px', borderRadius: 8, boxShadow: '0 1px 3px rgba(0,0,0,0.08)' }}>
-                <div style={{ fontSize: 24, fontWeight: 700, color: '#065fd4' }}>{value}</div>
-                <div style={{ fontSize: 12, color: '#888', marginTop: 2 }}>{label}</div>
-              </div>
-            ))}
-          </div>
-        )}
+    <AppShell<Route>
+      nav={NAV}
+      activeId={route}
+      onNavigate={(id) => go(id)}
+      railCollapsed={railCollapsed}
+      onToggleRail={() => setRailCollapsed((v) => !v)}
+      title={ROUTE_TITLE[route]}
+      meta={contactsMeta || undefined}
+      drawerOpen={drawerOpen}
+      onDrawerOpenChange={setDrawerOpen}
+      notificationCount={unseenFailures.length + (holdReason ? 1 : 0)}
+      notifications={
+        <NotificationsDrawer
+          failures={unseenFailures}
+          machines={machines}
+          queue={queue}
+          campaigns={campaigns}
+          onDismissFailures={dismissFailures}
+          onClearFailure={clearFailure}
+          onReview={() => go('campaigns', 'past')}
+          onViewQueue={() => go('campaigns', 'active')}
+        />
+      }
+    >
+      <div style={{ maxWidth: 1100, margin: '0 auto', padding: `${space.xl}px ${space.lg}px` }}>
 
         {/* Advanced search — full width above the two-column layout, since the
             query builder needs more room than the 320px contact column. */}
-        {activeTab === 'conversations' && (
+        {route === 'contacts' && (
           <>
             <PinnedSearchChips
               savedSearches={store.savedSearches}
@@ -1185,7 +1196,7 @@ export default function DashboardApp() {
         )}
 
         {/* Conversations tab */}
-        {activeTab === 'conversations' && (
+        {route === 'contacts' && (
           <div style={{ display: 'flex', gap: 14 }}>
             {/* Left: list */}
             <div style={{ flex: '0 0 320px' }}>
@@ -1307,7 +1318,7 @@ export default function DashboardApp() {
                       Open All
                     </button>
                     <button
-                      onClick={() => { setPreselectedRecipients(Array.from(selectedIds)); setActiveTab('messaging'); }}
+                      onClick={() => { setPreselectedRecipients(Array.from(selectedIds)); go('campaigns', 'compose'); }}
                       style={{ background: '#0a7c4a', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
                     >
                       💬 Message ({selectedIds.size})
@@ -1593,9 +1604,15 @@ export default function DashboardApp() {
           </div>
         )}
 
-        {/* Tags tab */}
-        {activeTab === 'tags' && (
-          <TagsPanel
+        {/* Tags & fields — one destination, two sections. Both define the
+            shape of a contact, so splitting them across two tabs meant setting
+            up "Stage" as a tag group and "Budget" as a field were unrelated
+            errands. */}
+        {route === 'tags' && (
+          <Stack gap="xxl">
+            <section aria-labelledby="sec-tags">
+              <Text as="h2" id="sec-tags" size="title" weight="bold" style={{ margin: `0 0 ${space.md}px` }}>Tags</Text>
+              <TagsPanel
             tags={tags}
             tagGroups={tagGroups}
             conversations={conversations}
@@ -1615,60 +1632,147 @@ export default function DashboardApp() {
             onRecolorTag={recolorTag}
             onSetTagGroup={setTagGroup}
             onSetTagHidden={setTagHidden}
-            onAddGroup={addTagGroup}
-            onRenameGroup={renameTagGroup}
-            onDeleteGroup={deleteTagGroup}
-          />
+                onAddGroup={addTagGroup}
+                onRenameGroup={renameTagGroup}
+                onDeleteGroup={deleteTagGroup}
+              />
+            </section>
+
+            <section aria-labelledby="sec-fields">
+              <Text as="h2" id="sec-fields" size="title" weight="bold" style={{ margin: `0 0 ${space.md}px` }}>Custom fields</Text>
+              <FieldsPanel
+                fieldDefs={fieldDefs}
+                conversations={conversations}
+                onAddField={addField}
+                onDeleteField={deleteField}
+                onSetFieldInPanel={setFieldInPanel}
+              />
+            </section>
+          </Stack>
         )}
 
-        {/* Fields tab */}
-        {activeTab === 'fields' && (
-          <FieldsPanel
-            fieldDefs={fieldDefs}
-            conversations={conversations}
-            onAddField={addField}
-            onDeleteField={deleteField}
-            onSetFieldInPanel={setFieldInPanel}
-          />
+        {/* Campaigns — the old Messaging and History tabs. They were one job
+            split in two: Messaging linked to History twice, and History told
+            you to "compose one in the Messaging tab". */}
+        {route === 'campaigns' && (
+          <Stack gap="lg">
+            <SubNav<CampaignView>
+              current={campaignView}
+              onChange={setCampaignView}
+              items={[
+                { id: 'compose', label: 'Compose' },
+                { id: 'active', label: 'Active', count: activeCampaigns(campaigns).length || undefined },
+                { id: 'past', label: 'Past sends', count: campaigns.length || undefined },
+              ]}
+            />
+
+            {campaignView === 'compose' && (
+              <MessagingPanel
+                conversations={conversations}
+                tags={tags}
+                store={store}
+                campaigns={campaigns}
+                queue={queue}
+                machines={machines}
+                preselected={preselectedRecipients}
+                onConsumePreselected={() => setPreselectedRecipients([])}
+                onChanged={refreshCampaigns}
+                onViewHistory={() => setCampaignView('past')}
+                showQueue={false}
+              />
+            )}
+
+            {campaignView === 'active' && (
+              <ActiveCampaignsView
+                campaigns={campaigns}
+                queue={queue}
+                machines={machines}
+                onChanged={refreshCampaigns}
+                onViewHistory={() => setCampaignView('past')}
+                onCompose={() => setCampaignView('compose')}
+              />
+            )}
+
+            {campaignView === 'past' && (
+              <HistoryPanel
+                campaigns={campaigns}
+                onChanged={refreshCampaigns}
+                store={store}
+                onEditProfileUrl={editRecipientProfileUrl}
+                onCompose={() => setCampaignView('compose')}
+                onViewProfile={(threadId) => {
+                  const conv = store.conversations[threadId];
+                  if (!conv) return;
+                  setSelectedConv(conv);
+                  go('contacts');
+                }}
+              />
+            )}
+          </Stack>
         )}
 
-        {/* Messaging tab */}
-        {activeTab === 'messaging' && (
-          <MessagingPanel
-            conversations={conversations}
-            tags={tags}
-            store={store}
-            campaigns={campaigns}
-            queue={queue}
-            machines={machines}
-            preselected={preselectedRecipients}
-            onConsumePreselected={() => setPreselectedRecipients([])}
-            onChanged={refreshCampaigns}
-            onViewHistory={() => setActiveTab('history')}
-          />
-        )}
-
-        {/* History tab */}
-        {activeTab === 'history' && (
-          <HistoryPanel
-            campaigns={campaigns}
-            onChanged={refreshCampaigns}
-            store={store}
-            onEditProfileUrl={editRecipientProfileUrl}
-            onViewProfile={(threadId) => {
-              const conv = store.conversations[threadId];
-              if (!conv) return;
-              setSelectedConv(conv);
-              setActiveTab('conversations');
-            }}
-          />
-        )}
-
-        {/* Settings tab */}
-        {activeTab === 'settings' && (
+        {route === 'settings' && (
           <SettingsPanel store={store} updateStore={updateStore} conversations={conversations} tags={tags} syncUsage={syncUsage} onStoreReplaced={async (s) => { setStore(s); getSyncUsage().then(setSyncUsage).catch(() => {}); }} />
         )}
       </div>
+    </AppShell>
+  );
+}
+
+// --- Sub-navigation -------------------------------------------------------
+
+interface SubNavItem<Id extends string> { id: Id; label: string; count?: number }
+
+/**
+ * Segmented control for sub-views within a destination. Deliberately different
+ * from the rail: these are views of one thing, not separate places, so they
+ * read as a control rather than as navigation.
+ */
+function SubNav<Id extends string>({
+  items, current, onChange,
+}: {
+  items: SubNavItem<Id>[];
+  current: Id;
+  onChange: (id: Id) => void;
+}) {
+  return (
+    <div
+      role="tablist"
+      aria-label="Campaign views"
+      style={{
+        display: 'inline-flex', gap: space.xxs, padding: space.xxs,
+        background: color.surface.sunken, border: `1px solid ${color.border.subtle}`,
+        borderRadius: radius.sm, alignSelf: 'flex-start',
+      }}
+    >
+      {items.map((item) => {
+        const active = item.id === current;
+        return (
+          <button
+            key={item.id}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(item.id)}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: space.xs,
+              minHeight: 30, padding: `0 ${space.md}px`,
+              border: 'none', borderRadius: radius.sm,
+              background: active ? color.surface.raised : 'transparent',
+              boxShadow: active ? elevation.sm : 'none',
+              color: active ? color.text.primary : color.text.secondary,
+              font: 'inherit', fontSize: fontSize.small,
+              fontWeight: active ? fontWeight.semibold : fontWeight.medium,
+              cursor: 'pointer',
+            }}
+          >
+            {item.label}
+            {item.count !== undefined && (
+              <Text size="micro" weight="semibold" tone={active ? 'accent' : 'muted'}>{item.count}</Text>
+            )}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -3885,9 +3989,12 @@ interface MessagingPanelProps {
   onConsumePreselected: () => void;
   onChanged: () => void;
   onViewHistory: () => void;
+  /** Draw the queue and in-flight campaign cards above the composer. False
+   *  now that Campaigns has an Active sub-view that owns them. */
+  showQueue?: boolean;
 }
 
-function MessagingPanel({ conversations, tags, store, campaigns, queue, machines, preselected, onConsumePreselected, onChanged, onViewHistory }: MessagingPanelProps) {
+function MessagingPanel({ conversations, tags, store, campaigns, queue, machines, preselected, onConsumePreselected, onChanged, onViewHistory, showQueue = true }: MessagingPanelProps) {
   const [template, setTemplate] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState('');
@@ -3995,7 +4102,11 @@ function MessagingPanel({ conversations, tags, store, campaigns, queue, machines
     <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' }}>
       {/* Left: composer + config */}
       <div style={{ flex: '1 1 420px', minWidth: 360 }}>
-        {active.length > 0 && (
+        {/* The queue used to live above the composer on this same screen. It
+            now has its own sub-view, so Compose is only about composing —
+            except that a running queue is still worth a one-line mention here,
+            since it changes what the Start button does. */}
+        {showQueue && active.length > 0 && (
           <div style={{ marginBottom: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
             <QueueCard campaigns={campaigns} queue={queue} machines={machines} onChanged={onChanged} onViewHistory={onViewHistory} />
             {active.map((c) => (
@@ -4351,6 +4462,126 @@ function SendingFrom({ machines, onChanged }: { machines: MachineView | null; on
  * previous behaviour in this situation — carrying on and messaging people twice
  * — at least looked like it was working.
  */
+/**
+ * The Active sub-view of Campaigns: the shared queue, and every campaign
+ * currently in flight. These used to sit above the composer, which meant the
+ * screen you went to in order to *write* a message was mostly taken up by the
+ * status of messages already going out.
+ */
+function ActiveCampaignsView({
+  campaigns, queue, machines, onChanged, onViewHistory, onCompose,
+}: {
+  campaigns: Campaign[];
+  queue: QueueState;
+  machines: MachineView | null;
+  onChanged: () => void;
+  onViewHistory: () => void;
+  onCompose: () => void;
+}) {
+  const active = activeCampaigns(campaigns);
+  const nextUp = runnableCampaigns(campaigns)[0] || null;
+
+  if (active.length === 0) {
+    return (
+      <Card>
+        <EmptyState
+          title="Nothing in the queue"
+          hint="Campaigns you start appear here while they send, with pacing, per-campaign controls and which machine is doing the sending."
+          action={<Button variant="primary" onClick={onCompose}>Compose a message</Button>}
+        />
+      </Card>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: space.md, maxWidth: 720 }}>
+      <QueueCard campaigns={campaigns} queue={queue} machines={machines} onChanged={onChanged} onViewHistory={onViewHistory} />
+      {active.map((c) => (
+        <ActiveCampaignCard key={c.id} campaign={c} queue={queue} isNext={nextUp?.id === c.id} onChanged={onChanged} />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Everything in the notifications drawer.
+ *
+ * The failed-send notice used to be injected into the content flow of every
+ * destination, pushing the actual work down the page, and the sync hold was
+ * buried inside the queue card where you only saw it if you were already
+ * looking at the queue. Both are "something needs your attention" — so both
+ * live behind the bell, and the bell carries the count.
+ */
+function NotificationsDrawer({
+  failures, machines, queue, campaigns, onDismissFailures, onClearFailure, onReview, onViewQueue,
+}: {
+  failures: FailedSend[];
+  machines: MachineView | null;
+  queue: QueueState;
+  campaigns: Campaign[];
+  onDismissFailures: () => void;
+  onClearFailure: (f: FailedSend) => void;
+  onReview: () => void;
+  onViewQueue: () => void;
+}) {
+  const { pending } = queueDepth(campaigns);
+  const held = holdOf(machines);
+  const nothing = failures.length === 0 && !held && pending === 0;
+
+  if (nothing) {
+    return (
+      <EmptyState
+        title="Nothing needs your attention"
+        hint="Failed sends, a paused queue, and problems reaching Google Drive all show up here."
+      />
+    );
+  }
+
+  return (
+    <Stack gap="md">
+      {held && <SyncHoldBanner machines={machines} />}
+
+      {failures.length > 0 && (
+        <FailedSendsNotice
+          failures={failures}
+          onDismiss={onDismissFailures}
+          onClear={onClearFailure}
+          onReview={onReview}
+        />
+      )}
+
+      {pending > 0 && (
+        <Card padding="lg">
+          <Stack gap="sm">
+            <Text weight="semibold">
+              {pending} message{pending !== 1 ? 's' : ''} waiting to send
+            </Text>
+            <Text size="small" tone="muted" leading="relaxed">
+              {queue.paused
+                ? 'Sending is paused. Nothing goes out until you resume it.'
+                : 'Going out on the shared pace, one at a time.'}
+            </Text>
+            <Button size="sm" variant="secondary" onClick={onViewQueue} style={{ alignSelf: 'flex-start' }}>
+              View the queue
+            </Button>
+          </Stack>
+        </Card>
+      )}
+    </Stack>
+  );
+}
+
+/**
+ * Whether sending is currently held, or heading that way. Shared by the bell
+ * count and the drawer so the badge can never disagree with the contents.
+ */
+function holdOf(machines: MachineView | null): boolean {
+  if (!machines?.syncEnabled) return false;
+  if (machines.sync?.hold) return true;
+  const health = machines.sync?.health;
+  return !!health && isDisconnected(health);
+}
+
 function SyncHoldBanner({ machines }: { machines: MachineView | null }) {
   // With sync off there is one machine, nothing to lose contact with, and any
   // hold left over from when it was on is meaningless.
@@ -4527,13 +4758,17 @@ function ActiveCampaignCard({ campaign, queue, isNext, onChanged }: { campaign: 
 //  Campaign history
 // =====================================================================
 
-function HistoryPanel({ campaigns, onChanged, store, onViewProfile, onEditProfileUrl }: { campaigns: Campaign[]; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null> }) {
+function HistoryPanel({ campaigns, onChanged, store, onViewProfile, onEditProfileUrl, onCompose }: { campaigns: Campaign[]; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null>; onCompose: () => void }) {
   const sorted = campaigns.slice().sort((a, b) => b.createdAt - a.createdAt);
   if (sorted.length === 0) {
     return (
-      <div style={{ background: '#fff', borderRadius: 10, padding: '48px 24px', textAlign: 'center', color: '#aaa', fontSize: 14, boxShadow: '0 1px 3px rgba(0,0,0,0.08)' }}>
-        No bulk messages yet. Compose one in the Messaging tab.
-      </div>
+      <Card>
+        <EmptyState
+          title="No bulk messages yet"
+          hint="Every campaign you send lands here — who received it, who failed, and the message that went out."
+          action={<Button variant="primary" onClick={onCompose}>Compose a message</Button>}
+        />
+      </Card>
     );
   }
   return (
