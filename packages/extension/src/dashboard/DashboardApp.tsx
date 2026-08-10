@@ -106,6 +106,92 @@ function stripedBackground(base: string, stripe: string): string {
   return `repeating-linear-gradient(45deg, ${stripe} 0, ${stripe} 4px, ${base} 4px, ${base} 8px)`;
 }
 
+/**
+ * What `hideInSidebar` means to the user, in one phrase. Hiding applies to the
+ * compact chip rows that preview a contact in a list — Messenger's conversation
+ * sidebar and the contact list here — and nowhere else.
+ */
+const HIDDEN_TAG_TITLE = 'Hidden from conversation previews — still available for sorting, filtering and search';
+
+/**
+ * The tags to draw as chips in a *preview* row (the contact list, the recipient
+ * picker). Tags marked "hide in previews" are dropped.
+ *
+ * Display only. Nothing that decides which contacts appear — the tag filter,
+ * sorting, and the advanced query — goes through here; those all read
+ * `conv.tags` and `store.tags` directly, so a hidden tag still filters, sorts
+ * and searches exactly like any other.
+ */
+function previewTags(tagIds: string[], tags: Record<string, Tag>): Tag[] {
+  return tagIds.map((id) => tags[id]).filter((t): t is Tag => !!t && !t.hideInSidebar);
+}
+
+/**
+ * Chip fill for a tag. Hidden tags get diagonal stripes over their own colour,
+ * mirroring .fb-crm-chip-hidden in content.css so a hidden tag is marked the
+ * same way in the dashboard and the in-page panel.
+ */
+function tagChipStyle(tag: Tag): React.CSSProperties {
+  if (!tag.hideInSidebar) return { background: tag.color };
+  return {
+    backgroundColor: tag.color,
+    backgroundImage: 'repeating-linear-gradient(45deg, rgba(255,255,255,0.42) 0, rgba(255,255,255,0.42) 4px, rgba(0,0,0,0) 4px, rgba(0,0,0,0) 8px)',
+    boxShadow: 'inset 0 0 0 1px rgba(0,0,0,0.18)',
+  };
+}
+
+/** A tag group and the subset of tags that fell into it. */
+interface TagBucket {
+  key: string;
+  label: string;
+  color?: string;
+  tags: Tag[];
+}
+
+const UNGROUPED_KEY = '__ungrouped__';
+
+/**
+ * Bucket `tags` by their tag group, in the same order the Tags tab uses
+ * (`order`, then `createdAt`), with ungrouped tags last. Input order is
+ * preserved inside each bucket.
+ *
+ * Empty buckets are dropped, so a profile shows headings only for groups the
+ * contact actually has tags in. A `groupId` pointing at a deleted group counts
+ * as ungrouped — the same reading as the Tags tab, so a tag can never vanish
+ * from a list just because its group went away.
+ */
+function bucketTagsByGroup(tags: Tag[], groups: Record<string, TagGroup>): TagBucket[] {
+  const ordered = Object.values(groups).sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
+  const byGroup = new Map<string, Tag[]>();
+  const ungrouped: Tag[] = [];
+
+  for (const t of tags) {
+    if (t.groupId && groups[t.groupId]) {
+      const list = byGroup.get(t.groupId);
+      if (list) list.push(t);
+      else byGroup.set(t.groupId, [t]);
+    } else {
+      ungrouped.push(t);
+    }
+  }
+
+  const out: TagBucket[] = [];
+  for (const g of ordered) {
+    const list = byGroup.get(g.id);
+    if (list?.length) out.push({ key: g.id, label: g.name, color: g.color, tags: list });
+  }
+  if (ungrouped.length) out.push({ key: UNGROUPED_KEY, label: 'Ungrouped', tags: ungrouped });
+  return out;
+}
+
+/**
+ * Whether to draw group headings at all. A single bucket of ungrouped tags is
+ * just a flat list, and labelling it "Ungrouped" would be noise.
+ */
+function showsGroupLabels(buckets: TagBucket[]): boolean {
+  return buckets.some((b) => b.key !== UNGROUPED_KEY);
+}
+
 function pagerBtnStyle(active: boolean, disabled: boolean): React.CSSProperties {
   return {
     minWidth: 26,
@@ -1419,21 +1505,26 @@ export default function DashboardApp() {
                         <div style={{ fontSize: 11, color: '#999', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2 }}>
                           {conv.lastMessage || ''}
                         </div>
-                        {conv.tags.length > 0 && (
-                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginTop: 4 }}>
-                            {conv.tags.map((tagId) => {
-                              const tag = store.tags[tagId];
-                              return tag ? (
+                        {/* Chips are a preview, so tags marked "hide in
+                            previews" are left out. They still count for the tag
+                            filter, the sort options and the advanced query —
+                            those read conv.tags, not this list. */}
+                        {(() => {
+                          const chips = previewTags(conv.tags, store.tags);
+                          if (chips.length === 0) return null;
+                          return (
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginTop: 4 }}>
+                              {chips.map((tag) => (
                                 <span
-                                  key={tagId}
+                                  key={tag.id}
                                   style={{ background: tag.color, color: '#fff', fontSize: 9, padding: '2px 6px', borderRadius: 8, fontWeight: 600 }}
                                 >
                                   {tag.name}
                                 </span>
-                              ) : null;
-                            })}
-                          </div>
-                        )}
+                              ))}
+                            </div>
+                          );
+                        })()}
                       </div>
                     </div>
                   );
@@ -1720,6 +1811,17 @@ function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState('');
 
+  // Tags on this contact, and the ones it could still be given, both bucketed by
+  // tag group. Applied tags keep conv.tags order inside each group, so adding a
+  // tag doesn't reshuffle the ones already there. Derived plainly rather than
+  // memoized — it's a handful of tags, and a memo keyed on freshly-built arrays
+  // would never hit anyway.
+  const appliedTags = conv.tags.map((id) => store.tags[id]).filter((t): t is Tag => !!t);
+  const appliedBuckets = bucketTagsByGroup(appliedTags, store.tagGroups);
+  const availableBuckets = bucketTagsByGroup(availableTags, store.tagGroups);
+  const showAppliedLabels = showsGroupLabels(appliedBuckets);
+  const showAvailableLabels = showsGroupLabels(availableBuckets);
+
   // Reset rename editor whenever a different contact is shown.
   useEffect(() => { setEditingName(false); }, [conv.id]);
 
@@ -1833,54 +1935,93 @@ function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm
         </div>
       )}
 
-      {/* Tags */}
+      {/* Tags — grouped by tag group, in the Tags tab's group order. This is the
+          contact's full picture, so hidden tags DO appear here (striped); it's
+          only the list previews that leave them out. */}
       <div style={{ marginBottom: 20 }}>
         <div style={{ fontSize: 12, fontWeight: 600, color: '#888', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Tags</div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-          {conv.tags.map((tagId) => {
-            const tag = store.tags[tagId];
-            return tag ? (
-              <span
-                key={tagId}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: tag.color, color: '#fff', padding: '5px 10px', borderRadius: 12, fontSize: 12, fontWeight: 600 }}
-              >
-                {tag.name}
-                <button
-                  onClick={() => onRemoveTag(tagId)}
-                  style={{ background: 'rgba(255,255,255,0.3)', border: 'none', color: '#fff', borderRadius: '50%', width: 16, height: 16, cursor: 'pointer', fontSize: 12, lineHeight: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}
-                >
-                  ×
-                </button>
-              </span>
-            ) : null;
-          })}
-          {availableTags.length > 0 && (
-            <div style={{ position: 'relative' }}>
-              <button
-                onClick={() => setAddingTag(!addingTag)}
-                style={{ border: '1px dashed #ccc', background: '#fff', color: '#888', padding: '5px 12px', borderRadius: 12, fontSize: 12, cursor: 'pointer' }}
-              >
-                + Add tag
-              </button>
-              {addingTag && (
-                <div style={{ position: 'absolute', top: '100%', left: 0, zIndex: 100, background: '#fff', border: '1px solid #e0e0e0', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.12)', padding: 8, minWidth: 160, marginTop: 4 }}>
-                  {availableTags.map((tag) => (
-                    <div
+
+        {appliedBuckets.length === 0 ? (
+          <div style={{ fontSize: 13, color: '#bbb', marginBottom: 10 }}>No tags yet.</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 12 }}>
+            {appliedBuckets.map((bucket) => (
+              <div key={bucket.key}>
+                {showAppliedLabels && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 5 }}>
+                    <div style={{ width: 9, height: 9, borderRadius: 2, background: bucket.color || '#ccc', flexShrink: 0 }} />
+                    <span style={{ fontSize: 11, fontWeight: 700, color: '#999', textTransform: 'uppercase', letterSpacing: 0.4 }}>
+                      {bucket.label}
+                    </span>
+                  </div>
+                )}
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {bucket.tags.map((tag) => (
+                    <span
                       key={tag.id}
-                      onClick={() => { onAddTag(tag.id); setAddingTag(false); }}
-                      style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', cursor: 'pointer', borderRadius: 6, fontSize: 13 }}
-                      onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
-                      onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                      title={tag.hideInSidebar ? HIDDEN_TAG_TITLE : undefined}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 6,
+                        color: '#fff', padding: '5px 10px', borderRadius: 12, fontSize: 12, fontWeight: 600,
+                        ...tagChipStyle(tag),
+                      }}
                     >
-                      <div style={{ width: 14, height: 14, borderRadius: 3, background: tag.color, flexShrink: 0 }} />
                       {tag.name}
-                    </div>
+                      <button
+                        onClick={() => onRemoveTag(tag.id)}
+                        style={{ background: 'rgba(255,255,255,0.3)', border: 'none', color: '#fff', borderRadius: '50%', width: 16, height: 16, cursor: 'pointer', fontSize: 12, lineHeight: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}
+                      >
+                        ×
+                      </button>
+                    </span>
                   ))}
                 </div>
-              )}
-            </div>
-          )}
-        </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {availableTags.length > 0 && (
+          <div style={{ position: 'relative' }}>
+            <button
+              onClick={() => setAddingTag(!addingTag)}
+              style={{ border: '1px dashed #ccc', background: '#fff', color: '#888', padding: '5px 12px', borderRadius: 12, fontSize: 12, cursor: 'pointer' }}
+            >
+              + Add tag
+            </button>
+            {addingTag && (
+              // Grouped the same way as the chips above, so picking a tag means
+              // looking in the same place you'd expect to find it.
+              <div style={{ position: 'absolute', top: '100%', left: 0, zIndex: 100, background: '#fff', border: '1px solid #e0e0e0', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.12)', padding: 8, minWidth: 180, maxHeight: 320, overflowY: 'auto', marginTop: 4 }}>
+                {availableBuckets.map((bucket) => (
+                  <div key={bucket.key}>
+                    {showAvailableLabels && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px 3px' }}>
+                        <div style={{ width: 8, height: 8, borderRadius: 2, background: bucket.color || '#ccc', flexShrink: 0 }} />
+                        <span style={{ fontSize: 10, fontWeight: 700, color: '#aaa', textTransform: 'uppercase', letterSpacing: 0.4 }}>
+                          {bucket.label}
+                        </span>
+                      </div>
+                    )}
+                    {bucket.tags.map((tag) => (
+                      <div
+                        key={tag.id}
+                        onClick={() => { onAddTag(tag.id); setAddingTag(false); }}
+                        title={tag.hideInSidebar ? HIDDEN_TAG_TITLE : undefined}
+                        style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', cursor: 'pointer', borderRadius: 6, fontSize: 13 }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                      >
+                        <div style={{ width: 14, height: 14, borderRadius: 3, flexShrink: 0, ...tagChipStyle(tag) }} />
+                        {tag.name}
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Custom fields */}
@@ -2046,11 +2187,11 @@ function TagsPanel(props: TagsPanelProps) {
           />
           <div style={{ fontSize: 12, color: '#aaa', paddingLeft: 6 }}>
             {usageCount} conversation{usageCount !== 1 ? 's' : ''}
-            {hidden && <span style={{ color: '#8a6d00', fontWeight: 600 }}>{' · hidden in sidebar'}</span>}
+            {hidden && <span style={{ color: '#8a6d00', fontWeight: 600 }}>{' · hidden in previews'}</span>}
           </div>
         </div>
         <label
-          title="Hide this tag's chip on Messenger's conversation rows. It stays available in the CRM panel, here, and in search."
+          title="Keep this tag's chip out of the compact list rows (Messenger's sidebar and the contact list). It still shows on the contact's profile and in the CRM panel, and still works for sorting, filtering and search."
           style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: '#666', fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}
         >
           <input
@@ -2059,7 +2200,7 @@ function TagsPanel(props: TagsPanelProps) {
             onChange={(e) => onSetTagHidden(tag.id, e.target.checked)}
             style={{ cursor: 'pointer', margin: 0 }}
           />
-          Hide in sidebar
+          Hide in previews
         </label>
         <select
           value={tag.groupId || ''}
@@ -2122,9 +2263,10 @@ function TagsPanel(props: TagsPanelProps) {
           </button>
         </div>
         <p style={{ margin: '12px 0 0', fontSize: 11, color: '#aaa', lineHeight: 1.5 }}>
-          <strong>Hide in sidebar</strong> keeps a tag's chip off Messenger's conversation rows — useful for tags that sit on nearly
-          everyone. The tag still works everywhere else: the in-page CRM panel, this dashboard, and search. Hidden tags are shown
-          with a striped background.
+          <strong>Hide in previews</strong> keeps a tag's chip out of the compact list rows — Messenger's conversation sidebar and the
+          contact list on the Conversations tab — which is useful for tags that sit on nearly everyone. The tag is untouched
+          everywhere else: it still shows on the contact's profile and in the in-page CRM panel, and it still works for
+          <strong> sorting, filtering and advanced search</strong>. Hidden tags are marked with a striped background.
         </p>
       </div>
 
@@ -4025,10 +4167,12 @@ function MessagingPanel({ conversations, tags, store, campaigns, queue, machines
                   </span>
                   {noUrl && <span style={{ fontSize: 10, color: '#b9770e' }}>no URL</span>}
                   {queuedIn && !noUrl && <span style={{ fontSize: 9, color: '#2b5fb8', background: '#eef4ff', padding: '1px 5px', borderRadius: 7, fontWeight: 600 }}>queued</span>}
-                  {c.tags.slice(0, 2).map((tid) => {
-                    const tag = store.tags[tid];
-                    return tag ? <span key={tid} style={{ background: tag.color, color: '#fff', fontSize: 9, padding: '1px 5px', borderRadius: 7 }}>{tag.name}</span> : null;
-                  })}
+                  {/* Also a preview, and only two chips fit — so a tag marked
+                      "hide in previews" must not be one of them. Filtered
+                      before the slice, or it would crowd out a useful tag. */}
+                  {previewTags(c.tags, store.tags).slice(0, 2).map((tag) => (
+                    <span key={tag.id} style={{ background: tag.color, color: '#fff', fontSize: 9, padding: '1px 5px', borderRadius: 7 }}>{tag.name}</span>
+                  ))}
                 </label>
               );
             })}
