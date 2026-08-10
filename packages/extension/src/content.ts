@@ -107,8 +107,20 @@ function getProfilePageName(): string {
 }
 
 /**
- * The name the page we are on is entitled to OFFER for a contact, or '' when it
- * isn't a credible source for one.
+ * The sidebar row for a specific thread, or null when that person isn't on
+ * screen. Matched on the PARSED thread id rather than an href substring, so a
+ * lookup for /t/123 can't pick up /t/1234's row.
+ */
+function sidebarLinkForThread(threadId: string): HTMLAnchorElement | null {
+  for (const link of Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href*="/t/"]'))) {
+    if (extractThreadId(link.href) === threadId) return link;
+  }
+  return null;
+}
+
+/**
+ * The name this page is entitled to OFFER for the contact the panel is bound to
+ * (`forThreadId`), or '' when it isn't a credible source for one.
  *
  * A Facebook profile page is not a Messenger thread, and extractActiveThreadName
  * reads it like one. With no /t/<id> in the URL it has no sidebar row to anchor
@@ -129,11 +141,30 @@ function getProfilePageName(): string {
  * for this profile, and when there isn't one we offer nothing rather than
  * guessing: a contact keeping the name it has always beats a fresh look at a
  * page that gets harder to read as it hydrates (see firstProfileName).
+ *
+ * In Messenger the equivalent trap is WHOSE thread the page describes.
+ * getActiveThreadName reads the open conversation — the header photo's alt, the
+ * headings inside [role="main"], the document title — and the panel is not
+ * always bound to that conversation. The sidebar "+" button opens the panel for
+ * a row WITHOUT navigating into it, and renderPanel then calls
+ * ensureConversation with no link, so the open conversation's name was offered
+ * for the person who was clicked. upsertContact takes a name unconditionally on
+ * a direct store-key hit, so it landed: every "+" click renamed that contact to
+ * whoever the page happened to be sitting on (the thread that was open at page
+ * load, since clicking "+" never navigates).
+ *
+ * So when the panel is on somebody other than the open thread, the only
+ * credible source for their name is their OWN sidebar row — and when they have
+ * no row on screen we offer nothing rather than the page's idea of a name.
  */
-function pageOfferedName(): string {
+function pageOfferedName(forThreadId?: string | null): string {
   if (isProfilePage()) {
     const n = getProfilePageName();
     return isUsableProfileName(n) ? n : '';
+  }
+  if (forThreadId && forThreadId !== getActiveThreadId()) {
+    const link = sidebarLinkForThread(forThreadId);
+    return link ? getNameFromLink(link) : '';
   }
   return getActiveThreadName();
 }
@@ -377,7 +408,7 @@ async function ensureConversation(threadId: string, link?: HTMLAnchorElement): P
       // '' when it isn't one); whether the offer is actually taken depends on
       // how the record was matched and whether the name was hand-set, and that
       // rule lives in the mutation so it runs against the real store.
-      name: link ? getNameFromLink(link) : pageOfferedName(),
+      name: link ? getNameFromLink(link) : pageOfferedName(threadId),
       allowCreate: true,
     },
   ]);
@@ -987,7 +1018,9 @@ async function renderPanel() {
   const autoCapture = (preStore.settings as Record<string, unknown>)?.autoCapture !== false;
   const wasRemoved = removedThreads.has(threadId);
   if ((!autoCapture || wasRemoved) && !preStore.conversations[threadId]) {
-    const guessName = isProfilePage() ? getProfilePageName() : getActiveThreadName();
+    // Read through the same resolver the save below will use, so this screen
+    // can't show one person's name and store another's.
+    const guessName = pageOfferedName(threadId) || 'Unknown';
     panelEl.innerHTML = `
       <div class="fb-crm-header">
         <span>Messenger CRM</span>
