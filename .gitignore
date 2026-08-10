@@ -1,5 +1,8 @@
 node_modules/
-dist/
+# Per-package build output stays untracked. The repo-root /dist is NOT ignored:
+# it holds the Chrome Web Store upload zips, which are committed as a record of
+# exactly what was submitted. A bare `dist/` here would match both.
+packages/*/dist/
 build/
 .env
 .env.local

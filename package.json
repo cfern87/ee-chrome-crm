@@ -1,6 +1,6 @@
 {
   "name": "not-another-social-crm",
-  "version": "1.0.23",
+  "version": "1.0.25",
   "description": "Not Another Social CRM with tagging and dashboard",
   "private": true,
   "workspaces": [
@@ -11,6 +11,7 @@
     "install-all": "npm install",
     "dev": "npm run dev --workspaces",
     "build": "npm run build --workspaces",
+    "package": "node scripts/package-extension.mjs",
     "start": "npm start --workspaces",
     "prepare": "git config core.hooksPath .githooks"
   },
