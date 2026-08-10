@@ -1,6 +1,6 @@
 {
   "name": "facebook-crm-dashboard",
-  "version": "1.0.25",
+  "version": "1.0.26",
   "description": "React dashboard for Social CRM",
   "type": "module",
   "scripts": {
