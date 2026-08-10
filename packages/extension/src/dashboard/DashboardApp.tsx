@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, addTagsTo, removeTagsFrom, lastTaggedAt, getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, isStoreChangeKey, isCrmSyncKey } from '../storage';
+import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, addTagsTo, removeTagsFrom, lastTaggedAt, getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, isStoreChangeKey, isCrmSyncKey, touchDef } from '../storage';
 import { BUILD_INFO } from '../buildInfo';
-import { getEntitlement, PLATFORM_URL, FREE_CONTACT_LIMIT, type Entitlement } from '../license';
+import { getEntitlement, PLATFORM_URL, FREE_CONTACT_LIMIT, isSignedIn, SESSION_KEY, EXTENSION_AUTH_PATH, type Entitlement } from '../license';
 
 import {
   QueryGroup, SavedSearch, ArchiveScope, QueryContext,
@@ -78,6 +78,32 @@ function pageWindow(current: number, total: number): (number | null)[] {
     prev = p;
   }
   return out;
+}
+
+/**
+ * Guard for import/export. The dashboard as a whole is already behind the
+ * sign-in gate, but that is render state: a session can expire while this tab
+ * sits open, and moving data in or out of the CRM is exactly where an
+ * out-of-date screen must not be trusted. So these paths re-check at click time
+ * against the stored session, not against React state.
+ *
+ * Import is additionally refused by the background (SET_STORE checks the same
+ * thing before writing); export has no write to be refused, which is why the
+ * check here is what actually stops it.
+ */
+async function ensureSignedIn(action: string): Promise<boolean> {
+  if (await isSignedIn()) return true;
+  alert(`Sign in to your Not Another Social CRM account to ${action}.`);
+  return false;
+}
+
+/**
+ * Diagonal stripes over a base colour — the shared visual for "this tag is
+ * hidden from the Messenger sidebar". Matches .fb-crm-chip-hidden in
+ * content.css so the dashboard and the in-page panel say it the same way.
+ */
+function stripedBackground(base: string, stripe: string): string {
+  return `repeating-linear-gradient(45deg, ${stripe} 0, ${stripe} 4px, ${base} 4px, ${base} 8px)`;
 }
 
 function pagerBtnStyle(active: boolean, disabled: boolean): React.CSSProperties {
@@ -212,6 +238,34 @@ export default function DashboardApp() {
   const [pageSize, setPageSize] = useState(50);
 
   const [syncUsage, setSyncUsage] = useState<SyncUsage | null>(null);
+
+  // An account gates the whole dashboard, not just saving. `null` while the
+  // first check is in flight so the tabs can't flash up and then be replaced by
+  // the sign-in screen. Re-checked whenever the session key changes, so signing
+  // in from the popup or the website unlocks this tab without a reload.
+  const [signedIn, setSignedIn] = useState<boolean | null>(null);
+  const refreshSignedIn = useCallback(() => {
+    isSignedIn().then(setSignedIn).catch(() => setSignedIn(false));
+  }, []);
+
+  useEffect(() => {
+    refreshSignedIn();
+    try {
+      if (typeof chrome === 'undefined' || !chrome.storage) return;
+      const handler = (changes: Record<string, unknown>, area: string) => {
+        if (area === 'local' && SESSION_KEY in changes) refreshSignedIn();
+      };
+      chrome.storage.onChanged.addListener(handler);
+      return () => chrome.storage.onChanged.removeListener(handler);
+    } catch { /* no storage events — the poll below covers it */ }
+  }, [refreshSignedIn]);
+
+  // Fallback for the case where storage events don't arrive (and to notice a
+  // session that expired while this tab sat open).
+  useEffect(() => {
+    const interval = setInterval(refreshSignedIn, 15_000);
+    return () => clearInterval(interval);
+  }, [refreshSignedIn]);
 
   // Bulk messaging
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -430,8 +484,9 @@ export default function DashboardApp() {
   useEffect(() => { if (page !== currentPage) setPage(currentPage); }, [page, currentPage]);
 
   // Export the current filtered/sorted view as a re-importable CSV.
-  const exportFilteredCsv = () => {
+  const exportFilteredCsv = async () => {
     if (filtered.length === 0) return;
+    if (!(await ensureSignedIn('export contacts'))) return;
     const exportFields = Object.values(store.fieldDefs).sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
     const csv = contactsToCsv(filtered, store.tags, exportFields);
     downloadText(`messenger-crm-contacts-${tsStamp()}.csv`, 'text/csv', csv);
@@ -710,12 +765,14 @@ export default function DashboardApp() {
   const addTag = async () => {
     const name = newTagName.trim();
     if (!name) return;
+    const ts = Date.now();
     const tag: Tag = {
-      id: Date.now().toString(),
+      id: ts.toString(),
       name,
       color: newTagColor,
       ...(newTagGroup ? { groupId: newTagGroup } : {}),
-      createdAt: Date.now(),
+      createdAt: ts,
+      updatedAt: ts,
     };
     const next = { ...store, tags: { ...store.tags, [tag.id]: tag } };
     await updateStore(next);
@@ -733,18 +790,21 @@ export default function DashboardApp() {
     await updateStore({ ...store, tags: nextTags, conversations: nextConvs });
   };
 
+  // Every one of these stamps updatedAt (via touchDef). That stamp is what
+  // carries the edit to the user's other machines — see Tag.updatedAt in
+  // storage.ts and the merge in drive.ts.
   const renameTag = async (tagId: string, name: string) => {
     const tag = store.tags[tagId];
     const trimmed = name.trim();
     if (!tag || !trimmed || trimmed === tag.name) return;
-    await updateStore({ ...store, tags: { ...store.tags, [tagId]: { ...tag, name: trimmed } } });
+    await updateStore({ ...store, tags: { ...store.tags, [tagId]: touchDef({ ...tag, name: trimmed }) } });
   };
 
   // Change a tag's color.
   const recolorTag = async (tagId: string, color: string) => {
     const tag = store.tags[tagId];
     if (!tag || color === tag.color) return;
-    await updateStore({ ...store, tags: { ...store.tags, [tagId]: { ...tag, color } } });
+    await updateStore({ ...store, tags: { ...store.tags, [tagId]: touchDef({ ...tag, color }) } });
   };
 
   // Move a tag into a group (or out of one when groupId is '').
@@ -754,7 +814,18 @@ export default function DashboardApp() {
     const nextTag: Tag = { ...tag };
     if (groupId) nextTag.groupId = groupId;
     else delete nextTag.groupId;
-    await updateStore({ ...store, tags: { ...store.tags, [tagId]: nextTag } });
+    await updateStore({ ...store, tags: { ...store.tags, [tagId]: touchDef(nextTag) } });
+  };
+
+  // Keep a tag out of Messenger's conversation rows without deleting it. The
+  // tag stays fully usable in the CRM panel, the dashboard and search.
+  const setTagHidden = async (tagId: string, hidden: boolean) => {
+    const tag = store.tags[tagId];
+    if (!tag || !!tag.hideInSidebar === hidden) return;
+    const nextTag: Tag = { ...tag };
+    if (hidden) nextTag.hideInSidebar = true;
+    else delete nextTag.hideInSidebar;
+    await updateStore({ ...store, tags: { ...store.tags, [tagId]: touchDef(nextTag) } });
   };
 
   // --- Tag groups ---
@@ -763,8 +834,9 @@ export default function DashboardApp() {
   const addTagGroup = async () => {
     const name = newGroupName.trim();
     if (!name) return;
-    const id = `grp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-    const group: TagGroup = { id, name, color: newGroupColor, order: tagGroups.length, createdAt: Date.now() };
+    const ts = Date.now();
+    const id = `grp_${ts.toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const group: TagGroup = { id, name, color: newGroupColor, order: tagGroups.length, createdAt: ts, updatedAt: ts };
     await updateStore({ ...store, tagGroups: { ...store.tagGroups, [id]: group } });
     setNewGroupName('');
   };
@@ -772,11 +844,12 @@ export default function DashboardApp() {
   const renameTagGroup = async (groupId: string, name: string) => {
     const g = store.tagGroups[groupId];
     if (!g || !name.trim() || name.trim() === g.name) return;
-    await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: { ...g, name: name.trim() } } });
+    await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: touchDef({ ...g, name: name.trim() }) } });
   };
 
   // Deleting a group leaves its tags intact but ungrouped.
   const deleteTagGroup = async (groupId: string) => {
+    const ts = Date.now();
     const nextGroups = { ...store.tagGroups };
     delete nextGroups[groupId];
     const nextTags = { ...store.tags };
@@ -784,7 +857,9 @@ export default function DashboardApp() {
       if (nextTags[id].groupId === groupId) {
         const t = { ...nextTags[id] };
         delete t.groupId;
-        nextTags[id] = t;
+        // Stamped, or the ungrouping wouldn't survive a merge against a machine
+        // that still has the tag inside the group.
+        nextTags[id] = touchDef(t, ts);
       }
     }
     await updateStore({ ...store, tagGroups: nextGroups, tags: nextTags });
@@ -796,7 +871,8 @@ export default function DashboardApp() {
   const addField = async (name: string, type: CustomFieldType, options: string[], showInPanel: boolean) => {
     const trimmed = name.trim();
     if (!trimmed) return;
-    const id = `fld_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const ts = Date.now();
+    const id = `fld_${ts.toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     const def: CustomFieldDef = {
       id,
       name: trimmed,
@@ -804,21 +880,21 @@ export default function DashboardApp() {
       ...(type === 'select' ? { options } : {}),
       order: fieldDefs.length,
       ...(showInPanel ? { showInPanel: true } : {}),
-      createdAt: Date.now(),
+      createdAt: ts,
+      updatedAt: ts,
     };
     await updateStore({ ...store, fieldDefs: { ...store.fieldDefs, [id]: def } });
   };
 
-  // Show/hide a field in the in-page CRM panel. Note this leaves createdAt
-  // alone: fieldDefs merge last-write-wins on createdAt with local edits
-  // winning ties, so the toggle still propagates to other machines.
+  // Show/hide a field in the in-page CRM panel. The updatedAt stamp is what
+  // carries the toggle to the user's other machines.
   const setFieldInPanel = async (fieldId: string, showInPanel: boolean) => {
     const def = store.fieldDefs[fieldId];
     if (!def) return;
     const next = { ...def };
     if (showInPanel) next.showInPanel = true;
     else delete next.showInPanel;
-    await updateStore({ ...store, fieldDefs: { ...store.fieldDefs, [fieldId]: next } });
+    await updateStore({ ...store, fieldDefs: { ...store.fieldDefs, [fieldId]: touchDef(next) } });
   };
 
   const deleteField = async (fieldId: string) => {
@@ -856,13 +932,18 @@ export default function DashboardApp() {
     (c) => Date.now() - c.updatedAt < 7 * 24 * 60 * 60 * 1000
   ).length;
 
-  if (loading) {
+  if (loading || signedIn === null) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', fontFamily: 'system-ui, sans-serif', color: '#666' }}>
         Loading...
       </div>
     );
   }
+
+  // Locked: the sign-in prompt is the entire dashboard. Nothing else is
+  // rendered — not the contact list, not export, not settings — because none of
+  // it can read or write without an account.
+  if (!signedIn) return <SignInGate onRecheck={refreshSignedIn} />;
 
   return (
     <div style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', minHeight: '100vh', background: '#f5f5f5', color: '#222' }}>
@@ -1442,6 +1523,7 @@ export default function DashboardApp() {
             onRenameTag={renameTag}
             onRecolorTag={recolorTag}
             onSetTagGroup={setTagGroup}
+            onSetTagHidden={setTagHidden}
             onAddGroup={addTagGroup}
             onRenameGroup={renameTagGroup}
             onDeleteGroup={deleteTagGroup}
@@ -1505,6 +1587,61 @@ export default function DashboardApp() {
 // returns an error string to display inline, or null on success. Reused in the
 // contact detail pane and in the messaging queue so a wrong/changed URL can be
 // fixed right where a send failed, then requeued.
+/**
+ * The whole dashboard while no account is signed in. Sign-in happens on the
+ * website (it owns the Google OAuth flow and hands the session back to the
+ * extension), so this is a prompt and a link rather than a form.
+ *
+ * Nothing about the CRM is shown here — no counts, no contact list — since the
+ * point is that the extension is locked, not merely read-only. Local data is
+ * untouched and comes straight back on sign-in.
+ */
+function SignInGate({ onRecheck }: { onRecheck: () => void }) {
+  const [checking, setChecking] = useState(false);
+
+  // Sign-in completes in the other tab, which writes the session to
+  // chrome.storage.local — the watcher in DashboardApp picks that up on its own.
+  // This button is for the case where the person got back here first.
+  const recheck = () => {
+    setChecking(true);
+    onRecheck();
+    setTimeout(() => setChecking(false), 1200);
+  };
+
+  return (
+    <div style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', minHeight: '100vh', background: '#f5f5f5', color: '#222', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+      <div style={{ background: '#fff', borderRadius: 12, padding: '32px 36px', boxShadow: '0 2px 12px rgba(0,0,0,0.1)', maxWidth: 460, textAlign: 'center' }}>
+        <div style={{ fontSize: 40, marginBottom: 12 }}>🏷️</div>
+        <h1 style={{ margin: '0 0 8px', fontSize: 22, fontWeight: 700 }}>Sign in to Not Another Social CRM</h1>
+        <p style={{ margin: '0 0 20px', fontSize: 14, color: '#666', lineHeight: 1.6 }}>
+          An account is required to use the extension. Free accounts store up to {FREE_CONTACT_LIMIT} contacts;
+          Pro adds unlimited contacts and Google Drive sync.
+        </p>
+        <a
+          href={`${PLATFORM_URL}${EXTENSION_AUTH_PATH}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ display: 'inline-block', background: '#065fd4', color: '#fff', textDecoration: 'none', padding: '11px 22px', borderRadius: 8, fontWeight: 600, fontSize: 14 }}
+        >
+          Sign in or create an account
+        </a>
+        <div style={{ marginTop: 16 }}>
+          <button
+            onClick={recheck}
+            disabled={checking}
+            style={{ background: 'none', border: 'none', color: '#065fd4', fontSize: 13, fontWeight: 600, cursor: checking ? 'default' : 'pointer', padding: 0 }}
+          >
+            {checking ? 'Checking…' : 'Already signed in? Check again'}
+          </button>
+        </div>
+        <p style={{ margin: '20px 0 0', fontSize: 12, color: '#aaa', lineHeight: 1.6 }}>
+          Your existing contacts and tags are still stored on this machine — they come straight back when you sign in.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function ProfileUrlEditor({ value, onSave, compact }: { value?: string; onSave: (raw: string) => Promise<string | null>; compact?: boolean }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
@@ -1858,6 +1995,7 @@ interface TagsPanelProps {
   onRenameTag: (tagId: string, name: string) => void;
   onRecolorTag: (tagId: string, color: string) => void;
   onSetTagGroup: (tagId: string, groupId: string) => void;
+  onSetTagHidden: (tagId: string, hidden: boolean) => void;
   onAddGroup: () => void;
   onRenameGroup: (groupId: string, name: string) => void;
   onDeleteGroup: (groupId: string) => void;
@@ -1868,15 +2006,26 @@ function TagsPanel(props: TagsPanelProps) {
     tags, tagGroups, conversations,
     newTagName, setNewTagName, newTagColor, setNewTagColor, newTagGroup, setNewTagGroup,
     newGroupName, setNewGroupName, newGroupColor, setNewGroupColor,
-    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onAddGroup, onRenameGroup, onDeleteGroup,
+    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onSetTagHidden, onAddGroup, onRenameGroup, onDeleteGroup,
   } = props;
 
   const usageOf = (tagId: string) => conversations.filter((c) => c.tags.includes(tagId)).length;
 
   const tagRow = (tag: Tag) => {
     const usageCount = usageOf(tag.id);
+    const hidden = !!tag.hideInSidebar;
     return (
-      <div key={tag.id} style={{ background: '#fff', borderRadius: 8, padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 12, boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }}>
+      <div
+        key={tag.id}
+        style={{
+          // Hidden tags carry the same striped fill the in-page panel uses, so
+          // the two surfaces read the same way. Kept faint here — this is a
+          // whole row, not a chip.
+          background: hidden ? stripedBackground('#ffffff', 'rgba(0,0,0,0.045)') : '#fff',
+          borderRadius: 8, padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 12,
+          boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
+        }}
+      >
         <input
           type="color"
           value={tag.color}
@@ -1895,8 +2044,23 @@ function TagsPanel(props: TagsPanelProps) {
             onFocus={(e) => (e.currentTarget.style.border = '1px solid #cfe0f5')}
             onBlurCapture={(e) => (e.currentTarget.style.border = '1px solid transparent')}
           />
-          <div style={{ fontSize: 12, color: '#aaa', paddingLeft: 6 }}>{usageCount} conversation{usageCount !== 1 ? 's' : ''}</div>
+          <div style={{ fontSize: 12, color: '#aaa', paddingLeft: 6 }}>
+            {usageCount} conversation{usageCount !== 1 ? 's' : ''}
+            {hidden && <span style={{ color: '#8a6d00', fontWeight: 600 }}>{' · hidden in sidebar'}</span>}
+          </div>
         </div>
+        <label
+          title="Hide this tag's chip on Messenger's conversation rows. It stays available in the CRM panel, here, and in search."
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: '#666', fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}
+        >
+          <input
+            type="checkbox"
+            checked={hidden}
+            onChange={(e) => onSetTagHidden(tag.id, e.target.checked)}
+            style={{ cursor: 'pointer', margin: 0 }}
+          />
+          Hide in sidebar
+        </label>
         <select
           value={tag.groupId || ''}
           onChange={(e) => onSetTagGroup(tag.id, e.target.value)}
@@ -1957,6 +2121,11 @@ function TagsPanel(props: TagsPanelProps) {
             Add Tag
           </button>
         </div>
+        <p style={{ margin: '12px 0 0', fontSize: 11, color: '#aaa', lineHeight: 1.5 }}>
+          <strong>Hide in sidebar</strong> keeps a tag's chip off Messenger's conversation rows — useful for tags that sit on nearly
+          everyone. The tag still works everywhere else: the in-page CRM panel, this dashboard, and search. Hidden tags are shown
+          with a striped background.
+        </p>
       </div>
 
       {/* Create group */}
@@ -2225,7 +2394,8 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
     await updateStore({ ...store, settings: { ...settings, [key]: val } });
   };
 
-  const exportData = () => {
+  const exportData = async () => {
+    if (!(await ensureSignedIn('export your data'))) return;
     const data = JSON.stringify(store, null, 2);
     const a = document.createElement('a');
     a.href = 'data:text/plain;charset=utf-8,' + encodeURIComponent(data);
@@ -2233,7 +2403,8 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
     a.click();
   };
 
-  const importData = () => {
+  const importData = async () => {
+    if (!(await ensureSignedIn('import data'))) return;
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.json';
@@ -2244,8 +2415,13 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
       reader.onload = async (ev) => {
         try {
           const data = JSON.parse(ev.target?.result as string);
-          await updateStore(data);
-          alert('Data imported successfully!');
+          const save = await updateStore(data);
+          // Report what actually happened. The background refuses the write when
+          // there's no account, and claiming success there would be a lie that
+          // costs the user their backup.
+          if (save.signedOut) alert(save.reason || 'Sign in to import data.');
+          else if (save.ok) alert('Data imported successfully!');
+          else alert(`Imported on this device, but ${save.pending} record(s) could not sync: ${save.reason || 'write rejected'}`);
         } catch {
           alert('Invalid file format');
         }
@@ -3149,6 +3325,7 @@ function CsvImportPanel({ store, updateStore }: CsvImportPanelProps) {
 
   const confirmImport = async () => {
     if (!file || !preview || preview.blocked) return;
+    if (!(await ensureSignedIn('import contacts'))) return;
     setBusy(true);
     try {
       // Re-parse against the live store at confirm time.
@@ -3156,6 +3333,14 @@ function CsvImportPanel({ store, updateStore }: CsvImportPanelProps) {
       const { contacts, errors, warnings, totalDataRows } = parse;
       const result = applyContacts(store, contacts);
       const save = await updateStore(result.store);
+      // Refused outright — the session expired between the click-time check and
+      // the write. Bail before recording history for an import that didn't
+      // happen, and leave the mapping in place so retrying after signing in is
+      // one click.
+      if (save.signedOut) {
+        setStatus({ type: 'error', msg: save.reason || 'Nothing was imported — sign in to your account first.' });
+        return;
+      }
       const entry = await recordImport({
         fileName: file.name,
         totalRows: totalDataRows,

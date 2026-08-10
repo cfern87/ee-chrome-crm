@@ -18,7 +18,7 @@ import {
 } from './storage';
 import type { Store, Tag, Conversation, CustomFieldDef } from './storage';
 import type { Mutation } from './mutations';
-import { PLATFORM_URL } from './license';
+import { PLATFORM_URL, SESSION_KEY } from './license';
 
 import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
 import { buildThreadIndex, isUnboundOrphan, planOrphanBinds, threadAliases } from './contacts';
@@ -245,6 +245,21 @@ interface MutateResponse {
 
 async function mutate(mutations: Mutation[]): Promise<Store> {
   if (!mutations.length) return getStore();
+
+  // Locked without an account. The background refuses these writes anyway; this
+  // stops the passes that run on intervals (profile-thread resolution, name
+  // repair, last-contacted tracking) from sending doomed writes.
+  //
+  // Deliberately silent, no notice: none of the callers that can reach this
+  // while locked is a deliberate CRM action — the panel is showing the sign-in
+  // prompt, so there is nothing for the user to have just clicked. The notice
+  // still fires below if a write is refused *after* passing this check, which is
+  // the case where they did act and the session died underneath them.
+  if (!(await isSignedIn())) {
+    console.info('[CRM] Skipped store write — no account signed in.');
+    return getStore();
+  }
+
   lastSelfWriteAt = Date.now();
   invalidateThreadIndex();
 
@@ -277,6 +292,57 @@ async function mutate(mutations: Mutation[]): Promise<Store> {
   storeCache = null;
   lastSelfWriteAt = Date.now();
   return getStore();
+}
+
+// ---- Sign-in gate ----
+//
+// An account is required to use the extension at all, not just to save. Nothing
+// is injected into Messenger and the panel offers only a sign-in prompt until
+// somebody signs in. Enforcement still lives in the background (saveStore
+// refuses when signed out) — this is what stops the UI from pretending to work.
+//
+// The answer is cached because the sidebar pass runs on a 2s interval and a
+// round trip per pass would be pure waste. Two things refresh it: the TTL, and
+// the session key changing (signing in from the popup or the website unlocks
+// every open Messenger tab straight away, no reload).
+
+const SIGNED_IN_TTL_MS = 30_000;
+let signedInCache: boolean | null = null;
+let signedInCheckedAt = 0;
+let signedInInFlight: Promise<boolean> | null = null;
+
+async function isSignedIn(): Promise<boolean> {
+  if (signedInCache !== null && Date.now() - signedInCheckedAt < SIGNED_IN_TTL_MS) return signedInCache;
+  if (signedInInFlight) return signedInInFlight;
+
+  signedInInFlight = (async () => {
+    const res = await sendBg<{ signedIn?: boolean }>({ type: 'GET_SIGNED_IN' });
+    // No answer means the worker is asleep or restarting — not that the user is
+    // signed out. Keep the last known answer rather than locking a working
+    // session out mid-use; a fresh tab with no answer yet stays locked, which is
+    // the safe direction.
+    if (res && typeof res.signedIn === 'boolean') {
+      signedInCache = res.signedIn;
+      signedInCheckedAt = Date.now();
+    }
+    return signedInCache ?? false;
+  })().finally(() => { signedInInFlight = null; });
+
+  return signedInInFlight;
+}
+
+/** Forget the cached answer so the next check really asks. */
+function invalidateSignedIn(): void {
+  signedInCache = null;
+  signedInCheckedAt = 0;
+}
+
+// Remove everything we've injected into Messenger. Runs when a sidebar pass
+// finds the extension locked, so signing out clears the page instead of leaving
+// stale chips and "+" buttons behind on rows the user can no longer act on.
+function removeInjectedSidebarUi(): void {
+  document.querySelectorAll('[data-crm-chips]').forEach((el) => el.remove());
+  document.querySelectorAll('[data-crm-add-tag]').forEach((el) => el.remove());
 }
 
 // The write never reached the service worker. Rare, but silent data loss is
@@ -482,6 +548,20 @@ let lastLoggedLinkCount = -1;
 // the corner made every one of those a full trip across the window and back.
 async function openPanelForThread(threadId: string, link?: HTMLAnchorElement, anchor?: AnchorBox) {
   if (!panelEl) buildLauncher();
+
+  // Locked: open the panel on the sign-in prompt rather than creating a contact
+  // that the background would refuse to save anyway.
+  if (!(await isSignedIn())) {
+    currentPanelThreadId = null;
+    panelAnchor = anchor ?? null;
+    if (panelEl) {
+      if (!panelAnchor) resetPanelPosition();
+      panelEl.style.display = 'block';
+      await renderPanel();
+    }
+    return;
+  }
+
   // Reaching for this person from the sidebar is an explicit "I want them in
   // the CRM", so it lifts any earlier removal.
   removedThreads.delete(threadId);
@@ -559,6 +639,15 @@ async function injectSidebarTags(): Promise<void> {
 
 async function injectSidebarTagsOnce() {
   lastInjectAt = Date.now();
+
+  // Locked without an account: draw nothing, and take down anything a previous
+  // signed-in pass left behind. The launcher stays so there's still a way to
+  // reach the sign-in prompt.
+  if (!(await isSignedIn())) {
+    removeInjectedSidebarUi();
+    return;
+  }
+
   const store = await getStore();
   const links = document.querySelectorAll<HTMLAnchorElement>('a[href*="/t/"]');
 
@@ -581,8 +670,11 @@ async function injectSidebarTagsOnce() {
     // their profile page is keyed on that profile's id, which differs from the
     // /t/<id> Facebook uses here. Without this their chips never render.
     const conv = findConversationForThread(store, threadId);
+    // hideInSidebar tags are deliberately dropped here and only here: they stay
+    // fully present in the CRM panel, the dashboard and search. It's for tags
+    // that sit on most of your contacts, where a chip on every row is noise.
     const tags: Tag[] = conv
-      ? (conv.tags.map(tid => store.tags[tid]).filter(Boolean) as Tag[])
+      ? (conv.tags.map(tid => store.tags[tid]).filter((t): t is Tag => !!t && !t.hideInSidebar))
       : [];
 
     // Find or create our chip container inside the link
@@ -752,6 +844,17 @@ function startSidebarObserver() {
 if (isExtensionAlive()) {
   try {
     chrome.storage.onChanged.addListener((changes, area) => {
+      // Signed in or out somewhere else (the popup, the website's hand-off).
+      // Re-check immediately instead of waiting out SIGNED_IN_TTL_MS, so the
+      // page locks or unlocks as soon as it happens.
+      if (area === 'local' && SESSION_KEY in changes) {
+        invalidateSignedIn();
+        storeCache = null;
+        void injectSidebarTags();
+        if (panelEl && panelEl.style.display !== 'none') void renderPanel();
+        return;
+      }
+
       const relevant =
         (area === 'local' && Object.keys(changes).some(isStoreChangeKey)) ||
         (area === 'sync' && Object.keys(changes).some(isCrmSyncKey));
@@ -1010,6 +1113,15 @@ async function renderPanel(): Promise<void> {
 
 async function renderPanelContent() {
   if (!panelEl) return;
+
+  // Nothing but the sign-in prompt until there's an account. This is the whole
+  // panel — no contact, no tags, no "save this contact" — because none of it
+  // would be allowed to write.
+  if (!(await isSignedIn())) {
+    renderSignInPanel();
+    return;
+  }
+
   let threadId = currentPanelThreadId || getActiveThreadId();
 
   // On a profile page there's no thread id in the URL. If this profile has
@@ -1181,7 +1293,7 @@ async function renderPanelContent() {
       <div class="fb-crm-chips">
         ${convTags.length === 0 ? '<span class="fb-crm-muted">No tags yet</span>' : ''}
         ${convTags.map(t =>
-          `<span class="fb-crm-chip" style="background:${t.color}">${escapeHtml(t.name)}<button class="fb-crm-chip-x" data-remove="${t.id}">✕</button></span>`
+          `<span class="${chipClass(t)}" style="${chipStyle(t)}" title="${chipTitle(t)}">${escapeHtml(t.name)}<button class="fb-crm-chip-x" data-remove="${t.id}">✕</button></span>`
         ).join('')}
       </div>
 
@@ -1189,7 +1301,7 @@ async function renderPanelContent() {
         <div class="fb-crm-section-title">Add existing tag</div>
         <div class="fb-crm-chips">
           ${availableTags.map(t =>
-            `<button class="fb-crm-chip fb-crm-chip-add" style="background:${t.color}" data-add="${t.id}">+ ${escapeHtml(t.name)}</button>`
+            `<button class="${chipClass(t)} fb-crm-chip-add" style="${chipStyle(t)}" title="${chipTitle(t)}" data-add="${t.id}">+ ${escapeHtml(t.name)}</button>`
           ).join('')}
         </div>` : ''}
 
@@ -1235,6 +1347,64 @@ async function renderPanelContent() {
       try { el.setSelectionRange(v.length, v.length); } catch { /* ignore */ }
     }
   }
+}
+
+/**
+ * The only thing the panel shows while no account is signed in. The button
+ * opens the platform's sign-in page in a new tab; when the session comes back
+ * the SESSION_KEY watcher below re-renders this panel into the real one.
+ */
+function renderSignInPanel(): void {
+  if (!panelEl) return;
+  // A locked panel has no contact and no armed delete to carry forward.
+  deleteArmed = false;
+  fieldDrafts.clear();
+  focusedFieldId = null;
+  lastRenderedThread = null;
+
+  panelEl.innerHTML = `
+    <div class="fb-crm-header">
+      <span>Messenger CRM</span>
+      <button class="fb-crm-close">✕</button>
+    </div>
+    <div class="fb-crm-body">
+      <div class="fb-crm-name-row"><div class="fb-crm-name">Sign in to continue</div></div>
+      <div class="fb-crm-muted" style="margin:6px 0 12px;line-height:1.5">
+        Social CRM needs an account before it can tag, save or sync anything.
+        Free accounts store up to 25 contacts.
+      </div>
+      <button class="fb-crm-pick-btn" id="fb-crm-signin">Sign in or create an account</button>
+    </div>`;
+
+  wireClose();
+  panelEl.querySelector('#fb-crm-signin')?.addEventListener('click', () => {
+    window.open(`${PLATFORM_URL}/extension-auth`, '_blank', 'noopener');
+  });
+}
+
+// ---- Tag chip presentation ----
+//
+// A tag with hideInSidebar set doesn't get a chip on Messenger's conversation
+// rows, so the panel has to say so — otherwise applying it looks like nothing
+// happened. The striped fill is that signal, and it's drawn from the tag's own
+// colour so the tag is still recognisable at a glance.
+
+function isHiddenTag(t: Tag): boolean {
+  return !!t.hideInSidebar;
+}
+
+function chipClass(t: Tag): string {
+  return isHiddenTag(t) ? 'fb-crm-chip fb-crm-chip-hidden' : 'fb-crm-chip';
+}
+
+function chipStyle(t: Tag): string {
+  // background-COLOR for the hidden case, not the `background` shorthand: the
+  // shorthand would reset the background-image the stripes are painted with.
+  return isHiddenTag(t) ? `background-color:${t.color}` : `background:${t.color}`;
+}
+
+function chipTitle(t: Tag): string {
+  return isHiddenTag(t) ? 'Hidden from the Messenger sidebar' : '';
 }
 
 // One row of the panel's "Details" section. Values are deliberately NOT baked
@@ -1335,7 +1505,8 @@ function wirePanelActions(threadId: string) {
     const name = nameEl?.value.trim();
     if (!name) { nameEl?.focus(); return; }
 
-    const tag: Tag = { id: genId(), name, color: colorEl?.value || randomColor(), createdAt: Date.now() };
+    const ts = Date.now();
+    const tag: Tag = { id: genId(), name, color: colorEl?.value || randomColor(), createdAt: ts, updatedAt: ts };
     // Reset the draft for the next tag (fresh random color, empty name).
     newTagDraft.name = '';
     newTagDraft.color = randomColor();

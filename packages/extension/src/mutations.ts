@@ -291,7 +291,9 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
 
     case 'createTag': {
       const next = copy(store);
-      next.tags[m.tag.id] = m.tag;
+      // Stamped here rather than trusted from the caller, so a tag created in
+      // the in-page panel merges by recency like every other definition record.
+      next.tags[m.tag.id] = { ...m.tag, updatedAt: now };
       if (m.attachTo) {
         const conv = next.conversations[m.attachTo];
         if (conv) next.conversations[m.attachTo] = addTagsTo(conv, [m.tag.id], now);

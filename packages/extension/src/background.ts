@@ -1403,7 +1403,9 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         case 'ADD_TAG': {
           await withStoreLock(async () => {
             const store = await loadStore();
-            store.tags[request.payload.id] = request.payload;
+            // updatedAt stamped here so the popup (a plain script that can't
+            // import storage.ts) doesn't have to know about the merge rule.
+            store.tags[request.payload.id] = { ...request.payload, updatedAt: Date.now() };
             await saveStore(store);
           });
           sendResponse({ success: true });
@@ -1454,7 +1456,15 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         // ---- account / plan ----
         case 'GET_ACCOUNT': {
           const [entitlement, session] = await Promise.all([getEntitlement(), getStoredSession()]);
-          sendResponse({ entitlement, email: session?.email ?? null });
+          sendResponse({ entitlement, email: session?.email ?? null, signedIn: !!session });
+          break;
+        }
+        // Just "is anyone signed in?" — a local storage read, no network. The
+        // content script asks this on a short interval to decide whether the
+        // extension is unlocked at all, so it must not go through
+        // getEntitlement()'s (possibly networked) path the way GET_ACCOUNT does.
+        case 'GET_SIGNED_IN': {
+          sendResponse({ signedIn: await isSignedIn() });
           break;
         }
         case 'REFRESH_ACCOUNT': {

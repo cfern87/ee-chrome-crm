@@ -226,6 +226,22 @@ select.fb-crm-field-input { cursor: pointer; }
 }
 .fb-crm-chip-add:hover { opacity: 1; }
 
+/* A tag marked "hide from Messenger sidebar". It is still fully usable here —
+   the stripes just say it won't be drawn on the conversation rows, so applying
+   it doesn't look like it did nothing. The tag's own colour is set inline as
+   background-color and shows through the transparent bands. */
+.fb-crm-chip-hidden {
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.42) 0,
+    rgba(255, 255, 255, 0.42) 4px,
+    rgba(0, 0, 0, 0) 4px,
+    rgba(0, 0, 0, 0) 8px
+  );
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+
 .fb-crm-chip-x {
   background: rgba(255,255,255,0.3);
   border: none;

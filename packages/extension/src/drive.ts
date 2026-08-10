@@ -18,6 +18,11 @@
 // the implicit flow, and for the fallback that keeps older OAuth clients working.
 
 import type { Store } from './storage';
+// Value import back into storage.ts, which also imports from here. Safe: this is
+// a hoisted function declaration and mergeStores only runs long after both
+// modules have evaluated. Shared rather than re-derived on purpose — the writer
+// stamping the revision and the merge comparing it must agree.
+import { defRevision } from './storage';
 import { DriveError, recordSyncOk, recordSyncFailure } from './syncHealth';
 
 // Files we keep in the app-data folder.
@@ -921,17 +926,23 @@ export function mergeStores(a: Store, b: Store): Store {
     const conv = out.conversations[id];
     if (conv && (conv.updatedAt || 0) <= at) delete out.conversations[id];
   }
+  // Tags, groups and field definitions merge on defRevision (updatedAt, or
+  // createdAt for records written before that stamp existed) — NOT on createdAt
+  // alone. Comparing createdAt made every edit to an existing definition a
+  // no-op across machines: the two copies share a creation time, the tie always
+  // resolved to `b`, and so a recolour or rename made on the other machine could
+  // never take. That is what "tag colours don't sync" was.
   for (const [id, tag] of Object.entries(b.tags)) {
     const cur = out.tags[id];
-    if (!cur || (tag.createdAt || 0) >= (cur.createdAt || 0)) out.tags[id] = tag;
+    if (!cur || defRevision(tag) >= defRevision(cur)) out.tags[id] = tag;
   }
   for (const [id, g] of Object.entries(b.tagGroups)) {
     const cur = out.tagGroups[id];
-    if (!cur || (g.createdAt || 0) >= (cur.createdAt || 0)) out.tagGroups[id] = g;
+    if (!cur || defRevision(g) >= defRevision(cur)) out.tagGroups[id] = g;
   }
   for (const [id, f] of Object.entries(b.fieldDefs)) {
     const cur = out.fieldDefs[id];
-    if (!cur || (f.createdAt || 0) >= (cur.createdAt || 0)) out.fieldDefs[id] = f;
+    if (!cur || defRevision(f) >= defRevision(cur)) out.fieldDefs[id] = f;
   }
   for (const [id, sq] of Object.entries(b.savedSearches)) {
     const cur = out.savedSearches[id];

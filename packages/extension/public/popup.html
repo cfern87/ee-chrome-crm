@@ -261,13 +261,39 @@
     </button>
   </div>
 
-  <div class="nav-tabs">
+  <!-- Sign-in gate. An account is required to use the extension at all, so
+       until there is one this is the only thing the popup shows — the tabs and
+       every panel below are hidden by popup.js. -->
+  <div id="signInGate" style="display:none;padding:22px 18px;text-align:center;">
+    <div style="font-size:34px;margin-bottom:10px;">🏷️</div>
+    <div style="font-size:15px;font-weight:600;margin-bottom:6px;">Sign in to continue</div>
+    <div style="font-size:12px;color:#666;line-height:1.6;margin-bottom:14px;">
+      Not Another Social CRM needs an account before it can tag, save or sync anything.
+      Free accounts store up to 25 contacts.
+    </div>
+    <button class="btn-primary" id="gateGoogleBtn" style="margin-top:0;">Continue with Google</button>
+    <div style="font-size:11px;color:#999;margin:10px 0 8px;">or use your email and password</div>
+    <input type="email" id="gateEmail" placeholder="Email"
+      style="width:100%;padding:8px 10px;border:1px solid #e0e0e0;border-radius:6px;font-size:13px;margin-bottom:6px;box-sizing:border-box;" />
+    <input type="password" id="gatePassword" placeholder="Password"
+      style="width:100%;padding:8px 10px;border:1px solid #e0e0e0;border-radius:6px;font-size:13px;margin-bottom:8px;box-sizing:border-box;" />
+    <button class="btn-primary" id="gateSignInBtn" style="margin-top:0;">Sign In</button>
+    <div id="gateError" style="display:none;font-size:12px;color:#c0392b;margin-top:8px;"></div>
+    <div style="font-size:11px;color:#999;margin-top:10px;">
+      <a href="#" id="gateCreateLink" style="color:#667eea;">Create an account</a>
+    </div>
+    <div style="font-size:11px;color:#bbb;line-height:1.6;margin-top:14px;">
+      Your contacts and tags are still stored on this machine — they come back when you sign in.
+    </div>
+  </div>
+
+  <div class="nav-tabs" id="navTabs">
     <button class="nav-tab active" data-tab="conversations">Conversations</button>
     <button class="nav-tab" data-tab="tags">Tags</button>
     <button class="nav-tab" data-tab="settings">Settings</button>
   </div>
 
-  <div class="content">
+  <div class="content" id="mainContent">
     <div class="tab-content active" id="conversations">
       <input type="text" id="convSearch" placeholder="Search conversations..."
         style="width:100%;padding:8px 12px;border:1px solid #e0e0e0;border-radius:6px;font-size:13px;margin-bottom:10px;box-sizing:border-box;" />

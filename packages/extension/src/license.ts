@@ -23,7 +23,14 @@ export const PLATFORM_URL = 'https://notanothersocialcrm.com';
 /** How many contacts a free account may store. */
 export const FREE_CONTACT_LIMIT = 25;
 
-const SESSION_KEY = 'crm_account_session';
+/**
+ * chrome.storage.local key holding the signed-in session. Exported because the
+ * extension is now gated on being signed in *everywhere* — the dashboard, the
+ * popup and the in-page panel all watch this key via chrome.storage.onChanged so
+ * signing in (or out) in one place unlocks (or locks) the others immediately,
+ * rather than on their next poll.
+ */
+export const SESSION_KEY = 'crm_account_session';
 const ENTITLEMENT_KEY = 'crm_entitlement_cache';
 
 // Cached entitlement is trusted for this long before we re-check.

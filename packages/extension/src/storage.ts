@@ -57,7 +57,20 @@ export interface Tag {
   // Optional grouping: the id of the TagGroup this tag belongs to. Absent =
   // ungrouped. Used to give tags order/structure in the dashboard.
   groupId?: string;
+  // When true, this tag's chip is NOT drawn on Messenger's conversation rows.
+  // It still exists everywhere else — the CRM panel, the dashboard, search — so
+  // this is purely about keeping the sidebar readable when a tag is applied to
+  // most of your contacts. Absent = false (shown), so tags created before this
+  // existed keep appearing.
+  hideInSidebar?: boolean;
   createdAt: number;
+  // Last edit to this tag's own properties (name, color, group, visibility).
+  // REQUIRED for cross-machine sync: mergeStores resolves two copies of the same
+  // tag by recency, and createdAt never changes when you recolor or rename one —
+  // so without this stamp an edit made here could never outrank the copy already
+  // sitting on the other machine, and colors silently reverted. Absent on tags
+  // written by an older build; the merge falls back to createdAt for those.
+  updatedAt?: number;
 }
 
 // A named bucket that tags can be organized under (e.g. "Stage", "Source").
@@ -67,6 +80,22 @@ export interface TagGroup {
   color?: string;   // optional accent color for the group header
   order: number;    // display order among groups
   createdAt: number;
+  updatedAt?: number; // see Tag.updatedAt — same reason, same fallback
+}
+
+/**
+ * The recency of a definition record (tag, tag group, custom field) for
+ * last-write-wins merging. `updatedAt` when the writer stamped one, otherwise
+ * `createdAt` — which is what every record written before that field existed
+ * has, and is correctly older than any fresh edit.
+ */
+export function defRevision(d: { createdAt?: number; updatedAt?: number }): number {
+  return d.updatedAt ?? d.createdAt ?? 0;
+}
+
+/** Stamp a definition record as edited now. Use on every tag/group/field edit. */
+export function touchDef<T extends { updatedAt?: number }>(d: T, ts = Date.now()): T {
+  return { ...d, updatedAt: ts };
 }
 
 export type CustomFieldType = 'text' | 'number' | 'date' | 'select';
@@ -84,6 +113,7 @@ export interface CustomFieldDef {
   // fields created before this existed stay dashboard-only until opted in.
   showInPanel?: boolean;
   createdAt: number;
+  updatedAt?: number; // see Tag.updatedAt — same reason, same fallback
 }
 
 export interface Conversation {

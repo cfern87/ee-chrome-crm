@@ -473,8 +473,9 @@ export function applyContacts(store: Store, contacts: ParsedContact[]): ApplyRes
     const key = name.toLowerCase();
     const existing = tagIdByName.get(key);
     if (existing) return existing;
-    const id = `tag_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-    tags[id] = { id, name, color: randomColor(tagIdByName.size), createdAt: Date.now() };
+    const ts = Date.now();
+    const id = `tag_${ts.toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    tags[id] = { id, name, color: randomColor(tagIdByName.size), createdAt: ts, updatedAt: ts };
     tagIdByName.set(key, id);
     tagsCreated.push(name);
     return id;
