@@ -41,6 +41,14 @@
   overflow: hidden;
 }
 
+/* Opened from a sidebar row's "+" rather than from the launcher: the panel is
+   pinned beside that row, so the corner dock is released and top/left are set
+   inline by positionPanelAt (which clamps them to the viewport). */
+#fb-crm-panel.fb-crm-panel-anchored {
+  bottom: auto;
+  right: auto;
+}
+
 .fb-crm-header {
   display: flex;
   align-items: center;

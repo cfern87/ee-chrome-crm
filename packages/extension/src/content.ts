@@ -476,7 +476,11 @@ let lastLoggedLinkCount = -1;
 // Open the CRM panel bound to a specific thread, without navigating the page
 // into that conversation. Used by the per-row "add tags" button so the user can
 // tag people straight from the message list.
-async function openPanelForThread(threadId: string, link?: HTMLAnchorElement) {
+//
+// `anchor` is where on screen the panel should open — the "+" button that was
+// clicked. Tagging from the list is a per-row gesture, and docking the panel in
+// the corner made every one of those a full trip across the window and back.
+async function openPanelForThread(threadId: string, link?: HTMLAnchorElement, anchor?: AnchorBox) {
   if (!panelEl) buildLauncher();
   // Reaching for this person from the sidebar is an explicit "I want them in
   // the CRM", so it lifts any earlier removal.
@@ -487,9 +491,11 @@ async function openPanelForThread(threadId: string, link?: HTMLAnchorElement) {
     console.error('[CRM] openPanelForThread: failed to ensure conversation', e);
   }
   currentPanelThreadId = threadId;
+  panelAnchor = anchor ?? null;
   if (panelEl) {
+    if (!panelAnchor) resetPanelPosition();
     panelEl.style.display = 'block';
-    await renderPanel();
+    await renderPanel(); // repositions to panelAnchor once the content is in
   }
 }
 
@@ -516,11 +522,15 @@ function ensureAddTagButton(link: HTMLAnchorElement) {
   btn.addEventListener('mousedown', swallow, true);
   btn.addEventListener('click', (e) => {
     swallow(e);
+    // Measured before any awaiting: the panel opens where the button is right
+    // now, not where a virtualized list has moved it to by the time the store
+    // read comes back.
+    const at = anchorBoxOf(btn);
     // Resolve the thread from the current link href at click time (Facebook
     // recycles row nodes, so a captured id could be stale).
     const anchor = btn.closest<HTMLAnchorElement>('a[href*="/t/"]');
     const id = anchor ? extractThreadId(anchor.href) : null;
-    if (id) openPanelForThread(id, anchor || undefined);
+    if (id) openPanelForThread(id, anchor || undefined, at);
   }, true);
 
   link.appendChild(btn);
@@ -807,10 +817,14 @@ function enterPickMode() {
       e.stopPropagation();
       exitPickMode();
 
+      // Same gesture as the "+" button — the user is pointing at a row — so the
+      // panel opens beside that row rather than back in the corner.
+      const at = anchorBoxOf(foundLink);
       try {
         removedThreads.delete(threadId);
         await ensureConversation(threadId, foundLink);
         currentPanelThreadId = threadId;
+        panelAnchor = at;
         if (panelEl) {
           panelEl.style.display = 'block';
           await renderPanel();
@@ -837,6 +851,69 @@ let panelEl: HTMLElement | null = null;
 let currentPanelThreadId: string | null = null;
 let lastRenderedThread: string | null = null;
 let editingName: string | null = null;
+
+// ---- Panel placement ----
+//
+// The panel normally docks above the launcher in the bottom-right corner. When
+// it is opened from a specific spot on the page — the sidebar "+" button, or a
+// row picked in pick mode — it opens THERE instead, so tagging a row is a click
+// and a short reach rather than a trip to the far corner and back.
+//
+// A viewport-relative box is enough (the panel is position:fixed), and it is
+// captured at click time: Facebook virtualizes the message list, so the button
+// the user aimed at may have moved by the time the store read returns.
+
+interface AnchorBox { top: number; bottom: number; left: number; right: number; }
+
+// Where the panel is currently pinned, or null when it is on its corner dock.
+// Kept at module scope because every re-render has to re-apply it: a render can
+// change the panel's height (tags added, the delete confirmation opening), and
+// a taller panel pinned near the bottom would otherwise run off screen.
+let panelAnchor: AnchorBox | null = null;
+
+function anchorBoxOf(el: Element): AnchorBox {
+  const r = el.getBoundingClientRect();
+  return { top: r.top, bottom: r.bottom, left: r.left, right: r.right };
+}
+
+const PANEL_GAP = 10;       // breathing room between the anchor and the panel
+const VIEWPORT_MARGIN = 8;  // never let an edge touch the window
+
+function positionPanelAt(anchor: AnchorBox): void {
+  if (!panelEl || panelEl.style.display === 'none') return;
+  panelEl.classList.add('fb-crm-panel-anchored');
+
+  // Measured after the render, so this is THIS contact's panel height rather
+  // than the previous one's.
+  const w = panelEl.offsetWidth;
+  const h = panelEl.offsetHeight;
+  const vw = document.documentElement.clientWidth;
+  const vh = document.documentElement.clientHeight;
+
+  // Open to the right of the "+" — the conversation list is on the left, so
+  // that is where the room is — and flip to the other side when it isn't.
+  let left = anchor.right + PANEL_GAP;
+  if (left + w > vw - VIEWPORT_MARGIN) left = anchor.left - PANEL_GAP - w;
+  left = Math.min(Math.max(left, VIEWPORT_MARGIN), Math.max(VIEWPORT_MARGIN, vw - w - VIEWPORT_MARGIN));
+
+  // Top-aligned to the button, nudged only as far as it takes to fit. Aligning
+  // the top (rather than centring) keeps the cursor inside the panel, next to
+  // the tag controls it came for.
+  let top = anchor.top - PANEL_GAP;
+  top = Math.min(Math.max(top, VIEWPORT_MARGIN), Math.max(VIEWPORT_MARGIN, vh - h - VIEWPORT_MARGIN));
+
+  panelEl.style.left = `${Math.round(left)}px`;
+  panelEl.style.top = `${Math.round(top)}px`;
+}
+
+/** Put the panel back on its dock in the bottom-right corner. */
+function resetPanelPosition(): void {
+  panelAnchor = null;
+  if (!panelEl) return;
+  panelEl.classList.remove('fb-crm-panel-anchored');
+  panelEl.style.left = '';
+  panelEl.style.top = '';
+}
 
 // In-progress "create new tag" inputs. Kept at module scope so they survive a
 // panel re-render (otherwise typing a tag name would be wiped, and the color
@@ -909,6 +986,9 @@ async function togglePanel() {
   if (!panelEl) return;
   if (panelEl.style.display === 'none') {
     currentPanelThreadId = getActiveThreadId();
+    // Opened from the launcher, so it belongs on the launcher's dock — not
+    // still pinned beside whichever row was tagged last.
+    resetPanelPosition();
     panelEl.style.display = 'block';
     await renderPanel();
   } else {
@@ -917,7 +997,18 @@ async function togglePanel() {
   }
 }
 
-async function renderPanel() {
+/**
+ * Render the panel and put it back where it belongs. The reposition lives out
+ * here, wrapping every one of renderPanelContent's exits, because the height it
+ * has to clamp against isn't known until the content is in the DOM — and it
+ * changes on every render (a tag added, the delete confirmation opening).
+ */
+async function renderPanel(): Promise<void> {
+  await renderPanelContent();
+  if (panelAnchor) positionPanelAt(panelAnchor);
+}
+
+async function renderPanelContent() {
   if (!panelEl) return;
   let threadId = currentPanelThreadId || getActiveThreadId();
 
@@ -1460,7 +1551,14 @@ function removeLauncher() {
   document.getElementById('fb-crm-launcher')?.remove();
   document.getElementById('fb-crm-panel')?.remove();
   panelEl = null;
+  panelAnchor = null;
 }
+
+// A pinned panel is clamped to the window it was opened in. Re-clamp on resize
+// so it can't end up half off screen.
+window.addEventListener('resize', () => {
+  if (panelAnchor) positionPanelAt(panelAnchor);
+});
 
 // ---- Navigation watcher (SPA) ----
 
@@ -1492,6 +1590,9 @@ function watchNavigation() {
       // profile — renderPanel() re-resolves both from scratch).
       if (panelEl && panelEl.style.display !== 'none') {
         currentPanelThreadId = getActiveThreadId();
+        // The row this panel was pinned beside belongs to the page we just
+        // left; back to the dock.
+        resetPanelPosition();
         console.log('[CRM] Re-rendering panel for new page');
         renderPanel();
       }
