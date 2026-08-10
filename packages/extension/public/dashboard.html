@@ -4,7 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Messenger CRM Dashboard</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Styling comes from src/ui/stylesheet.ts, injected by main.tsx before the
+       first render. There is deliberately no external stylesheet or script
+       here: MV3 blocks remote code on extension pages, so the Tailwind CDN tag
+       that used to sit on this line never executed — and nothing referenced it
+       (the dashboard had zero className usages). -->
 </head>
 <body>
   <div id="root"></div>
