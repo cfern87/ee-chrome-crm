@@ -6,6 +6,7 @@
 // there is no lookup-by-id and no risk of a stale subtree overwriting a sibling.
 
 import React, { useMemo, useState } from 'react';
+import { color } from '../ui/primitives';
 import type { Tag, TagGroup, CustomFieldDef } from '../storage';
 import {
   QueryGroup, QueryNode, Condition, Combinator, SavedSearch, DurationUnit,
@@ -17,22 +18,22 @@ import {
 // ---- shared styles -------------------------------------------------------
 
 const control: React.CSSProperties = {
-  padding: '5px 7px', border: '1px solid #d0d0d0', borderRadius: 5,
-  fontSize: 12, background: '#fff', color: '#222', outline: 'none',
+  padding: '5px 7px', border: `1px solid ${color.border.control}`, borderRadius: 5,
+  fontSize: 12, background: color.surface.raised, color: color.text.primary, outline: 'none',
 };
 const selectStyle: React.CSSProperties = { ...control, cursor: 'pointer' };
 const iconBtn: React.CSSProperties = {
-  border: '1px solid #e0e0e0', background: '#fff', color: '#999', borderRadius: 5,
+  border: `1px solid ${color.border.subtle}`, background: color.surface.raised, color: color.text.muted, borderRadius: 5,
   fontSize: 12, lineHeight: 1, padding: '5px 7px', cursor: 'pointer',
 };
 const addBtn: React.CSSProperties = {
-  border: '1px dashed #b9d3f2', background: '#fff', color: '#065fd4', borderRadius: 5,
+  border: '1px dashed #b9d3f2', background: color.surface.raised, color: color.accent.base, borderRadius: 5,
   fontSize: 11, fontWeight: 600, padding: '4px 9px', cursor: 'pointer',
 };
 
 // Nesting depth is shown with color rather than only indentation, so a deep
 // query stays readable in a narrow panel.
-const DEPTH_COLORS = ['#065fd4', '#0a7c4a', '#9B5DE5', '#d97706'];
+const DEPTH_COLORS = [color.accent.base, color.success.base, color.special.base, color.warning.base];
 const depthColor = (d: number) => DEPTH_COLORS[d % DEPTH_COLORS.length];
 
 // ---- multi-select --------------------------------------------------------
@@ -64,7 +65,7 @@ function MultiChipSelect({ choices, selected, onChange, placeholder }: {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 170, flex: 1 }}>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, alignItems: 'center' }}>
         {selected.length === 0 && (
-          <span style={{ fontSize: 11, color: '#bbb' }}>{placeholder}</span>
+          <span style={{ fontSize: 11, color: color.text.muted }}>{placeholder}</span>
         )}
         {selected.map((v) => {
           const c = choices.find((x) => x.value === v);
@@ -95,7 +96,7 @@ function MultiChipSelect({ choices, selected, onChange, placeholder }: {
       </div>
 
       {open && (
-        <div style={{ border: '1px solid #e0e0e0', borderRadius: 6, padding: 6, background: '#fafafa' }}>
+        <div style={{ border: `1px solid ${color.border.subtle}`, borderRadius: 6, padding: 6, background: color.surface.sunken }}>
           {choices.length > 8 && (
             <input
               autoFocus
@@ -106,7 +107,7 @@ function MultiChipSelect({ choices, selected, onChange, placeholder }: {
             />
           )}
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: 150, overflowY: 'auto' }}>
-            {visible.length === 0 && <span style={{ fontSize: 11, color: '#aaa' }}>Nothing to choose from.</span>}
+            {visible.length === 0 && <span style={{ fontSize: 11, color: color.text.muted }}>Nothing to choose from.</span>}
             {visible.map((c) => {
               const on = selected.includes(c.value);
               return (
@@ -114,9 +115,9 @@ function MultiChipSelect({ choices, selected, onChange, placeholder }: {
                   key={c.value}
                   onClick={() => toggle(c.value)}
                   style={{
-                    border: `1px solid ${on ? (c.color || '#065fd4') : '#ddd'}`,
-                    background: on ? (c.color || '#065fd4') : '#fff',
-                    color: on ? '#fff' : '#555',
+                    border: `1px solid ${on ? (c.color || color.accent.base) : color.border.subtle}`,
+                    background: on ? (c.color || color.accent.base) : color.surface.raised,
+                    color: on ? color.surface.raised : color.text.secondary,
                     borderRadius: 10, fontSize: 11, fontWeight: 600, padding: '3px 9px', cursor: 'pointer',
                   }}
                 >
@@ -223,7 +224,7 @@ function ConditionRow({ cond, fields, ctx, onChange, onRemove }: ConditionRowPro
               onChange={(e) => onChange({ ...cond, value: e.target.value })}
               style={{ ...control, width: valueInputType === 'date' ? 130 : 80 }}
             />
-            <span style={{ fontSize: 11, color: '#888' }}>and</span>
+            <span style={{ fontSize: 11, color: color.text.muted }}>and</span>
             <input
               type={valueInputType}
               value={cond.value2 ?? ''}
@@ -262,7 +263,7 @@ function ConditionRow({ cond, fields, ctx, onChange, onRemove }: ConditionRowPro
   };
 
   return (
-    <div style={{ background: '#fff', border: `1px solid ${issue ? '#f3d0a0' : '#e6e6e6'}`, borderRadius: 6, padding: '6px 8px' }}>
+    <div style={{ background: color.surface.raised, border: `1px solid ${issue ? '#f3d0a0' : color.border.subtle}`, borderRadius: 6, padding: '6px 8px' }}>
       <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
         <select value={cond.field} onChange={(e) => changeField(e.target.value)} style={{ ...selectStyle, maxWidth: 190 }}>
           {categories.map((cat) => (
@@ -297,11 +298,11 @@ function ConditionRow({ cond, fields, ctx, onChange, onRemove }: ConditionRowPro
 
       {issue && (
         <div style={{ fontSize: 11, color: '#b45309', marginTop: 5 }}>
-          {issue} <span style={{ color: '#a0a0a0' }}>— this condition is ignored until you finish it.</span>
+          {issue} <span style={{ color: color.text.muted }}>— this condition is ignored until you finish it.</span>
         </div>
       )}
       {!issue && field?.hint && (
-        <div style={{ fontSize: 11, color: '#aaa', marginTop: 4 }}>{field.hint}</div>
+        <div style={{ fontSize: 11, color: color.text.muted, marginTop: 4 }}>{field.hint}</div>
       )}
     </div>
   );
@@ -335,7 +336,7 @@ function GroupEditor({ group, fields, ctx, depth, onChange, onRemove }: GroupEdi
         border: `1px solid ${accent}33`,
         borderLeft: `3px solid ${accent}`,
         borderRadius: 6,
-        background: depth % 2 === 0 ? '#fafbfc' : '#fff',
+        background: depth % 2 === 0 ? '#fafbfc' : color.surface.raised,
         padding: 8,
       }}
     >
@@ -348,8 +349,8 @@ function GroupEditor({ group, fields, ctx, depth, onChange, onRemove }: GroupEdi
               onClick={() => onChange({ ...group, combinator: c })}
               style={{
                 border: 'none', padding: '4px 10px', fontSize: 11, fontWeight: 700, cursor: 'pointer',
-                background: group.combinator === c ? accent : '#fff',
-                color: group.combinator === c ? '#fff' : accent,
+                background: group.combinator === c ? accent : color.surface.raised,
+                color: group.combinator === c ? color.surface.raised : accent,
               }}
             >
               {c.toUpperCase()}
@@ -359,7 +360,7 @@ function GroupEditor({ group, fields, ctx, depth, onChange, onRemove }: GroupEdi
 
         <label
           title="Invert this whole group — matches contacts that do NOT satisfy it"
-          style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, fontWeight: 600, color: group.negate ? '#e53e3e' : '#888', cursor: 'pointer' }}
+          style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, fontWeight: 600, color: group.negate ? color.danger.base : color.text.muted, cursor: 'pointer' }}
         >
           <input
             type="checkbox"
@@ -370,7 +371,7 @@ function GroupEditor({ group, fields, ctx, depth, onChange, onRemove }: GroupEdi
           NOT
         </label>
 
-        <span style={{ fontSize: 11, color: '#aaa' }}>
+        <span style={{ fontSize: 11, color: color.text.muted }}>
           {group.children.length === 0
             ? 'empty — matches everyone'
             : group.combinator === 'and' ? 'all of these must be true' : 'any of these can be true'}
@@ -468,10 +469,10 @@ function PresetBar({
   return (
     <div style={{ marginBottom: 10 }}>
       <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-        <span style={{ fontSize: 11, fontWeight: 700, color: '#666' }}>Saved searches</span>
+        <span style={{ fontSize: 11, fontWeight: 700, color: color.text.secondary }}>Saved searches</span>
 
         {presets.length === 0 && (
-          <span style={{ fontSize: 11, color: '#aaa' }}>none yet — build a query and save it</span>
+          <span style={{ fontSize: 11, color: color.text.muted }}>none yet — build a query and save it</span>
         )}
 
         {presets.map((p) => {
@@ -484,9 +485,9 @@ function PresetBar({
               style={{
                 display: 'inline-flex', alignItems: 'center', gap: 4,
                 padding: '4px 10px', borderRadius: 12, fontSize: 11, fontWeight: 600, cursor: 'pointer',
-                border: `1px solid ${isActive ? '#065fd4' : '#d8d8d8'}`,
-                background: isActive ? '#065fd4' : '#fff',
-                color: isActive ? '#fff' : '#555',
+                border: `1px solid ${isActive ? color.accent.base : '#d8d8d8'}`,
+                background: isActive ? color.accent.base : color.surface.raised,
+                color: isActive ? color.surface.raised : color.text.secondary,
               }}
             >
               {p.pinned && <span title="Pinned">★</span>}
@@ -501,7 +502,7 @@ function PresetBar({
             <button
               onClick={onUpdateActive}
               title={`Overwrite "${active.name}" with the current query`}
-              style={{ ...addBtn, border: '1px solid #065fd4', background: '#065fd4', color: '#fff' }}
+              style={{ ...addBtn, border: `1px solid ${color.accent.base}`, background: color.accent.base, color: color.surface.raised }}
             >
               Update “{active.name}”
             </button>
@@ -532,7 +533,7 @@ function PresetBar({
             disabled={!draftName.trim()}
             style={{
               border: 'none', borderRadius: 5, padding: '6px 12px', fontSize: 11, fontWeight: 700,
-              background: draftName.trim() ? '#065fd4' : '#e6e6e6', color: draftName.trim() ? '#fff' : '#aaa',
+              background: draftName.trim() ? color.accent.base : color.border.subtle, color: draftName.trim() ? color.surface.raised : color.text.muted,
               cursor: draftName.trim() ? 'pointer' : 'not-allowed',
             }}
           >
@@ -542,7 +543,7 @@ function PresetBar({
       )}
 
       {managing && (
-        <div style={{ marginTop: 8, border: '1px solid #e6e6e6', borderRadius: 6, background: '#fafafa', padding: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ marginTop: 8, border: `1px solid ${color.border.subtle}`, borderRadius: 6, background: color.surface.sunken, padding: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
           {presets.map((p, i) => (
             <div key={p.id} style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
               {renamingId === p.id ? (
@@ -567,8 +568,8 @@ function PresetBar({
                 </>
               ) : (
                 <>
-                  <span style={{ fontSize: 12, fontWeight: 600, color: '#333', minWidth: 110 }}>{p.name}</span>
-                  <span style={{ fontSize: 11, color: '#999', flex: 1, minWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: color.text.primary, minWidth: 110 }}>{p.name}</span>
+                  <span style={{ fontSize: 11, color: color.text.muted, flex: 1, minWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {describeQuery(p.query, ctx)}
                   </span>
                   <button onClick={() => onReorder(p.id, -1)} disabled={i === 0} title="Move up" style={{ ...iconBtn, opacity: i === 0 ? 0.4 : 1 }}>↑</button>
@@ -576,7 +577,7 @@ function PresetBar({
                   <button
                     onClick={() => onTogglePin(p.id)}
                     title={p.pinned ? 'Unpin from the quick bar' : 'Pin to the quick bar'}
-                    style={{ ...iconBtn, color: p.pinned ? '#d97706' : '#bbb' }}
+                    style={{ ...iconBtn, color: p.pinned ? color.warning.base : color.text.muted }}
                   >
                     {p.pinned ? '★' : '☆'}
                   </button>
@@ -585,14 +586,14 @@ function PresetBar({
                     <>
                       <button
                         onClick={() => { onDelete(p.id); setConfirmDelete(null); }}
-                        style={{ ...iconBtn, background: '#e53e3e', color: '#fff', border: '1px solid #e53e3e', fontWeight: 700 }}
+                        style={{ ...iconBtn, background: color.danger.base, color: color.surface.raised, border: `1px solid ${color.danger.base}`, fontWeight: 700 }}
                       >
                         Delete?
                       </button>
                       <button onClick={() => setConfirmDelete(null)} style={iconBtn}>No</button>
                     </>
                   ) : (
-                    <button onClick={() => setConfirmDelete(p.id)} style={{ ...iconBtn, color: '#e53e3e' }}>Delete</button>
+                    <button onClick={() => setConfirmDelete(p.id)} style={{ ...iconBtn, color: color.danger.base }}>Delete</button>
                   )}
                 </>
               )}
@@ -616,7 +617,7 @@ export function PinnedSearchChips({ savedSearches, activeId, onApply, onClear, c
   if (pinned.length === 0) return null;
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10, alignItems: 'center' }}>
-      <span style={{ fontSize: 11, color: '#888', fontWeight: 600 }}>★</span>
+      <span style={{ fontSize: 11, color: color.text.muted, fontWeight: 600 }}>★</span>
       {pinned.map((p) => {
         const isActive = p.id === activeId;
         return (
@@ -626,9 +627,9 @@ export function PinnedSearchChips({ savedSearches, activeId, onApply, onClear, c
             title={describeQuery(p.query, ctx)}
             style={{
               padding: '4px 10px', borderRadius: 12, fontSize: 11, fontWeight: 600, cursor: 'pointer',
-              border: `1px solid ${isActive ? '#d97706' : '#e0d5c0'}`,
-              background: isActive ? '#d97706' : '#fffaf0',
-              color: isActive ? '#fff' : '#92670a',
+              border: `1px solid ${isActive ? color.warning.base : '#e0d5c0'}`,
+              background: isActive ? color.warning.base : color.warning.subtle,
+              color: isActive ? color.surface.raised : '#92670a',
             }}
           >
             {p.name}
@@ -672,7 +673,7 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
   const empty = isQueryEmpty(query);
 
   return (
-    <div style={{ background: '#fff', border: '1px solid #e0e0e0', borderRadius: 8, padding: 12, marginBottom: 12 }}>
+    <div style={{ background: color.surface.raised, border: `1px solid ${color.border.subtle}`, borderRadius: 8, padding: 12, marginBottom: 12 }}>
       <PresetBar
         savedSearches={props.savedSearches}
         activeId={props.activePresetId}
@@ -696,19 +697,19 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
       />
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10, flexWrap: 'wrap' }}>
-        <span style={{ fontSize: 12, fontWeight: 700, color: empty ? '#888' : '#065fd4' }}>
+        <span style={{ fontSize: 12, fontWeight: 700, color: empty ? color.text.muted : color.accent.base }}>
           {matchCount} of {totalCount} contacts match
         </span>
         <span
           title={describeQuery(query, ctx)}
-          style={{ fontSize: 11, color: '#999', flex: 1, minWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+          style={{ fontSize: 11, color: color.text.muted, flex: 1, minWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
         >
           {describeQuery(query, ctx)}
         </span>
         <button
           onClick={() => onQueryChange(newGroup('and', []))}
           disabled={empty}
-          style={{ ...iconBtn, color: empty ? '#ccc' : '#e53e3e', cursor: empty ? 'not-allowed' : 'pointer', fontWeight: 600 }}
+          style={{ ...iconBtn, color: empty ? color.border.control : color.danger.base, cursor: empty ? 'not-allowed' : 'pointer', fontWeight: 600 }}
         >
           Clear query
         </button>
