@@ -13,10 +13,13 @@ import {
 import { tint } from '../ui/contrast';
 import { useLocalPref } from '../ui/prefs';
 import {
-  HIDDEN_TAG_TITLE, bucketTagsByGroup, showsGroupLabels, formatRelativeTime, ProfileUrlEditor,
+  HIDDEN_TAG_TITLE, bucketTags, showsGroupLabels, formatRelativeTime, ProfileUrlEditor,
 } from './shared';
 
 export const TAG_FILTER_VISIBLE = 12;
+
+/** How several selected tags combine: every one of them, or any of them. */
+export type TagFilterMode = 'all' | 'any';
 
 /**
  * The tag filter in the contact list column.
@@ -36,102 +39,229 @@ export const TAG_FILTER_VISIBLE = 12;
  *     A toggle brings them back, and the eye-off marker only appears there.
  *  3. Rank by use within each group, so the tag on 80 contacts comes before
  *     the one on 2.
+ *
+ * Grouping and the section itself are both foldable. This lives at the top of a
+ * narrow column above the contact list, so on a store with a lot of tags it can
+ * push the actual contacts off the first screen — and a filter is set once and
+ * then read many times.
+ *
+ * Selection is a set, not a single choice — every chip is its own toggle, so
+ * "Warm Lead and Houston" or "Warm Lead or Referral" are both one click each
+ * rather than something you'd otherwise reach for the advanced query builder
+ * to express. The AND/OR switch only appears once there are two or more
+ * selected, because with zero or one tag the two readings agree.
  */
 export function TagFilter({
-  tags, tagGroups, usage, active, onChange,
+  tags, tagGroups, usage, active, mode, onChangeMode, grouped, onToggleGrouped, onChange,
 }: {
   tags: Tag[];
   tagGroups: Record<string, TagGroup>;
   usage: Map<string, number>;
-  active: string | null;
-  onChange: (id: string | null) => void;
+  active: string[];
+  /** How multiple selected tags combine. Ignored (but still accepted) when fewer than two are selected. */
+  mode: TagFilterMode;
+  onChangeMode: (mode: TagFilterMode) => void;
+  /** Owned by the workspace, so the detail pane groups the same way. */
+  grouped: boolean;
+  onToggleGrouped: () => void;
+  onChange: (ids: string[]) => void;
 }) {
   const [showHidden, setShowHidden] = useLocalPref('tagFilterShowHidden', false);
+  const [collapsed, setCollapsed] = useLocalPref('tagFilterCollapsed', false);
   const [expanded, setExpanded] = useState(false);
 
+  const activeSet = useMemo(() => new Set(active), [active]);
   const hiddenCount = tags.filter((t) => t.hideInSidebar).length;
 
-  // The active filter always stays visible, even if it is a hidden tag and the
+  // Every active filter stays visible, even one that is a hidden tag and the
   // toggle is off — otherwise the list would be filtered by something the user
   // can neither see nor clear.
-  const offered = tags.filter((t) => showHidden || !t.hideInSidebar || t.id === active);
+  const offered = tags.filter((t) => showHidden || !t.hideInSidebar || activeSet.has(t.id));
 
   const ranked = offered
     .slice()
     .sort((a, b) => (usage.get(b.id) || 0) - (usage.get(a.id) || 0) || a.name.localeCompare(b.name));
 
   const capped = expanded ? ranked : ranked.slice(0, TAG_FILTER_VISIBLE);
-  const buckets = bucketTagsByGroup(capped, tagGroups);
+  const buckets = bucketTags(capped, tagGroups, grouped);
   const withLabels = showsGroupLabels(buckets);
+
+  // Grouping only means something once there is more than one group in play.
+  const groupable = distinctGroupCount(offered, tagGroups) > 1;
+
+  const activeTags = active.map((id) => tags.find((t) => t.id === id)).filter((t): t is Tag => !!t);
+  const toggle = (id: string) => onChange(activeSet.has(id) ? active.filter((x) => x !== id) : [...active, id]);
 
   if (tags.length === 0) return null;
 
   return (
     <div style={{ marginBottom: space.md }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: space.sm, marginBottom: space.xs }}>
-        <SectionTitle>Filter by tag</SectionTitle>
-        {active && (
-          <Button size="sm" variant="link" onClick={() => onChange(null)} style={{ marginLeft: 'auto' }}>
-            Clear
-          </Button>
-        )}
-      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: space.sm, marginBottom: space.xs, flexWrap: 'wrap' }}>
+        {/* The heading is the disclosure. A separate caret next to a label that
+            does nothing is one more target for the same job. */}
+        <button
+          type="button"
+          onClick={() => setCollapsed(!collapsed)}
+          aria-expanded={!collapsed}
+          style={{
+            display: 'flex', alignItems: 'center', gap: space.xs,
+            background: 'none', border: 'none', padding: 0, cursor: 'pointer',
+            font: 'inherit', color: 'inherit', textAlign: 'left',
+          }}
+        >
+          <Text size="micro" tone="muted" aria-hidden="true">{collapsed ? '▸' : '▾'}</Text>
+          <SectionTitle>Filter by tag</SectionTitle>
+        </button>
 
-      <Stack gap="sm" role="group" aria-label="Filter by tag">
-        {buckets.map((bucket) => (
-          <div key={bucket.key}>
-            {withLabels && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: space.xs, marginBottom: space.xxs }}>
-                <span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: 2, background: bucket.color || color.border.control, flexShrink: 0 }} />
-                <Text size="micro" weight="bold" tone="muted" style={{ textTransform: 'uppercase', letterSpacing: 0.4 }}>
-                  {bucket.label}
-                </Text>
-              </div>
-            )}
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: space.xs }}>
-              {bucket.tags.map((tag) => {
-                const on = active === tag.id;
-                const count = usage.get(tag.id) || 0;
-                return (
-                  <Chip
-                    key={tag.id}
-                    label={count > 0 ? `${tag.name} ${count}` : tag.name}
-                    // Unselected chips are a blend, not an alpha — see tint().
-                    fill={on ? tag.color : tint(tag.color, 0.18)}
-                    // The marker is only worth its noise where hidden tags are
-                    // mixed in with visible ones.
-                    hidden={showHidden && tag.hideInSidebar}
-                    pressed={on}
-                    title={tag.hideInSidebar ? HIDDEN_TAG_TITLE : `${count} contact${count === 1 ? '' : 's'}`}
-                    onClick={() => onChange(on ? null : tag.id)}
-                  />
-                );
-              })}
-            </div>
+        {/* Collapsed with a filter on is the one state that can mislead: the
+            list is showing a subset and the reason is folded away. So the
+            active tags come out of hiding and sit in the header, each still
+            removable, with the combinator spelled out once there are two. */}
+        {collapsed && activeTags.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: space.xxs, flexWrap: 'wrap' }}>
+            {activeTags.map((tag, i) => (
+              <React.Fragment key={tag.id}>
+                {i > 0 && (
+                  <Text size="micro" weight="bold" tone="muted">{mode === 'all' ? 'AND' : 'OR'}</Text>
+                )}
+                <Chip
+                  label={tag.name}
+                  fill={tag.color}
+                  pressed
+                  title={`Filtering by ${tag.name} — click to remove`}
+                  onClick={() => toggle(tag.id)}
+                />
+              </React.Fragment>
+            ))}
           </div>
-        ))}
+        )}
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: space.md, flexWrap: 'wrap' }}>
-          {ranked.length > TAG_FILTER_VISIBLE && (
-            <Button size="sm" variant="link" onClick={() => setExpanded(!expanded)}>
-              {expanded ? 'Show fewer' : `Show all ${ranked.length}`}
-            </Button>
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: space.sm }}>
+          {!collapsed && active.length > 1 && (
+            <TagMatchToggle mode={mode} onChange={onChangeMode} />
           )}
-          {hiddenCount > 0 && (
+          {!collapsed && groupable && (
             <Button
               size="sm"
               variant="link"
-              aria-pressed={showHidden}
-              onClick={() => setShowHidden(!showHidden)}
-              title={HIDDEN_TAG_TITLE}
+              aria-pressed={grouped}
+              onClick={onToggleGrouped}
+              title={grouped ? 'Show every tag in one list' : 'Split the tags by tag group'}
             >
-              {showHidden ? `Hide ${hiddenCount} preview-hidden` : `Show ${hiddenCount} preview-hidden`}
+              {grouped ? 'Ungroup' : 'Group'}
+            </Button>
+          )}
+          {active.length > 0 && (
+            <Button size="sm" variant="link" onClick={() => onChange([])}>
+              Clear
             </Button>
           )}
         </div>
-      </Stack>
+      </div>
+
+      {!collapsed && (
+        <Stack gap="sm" role="group" aria-label="Filter by tag">
+          {active.length > 1 && (
+            <Text size="micro" tone="muted">
+              Showing contacts with {mode === 'all' ? 'every' : 'any'} selected tag.
+            </Text>
+          )}
+          {buckets.map((bucket) => (
+            <div key={bucket.key}>
+              {withLabels && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: space.xs, marginBottom: space.xxs }}>
+                  <span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: 2, background: bucket.color || color.border.control, flexShrink: 0 }} />
+                  <Text size="micro" weight="bold" tone="muted" style={{ textTransform: 'uppercase', letterSpacing: 0.4 }}>
+                    {bucket.label}
+                  </Text>
+                </div>
+              )}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: space.xs }}>
+                {bucket.tags.map((tag) => {
+                  const on = activeSet.has(tag.id);
+                  const count = usage.get(tag.id) || 0;
+                  return (
+                    <Chip
+                      key={tag.id}
+                      label={count > 0 ? `${tag.name} ${count}` : tag.name}
+                      // Unselected chips are a blend, not an alpha — see tint().
+                      fill={on ? tag.color : tint(tag.color, 0.18)}
+                      // The marker is only worth its noise where hidden tags are
+                      // mixed in with visible ones.
+                      hidden={showHidden && tag.hideInSidebar}
+                      pressed={on}
+                      title={tag.hideInSidebar ? HIDDEN_TAG_TITLE : `${count} contact${count === 1 ? '' : 's'}`}
+                      onClick={() => toggle(tag.id)}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: space.md, flexWrap: 'wrap' }}>
+            {ranked.length > TAG_FILTER_VISIBLE && (
+              <Button size="sm" variant="link" onClick={() => setExpanded(!expanded)}>
+                {expanded ? 'Show fewer' : `Show all ${ranked.length}`}
+              </Button>
+            )}
+            {hiddenCount > 0 && (
+              <Button
+                size="sm"
+                variant="link"
+                aria-pressed={showHidden}
+                onClick={() => setShowHidden(!showHidden)}
+                title={HIDDEN_TAG_TITLE}
+              >
+                {showHidden ? `Hide ${hiddenCount} preview-hidden` : `Show ${hiddenCount} preview-hidden`}
+              </Button>
+            )}
+          </div>
+        </Stack>
+      )}
     </div>
   );
+}
+
+/** AND/OR segmented switch for combining multiple selected filter tags. */
+function TagMatchToggle({ mode, onChange }: { mode: TagFilterMode; onChange: (mode: TagFilterMode) => void }) {
+  const seg = (m: TagFilterMode, label: string, title: string) => {
+    const on = mode === m;
+    return (
+      <button
+        key={m}
+        type="button"
+        onClick={() => onChange(m)}
+        aria-pressed={on}
+        title={title}
+        style={{
+          padding: '3px 8px', border: 'none', borderRadius: 4, cursor: 'pointer',
+          font: 'inherit', fontSize: fontSize.micro, fontWeight: fontWeight.bold,
+          background: on ? color.accent.base : 'transparent',
+          color: on ? color.accent.onBase : color.text.secondary,
+        }}
+      >
+        {label}
+      </button>
+    );
+  };
+  return (
+    <div
+      role="group"
+      aria-label="Combine selected tags with"
+      style={{ display: 'flex', gap: 2, padding: 2, border: `1px solid ${color.border.subtle}`, borderRadius: radius.sm }}
+    >
+      {seg('all', 'AND', 'Show contacts that have every selected tag')}
+      {seg('any', 'OR', 'Show contacts that have any of the selected tags')}
+    </div>
+  );
+}
+
+/** How many distinct groups a set of tags lands in — including "ungrouped". */
+function distinctGroupCount(tags: Tag[], groups: Record<string, TagGroup>): number {
+  const seen = new Set<string>();
+  for (const t of tags) seen.add(t.groupId && groups[t.groupId] ? t.groupId : '');
+  return seen.size;
 }
 
 // --- ConvDetail sub-component ---
@@ -154,9 +284,15 @@ export interface ConvDetailProps {
   onStartDelete: () => void;
   onConfirmDelete1: () => void;
   onCancelDelete: () => void;
+  /**
+   * Group tags under their tag-group headings. The same preference the tag
+   * filter exposes — one switch for the whole workspace, because two lists of
+   * the same tags disagreeing about their own shape is worse than either shape.
+   */
+  grouped: boolean;
 }
 
-export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm2, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onSetCustomField, onRename, onSetProfileUrl, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
+export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm2, grouped, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onSetCustomField, onRename, onSetProfileUrl, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
   const availableTags = tags.filter((t) => !conv.tags.includes(t.id));
   const [addingTag, setAddingTag] = useState(false);
   const [editingName, setEditingName] = useState(false);
@@ -168,8 +304,8 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
   // memoized — it's a handful of tags, and a memo keyed on freshly-built arrays
   // would never hit anyway.
   const appliedTags = conv.tags.map((id) => store.tags[id]).filter((t): t is Tag => !!t);
-  const appliedBuckets = bucketTagsByGroup(appliedTags, store.tagGroups);
-  const availableBuckets = bucketTagsByGroup(availableTags, store.tagGroups);
+  const appliedBuckets = bucketTags(appliedTags, store.tagGroups, grouped);
+  const availableBuckets = bucketTags(availableTags, store.tagGroups, grouped);
   const showAppliedLabels = showsGroupLabels(appliedBuckets);
   const showAvailableLabels = showsGroupLabels(availableBuckets);
 
@@ -406,12 +542,39 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
       {/* Meta info */}
       <div style={{ fontSize: 12, color: color.text.muted, marginTop: 8 }}>
         <div>ID: {conv.participantId || conv.id}</div>
-        {conv.source === 'import' && <div>Source: CSV import</div>}
+        <div title={sourceHint(conv.source)}>Source: {describeSource(conv.source)}</div>
         {conv.chatUrl && <div>Chat URL: <a href={conv.chatUrl} target="_blank" rel="noreferrer" style={{ color: color.accent.base }}>{conv.chatUrl}</a></div>}
         {conv.createdAt && <div>Added: {new Date(conv.createdAt).toLocaleString()}</div>}
       </div>
     </div>
   );
+}
+
+/**
+ * How a contact first entered the CRM, in the user's terms. Shown for every
+ * contact now, not only imported ones — provenance is useful context for any
+ * record, and hiding it for the two more common paths is what made "CSV
+ * import" look like the default rather than one of three.
+ *
+ * `undefined` reads as 'messenger': see the Conversation.source comment in
+ * storage.ts — that value was never actually stamped, only ever implied.
+ */
+function describeSource(source: Conversation['source']): string {
+  switch (source) {
+    case 'import': return 'CSV import';
+    case 'profile': return 'Added from their Facebook profile';
+    case 'messenger':
+    default: return 'Captured from Messenger';
+  }
+}
+
+function sourceHint(source: Conversation['source']): string {
+  switch (source) {
+    case 'import': return 'Added in bulk from a CSV file';
+    case 'profile': return 'Added one at a time via the "+ Add to CRM" button on their profile page, before any Messenger thread existed';
+    case 'messenger':
+    default: return 'Picked up automatically from a Messenger conversation or sidebar row';
+  }
 }
 
 // --- Custom field editor (used in ConvDetail) ---

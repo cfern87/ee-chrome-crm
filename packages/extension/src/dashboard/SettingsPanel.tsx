@@ -24,7 +24,8 @@ import {
   parseContactsCsv, applyContacts, sampleCsv, resolveThread, csvHeaders, detectMapping,
   MAPPABLE_FIELDS, Mapping, Field, loadImportHistory, recordImport, ImportHistoryEntry,
 } from '../csv';
-import { mergeConversations, findDuplicateGroups, cleanStoredNames, pickPrimary, DuplicateGroup } from '../contacts';
+import { mergeConversations, findDuplicateGroups, cleanStoredNames, pickPrimary, duplicateGroupKey, DuplicateGroup } from '../contacts';
+import { IS_UNPACKED } from '../devMode';
 import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo } from '../devices';
 import {
   Banner, Button, Card, Input, Select, Stack, Text, Toggle,
@@ -386,6 +387,12 @@ export function SendingPaceSettings({ store, updateStore }: { store: Store; upda
 // The .githooks post-commit and post-merge hooks now rebuild automatically, so
 // these values stay current on their own. The banner below covers the remaining
 // cases — hooks not installed, or a build that failed.
+//
+// All of that is a developer's problem, and none of it is actionable for
+// someone who installed this from the Web Store: the rebuild advice, the hook
+// instructions and the staleness banner are all gated on IS_UNPACKED. The
+// identity rows themselves stay — "which build am I on" is the first question
+// of any support conversation.
 export function AboutPanel() {
   const [copied, setCopied] = useState(false);
 
@@ -448,20 +455,26 @@ export function AboutPanel() {
         {row('Built', BUILD_INFO.builtAt ? `${new Date(BUILD_INFO.builtAt).toLocaleString()} (${formatRelativeTime(BUILD_INFO.builtAt)})` : '—')}
       </div>
 
-      {stale && (
+      {stale && IS_UNPACKED && (
         <div style={{ marginTop: 10, fontSize: 12, padding: '8px 10px', borderRadius: 6, background: color.danger.subtle, color: color.danger.base, lineHeight: 1.5 }}>
           The loaded manifest says <strong>v{manifestVersion}</strong> but the bundle was built from <strong>v{BUILD_INFO.version}</strong>.
           The automatic rebuild didn't run or didn't finish — run <code>npm run build</code> and reload the extension.
         </div>
       )}
 
-      <p style={{ margin: '10px 0 0', fontSize: 11, color: color.text.muted, lineHeight: 1.6 }}>
-        The version bumps on every commit to <code>main</code>, and the <code>post-commit</code> and <code>post-merge</code> hooks rebuild
-        {' '}<code>packages/extension/dist/</code> for you — so these values keep themselves current. You still have to reload at
-        {' '}<code>chrome://extensions</code> for a new build to take effect. While actively editing, <code>npm run watch</code> rebuilds
-        on every save. If the commit above doesn't match <code>git log -1 --format=%h</code> and no banner is showing, the hooks aren't
-        installed: run <code>npm install</code>.
-      </p>
+      {IS_UNPACKED ? (
+        <p style={{ margin: '10px 0 0', fontSize: 11, color: color.text.muted, lineHeight: 1.6 }}>
+          The version bumps on every commit to <code>main</code>, and the <code>post-commit</code> and <code>post-merge</code> hooks rebuild
+          {' '}<code>packages/extension/dist/</code> for you — so these values keep themselves current. You still have to reload at
+          {' '}<code>chrome://extensions</code> for a new build to take effect. While actively editing, <code>npm run watch</code> rebuilds
+          on every save. If the commit above doesn't match <code>git log -1 --format=%h</code> and no banner is showing, the hooks aren't
+          installed: run <code>npm install</code>.
+        </p>
+      ) : (
+        <p style={{ margin: '10px 0 0', fontSize: 11, color: color.text.muted, lineHeight: 1.6 }}>
+          Include these details if you get in touch about a problem — they identify exactly which build you're running.
+        </p>
+      )}
     </div>
   );
 }
@@ -809,23 +822,37 @@ export function DriveBackupPanel({ store, updateStore }: { store: Store; updateS
           </a>
         </div>
       ) : !configured ? (
-
-        <div style={{ fontSize: 12, padding: '10px 12px', borderRadius: 6, background: color.warning.subtle, color: color.warning.base, lineHeight: 1.6 }}>
-          <strong>Setup needed.</strong> A Google OAuth client id hasn't been added to the extension yet. In the Google Cloud Console:
-          create a project → enable the <strong>Google Drive API</strong> → create an <strong>OAuth client ID</strong> of type
-          <strong>“Web application”</strong> → add the redirect URI below to its Authorized redirect URIs → paste the client id
-          into <code>manifest.json</code> under <code>oauth2.client_id</code>, then rebuild.
-        </div>
+        // Two different audiences for the same state. A developer needs the
+        // Cloud Console recipe; a customer needs to know it isn't their fault
+        // and that nothing they can do in this panel will fix it.
+        IS_UNPACKED ? (
+          <div style={{ fontSize: 12, padding: '10px 12px', borderRadius: 6, background: color.warning.subtle, color: color.warning.base, lineHeight: 1.6 }}>
+            <strong>Setup needed.</strong> A Google OAuth client id hasn't been added to the extension yet. In the Google Cloud Console:
+            create a project → enable the <strong>Google Drive API</strong> → create an <strong>OAuth client ID</strong> of type
+            <strong>“Web application”</strong> → add the redirect URI below to its Authorized redirect URIs → paste the client id
+            into <code>manifest.json</code> under <code>oauth2.client_id</code>, then rebuild.
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, padding: '10px 12px', borderRadius: 6, background: color.warning.subtle, color: color.warning.base, lineHeight: 1.6 }}>
+            <strong>Drive sync isn't available in this build.</strong> Your data is safe and still syncing through Chrome.
+            Updating the extension should restore it — get in touch if it doesn't.
+          </div>
+        )
       ) : (
         <>
-          <div style={{ fontSize: 11, color: color.text.muted, marginBottom: 12, lineHeight: 1.6, background: color.surface.sunken, borderRadius: 6, padding: '8px 10px' }}>
-            Two OAuth clients are used, from the same Cloud project. Chrome uses the <strong>“Chrome Extension”</strong>
-            client in <code>manifest.json</code> (its Item ID must be this extension's id). Edge falls back to a
-            <strong> “Web application”</strong> client, which must list this exact URI — trailing slash included — under
-            its <strong>Authorized redirect URIs</strong>:
-            <br />
-            <code style={{ wordBreak: 'break-all', color: color.text.primary }}>{getAuthRedirectUri() || '(unavailable)'}</code>
-          </div>
+          {/* Which OAuth client this browser ends up on is a Cloud Console
+              detail: it only means something to whoever can edit that project,
+              and the redirect URI it prints is deployment plumbing. */}
+          {IS_UNPACKED && (
+            <div style={{ fontSize: 11, color: color.text.muted, marginBottom: 12, lineHeight: 1.6, background: color.surface.sunken, borderRadius: 6, padding: '8px 10px' }}>
+              Two OAuth clients are used, from the same Cloud project. Chrome uses the <strong>“Chrome Extension”</strong>
+              client in <code>manifest.json</code> (its Item ID must be this extension's id). Edge falls back to a
+              <strong> “Web application”</strong> client, which must list this exact URI — trailing slash included — under
+              its <strong>Authorized redirect URIs</strong>:
+              <br />
+              <code style={{ wordBreak: 'break-all', color: color.text.primary }}>{getAuthRedirectUri() || '(unavailable)'}</code>
+            </div>
+          )}
 
           {/* Which flow this machine ended up on. This is the difference between
               renewing silently in the background forever and needing a fresh
@@ -969,6 +996,16 @@ export function ContactsMaintenance({ store, updateStore }: { store: Store; upda
   const [status, setStatus] = useState<{ type: 'success' | 'info'; msg: string } | null>(null);
   const [groups, setGroups] = useState<DuplicateGroup[] | null>(null);
   const [busy, setBusy] = useState(false);
+  // Suggestions the user has looked at and rejected. Without this, two people
+  // who genuinely share a name are re-offered on every single scan, and the
+  // only way to stop being asked is to merge two unrelated contacts.
+  //
+  // Per-machine (localStorage), like the failed-send dismissals: it records a
+  // judgement about a suggestion, not a change to the data, so nothing is lost
+  // if another machine hasn't heard about it.
+  const [ignored, setIgnored] = useLocalPref<string[]>('ignoredDuplicates', []);
+  const [showIgnored, setShowIgnored] = useState(false);
+  const ignoredSet = useMemo(() => new Set(ignored), [ignored]);
 
   const cardStyle: React.CSSProperties = { background: color.surface.raised, borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 };
 
@@ -985,7 +1022,18 @@ export function ContactsMaintenance({ store, updateStore }: { store: Store; upda
   };
 
   const scan = () => {
-    setGroups(findDuplicateGroups(store.conversations));
+    const found = findDuplicateGroups(store.conversations);
+    // Drop dismissals whose pair no longer exists — merged, deleted, or renamed
+    // apart. A scan sees the whole store, so anything it didn't return can't
+    // come back under the same key, and keeping it would let this list grow for
+    // the life of the install.
+    const live = new Set(found.map(duplicateGroupKey));
+    setIgnored((prev) => {
+      const kept = prev.filter((k) => live.has(k));
+      return kept.length === prev.length ? prev : kept;
+    });
+    setGroups(found);
+    setShowIgnored(false);
     setStatus(null);
   };
 
@@ -997,8 +1045,28 @@ export function ContactsMaintenance({ store, updateStore }: { store: Store; upda
     setStatus({ type: 'success', msg: `Merged ${removed + 1} contacts into “${next.conversations[mergedInto]?.participantName || mergedInto}”.` });
   };
 
-  const identityCount = groups?.filter((g) => g.reason === 'identity').length ?? 0;
-  const nameCount = groups?.filter((g) => g.reason === 'name').length ?? 0;
+  // The suggestion stays on screen under "ignored" rather than disappearing —
+  // one misplaced click shouldn't silently hide a real duplicate with no way
+  // back to it.
+  const ignoreGroup = (g: DuplicateGroup) => {
+    const key = duplicateGroupKey(g);
+    setIgnored((prev) => (prev.includes(key) ? prev : [...prev, key]));
+    setStatus({ type: 'info', msg: 'Suggestion ignored. It stays hidden on this machine until you restore it.' });
+  };
+
+  const restoreGroup = (g: DuplicateGroup) => {
+    const key = duplicateGroupKey(g);
+    setIgnored((prev) => prev.filter((k) => k !== key));
+    setStatus(null);
+  };
+
+  // Split rather than filtered, so the ignored ones stay reachable and the
+  // count of what's left can't drift from what's rendered.
+  const active = groups?.filter((g) => !ignoredSet.has(duplicateGroupKey(g))) ?? [];
+  const hidden = groups?.filter((g) => ignoredSet.has(duplicateGroupKey(g))) ?? [];
+
+  const identityCount = active.filter((g) => g.reason === 'identity').length;
+  const nameCount = active.filter((g) => g.reason === 'name').length;
 
   return (
     <div style={cardStyle}>
@@ -1027,9 +1095,9 @@ export function ContactsMaintenance({ store, updateStore }: { store: Store; upda
 
       {groups && (
         <div style={{ marginTop: 14 }}>
-          {groups.length === 0 ? (
+          {active.length === 0 ? (
             <div style={{ fontSize: 13, color: color.success.base, background: color.success.subtle, padding: '10px 12px', borderRadius: 7 }}>
-              ✓ No duplicates found.
+              ✓ No duplicates found{hidden.length > 0 ? ` (${hidden.length} ignored)` : ''}.
             </div>
           ) : (
             <>
@@ -1037,11 +1105,41 @@ export function ContactsMaintenance({ store, updateStore }: { store: Store; upda
                 {identityCount} identity match{identityCount !== 1 ? 'es' : ''} · {nameCount} same-name group{nameCount !== 1 ? 's' : ''}
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                {groups.map((g, i) => (
-                  <DuplicateGroupRow key={i} group={g} store={store} onMerge={() => mergeGroup(g)} />
+                {active.map((g) => (
+                  <DuplicateGroupRow
+                    key={duplicateGroupKey(g)}
+                    group={g}
+                    store={store}
+                    onMerge={() => mergeGroup(g)}
+                    onIgnore={() => ignoreGroup(g)}
+                  />
                 ))}
               </div>
             </>
+          )}
+
+          {hidden.length > 0 && (
+            <div style={{ marginTop: 12 }}>
+              <button
+                onClick={() => setShowIgnored((v) => !v)}
+                style={{ background: 'none', border: 'none', padding: 0, fontSize: 12, fontWeight: 600, color: color.accent.base, cursor: 'pointer' }}
+              >
+                {showIgnored ? 'Hide' : 'Show'} {hidden.length} ignored suggestion{hidden.length !== 1 ? 's' : ''}
+              </button>
+              {showIgnored && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8, opacity: 0.72 }}>
+                  {hidden.map((g) => (
+                    <DuplicateGroupRow
+                      key={duplicateGroupKey(g)}
+                      group={g}
+                      store={store}
+                      onMerge={() => mergeGroup(g)}
+                      onRestore={() => restoreGroup(g)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
           )}
         </div>
       )}
@@ -1049,7 +1147,7 @@ export function ContactsMaintenance({ store, updateStore }: { store: Store; upda
   );
 }
 
-export function DuplicateGroupRow({ group, store, onMerge }: { group: DuplicateGroup; store: Store; onMerge: () => void }) {
+export function DuplicateGroupRow({ group, store, onMerge, onIgnore, onRestore }: { group: DuplicateGroup; store: Store; onMerge: () => void; onIgnore?: () => void; onRestore?: () => void }) {
   const convs = group.ids.map((id) => store.conversations[id]).filter(Boolean) as Conversation[];
   if (convs.length < 2) return null;
   const primary = pickPrimary(convs);
@@ -1070,9 +1168,31 @@ export function DuplicateGroupRow({ group, store, onMerge }: { group: DuplicateG
             ))}
           </div>
         </div>
-        <button onClick={onMerge} style={{ flexShrink: 0, background: color.special.base, color: color.surface.raised, border: 'none', padding: '7px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
-          Merge {convs.length}
-        </button>
+        <div style={{ flexShrink: 0, display: 'flex', gap: 6, alignItems: 'center' }}>
+          {/* "Not duplicates" rather than "Ignore": the button states the
+              judgement being recorded, not the effect on the list. */}
+          {onIgnore && (
+            <button
+              onClick={onIgnore}
+              title="These are different people — stop suggesting this merge"
+              style={{ background: 'none', color: color.text.secondary, border: `1px solid ${color.border.subtle}`, padding: '6px 10px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+            >
+              Not duplicates
+            </button>
+          )}
+          {onRestore && (
+            <button
+              onClick={onRestore}
+              title="Start suggesting this merge again"
+              style={{ background: 'none', color: color.accent.base, border: `1px solid ${color.border.subtle}`, padding: '6px 10px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+            >
+              Restore
+            </button>
+          )}
+          <button onClick={onMerge} style={{ background: color.special.base, color: color.surface.raised, border: 'none', padding: '7px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
+            Merge {convs.length}
+          </button>
+        </div>
       </div>
       <div style={{ fontSize: 10, color: color.text.muted, marginTop: 4 }}>★ survivor keeps the best thread id; tags are combined.</div>
     </div>

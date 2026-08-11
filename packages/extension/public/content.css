@@ -166,6 +166,58 @@
   align-items: center;
 }
 
+/* ---- Tag sections ("Tags on this conversation", "Add existing tag") ---- */
+
+.fb-crm-section-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 13px 0 6px;
+}
+/* The row already carries the spacing the bare title normally provides. */
+.fb-crm-section-title-row .fb-crm-section-title {
+  margin: 0;
+}
+
+.fb-crm-group-toggle {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 11px;
+  font-weight: 700;
+  color: #065fd4;
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.fb-crm-group-toggle:hover { text-decoration: underline; }
+
+.fb-crm-tag-group-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #8a8d91;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 8px 0 4px;
+}
+/* First group under a section title needs no extra gap above it — the
+   section title row already left the standard 6px. */
+.fb-crm-chips + .fb-crm-tag-group-label { margin-top: 8px; }
+.fb-crm-section-title-row + .fb-crm-tag-group-label { margin-top: 0; }
+
+.fb-crm-tag-group-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  background: #ccd0d5;
+}
+
 /* ---- Custom fields ("Details", above the tag sections) ---- */
 
 .fb-crm-fields {

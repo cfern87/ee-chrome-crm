@@ -8,7 +8,7 @@
 // The notification pieces live here too: a failed send and a held queue are
 // both campaign state, and both surface in the shell's drawer.
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { Store, Tag, Conversation } from '../storage';
 import {
   Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS,
@@ -18,6 +18,7 @@ import {
 } from '../campaigns';
 import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo } from '../devices';
 import { isDisconnected } from '../syncHealth';
+import { IS_UNPACKED } from '../devMode';
 import {
   Banner, Button, Card, EmptyState, Input, Stack, Text,
   color, fontSize, fontWeight, radius, space,
@@ -26,6 +27,34 @@ import {
   MachineView, describeHold, sendBg, previewTags, formatRelativeTime, formatDateTime,
   minutes, describePace, readPace, ProfileUrlEditor, CopyButton, type SendingPace,
 } from './shared';
+
+/**
+ * A specific recipient line in Past sends, asked for from somewhere else.
+ *
+ * `nonce` exists because the same failure clicked twice is the same
+ * campaign/thread pair: without something that changes, the second click sets
+ * identical state, React re-renders nothing, and the row never scrolls back
+ * into view.
+ */
+export interface HistoryFocus {
+  campaignId: string;
+  threadId: string;
+  nonce: number;
+}
+
+/**
+ * The background service worker didn't answer at all.
+ *
+ * Two audiences, one condition. A developer's copy is almost always mid-edit:
+ * the loaded build predates a permission the composer now needs, and the fix is
+ * the unpacked reload button. A customer's copy came from the store with its
+ * permissions intact, so the same words send them hunting for a Developer mode
+ * toggle that won't help — for them this is a worker that didn't wake, and the
+ * ladder is refresh → toggle the extension → restart the browser.
+ */
+const NO_BACKGROUND_ERROR = IS_UNPACKED
+  ? 'No response from the extension background. Fully reload the extension at chrome://extensions (Developer mode → ⟳ on this extension), then refresh this page — the messaging feature needs the new "alarms" permission.'
+  : "The extension's background service didn't respond, so nothing was sent. Refresh this page and try again. If it keeps happening, switch the extension off and back on at chrome://extensions, or restart your browser.";
 
 export function statusColor(s: RecipientStatus): string {
   switch (s) {
@@ -183,7 +212,7 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
       // whole point of the queue is that you can line up the next group
       // straight away, and the queue card above shows what's in flight.
     } else if (res === null) {
-      setError('No response from the extension background. Fully reload the extension at chrome://extensions (Developer mode → ⟳ on this extension), then refresh this page — the messaging feature needs the new "alarms" permission.');
+      setError(NO_BACKGROUND_ERROR);
     } else {
       setError(res.error || 'Failed to start campaign.');
     }
@@ -596,7 +625,7 @@ export function ActiveCampaignsView({
  * live behind the bell, and the bell carries the count.
  */
 export function NotificationsDrawer({
-  failures, machines, queue, campaigns, onDismissFailures, onClearFailure, onReview, onViewQueue,
+  failures, machines, queue, campaigns, onDismissFailures, onClearFailure, onReview, onOpenFailure, onViewQueue,
 }: {
   failures: FailedSend[];
   machines: MachineView | null;
@@ -605,6 +634,7 @@ export function NotificationsDrawer({
   onDismissFailures: () => void;
   onClearFailure: (f: FailedSend) => void;
   onReview: () => void;
+  onOpenFailure: (f: FailedSend) => void;
   onViewQueue: () => void;
 }) {
   const { pending } = queueDepth(campaigns);
@@ -630,6 +660,7 @@ export function NotificationsDrawer({
           onDismiss={onDismissFailures}
           onClear={onClearFailure}
           onReview={onReview}
+          onOpen={onOpenFailure}
         />
       )}
 
@@ -642,7 +673,9 @@ export function NotificationsDrawer({
             <Text size="small" tone="muted" leading="relaxed">
               {queue.paused
                 ? 'Sending is paused. Nothing goes out until you resume it.'
-                : 'Going out on the shared pace, one at a time.'}
+                : awaitingSchedule(queue, campaigns)
+                  ? 'Not scheduled yet — this should clear on its own shortly.'
+                  : 'Going out on the shared pace, one at a time.'}
             </Text>
             <Button size="sm" variant="secondary" onClick={onViewQueue} style={{ alignSelf: 'flex-start' }}>
               View the queue
@@ -652,6 +685,29 @@ export function NotificationsDrawer({
       )}
     </Stack>
   );
+}
+
+/**
+ * There is a message waiting to go out, sending isn't paused (globally or for
+ * a batch), nothing is currently in flight — and yet the queue has no
+ * `nextSendAt`. That combination should be momentary: the background's own
+ * watchdog notices exactly this state and kicks the queue within one pass (see
+ * `watchdog()` in background.ts). If it's still true when the dashboard reads
+ * it, that's worth saying out loud rather than quietly showing "Idle." next to
+ * a pile of messages that clearly are not idle — the silent version of this is
+ * what makes a stalled queue look like a slow one.
+ *
+ * Deliberately blind to WHY: on a synced setup this machine may simply not be
+ * the sender, and the real answer lives in `machines` (see SendingFrom) —
+ * callers that have that context should read it themselves rather than this
+ * function guessing at it.
+ */
+export function awaitingSchedule(queue: QueueState, campaigns: Campaign[]): boolean {
+  if (queue.paused) return false;
+  if (queue.pausedForBatchUntil && queue.pausedForBatchUntil > Date.now()) return false;
+  if (queue.inFlight) return false;
+  if (queue.nextSendAt) return false;
+  return queueDepth(campaigns).pending > 0;
 }
 
 /**
@@ -709,6 +765,70 @@ export function SyncHoldBanner({ machines }: { machines: MachineView | null }) {
   );
 }
 
+/**
+ * Compact queue status, shown in the rail directly under the Campaigns nav
+ * item — see AppShell's `navExtra`. It renders whenever a campaign is running
+ * or paused, regardless of which destination is currently open, so a
+ * background send stays visible from Contacts or Tags without having to
+ * detour through Campaigns to check on it.
+ *
+ * Deliberately much smaller than QueueCard: this is "is something happening,
+ * and should I go look", not the controls themselves. Clicking it is the
+ * answer to "go look".
+ */
+export function QueuePreview({ campaigns, queue, onOpen }: { campaigns: Campaign[]; queue: QueueState; onOpen: () => void }) {
+  if (activeCampaigns(campaigns).length === 0) return null;
+
+  const depth = queueDepth(campaigns);
+  const pausing = !!(queue.pausedForBatchUntil && queue.pausedForBatchUntil > Date.now());
+  const inFlight = queue.inFlight
+    ? campaigns.find((c) => c.id === queue.inFlight!.campaignId)
+        ?.recipients.find((r) => r.threadId === queue.inFlight!.threadId)
+    : undefined;
+  const stalled = awaitingSchedule(queue, campaigns);
+
+  const status: React.ReactNode = queue.paused
+    ? 'Paused'
+    : inFlight
+      ? <>→ {inFlight.participantName}</>
+      : pausing
+        ? <>Resumes in <Countdown to={queue.pausedForBatchUntil} /></>
+        : queue.nextSendAt
+          ? <>Next in <Countdown to={queue.nextSendAt} /></>
+          : stalled
+            ? 'Not scheduled'
+            : 'Idle';
+
+  const warn = queue.paused || stalled;
+
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      title="Open the send queue"
+      style={{
+        display: 'block', width: '100%', textAlign: 'left',
+        background: color.surface.sunken, border: 'none', borderRadius: radius.sm,
+        margin: `1px ${space.xs}px ${space.xxs}px`, padding: `${space.xs}px ${space.sm}px`,
+        cursor: 'pointer', font: 'inherit',
+      }}
+    >
+      <div style={{ fontSize: fontSize.micro, fontWeight: fontWeight.bold, color: color.text.secondary }}>
+        {depth.pending} waiting
+      </div>
+      <div
+        style={{
+          fontSize: fontSize.micro, marginTop: 2, color: warn ? color.warning.base : color.text.muted,
+          fontWeight: warn ? fontWeight.bold : fontWeight.regular,
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}
+      >
+        {status}
+      </div>
+    </button>
+  );
+}
+
 // The queue header: one processor, one clock, however many campaigns are
 // feeding it. This is where the global controls live, because pausing "the
 // sending" and pausing "this campaign" are genuinely different actions and
@@ -720,6 +840,7 @@ export function QueueCard({ campaigns, queue, machines, onChanged, onViewHistory
     ? campaigns.find((c) => c.id === queue.inFlight!.campaignId)
         ?.recipients.find((r) => r.threadId === queue.inFlight!.threadId)
     : undefined;
+  const stalled = awaitingSchedule(queue, campaigns);
 
   const control = async (type: string, payload?: unknown) => {
     await sendBg({ type, payload });
@@ -772,12 +893,30 @@ export function QueueCard({ campaigns, queue, machines, onChanged, onViewHistory
                 ? <>Batch pause · sending resumes in <Countdown to={queue.pausedForBatchUntil} /></>
                 : queue.nextSendAt
                   ? <>Next message in <Countdown to={queue.nextSendAt} /></>
-                  : 'Idle.'}
+                  : stalled
+                    ? <span style={{ color: color.warning.base, fontWeight: 600 }}>⚠ Not scheduled yet</span>
+                    : 'Idle.'}
         </span>
         <button onClick={onViewHistory} style={{ marginLeft: 'auto', background: 'none', border: 'none', color: color.accent.base, fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>
           History &amp; logs →
         </button>
       </div>
+
+      {/* `stalled` should be momentary — see awaitingSchedule — so this only
+          shows up when the background hasn't self-corrected as fast as the
+          dashboard's own refresh. Worth a full sentence rather than folding
+          into the status line above: it's the one queue state that looks
+          exactly like "nothing to do" while actually meaning "something is
+          wrong", and the two need different reactions from the user. */}
+      {stalled && (
+        <div style={{ marginTop: 8, fontSize: 12, padding: '8px 10px', borderRadius: 6, background: color.warning.subtle, color: color.warning.base, lineHeight: 1.5 }}>
+          {depth.pending} message{depth.pending !== 1 ? 's' : ''} waiting, but nothing is scheduled to send.
+          This usually clears within a minute on its own —
+          {machines?.syncEnabled
+            ? ' if it doesn’t, check which machine is sending below.'
+            : ' if it doesn’t, reload the extension at chrome://extensions.'}
+        </div>
+      )}
 
       <SendingFrom machines={machines} onChanged={onChanged} />
     </div>
@@ -800,7 +939,13 @@ export function ActiveCampaignCard({ campaign, queue, isNext, onChanged }: { cam
     if (queue.paused) return 'Sending paused';
     if (pausing) return <>Batch pause · resumes in <Countdown to={queue.pausedForBatchUntil} /></>;
     if (queue.inFlight?.campaignId === campaign.id) return 'Sending now…';
-    if (isNext) return <>Next send in <Countdown to={queue.nextSendAt} /></>;
+    // `isNext` is worked out from campaign data alone (see runnableCampaigns) —
+    // it doesn't know whether the queue has actually scheduled a time yet. Without
+    // this branch, a queue with no `nextSendAt` rendered "Next send in" followed
+    // by nothing, which read as broken rather than as the momentary gap it is.
+    if (isNext) return queue.nextSendAt
+      ? <>Next send in <Countdown to={queue.nextSendAt} /></>
+      : <span style={{ color: color.warning.base }}>Not scheduled yet</span>;
     return 'Waiting its turn';
   };
 
@@ -837,7 +982,7 @@ export function ActiveCampaignCard({ campaign, queue, isNext, onChanged }: { cam
   );
 }
 
-export function HistoryPanel({ campaigns, onChanged, store, onViewProfile, onEditProfileUrl, onCompose }: { campaigns: Campaign[]; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null>; onCompose: () => void }) {
+export function HistoryPanel({ campaigns, onChanged, store, onViewProfile, onEditProfileUrl, onCompose, focus }: { campaigns: Campaign[]; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null>; onCompose: () => void; focus?: HistoryFocus | null }) {
   const sorted = campaigns.slice().sort((a, b) => b.createdAt - a.createdAt);
   if (sorted.length === 0) {
     return (
@@ -852,7 +997,17 @@ export function HistoryPanel({ campaigns, onChanged, store, onViewProfile, onEdi
   }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {sorted.map((c) => <CampaignHistoryCard key={c.id} campaign={c} onChanged={onChanged} store={store} onViewProfile={onViewProfile} onEditProfileUrl={onEditProfileUrl} />)}
+      {sorted.map((c) => (
+        <CampaignHistoryCard
+          key={c.id}
+          campaign={c}
+          onChanged={onChanged}
+          store={store}
+          onViewProfile={onViewProfile}
+          onEditProfileUrl={onEditProfileUrl}
+          focus={focus?.campaignId === c.id ? focus : null}
+        />
+      ))}
     </div>
   );
 }
@@ -860,7 +1015,7 @@ export function HistoryPanel({ campaigns, onChanged, store, onViewProfile, onEdi
 // Banner for messages that failed while nobody was watching. Blocked/
 // unavailable recipients are called out separately: those never succeed on a
 // retry, so requeueing them is wasted effort.
-export function FailedSendsNotice({ failures, onDismiss, onClear, onReview }: { failures: FailedSend[]; onDismiss: () => void; onClear: (f: FailedSend) => void; onReview: () => void }) {
+export function FailedSendsNotice({ failures, onDismiss, onClear, onReview, onOpen }: { failures: FailedSend[]; onDismiss: () => void; onClear: (f: FailedSend) => void; onReview: () => void; onOpen?: (f: FailedSend) => void }) {
   const [expanded, setExpanded] = useState(false);
   const unavailable = failures.filter((f) => f.errorKind === 'unavailable');
   const shown = expanded ? failures : failures.slice(0, 5);
@@ -895,7 +1050,25 @@ export function FailedSendsNotice({ failures, onDismiss, onClear, onReview }: { 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 10 }}>
         {shown.map((f) => (
           <div key={failureKey(f)} style={{ fontSize: 12, color: '#7a3b33', display: 'flex', gap: 8, alignItems: 'center' }}>
-            <span style={{ fontWeight: 600, flexShrink: 0 }}>{f.participantName || f.threadId}</span>
+            {/* The name goes straight to that person's line in Past sends.
+                Without it the only route is "Review in past sends" and then
+                scrolling every campaign looking for the one that failed — which
+                is the whole reason this notice existed. */}
+            {onOpen ? (
+              <button
+                onClick={() => onOpen(f)}
+                title={`Show this send in ${f.campaignName}`}
+                style={{
+                  flexShrink: 0, background: 'none', border: 'none', padding: 0,
+                  font: 'inherit', fontWeight: 600, color: '#7a3b33',
+                  textDecoration: 'underline', cursor: 'pointer',
+                }}
+              >
+                {f.participantName || f.threadId}
+              </button>
+            ) : (
+              <span style={{ fontWeight: 600, flexShrink: 0 }}>{f.participantName || f.threadId}</span>
+            )}
             <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.error || 'Unknown error'}</span>
             <span style={{ color: color.text.secondary, flexShrink: 0 }}>{formatRelativeTime(f.failedAt)}</span>
             <button
@@ -920,8 +1093,15 @@ export function FailedSendsNotice({ failures, onDismiss, onClear, onReview }: { 
   );
 }
 
-export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile, onEditProfileUrl }: { campaign: Campaign; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null> }) {
+export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile, onEditProfileUrl, focus }: { campaign: Campaign; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null>; focus?: HistoryFocus | null }) {
   const [expanded, setExpanded] = useState(false);
+  // A card arrived at from a notification opens itself — the recipient rows
+  // don't exist until it does, so the row below can't scroll to anything while
+  // this is collapsed. Left open afterwards rather than snapping shut, because
+  // the point of arriving here is to work on that send.
+  useEffect(() => {
+    if (focus) setExpanded(true);
+  }, [focus]);
   // A refused queue change is shown on the campaign it belongs to, rather than
   // in a browser alert that gives no clue which card it came from.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -1033,6 +1213,7 @@ export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile,
                 onEditProfileUrl={store.conversations[r.threadId] ? (raw) => onEditProfileUrl(r.threadId, raw) : undefined}
                 onRemove={canRemove && r.status !== 'sending' ? () => removeRecipient(r.threadId) : undefined}
                 onRequeue={r.status === 'error' ? () => requeueRecipient(r.threadId) : undefined}
+                focus={focus?.threadId === r.threadId ? focus : null}
               />
             ))}
           </div>
@@ -1042,7 +1223,7 @@ export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile,
   );
 }
 
-export function RecipientRow({ r, conv, onViewProfile, onEditProfileUrl, onRemove, onRequeue }: { r: CampaignRecipient; conv?: Conversation; onViewProfile: () => void; onEditProfileUrl?: (raw: string) => Promise<string | null>; onRemove?: () => void; onRequeue?: () => void }) {
+export function RecipientRow({ r, conv, onViewProfile, onEditProfileUrl, onRemove, onRequeue, focus }: { r: CampaignRecipient; conv?: Conversation; onViewProfile: () => void; onEditProfileUrl?: (raw: string) => Promise<string | null>; onRemove?: () => void; onRequeue?: () => void; focus?: HistoryFocus | null }) {
   const [open, setOpen] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   // Reveal the profile-URL editor by default for a failed send — a wrong or
@@ -1052,8 +1233,35 @@ export function RecipientRow({ r, conv, onViewProfile, onEditProfileUrl, onRemov
   // Prefer the contact's current chat URL; the recipient snapshot can be stale.
   const chatUrl = conv?.chatUrl || r.chatUrl;
 
+  // Arriving from a notification: scroll here and say so. The highlight fades
+  // rather than sticking, because after a couple of seconds the row is just a
+  // row again and a permanent marker would read as a status.
+  const rowRef = useRef<HTMLDivElement>(null);
+  const [highlight, setHighlight] = useState(false);
+  useEffect(() => {
+    if (!focus) return;
+    // One frame's grace so the parent card's expansion has laid the row out —
+    // scrolling to a zero-height element lands in the wrong place.
+    const raf = requestAnimationFrame(() => {
+      rowRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+    setHighlight(true);
+    const fade = window.setTimeout(() => setHighlight(false), 2500);
+    return () => { cancelAnimationFrame(raf); window.clearTimeout(fade); };
+  }, [focus]);
+
   return (
-    <div style={{ background: color.surface.sunken, borderRadius: 6, padding: '8px 10px' }}>
+    <div
+      ref={rowRef}
+      style={{
+        background: highlight ? color.warning.subtle : color.surface.sunken,
+        borderRadius: 6,
+        padding: '8px 10px',
+        boxShadow: highlight ? `0 0 0 2px ${color.warning.base}` : 'none',
+        transition: 'background 400ms ease, box-shadow 400ms ease',
+        scrollMarginTop: 12,
+      }}
+    >
       <div
         onClick={() => hasLog && setOpen(!open)}
         style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: hasLog ? 'pointer' : 'default' }}

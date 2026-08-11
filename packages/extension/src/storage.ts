@@ -139,9 +139,18 @@ export interface Conversation {
   // (the most reliable thread id); fbUsername is the vanity handle.
   fbUserId?: string;
   fbUsername?: string;
-  // Provenance: 'messenger' for contacts captured from Messenger, 'import' for
-  // contacts added via CSV import. Absent = legacy/messenger.
-  source?: 'messenger' | 'import';
+  // Provenance — how this contact first entered the CRM:
+  //   'messenger' — captured automatically off a Messenger sidebar row.
+  //                 Absent means this too; the value only started being
+  //                 stamped once 'import' and 'profile' needed telling apart
+  //                 from it, so nothing pre-existing was rewritten.
+  //   'import'    — added in bulk from a CSV file (Settings → Data → Import).
+  //   'profile'   — added one at a time from the "+ Add to CRM" button on
+  //                 their Facebook profile page, before any Messenger thread
+  //                 existed. Distinct from 'import': same code path used to
+  //                 stamp this 'import' too, which mislabelled every contact
+  //                 added this way as a CSV row.
+  source?: 'messenger' | 'import' | 'profile';
   // Set when the user renames the contact by hand. While true, the content
   // script will not overwrite participantName with a name scraped from the DOM.
   nameManual?: boolean;

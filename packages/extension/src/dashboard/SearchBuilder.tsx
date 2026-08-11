@@ -15,6 +15,23 @@ import {
   newGroup, newCondition, conditionIssue, describeQuery, isQueryEmpty, sortSavedSearches,
 } from '../search';
 
+// A raw enum option value is normally its own label — fine for something like
+// a custom-field dropdown, whose choices are already whatever the user typed.
+// The one built-in enum, 'source', has values that are internal vocabulary
+// ('profile' means "added from their Facebook profile page", not a settings
+// tab), so it gets human labels here instead of a value-list widget having to
+// know the meaning of every field it might render.
+const SOURCE_LABELS: Record<string, string> = {
+  messenger: 'Captured from Messenger',
+  import: 'CSV import',
+  profile: 'Added from Facebook profile',
+};
+
+function enumOptionLabel(fieldKey: string | undefined, value: string): string {
+  if (fieldKey === 'source') return SOURCE_LABELS[value] || value;
+  return value;
+}
+
 // ---- shared styles -------------------------------------------------------
 
 const control: React.CSSProperties = {
@@ -237,7 +254,7 @@ function ConditionRow({ cond, fields, ctx, onChange, onRemove }: ConditionRowPro
       case 'multi': {
         const choices = kind === 'tags' ? tagChoices
           : kind === 'tagGroups' ? groupChoices
-          : (field?.options || []).map((o) => ({ value: o, label: o }));
+          : (field?.options || []).map((o) => ({ value: o, label: enumOptionLabel(field?.key, o) }));
         return (
           <MultiChipSelect
             choices={choices}

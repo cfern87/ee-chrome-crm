@@ -242,6 +242,20 @@ export interface DuplicateGroup {
 }
 
 /**
+ * Stable identity for a suggestion, so "I've looked at this one, they're
+ * different people" can survive a re-scan.
+ *
+ * Sorted, because grouping order depends on iteration order over the store and
+ * would otherwise produce a different key for the same pair. The reason is part
+ * of the key on purpose: a pair dismissed as a same-name coincidence deserves
+ * to come back if it later turns out to share an identity, which is a much
+ * stronger claim than the one that was dismissed.
+ */
+export function duplicateGroupKey(g: DuplicateGroup): string {
+  return `${g.reason}:${[...g.ids].sort().join('|')}`;
+}
+
+/**
  * Find groups of likely-duplicate conversations.
  *   - 'identity': share a profile URL, FB user id/username, or thread id —
  *     these are almost certainly the same person (safe to merge).

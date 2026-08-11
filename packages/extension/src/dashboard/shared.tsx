@@ -86,57 +86,13 @@ export function previewTags(tagIds: string[], tags: Record<string, Tag>): Tag[] 
   return tagIds.map((id) => tags[id]).filter((t): t is Tag => !!t && !t.hideInSidebar);
 }
 
-/** A tag group and the subset of tags that fell into it. */
-export interface TagBucket {
-  key: string;
-  label: string;
-  color?: string;
-  tags: Tag[];
-}
+// Tag-group bucketing lives in ../tagGrouping (a plain, non-JSX module) so the
+// in-page panel's content-script build — which has no React plugin — can
+// import it too. Re-exported here so the dashboard's existing `from './shared'`
+// imports don't all need to change.
+export type { TagBucket } from '../tagGrouping';
+export { bucketTagsByGroup, bucketTags, showsGroupLabels } from '../tagGrouping';
 
-const UNGROUPED_KEY = '__ungrouped__';
-
-/**
- * Bucket `tags` by their tag group, in the same order the Tags tab uses
- * (`order`, then `createdAt`), with ungrouped tags last. Input order is
- * preserved inside each bucket.
- *
- * Empty buckets are dropped, so a profile shows headings only for groups the
- * contact actually has tags in. A `groupId` pointing at a deleted group counts
- * as ungrouped — the same reading as the Tags tab, so a tag can never vanish
- * from a list just because its group went away.
- */
-export function bucketTagsByGroup(tags: Tag[], groups: Record<string, TagGroup>): TagBucket[] {
-  const ordered = Object.values(groups).sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
-  const byGroup = new Map<string, Tag[]>();
-  const ungrouped: Tag[] = [];
-
-  for (const t of tags) {
-    if (t.groupId && groups[t.groupId]) {
-      const list = byGroup.get(t.groupId);
-      if (list) list.push(t);
-      else byGroup.set(t.groupId, [t]);
-    } else {
-      ungrouped.push(t);
-    }
-  }
-
-  const out: TagBucket[] = [];
-  for (const g of ordered) {
-    const list = byGroup.get(g.id);
-    if (list?.length) out.push({ key: g.id, label: g.name, color: g.color, tags: list });
-  }
-  if (ungrouped.length) out.push({ key: UNGROUPED_KEY, label: 'Ungrouped', tags: ungrouped });
-  return out;
-}
-
-/**
- * Whether to draw group headings at all. A single bucket of ungrouped tags is
- * just a flat list, and labelling it "Ungrouped" would be noise.
- */
-export function showsGroupLabels(buckets: TagBucket[]): boolean {
-  return buckets.some((b) => b.key !== UNGROUPED_KEY);
-}
 export function tsStamp(): string {
   return new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
 }

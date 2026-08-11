@@ -31,6 +31,23 @@ export interface NavItem<Id extends string = string> {
 
 export interface AppShellProps<Id extends string = string> {
   nav: NavItem<Id>[];
+  /**
+   * Destinations pinned to the bottom of the rail, below a divider. Settings is
+   * config, not a place you work — listed as a fourth peer it read as "the last
+   * one of the four", which is the wrong shape for the thing you visit once and
+   * then leave alone.
+   */
+  footerNav?: NavItem<Id>[];
+  /**
+   * Extra content inserted directly under a nav item's button, keyed by that
+   * item's id. Built for a live status preview (the send queue, while a
+   * campaign is running) that should stay visible from every destination, not
+   * only while that item is the active route — a background campaign doesn't
+   * stop being relevant just because you've navigated to Contacts. Hidden
+   * while the rail is collapsed, along with everything else that needs room
+   * for a label.
+   */
+  navExtra?: Partial<Record<Id, React.ReactNode>>;
   activeId: Id;
   onNavigate: (id: Id) => void;
 
@@ -66,7 +83,7 @@ const RAIL_NARROW = 60;
 const TOPBAR_HEIGHT = 52;
 
 export function AppShell<Id extends string>({
-  nav, activeId, onNavigate,
+  nav, footerNav, navExtra, activeId, onNavigate,
   railCollapsed, onToggleRail,
   title, meta, actions,
   contentScroll = true,
@@ -91,6 +108,8 @@ export function AppShell<Id extends string>({
     >
       <Rail
         nav={nav}
+        footerNav={footerNav}
+        navExtra={navExtra}
         activeId={activeId}
         onNavigate={onNavigate}
         collapsed={railCollapsed}
@@ -135,14 +154,55 @@ export function AppShell<Id extends string>({
 // --- Rail -----------------------------------------------------------------
 
 function Rail<Id extends string>({
-  nav, activeId, onNavigate, collapsed, onToggle,
+  nav, footerNav, navExtra, activeId, onNavigate, collapsed, onToggle,
 }: {
   nav: NavItem<Id>[];
+  footerNav?: NavItem<Id>[];
+  navExtra?: Partial<Record<Id, React.ReactNode>>;
   activeId: Id;
   onNavigate: (id: Id) => void;
   collapsed: boolean;
   onToggle: () => void;
 }) {
+  const item = (entry: NavItem<Id>) => {
+    const active = entry.id === activeId;
+    return (
+      <button
+        key={entry.id}
+        type="button"
+        onClick={() => onNavigate(entry.id)}
+        aria-current={active ? 'page' : undefined}
+        title={collapsed ? entry.label : undefined}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: space.md,
+          width: '100%',
+          minHeight: 38,
+          padding: `0 ${space.md}px`,
+          border: 'none',
+          borderRadius: radius.sm,
+          background: active ? color.accent.subtle : 'transparent',
+          color: active ? color.accent.base : color.text.secondary,
+          font: 'inherit',
+          fontWeight: active ? fontWeight.semibold : fontWeight.medium,
+          cursor: 'pointer',
+          justifyContent: collapsed ? 'center' : undefined,
+        }}
+      >
+        <Icon paths={entry.icon} />
+        {!collapsed && (
+          <>
+            <span style={{ flex: 1, textAlign: 'left', whiteSpace: 'nowrap' }}>{entry.label}</span>
+            {entry.count !== undefined && (
+              <Text size="micro" weight="semibold" tone={active ? 'accent' : 'muted'}>{entry.count}</Text>
+            )}
+          </>
+        )}
+      </button>
+    );
+  };
+
   return (
     <nav
       aria-label="Sections"
@@ -172,44 +232,30 @@ function Rail<Id extends string>({
         )}
       </div>
 
-      {nav.map((item) => {
-        const active = item.id === activeId;
-        return (
-          <button
-            key={item.id}
-            type="button"
-            onClick={() => onNavigate(item.id)}
-            aria-current={active ? 'page' : undefined}
-            title={collapsed ? item.label : undefined}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: space.md,
-              width: '100%',
-              minHeight: 38,
-              padding: `0 ${space.md}px`,
-              border: 'none',
-              borderRadius: radius.sm,
-              background: active ? color.accent.subtle : 'transparent',
-              color: active ? color.accent.base : color.text.secondary,
-              font: 'inherit',
-              fontWeight: active ? fontWeight.semibold : fontWeight.medium,
-              cursor: 'pointer',
-              justifyContent: collapsed ? 'center' : undefined,
-            }}
-          >
-            <Icon paths={item.icon} />
-            {!collapsed && (
-              <>
-                <span style={{ flex: 1, textAlign: 'left', whiteSpace: 'nowrap' }}>{item.label}</span>
-                {item.count !== undefined && (
-                  <Text size="micro" weight="semibold" tone={active ? 'accent' : 'muted'}>{item.count}</Text>
-                )}
-              </>
-            )}
-          </button>
-        );
-      })}
+      {nav.map((entry) => (
+        <React.Fragment key={entry.id}>
+          {item(entry)}
+          {!collapsed && navExtra?.[entry.id]}
+        </React.Fragment>
+      ))}
+
+      {/* Everything below this is pinned to the bottom of the rail. The spacer
+          rather than `marginTop: auto` on the first footer child, because the
+          divider has to sit at the top of the pinned group and not float with
+          whatever happens to be first. */}
+      <div style={{ flex: 1, minHeight: space.md }} />
+
+      {!!footerNav?.length && (
+        <div
+          style={{
+            display: 'flex', flexDirection: 'column', gap: space.xxs,
+            paddingTop: space.xs,
+            borderTop: `1px solid ${color.border.subtle}`,
+          }}
+        >
+          {footerNav.map(item)}
+        </div>
+      )}
 
       <button
         type="button"
@@ -218,7 +264,7 @@ function Rail<Id extends string>({
         title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
         style={{
           display: 'flex', alignItems: 'center', gap: space.md,
-          marginTop: 'auto', minHeight: 34, padding: `0 ${space.md}px`,
+          minHeight: 34, padding: `0 ${space.md}px`,
           border: 'none', borderRadius: radius.sm, background: 'transparent',
           color: color.text.muted, font: 'inherit', fontSize: fontSize.small,
           cursor: 'pointer', justifyContent: collapsed ? 'center' : undefined,

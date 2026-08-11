@@ -16,7 +16,8 @@ import {
   isStoreChangeKey,
   loadStore as _loadStore,
 } from './storage';
-import type { Store, Tag, Conversation, CustomFieldDef } from './storage';
+import type { Store, Tag, Conversation, CustomFieldDef, TagGroup } from './storage';
+import { bucketTags, showsGroupLabels, type TagBucket } from './tagGrouping';
 import { PRODUCT_NAME } from './product';
 import { readableFill, chipOutline, ON_DARK } from './ui/contrast';
 import { eyeOffSvgMarkup } from './ui/icons';
@@ -1054,6 +1055,85 @@ const removedThreads = new Set<string>();
 // re-render can't disarm it (or leave it armed) mid-decision.
 let deleteArmed = false;
 
+// ---- Panel preferences (per-browser, via localStorage) -------------------
+//
+// Whether each of the panel's two tag sections is split by tag group. Two
+// independent preferences, not one: "Tags on this conversation" is usually
+// short (a handful of tags on one person) where grouping mostly adds heading
+// noise, while "Add existing tag" is the whole tag library and grouping is
+// how you find one you half-remember. A user who wants one grouped and the
+// other flat shouldn't have to choose.
+//
+// localStorage rather than the CRM store: this is a per-browser reading
+// preference, not data — it shouldn't sync across machines or cost a Drive
+// write — and it needs to survive nothing more than navigating between
+// profiles, which localStorage does for free since the panel re-renders in
+// place rather than reloading the page.
+const PANEL_PREF_PREFIX = 'fb_crm_panel_';
+
+function readPanelPref(key: string, fallback: boolean): boolean {
+  try {
+    const raw = window.localStorage.getItem(PANEL_PREF_PREFIX + key);
+    return raw === null ? fallback : raw === '1';
+  } catch {
+    return fallback; // localStorage disabled or unavailable — just don't persist
+  }
+}
+
+function writePanelPref(key: string, value: boolean): void {
+  try {
+    window.localStorage.setItem(PANEL_PREF_PREFIX + key, value ? '1' : '0');
+  } catch { /* a preference that won't persist isn't worth failing the click over */ }
+}
+
+/**
+ * Render one of the panel's tag sections: a title with an optional
+ * Group/Ungroup toggle, then the tags themselves — bucketed by tag group when
+ * `grouped` is on, one flat wrap when it's off. `chip` renders a single tag;
+ * `emptyHtml` covers the section having nothing to show.
+ *
+ * The toggle only appears once there's more than one group in play, matching
+ * the dashboard's tag filter — with a single group, "Group" and "Ungroup"
+ * would look identical and the button would just be noise.
+ */
+function tagSectionHtml(opts: {
+  title: string;
+  tags: Tag[];
+  groups: Record<string, TagGroup>;
+  grouped: boolean;
+  toggleKey: string;
+  chip: (t: Tag) => string;
+  emptyHtml?: string;
+}): string {
+  const { title, tags, groups, grouped, toggleKey, chip, emptyHtml } = opts;
+  const distinctGroups = new Set(tags.map((t) => (t.groupId && groups[t.groupId] ? t.groupId : ''))).size;
+  const toggle = distinctGroups > 1
+    ? `<button class="fb-crm-group-toggle" data-group-toggle="${toggleKey}" title="${grouped ? 'Show every tag in one list' : 'Split tags by tag group'}">${grouped ? 'Ungroup' : 'Group'}</button>`
+    : '';
+
+  let body: string;
+  if (tags.length === 0) {
+    body = emptyHtml || '';
+  } else {
+    const buckets = bucketTags(tags, groups, grouped);
+    const withLabels = showsGroupLabels(buckets);
+    body = buckets.map((b: TagBucket) => `
+      ${withLabels ? `
+        <div class="fb-crm-tag-group-label">
+          ${b.color ? `<span class="fb-crm-tag-group-dot" style="background:${b.color}"></span>` : ''}${escapeHtml(b.label)}
+        </div>` : ''}
+      <div class="fb-crm-chips">${b.tags.map(chip).join('')}</div>
+    `).join('');
+  }
+
+  return `
+    <div class="fb-crm-section-title-row">
+      <div class="fb-crm-section-title">${title}</div>
+      ${toggle}
+    </div>
+    ${body}`;
+}
+
 function buildLauncher() {
   const existing = document.getElementById('fb-crm-launcher');
   if (existing) {
@@ -1279,6 +1359,10 @@ async function renderPanelContent() {
     .filter(f => f.showInPanel)
     .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
 
+  // Independent per section — see the PANEL_PREF_PREFIX comment above.
+  const tagsGrouped = readPanelPref('tagsGrouped', true);
+  const addTagGrouped = readPanelPref('addTagGrouped', true);
+
   panelEl.innerHTML = `
     <div class="fb-crm-header">
       <span>${PRODUCT_NAME}</span>
@@ -1298,21 +1382,26 @@ async function renderPanelContent() {
           ${panelFields.map(fieldRowHtml).join('')}
         </div>` : ''}
 
-      <div class="fb-crm-section-title">Tags on this conversation</div>
-      <div class="fb-crm-chips">
-        ${convTags.length === 0 ? '<span class="fb-crm-muted">No tags yet</span>' : ''}
-        ${convTags.map(t =>
-          `<span class="${chipClass(t)}" style="${chipStyle(t)}" title="${chipTitle(t)}">${chipHiddenMark(t)}${escapeHtml(t.name)}<button class="fb-crm-chip-x" data-remove="${t.id}" aria-label="Remove tag ${escapeHtml(t.name)}">✕</button></span>`
-        ).join('')}
-      </div>
+      ${tagSectionHtml({
+        title: 'Tags on this conversation',
+        tags: convTags,
+        groups: store.tagGroups,
+        grouped: tagsGrouped,
+        toggleKey: 'tagsGrouped',
+        emptyHtml: '<div class="fb-crm-chips"><span class="fb-crm-muted">No tags yet</span></div>',
+        chip: (t) =>
+          `<span class="${chipClass(t)}" style="${chipStyle(t)}" title="${chipTitle(t)}">${chipHiddenMark(t)}${escapeHtml(t.name)}<button class="fb-crm-chip-x" data-remove="${t.id}" aria-label="Remove tag ${escapeHtml(t.name)}">✕</button></span>`,
+      })}
 
-      ${availableTags.length > 0 ? `
-        <div class="fb-crm-section-title">Add existing tag</div>
-        <div class="fb-crm-chips">
-          ${availableTags.map(t =>
-            `<button class="${chipClass(t)} fb-crm-chip-add" style="${chipStyle(t)}" title="${chipTitle(t)}" data-add="${t.id}">${chipHiddenMark(t)}+ ${escapeHtml(t.name)}</button>`
-          ).join('')}
-        </div>` : ''}
+      ${availableTags.length > 0 ? tagSectionHtml({
+        title: 'Add existing tag',
+        tags: availableTags,
+        groups: store.tagGroups,
+        grouped: addTagGrouped,
+        toggleKey: 'addTagGrouped',
+        chip: (t) =>
+          `<button class="${chipClass(t)} fb-crm-chip-add" style="${chipStyle(t)}" title="${chipTitle(t)}" data-add="${t.id}">${chipHiddenMark(t)}+ ${escapeHtml(t.name)}</button>`,
+      }) : ''}
 
       <div class="fb-crm-section-title">Create new tag</div>
       <div class="fb-crm-new">
@@ -1504,6 +1593,14 @@ function wireClose() {
 
 function wirePanelActions(threadId: string) {
   if (!panelEl) return;
+
+  panelEl.querySelectorAll<HTMLElement>('[data-group-toggle]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const key = btn.dataset.groupToggle!;
+      writePanelPref(key, !readPanelPref(key, true));
+      await renderPanel(); // no store change — just re-read the preference and redraw
+    });
+  });
 
   panelEl.querySelectorAll<HTMLElement>('[data-remove]').forEach(btn => {
     btn.addEventListener('click', async () => {

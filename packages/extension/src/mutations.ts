@@ -239,6 +239,10 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
         return { store: next, changed: true, conversationId: conv.id };
       }
 
+      // The id scheme (imp_<key>_<rand>) is shared with CSV import — not because
+      // this IS an import, but so a contact added this way lines up under the
+      // same synthetic-id convention if a CSV row for the same person turns up
+      // later. `source` below is what actually records how they got here.
       const pk = profileKey(m.profileUrl) || Math.random().toString(36).slice(2);
       const id =
         m.pageThreadId ||
@@ -260,7 +264,10 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
             : undefined,
         fbUserId: m.pageThreadId && /^\d+$/.test(m.pageThreadId) ? m.pageThreadId : undefined,
         fbUsername: m.urlThreadId && !m.urlThreadNumeric ? m.urlThreadId : undefined,
-        source: 'import',
+        // This is the "+ Add to CRM" button on a profile page, not a CSV row —
+        // see the Conversation.source comment in storage.ts for why these were
+        // ever conflated.
+        source: 'profile',
         archived: false,
         createdAt: now,
         updatedAt: now,

@@ -38,13 +38,14 @@ import { Resizer } from '../ui/SplitPane';
 import { useLocalPref } from '../ui/prefs';
 import { tint } from '../ui/contrast';
 import {
-  MessagingPanel, ActiveCampaignsView, HistoryPanel, NotificationsDrawer, holdOf, OnlineDot,
+  MessagingPanel, ActiveCampaignsView, HistoryPanel, NotificationsDrawer, holdOf, OnlineDot, QueuePreview,
+  type HistoryFocus,
 } from './Campaigns';
 import {
   MachineView, sendBg, ensureSignedIn, downloadText, tsStamp, formatRelativeTime, previewTags, SubNav,
 } from './shared';
 import { SettingsPanel } from './SettingsPanel';
-import { TagFilter, ConvDetail } from './ContactDetail';
+import { TagFilter, ConvDetail, type TagFilterMode } from './ContactDetail';
 import { TagsPanel, FieldsPanel } from './SchemaPanels';
 import { PRODUCT_NAME, PRODUCT_SLUG } from '../product';
 
@@ -128,6 +129,10 @@ export default function DashboardApp() {
   const [campaignView, setCampaignView] = useState<CampaignView>('compose');
   const [schemaView, setSchemaView] = useState<SchemaView>('tags');
   const [railCollapsed, setRailCollapsed] = useLocalPref('railCollapsed', false);
+  // Whether tag lists in the Contacts workspace are split under their group
+  // headings. Held here rather than inside either component so the tag filter
+  // and the contact detail can't end up showing the same tags two ways.
+  const [tagsGrouped, setTagsGrouped] = useLocalPref('tagsGrouped', true);
   const [drawerOpen, setDrawerOpen] = useState(false);
   // Only reachable when a session expires while this tab sits open, which is
   // exactly when a browser alert is least helpful.
@@ -147,6 +152,16 @@ export default function DashboardApp() {
     setDrawerOpen(false);
   }, []);
 
+  // A recipient line in Past sends that something else asked us to show —
+  // currently the failed-send notifications. Held here rather than inside
+  // Campaigns because the navigation and the target are one action.
+  const [historyFocus, setHistoryFocus] = useState<HistoryFocus | null>(null);
+
+  const openFailure = useCallback((f: { campaignId: string; threadId: string }) => {
+    setHistoryFocus({ campaignId: f.campaignId, threadId: f.threadId, nonce: Date.now() });
+    go('campaigns', 'past');
+  }, [go]);
+
   const [search, setSearch] = useState('');
   const [selectedConv, setSelectedConv] = useState<Conversation | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
@@ -159,7 +174,11 @@ export default function DashboardApp() {
   // the literal '#065fd4' and no other colour could be picked.
   const [newGroupColor, setNewGroupColor] = useState<string>(color.accent.base);
   const [loading, setLoading] = useState(true);
-  const [filterTag, setFilterTag] = useState<string | null>(null);
+  // The tag filter is a set, not a choice. "Everyone tagged Warm Lead AND
+  // Houston" and "anyone tagged Warm Lead OR Referral" are both ordinary
+  // questions, and answering either used to mean building an advanced query.
+  const [filterTags, setFilterTags] = useState<string[]>([]);
+  const [filterTagMode, setFilterTagMode] = useLocalPref<TagFilterMode>('tagFilterMode', 'all');
   const [archiveScope, setArchiveScope] = useState<ArchiveScope>('active');
   const [dateFilter, setDateFilter] = useState<DateFilter>('all');
 
@@ -356,8 +375,13 @@ export default function DashboardApp() {
       c.participantName.toLowerCase().includes(search.toLowerCase()) ||
       c.lastMessage.toLowerCase().includes(search.toLowerCase());
 
-    // Tag filter
-    const matchesTag = !filterTag || c.tags.includes(filterTag);
+    // Tag filter. No selection matches everything; the mode only bites once
+    // there are two, but applying it uniformly keeps this a single expression.
+    const matchesTag =
+      filterTags.length === 0 ||
+      (filterTagMode === 'all'
+        ? filterTags.every((id) => c.tags.includes(id))
+        : filterTags.some((id) => c.tags.includes(id)));
 
     // Archive filter
     const matchesArchived =
@@ -444,7 +468,7 @@ export default function DashboardApp() {
   const activeFilterCount =
     (archiveScope !== 'active' ? 1 : 0) +
     (dateFilter !== 'all' ? 1 : 0) +
-    (filterTag ? 1 : 0) +
+    (filterTags.length > 0 ? 1 : 0) +
     (isQueryEmpty(query) ? 0 : 1);
 
   // How many contacts carry each tag, in one pass rather than a scan per tag —
@@ -493,7 +517,7 @@ export default function DashboardApp() {
 
   // Any change to the result set sends you back to page 1 — otherwise a
   // narrower filter can leave you stranded on a page that no longer exists.
-  const pageResetKey = JSON.stringify([search, filterTag, archiveScope, dateFilter, query, sortBy, sortDir, pageSize]);
+  const pageResetKey = JSON.stringify([search, filterTags, filterTagMode, archiveScope, dateFilter, query, sortBy, sortDir, pageSize]);
   useEffect(() => { setPage(0); }, [pageResetKey]);
   // Clamp when the list shrinks underneath us (e.g. after a bulk delete).
   useEffect(() => { if (page !== currentPage) setPage(currentPage); }, [page, currentPage]);
@@ -962,10 +986,16 @@ export default function DashboardApp() {
   // it can read or write without an account.
   if (!signedIn) return <SignInGate onRecheck={refreshSignedIn} />;
 
+  // The three places you work. Settings is not one of them — it's config you
+  // visit and leave, so it's pinned to the foot of the rail instead of sitting
+  // in the list as a fourth peer.
   const NAV: NavItem<Route>[] = [
     { id: 'contacts', label: 'Contacts', icon: ICON_CONTACTS, count: totalConvs },
     { id: 'campaigns', label: 'Campaigns', icon: ICON_CAMPAIGNS, count: campaigns.length },
     { id: 'tags', label: 'Tags & fields', icon: ICON_TAGS, count: totalTags + fieldDefs.length },
+  ];
+
+  const FOOTER_NAV: NavItem<Route>[] = [
     { id: 'settings', label: 'Settings', icon: ICON_SETTINGS },
   ];
 
@@ -998,6 +1028,8 @@ export default function DashboardApp() {
   return (
     <AppShell<Route>
       nav={NAV}
+      footerNav={FOOTER_NAV}
+      navExtra={{ campaigns: <QueuePreview campaigns={campaigns} queue={queue} onOpen={() => go('campaigns', 'active')} /> }}
       activeId={route}
       onNavigate={(id) => go(id)}
       railCollapsed={railCollapsed}
@@ -1017,6 +1049,7 @@ export default function DashboardApp() {
           onDismissFailures={dismissFailures}
           onClearFailure={clearFailure}
           onReview={() => go('campaigns', 'past')}
+          onOpenFailure={openFailure}
           onViewQueue={() => go('campaigns', 'active')}
         />
       }
@@ -1183,8 +1216,12 @@ export default function DashboardApp() {
                 tags={tags}
                 tagGroups={store.tagGroups}
                 usage={tagUsage}
-                active={filterTag}
-                onChange={setFilterTag}
+                active={filterTags}
+                mode={filterTagMode}
+                onChangeMode={setFilterTagMode}
+                grouped={tagsGrouped}
+                onToggleGrouped={() => setTagsGrouped((v) => !v)}
+                onChange={setFilterTags}
               />
 
               {/* Bulk actions bar */}
@@ -1373,7 +1410,7 @@ export default function DashboardApp() {
                     ? 'Open Messenger and visit a chat — the CRM panel saves whoever you talk to. You can also import a CSV from Settings.'
                     : 'Try clearing the search box, the tag filter, or the time range.'}
                   action={conversations.length > 0 ? (
-                    <Button size="sm" variant="secondary" onClick={() => { setSearch(''); setFilterTag(null); setDateFilter('all'); clearPreset(); }}>
+                    <Button size="sm" variant="secondary" onClick={() => { setSearch(''); setFilterTags([]); setDateFilter('all'); clearPreset(); }}>
                       Clear all filters
                     </Button>
                   ) : undefined}
@@ -1474,6 +1511,7 @@ export default function DashboardApp() {
                   store={store}
                   tags={tags}
                   fieldDefs={fieldDefs}
+                  grouped={tagsGrouped}
                   deleteConfirm={deleteConfirm}
                   deleteConfirm2={deleteConfirm2}
                   onClose={() => setSelectedConv(null)}
@@ -1651,6 +1689,7 @@ export default function DashboardApp() {
                 campaigns={campaigns}
                 onChanged={refreshCampaigns}
                 store={store}
+                focus={historyFocus}
                 onEditProfileUrl={editRecipientProfileUrl}
                 onCompose={() => setCampaignView('compose')}
                 onViewProfile={(threadId) => {

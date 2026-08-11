@@ -131,7 +131,7 @@ export const BUILTIN_FIELDS: FieldDef[] = [
   { key: 'lastMessageTime', label: 'Last message date', kind: 'date', category: 'Dates' },
 
   { key: 'archived', label: 'Archived', kind: 'boolean', category: 'Status' },
-  { key: 'source', label: 'Source', kind: 'enum', category: 'Status', options: ['messenger', 'import'] },
+  { key: 'source', label: 'Source', kind: 'enum', category: 'Status', options: ['messenger', 'import', 'profile'] },
   { key: 'nameManual', label: 'Name edited by hand', kind: 'boolean', category: 'Status' },
 ];
 

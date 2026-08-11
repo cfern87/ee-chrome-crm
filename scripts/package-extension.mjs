@@ -14,6 +14,8 @@
 //      itself nests everything one level down and CWS reports the manifest as
 //      missing or unreadable.
 //   2. The `key` field must not ship. See PROD_EXTENSION_ID below.
+//   3. oauth2.client_id must be the client registered against the PRODUCTION
+//      item id, not the development one. See PROD_OAUTH_CLIENT_ID below.
 
 import { execFileSync } from 'child_process';
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, existsSync } from 'fs';
@@ -29,6 +31,28 @@ const outDir = join(root, 'dist');
 // The Web Store item this package is destined for. Recorded for humans: the
 // archive itself carries no identity, because `key` is stripped below.
 const PROD_EXTENSION_ID = 'hdknnokfjebdmklpadidgafodjlmelba';
+
+// The "Chrome Extension" OAuth client registered against PROD_EXTENSION_ID.
+//
+// WHY IT IS SWAPPED HERE. A Chrome Extension OAuth client is bound to one Item
+// ID. public/manifest.json carries the client for the DEVELOPMENT item (the one
+// `key` pins), because that is the id an unpacked build actually runs under —
+// swapping it at source would break Drive sync for every local build in
+// exchange for fixing it once at release. So dist/ keeps the dev client and
+// only the packaged copy gets the production one, exactly like `key`.
+//
+// The failure this prevents is silent and late: an upload with the dev client
+// installs fine, and Drive sync then fails at first connect for every customer
+// with bad_client_id, days after the release went out.
+//
+// NOT covered here: drive.ts's WEB_APP_CLIENT_ID (the launchWebAuthFlow
+// fallback for Edge and Chrome profiles that aren't signed in). That client is
+// a "Web application" type and is not bound to an Item ID, so the constant is
+// correct as-is — but it authorises by redirect URI, so the production item's
+// https://<id>.chromiumapp.org/ has to be listed under its Authorized redirect
+// URIs in the Cloud Console. That is a console change, not a code one; the
+// reminder is printed at the end of a successful package.
+const PROD_OAUTH_CLIENT_ID = '280559630109-tssahm5j80tb7730vh1v73sfebu04pal.apps.googleusercontent.com';
 
 /** Every file under `dir`, as forward-slash paths relative to it, sorted. */
 function walk(dir, prefix = '') {
@@ -79,6 +103,14 @@ if (!version) fail('Built manifest has no version field.');
 
 const hadKey = 'key' in manifest;
 delete manifest.key;
+
+// Swap the dev OAuth client for the production one. A build with no oauth2
+// block at all would ship a package where Drive sync can never be configured,
+// so that's a hard stop rather than something to paper over.
+const devClientId = manifest.oauth2?.client_id;
+if (!devClientId) fail('Built manifest has no oauth2.client_id to replace with the production client.');
+manifest.oauth2 = { ...manifest.oauth2, client_id: PROD_OAUTH_CLIENT_ID };
+
 const packagedManifest = Buffer.from(JSON.stringify(manifest, null, 2) + '\n', 'utf8');
 
 // 3. Gather entries, substituting the stripped manifest.
@@ -97,8 +129,13 @@ if (missing.length) {
   fail(`Manifest references files that are not in the build:\n    ${missing.join('\n    ')}`);
 }
 
+// Assert against the bytes that actually go into the zip, not the object they
+// were serialised from — this is the last point where a mistake is still cheap.
 const roundTripped = JSON.parse(packagedManifest.toString('utf8'));
 if ('key' in roundTripped) fail('`key` survived into the packaged manifest.');
+if (roundTripped.oauth2?.client_id !== PROD_OAUTH_CLIENT_ID) {
+  fail(`Packaged manifest carries OAuth client ${roundTripped.oauth2?.client_id || '(none)'}, not the production one.`);
+}
 
 // 5. Write the archive.
 mkdirSync(outDir, { recursive: true });
@@ -111,5 +148,9 @@ const kb = (n) => `${(n / 1024).toFixed(1)} KB`;
 console.log(`\n  Packaged ${files.length} files -> ${relative(root, outFile).replace(/\\/g, '/')}` +
             `  (${kb(statSync(outFile).size)})${replaced ? '  [replaced]' : ''}`);
 console.log(`  v${version}` + (hadKey ? '  ·  `key` stripped for upload' : ''));
+console.log(`  OAuth client  ${devClientId}`);
+console.log(`             ->  ${PROD_OAUTH_CLIENT_ID}  (production item)`);
 console.log(`\n  Upload to Web Store item ${PROD_EXTENSION_ID}`);
+console.log(`  Cloud Console must also list https://${PROD_EXTENSION_ID}.chromiumapp.org/ under the`);
+console.log('  "Web application" client\'s Authorized redirect URIs — that is the Edge fallback path.');
 console.log('  Local dev is unaffected — load packages/extension/dist unpacked as before.\n');
