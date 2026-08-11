@@ -18,6 +18,7 @@ import React, { useCallback, useEffect, useRef } from 'react';
 import { color, fontSize, fontWeight, radius, space, elevation } from './tokens';
 import { Icon, Text, IconButton } from './primitives';
 import { ICON_BELL, ICON_CHEVRON, ICON_CLOSE } from './icons';
+import { PRODUCT_NAME } from '../product';
 
 export interface NavItem<Id extends string = string> {
   id: Id;
@@ -158,15 +159,16 @@ function Rail<Id extends string>({
     >
       <div
         style={{
-          display: 'flex', alignItems: 'center', gap: space.sm,
+          display: 'flex', alignItems: 'flex-start', gap: space.sm,
           padding: `${space.xs}px ${space.sm}px ${space.md}px`,
         }}
       >
-        <span aria-hidden="true" style={{ fontSize: fontSize.title, lineHeight: 1 }}>🏷️</span>
+        <span aria-hidden="true" style={{ fontSize: fontSize.title, lineHeight: 1.1 }}>🏷️</span>
         {!collapsed && (
-          <Text size="body" weight="bold" style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            Social CRM
-          </Text>
+          // Wraps rather than truncating. There is one product name and this is
+          // it — an abbreviation here is what let four different names grow in
+          // the first place.
+          <Text size="body" weight="bold" leading="tight">{PRODUCT_NAME}</Text>
         )}
       </div>
 

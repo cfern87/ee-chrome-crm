@@ -27,7 +27,7 @@ import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo, type DeviceO
 import { isDisconnected, type SyncStatusView, type SendHoldReason } from '../syncHealth';
 import { AppShell, type NavItem } from '../ui/AppShell';
 import {
-  Banner, Button, Card, Chip, EmptyState, Input, Option, Pager, Select, Stack, Text, Toggle,
+  Banner, Button, Card, Chip, EmptyState, Input, Option, Pager, SectionTitle, Select, Stack, Text, Toggle,
   // `Field` is already taken in this file by the CSV mapping type.
   Field as FormField,
   color, fontSize, fontWeight, radius, space,
@@ -37,6 +37,7 @@ import { ICON_CONTACTS, ICON_CAMPAIGNS, ICON_TAGS, ICON_SETTINGS } from '../ui/i
 import { Resizer } from '../ui/SplitPane';
 import { useLocalPref } from '../ui/prefs';
 import { tint } from '../ui/contrast';
+import { PRODUCT_NAME, PRODUCT_SLUG } from '../product';
 
 // What GET_DEVICES answers with: the machine roster and lease from devices.ts,
 // plus the things only the background worker knows.
@@ -85,10 +86,9 @@ function downloadText(filename: string, mime: string, content: string) {
  * thing before writing); export has no write to be refused, which is why the
  * check here is what actually stops it.
  */
-async function ensureSignedIn(action: string): Promise<boolean> {
-  if (await isSignedIn()) return true;
-  alert(`Sign in to your Not Another Social CRM account to ${action}.`);
-  return false;
+async function ensureSignedIn(action: string): Promise<string | null> {
+  if (await isSignedIn()) return null;
+  return `Sign in to your ${PRODUCT_NAME} account to ${action}.`;
 }
 
 /**
@@ -359,6 +359,9 @@ export default function DashboardApp() {
   const [schemaView, setSchemaView] = useState<SchemaView>('tags');
   const [railCollapsed, setRailCollapsed] = useLocalPref('railCollapsed', false);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // Only reachable when a session expires while this tab sits open, which is
+  // exactly when a browser alert is least helpful.
+  const [exportError, setExportError] = useState<string | null>(null);
 
   // Contact list column width. Held in React state during a drag (so it tracks
   // the pointer) and written to the per-machine preference only on release —
@@ -645,6 +648,44 @@ export default function DashboardApp() {
   const pageSelectedCount = pageIds.reduce((n, id) => (selectedIds.has(id) ? n + 1 : n), 0);
   const offPageSelected = selectedIds.size - pageSelectedCount;
 
+  // --- Collapsing the list filters on scroll ---
+  //
+  // Filters get set once and read many times, so the header holding them open
+  // permanently costs three or four contact rows on every screen. It collapses
+  // to just the search box as soon as the list moves, and comes back at the
+  // top. A "Filters" button reaches them without scrolling up.
+  const listScrollRef = useRef<HTMLDivElement>(null);
+  const [listScrolled, setListScrolled] = useState(false);
+  /** null = follow the scroll position; true/false = the user overrode it. */
+  const [filtersForced, setFiltersForced] = useState<boolean | null>(null);
+  const filtersVisible = filtersForced ?? !listScrolled;
+
+  const onListScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const top = e.currentTarget.scrollTop;
+    // Different thresholds each way, or a header that changes height would
+    // change the scroll position and flap against its own boundary.
+    setListScrolled((was) => (was ? top > 8 : top > 48));
+    // Back at the top, drop any override and follow the scroll again.
+    if (top <= 8) setFiltersForced(null);
+  };
+
+  const activeFilterCount =
+    (archiveScope !== 'active' ? 1 : 0) +
+    (dateFilter !== 'all' ? 1 : 0) +
+    (filterTag ? 1 : 0) +
+    (isQueryEmpty(query) ? 0 : 1);
+
+  // How many contacts carry each tag, in one pass rather than a scan per tag —
+  // the filter ranks by this on every render, and the naive version is
+  // tags × contacts.
+  const tagUsage = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of conversations) {
+      for (const id of c.tags) counts.set(id, (counts.get(id) || 0) + 1);
+    }
+    return counts;
+  }, [conversations]);
+
   // --- Keyboard navigation of the contact list ---
   //
   // The rows are a listbox of buttons, so one row holds the tab stop and the
@@ -688,10 +729,12 @@ export default function DashboardApp() {
   // Export the current filtered/sorted view as a re-importable CSV.
   const exportFilteredCsv = async () => {
     if (filtered.length === 0) return;
-    if (!(await ensureSignedIn('export contacts'))) return;
+    const blocked = await ensureSignedIn('export contacts');
+    if (blocked) { setExportError(blocked); return; }
+    setExportError(null);
     const exportFields = Object.values(store.fieldDefs).sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
     const csv = contactsToCsv(filtered, store.tags, exportFields);
-    downloadText(`messenger-crm-contacts-${tsStamp()}.csv`, 'text/csv', csv);
+    downloadText(`${PRODUCT_SLUG}-contacts-${tsStamp()}.csv`, 'text/csv', csv);
     console.info(`[CRM][export] Exported ${filtered.length} contacts to CSV`);
   };
 
@@ -1228,19 +1271,42 @@ export default function DashboardApp() {
               borderRight: `1px solid ${color.border.subtle}`,
             }}
           >
+            {/* The header keeps the search box and nothing else once the list
+                is scrolled: the filters are set once and then read many times,
+                so holding ~150px of them open costs three or four contacts on
+                every screen. Scrolling back to the top brings them back. */}
             <div style={{ flex: '0 0 auto', padding: space.md, borderBottom: `1px solid ${color.border.subtle}`, display: 'flex', flexDirection: 'column', gap: space.sm }}>
-              <FormField label="Search contacts" hideLabel>
-                {(p) => (
-                  <Input
-                    {...p}
-                    type="search"
-                    placeholder="Search contacts…"
-                    value={search}
-                    onChange={(e) => setSearch(e.target.value)}
-                  />
+              <div style={{ display: 'flex', gap: space.xs, alignItems: 'center' }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <FormField label="Search contacts" hideLabel>
+                    {(p) => (
+                      <Input
+                        {...p}
+                        type="search"
+                        placeholder="Search contacts…"
+                        value={search}
+                        onChange={(e) => setSearch(e.target.value)}
+                      />
+                    )}
+                  </FormField>
+                </div>
+                {/* Only offered while collapsed — expanded, the controls are
+                    right there and a toggle would just be another control. */}
+                {!filtersVisible && (
+                  <Button
+                    size="sm"
+                    variant={activeFilterCount > 0 ? 'primary' : 'secondary'}
+                    aria-expanded={false}
+                    onClick={() => setFiltersForced(true)}
+                    title="Show filters and sorting"
+                  >
+                    Filters{activeFilterCount > 0 ? ` · ${activeFilterCount}` : ''}
+                  </Button>
                 )}
-              </FormField>
+              </div>
 
+              {filtersVisible && (
+              <>
               <div style={{ display: 'flex', gap: space.sm }}>
                 <FormField label="Archived" hideLabel>
                   {(p) => (
@@ -1318,35 +1384,36 @@ export default function DashboardApp() {
                 onClear={clearPreset}
                 ctx={queryCtx}
               />
+
+              {/* Only when held open against the scroll position — at the top
+                  they collapse on their own and this would be a dead control. */}
+              {filtersForced === true && listScrolled && (
+                <Button size="sm" variant="link" onClick={() => setFiltersForced(false)} style={{ alignSelf: 'flex-start' }}>
+                  Hide filters
+                </Button>
+              )}
+              </>
+              )}
             </div>
 
             {/* Only this scrolls. */}
-            <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: space.md }}>
-              {/* Tag filter chips */}
-              {tags.length > 0 && (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: space.xs, marginBottom: space.md }} role="group" aria-label="Filter by tag">
-                  <Button
-                    size="sm"
-                    variant={filterTag === null ? 'primary' : 'secondary'}
-                    aria-pressed={filterTag === null}
-                    onClick={() => setFilterTag(null)}
-                  >
-                    All tags
-                  </Button>
-                  {tags.map((tag) => (
-                    <Chip
-                      key={tag.id}
-                      label={tag.name}
-                      // Unselected chips are a blend, not an alpha — see tint().
-                      fill={filterTag === tag.id ? tag.color : tint(tag.color, 0.18)}
-                      hidden={tag.hideInSidebar}
-                      pressed={filterTag === tag.id}
-                      title={tag.hideInSidebar ? HIDDEN_TAG_TITLE : undefined}
-                      onClick={() => setFilterTag(filterTag === tag.id ? null : tag.id)}
-                    />
-                  ))}
+            <div
+              ref={listScrollRef}
+              onScroll={onListScroll}
+              style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: space.md }}
+            >
+              {exportError && (
+                <div style={{ marginBottom: space.md }}>
+                  <Banner tone="danger" live>{exportError}</Banner>
                 </div>
               )}
+              <TagFilter
+                tags={tags}
+                tagGroups={store.tagGroups}
+                usage={tagUsage}
+                active={filterTag}
+                onChange={setFilterTag}
+              />
 
               {/* Bulk actions bar */}
               {selectedIds.size > 0 && (
@@ -1438,7 +1505,7 @@ export default function DashboardApp() {
                   {bulkDeleteConfirm && (
                     <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid #cfe2f5' }}>
                       <div style={{ fontSize: 13, color: '#e53e3e', fontWeight: 600, marginBottom: 8 }}>
-                        Delete {selectedIds.size} conversation{selectedIds.size !== 1 ? 's' : ''}? This cannot be undone.
+                        Delete {selectedIds.size} contact{selectedIds.size !== 1 ? 's' : ''}? Their tags, custom fields and message history go too. This cannot be undone.
                       </div>
                       <div style={{ display: 'flex', gap: 8 }}>
                         <button
@@ -1834,6 +1901,127 @@ export default function DashboardApp() {
   );
 }
 
+// --- Tag filter -----------------------------------------------------------
+
+/** How many tags to show before collapsing behind "Show all". */
+const TAG_FILTER_VISIBLE = 12;
+
+/**
+ * The tag filter in the contact list column.
+ *
+ * The old version was every tag in the store, in creation order, as one flat
+ * wrap of chips — with an "All tags" button permanently taking the first slot
+ * and an eye-off icon on every hidden tag. Three problems compounded: no
+ * structure, no ranking, and a marker repeated often enough to become noise.
+ *
+ * Three fixes, in order of how much they help:
+ *
+ *  1. Group the chips, the same way the contact detail and the tag picker
+ *     already do. This is the only place in the app that ignored tag groups.
+ *  2. Leave hidden tags out by default. They tend to be the ones that sit on
+ *     nearly everyone — which is exactly why they were hidden from previews —
+ *     so they are the least useful things to filter by and the most numerous.
+ *     A toggle brings them back, and the eye-off marker only appears there.
+ *  3. Rank by use within each group, so the tag on 80 contacts comes before
+ *     the one on 2.
+ */
+function TagFilter({
+  tags, tagGroups, usage, active, onChange,
+}: {
+  tags: Tag[];
+  tagGroups: Record<string, TagGroup>;
+  usage: Map<string, number>;
+  active: string | null;
+  onChange: (id: string | null) => void;
+}) {
+  const [showHidden, setShowHidden] = useLocalPref('tagFilterShowHidden', false);
+  const [expanded, setExpanded] = useState(false);
+
+  const hiddenCount = tags.filter((t) => t.hideInSidebar).length;
+
+  // The active filter always stays visible, even if it is a hidden tag and the
+  // toggle is off — otherwise the list would be filtered by something the user
+  // can neither see nor clear.
+  const offered = tags.filter((t) => showHidden || !t.hideInSidebar || t.id === active);
+
+  const ranked = offered
+    .slice()
+    .sort((a, b) => (usage.get(b.id) || 0) - (usage.get(a.id) || 0) || a.name.localeCompare(b.name));
+
+  const capped = expanded ? ranked : ranked.slice(0, TAG_FILTER_VISIBLE);
+  const buckets = bucketTagsByGroup(capped, tagGroups);
+  const withLabels = showsGroupLabels(buckets);
+
+  if (tags.length === 0) return null;
+
+  return (
+    <div style={{ marginBottom: space.md }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: space.sm, marginBottom: space.xs }}>
+        <SectionTitle>Filter by tag</SectionTitle>
+        {active && (
+          <Button size="sm" variant="link" onClick={() => onChange(null)} style={{ marginLeft: 'auto' }}>
+            Clear
+          </Button>
+        )}
+      </div>
+
+      <Stack gap="sm" role="group" aria-label="Filter by tag">
+        {buckets.map((bucket) => (
+          <div key={bucket.key}>
+            {withLabels && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: space.xs, marginBottom: space.xxs }}>
+                <span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: 2, background: bucket.color || color.border.control, flexShrink: 0 }} />
+                <Text size="micro" weight="bold" tone="muted" style={{ textTransform: 'uppercase', letterSpacing: 0.4 }}>
+                  {bucket.label}
+                </Text>
+              </div>
+            )}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: space.xs }}>
+              {bucket.tags.map((tag) => {
+                const on = active === tag.id;
+                const count = usage.get(tag.id) || 0;
+                return (
+                  <Chip
+                    key={tag.id}
+                    label={count > 0 ? `${tag.name} ${count}` : tag.name}
+                    // Unselected chips are a blend, not an alpha — see tint().
+                    fill={on ? tag.color : tint(tag.color, 0.18)}
+                    // The marker is only worth its noise where hidden tags are
+                    // mixed in with visible ones.
+                    hidden={showHidden && tag.hideInSidebar}
+                    pressed={on}
+                    title={tag.hideInSidebar ? HIDDEN_TAG_TITLE : `${count} contact${count === 1 ? '' : 's'}`}
+                    onClick={() => onChange(on ? null : tag.id)}
+                  />
+                );
+              })}
+            </div>
+          </div>
+        ))}
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: space.md, flexWrap: 'wrap' }}>
+          {ranked.length > TAG_FILTER_VISIBLE && (
+            <Button size="sm" variant="link" onClick={() => setExpanded(!expanded)}>
+              {expanded ? 'Show fewer' : `Show all ${ranked.length}`}
+            </Button>
+          )}
+          {hiddenCount > 0 && (
+            <Button
+              size="sm"
+              variant="link"
+              aria-pressed={showHidden}
+              onClick={() => setShowHidden(!showHidden)}
+              title={HIDDEN_TAG_TITLE}
+            >
+              {showHidden ? `Hide ${hiddenCount} preview-hidden` : `Show ${hiddenCount} preview-hidden`}
+            </Button>
+          )}
+        </div>
+      </Stack>
+    </div>
+  );
+}
+
 // --- Sub-navigation -------------------------------------------------------
 
 interface SubNavItem<Id extends string> { id: Id; label: string; count?: number }
@@ -1924,7 +2112,7 @@ function SignInGate({ onRecheck }: { onRecheck: () => void }) {
     <div style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', minHeight: '100vh', background: '#f5f5f5', color: '#222', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
       <div style={{ background: '#fff', borderRadius: 12, padding: '32px 36px', boxShadow: '0 2px 12px rgba(0,0,0,0.1)', maxWidth: 460, textAlign: 'center' }}>
         <div style={{ fontSize: 40, marginBottom: 12 }}>🏷️</div>
-        <h1 style={{ margin: '0 0 8px', fontSize: 22, fontWeight: 700 }}>Sign in to Not Another Social CRM</h1>
+        <h1 style={{ margin: '0 0 8px', fontSize: 22, fontWeight: 700 }}>Sign in to {PRODUCT_NAME}</h1>
         <p style={{ margin: '0 0 20px', fontSize: 14, color: '#666', lineHeight: 1.6 }}>
           An account is required to use the extension. Free accounts store up to {FREE_CONTACT_LIMIT} contacts;
           Pro adds unlimited contacts and Google Drive sync.
@@ -2113,28 +2301,26 @@ function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm
           {conv.archived ? 'Unarchive' : 'Archive'}
         </button>
 
-        {/* Delete with double confirm */}
+        {/* Delete, in two steps. The second step used to ask "Are you
+            absolutely sure?", which names no consequence — the in-page panel
+            always did this properly, and that's the wording that wins. */}
         {deleteConfirm === conv.id ? (
           deleteConfirm2 ? (
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <span style={{ fontSize: 13, color: '#e53e3e', fontWeight: 600 }}>Are you absolutely sure?</span>
-              <button onClick={onDelete} style={{ background: '#e53e3e', color: '#fff', border: 'none', padding: '8px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
-                Yes, Delete
-              </button>
-              <button onClick={onCancelDelete} style={{ background: '#f5f5f5', color: '#555', border: '1px solid #ddd', padding: '8px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
-                Cancel
-              </button>
-            </div>
+            <Stack direction="row" gap="sm" align="center" wrap>
+              <Text size="body" weight="semibold" tone="danger">
+                This deletes {conv.participantName || 'this contact'} permanently. It can't be undone.
+              </Text>
+              <Button variant="danger-solid" onClick={onDelete}>Delete contact</Button>
+              <Button variant="secondary" onClick={onCancelDelete}>Keep</Button>
+            </Stack>
           ) : (
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <span style={{ fontSize: 13, color: '#e53e3e', fontWeight: 600 }}>Delete {conv.participantName}?</span>
-              <button onClick={onConfirmDelete1} style={{ background: '#e53e3e', color: '#fff', border: 'none', padding: '8px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
-                Confirm Delete
-              </button>
-              <button onClick={onCancelDelete} style={{ background: '#f5f5f5', color: '#555', border: '1px solid #ddd', padding: '8px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
-                Cancel
-              </button>
-            </div>
+            <Stack direction="row" gap="sm" align="center" wrap>
+              <Text size="body" weight="semibold" tone="danger">
+                Delete {conv.participantName || 'this contact'}? Their tags, custom fields and history go too.
+              </Text>
+              <Button variant="danger" onClick={onConfirmDelete1}>Delete</Button>
+              <Button variant="secondary" onClick={onCancelDelete}>Keep</Button>
+            </Stack>
           )
         ) : (
           <button
@@ -2721,6 +2907,10 @@ interface SettingsPanelProps {
 function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onStoreReplaced }: SettingsPanelProps) {
   const settings = store.settings as Record<string, unknown>;
   const [view, setView] = useLocalPref<SettingsView>('settingsView', 'account');
+  // Backup import/export result. Shown in place rather than through alert(),
+  // which is browser chrome: it can't be styled, isn't announced in context,
+  // and blocks the page.
+  const [dataStatus, setDataStatus] = useState<{ tone: 'success' | 'warning' | 'danger'; msg: string } | null>(null);
   const [syncStatus, setSyncStatus] = useState<{ type: 'success' | 'error' | 'info'; msg: string } | null>(null);
   const [pushConfirm, setPushConfirm] = useState(false);
   // Chrome Sync is legacy once Drive is canonical, so it starts collapsed.
@@ -2759,16 +2949,20 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
   };
 
   const exportData = async () => {
-    if (!(await ensureSignedIn('export your data'))) return;
+    const blocked = await ensureSignedIn('export your data');
+    if (blocked) { setDataStatus({ tone: 'danger', msg: blocked }); return; }
+    setDataStatus(null);
     const data = JSON.stringify(store, null, 2);
     const a = document.createElement('a');
     a.href = 'data:text/plain;charset=utf-8,' + encodeURIComponent(data);
-    a.download = `messenger-crm-${Date.now()}.json`;
+    a.download = `${PRODUCT_SLUG}-backup-${tsStamp()}.json`;
     a.click();
   };
 
   const importData = async () => {
-    if (!(await ensureSignedIn('import data'))) return;
+    const blocked = await ensureSignedIn('import a backup');
+    if (blocked) { setDataStatus({ tone: 'danger', msg: blocked }); return; }
+    setDataStatus(null);
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.json';
@@ -2783,11 +2977,18 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
           // Report what actually happened. The background refuses the write when
           // there's no account, and claiming success there would be a lie that
           // costs the user their backup.
-          if (save.signedOut) alert(save.reason || 'Sign in to import data.');
-          else if (save.ok) alert('Data imported successfully!');
-          else alert(`Imported on this device, but ${save.pending} record(s) could not sync: ${save.reason || 'write rejected'}`);
+          if (save.signedOut) {
+            setDataStatus({ tone: 'danger', msg: save.reason || 'Sign in to import a backup.' });
+          } else if (save.ok) {
+            setDataStatus({ tone: 'success', msg: 'Backup restored.' });
+          } else {
+            setDataStatus({
+              tone: 'warning',
+              msg: `Restored on this machine, but ${save.pending} record${save.pending === 1 ? '' : 's'} could not sync: ${save.reason || 'the write was rejected'}.`,
+            });
+          }
         } catch {
-          alert('Invalid file format');
+          setDataStatus({ tone: 'danger', msg: "That file isn't a Not Another Social CRM backup — it should be the .json this page exports." });
         }
       };
       reader.readAsText(file);
@@ -2921,6 +3122,11 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
           <Button variant="primary" onClick={exportData} block>Export backup</Button>
           <Button variant="secondary" onClick={importData} block>Import backup</Button>
         </Stack>
+        {dataStatus && (
+          <div style={{ marginTop: space.md }}>
+            <Banner tone={dataStatus.tone} live>{dataStatus.msg}</Banner>
+          </div>
+        )}
         <Text as="p" size="micro" tone="muted" leading="relaxed" style={{ margin: `${space.md}px 0 0` }}>
           A complete JSON copy of everything — contacts, tags, fields, saved searches and settings.
           For contacts as <strong>CSV</strong>, use the import above, or the <strong>CSV</strong> button on
@@ -3785,7 +3991,8 @@ function CsvImportPanel({ store, updateStore }: CsvImportPanelProps) {
 
   const confirmImport = async () => {
     if (!file || !preview || preview.blocked) return;
-    if (!(await ensureSignedIn('import contacts'))) return;
+    const blocked = await ensureSignedIn('import contacts');
+    if (blocked) { setStatus({ type: 'error', msg: blocked }); return; }
     setBusy(true);
     try {
       // Re-parse against the live store at confirm time.
@@ -5057,19 +5264,17 @@ function FailedSendsNotice({ failures, onDismiss, onClear, onReview }: { failure
             </div>
           )}
         </div>
-        <button
-          onClick={onReview}
-          style={{ background: '#fff', color: '#b42318', border: '1px solid #fecaca', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
-        >
-          Review in History
-        </button>
-        <button
+        <Button size="sm" variant="secondary" onClick={onReview}>Review in past sends</Button>
+        {/* "Clear all" read as though it deleted the failures. It only stops
+            them being reported again — the sends stay in the campaign. */}
+        <Button
+          size="sm"
+          variant="ghost"
           onClick={onDismiss}
-          title="Clear all — none of these will be shown again"
-          style={{ background: 'none', border: '1px solid #fecaca', color: '#a1655d', fontSize: 12, fontWeight: 600, cursor: 'pointer', padding: '6px 10px', borderRadius: 6, lineHeight: 1 }}
+          title="Stop reporting these. The failed sends stay on the campaign."
         >
-          Clear all
-        </button>
+          Dismiss
+        </Button>
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 10 }}>
@@ -5102,6 +5307,9 @@ function FailedSendsNotice({ failures, onDismiss, onClear, onReview }: { failure
 
 function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile, onEditProfileUrl }: { campaign: Campaign; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null> }) {
   const [expanded, setExpanded] = useState(false);
+  // A refused queue change is shown on the campaign it belongs to, rather than
+  // in a browser alert that gives no clue which card it came from.
+  const [actionError, setActionError] = useState<string | null>(null);
   const sum = summarize(campaign);
 
   const control = async (type: string) => {
@@ -5110,20 +5318,22 @@ function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile, onEdit
   };
 
   const removeRecipient = async (threadId: string) => {
+    setActionError(null);
     const res = await sendBg<{ success: boolean; error?: string }>({
       type: 'REMOVE_CAMPAIGN_RECIPIENT',
       payload: { campaignId: campaign.id, threadId },
     });
-    if (res && !res.success && res.error) window.alert(res.error);
+    if (res && !res.success && res.error) setActionError(res.error);
     onChanged();
   };
 
   const requeueRecipient = async (threadId: string) => {
+    setActionError(null);
     const res = await sendBg<{ success: boolean; error?: string }>({
       type: 'REQUEUE_CAMPAIGN_RECIPIENT',
       payload: { campaignId: campaign.id, threadId },
     });
-    if (res && !res.success && res.error) window.alert(res.error);
+    if (res && !res.success && res.error) setActionError(res.error);
     onChanged();
   };
 
@@ -5155,6 +5365,11 @@ function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile, onEdit
 
       {expanded && (
         <div style={{ borderTop: '1px solid #eee', padding: '14px 18px' }}>
+          {actionError && (
+            <div style={{ marginBottom: space.md }}>
+              <Banner tone="danger" live>{actionError}</Banner>
+            </div>
+          )}
           {/* Controls for an in-flight campaign */}
           {(campaign.status === 'running' || campaign.status === 'paused') && (
             <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>

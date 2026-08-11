@@ -1,5 +1,10 @@
 # UX rewrite — feature parity checklist
 
+> **All six phases are implemented.** `npm run type-check` and `npm run build` are
+> clean. What remains is the walkthrough below, on the reloaded extension against
+> your real data — that is the gate this rewrite has instead of tests.
+
+
 The contract for the UX rewrite. Every item below exists in the app **today**. The rewrite changes how these look and where they live; it must not remove what they do.
 
 How to use it: after each phase, walk the affected sections in the rebuilt extension and tick them. An item is only ticked when the affordance was actually exercised, not merely spotted on screen.

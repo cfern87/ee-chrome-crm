@@ -1,4 +1,4 @@
-// Service Worker for Social CRM Extension.
+// Service worker for Not Another Social CRM.
 //
 // Two responsibilities:
 //   1. CRM store proxy — reads/writes go through the shared storage module so
@@ -60,6 +60,10 @@ import {
   pickNext,
   nextRecipientIndex,
   runnableCampaigns,
+  queueDepth,
+  collectUnseenFailures,
+  getFailedNoticeAck,
+  getClearedFailures,
 } from './campaigns';
 import {
   heartbeat,
@@ -1511,6 +1515,31 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         }
         case 'GET_QUEUE': {
           sendResponse({ queue: await loadQueue() });
+          break;
+        }
+
+        // What needs the user's attention right now, answered here rather than
+        // recomputed by each surface.
+        //
+        // The popup is a plain script and cannot import campaigns.ts, so it
+        // used to count these itself — and got both wrong. It counted pending
+        // recipients across *every* campaign, including cancelled ones whose
+        // messages will never go out, and it reported every failure ever
+        // recorded, including the ones the user had already cleared.
+        case 'GET_NOTIFICATIONS': {
+          const [campaigns, queue, ackAt, cleared] = await Promise.all([
+            loadCampaigns(), loadQueue(), getFailedNoticeAck(), getClearedFailures(),
+          ]);
+          // queueDepth counts running and paused campaigns only — the same
+          // rule the dashboard's queue card uses.
+          const depth = queueDepth(campaigns);
+          const unseen = collectUnseenFailures(campaigns, ackAt, new Set(cleared));
+          sendResponse({
+            queued: depth.pending,
+            queuedCampaigns: depth.campaigns,
+            paused: !!queue.paused,
+            failures: unseen.length,
+          });
           break;
         }
 

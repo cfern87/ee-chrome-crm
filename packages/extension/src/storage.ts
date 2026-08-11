@@ -1,4 +1,4 @@
-// Cross-machine storage for the Social CRM.
+// Cross-machine storage for Not Another Social CRM.
 //
 // Two canonical modes, chosen per-machine by whether the user has connected
 // Google Drive (isDriveEnabled — a flag in chrome.storage.local set when they

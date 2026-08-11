@@ -1,4 +1,4 @@
-// Content script for Facebook Messenger CRM
+// Content script for Not Another Social CRM.
 //
 // Two anchor points for a stable, class-name-independent approach:
 //   1. Every conversation link contains /t/<id> in its href  → sidebar injection
@@ -17,6 +17,9 @@ import {
   loadStore as _loadStore,
 } from './storage';
 import type { Store, Tag, Conversation, CustomFieldDef } from './storage';
+import { PRODUCT_NAME } from './product';
+import { readableFill, chipOutline, ON_DARK } from './ui/contrast';
+import { eyeOffSvgMarkup } from './ui/icons';
 import type { Mutation } from './mutations';
 import { PLATFORM_URL, SESSION_KEY } from './license';
 
@@ -378,7 +381,7 @@ function showSignedOutNotice(): void {
     'color:#fff;font:13px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;padding:14px 16px;' +
     'border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.28);';
   el.innerHTML =
-    '<strong style="display:block;margin-bottom:4px;">Sign in to use Social CRM</strong>' +
+    `<strong style="display:block;margin-bottom:4px;">Sign in to use ${PRODUCT_NAME}</strong>` +
     'Nothing was saved. Sign in with Google or email to unlock the extension — free accounts store up to 25 contacts. ' +
     '<a href="' + PLATFORM_URL + '/extension-auth" target="_blank" rel="noopener" ' +
     'style="color:#7fb3ff;font-weight:600;">Sign in</a>';
@@ -701,7 +704,13 @@ async function injectSidebarTagsOnce() {
     } else {
       container.style.display = 'flex';
       container.innerHTML = tags
-        .map(t => `<span class="fb-crm-sidebar-chip" style="background:${t.color}">${escapeHtml(t.name)}</span>`)
+        // Same computed foreground as every other chip. These sit on
+        // Messenger's own conversation rows, where a white label on a pale tag
+        // was effectively invisible.
+        .map(t => {
+          const { fill, fg } = readableFill(t.color);
+          return `<span class="fb-crm-sidebar-chip" style="background:${fill};color:${fg}">${escapeHtml(t.name)}</span>`;
+        })
         .join('');
     }
 
@@ -1057,7 +1066,7 @@ function buildLauncher() {
     const btn = document.createElement('button');
     btn.id = 'fb-crm-launcher';
     btn.textContent = '🏷️ CRM';
-    btn.title = 'Messenger CRM';
+    btn.title = PRODUCT_NAME;
     btn.addEventListener('click', togglePanel);
 
     console.log('[CRM] Appending button to document.body (body exists?', !!document.body, ')');
@@ -1161,7 +1170,7 @@ async function renderPanelContent() {
       const guessName = getProfilePageName();
       panelEl.innerHTML = `
         <div class="fb-crm-header">
-          <span>Messenger CRM</span>
+          <span>${PRODUCT_NAME}</span>
           <button class="fb-crm-close">✕</button>
         </div>
         <div class="fb-crm-body">
@@ -1201,7 +1210,7 @@ async function renderPanelContent() {
 
     panelEl.innerHTML = `
       <div class="fb-crm-header">
-        <span>Messenger CRM</span>
+        <span>${PRODUCT_NAME}</span>
         <button class="fb-crm-close">✕</button>
       </div>
       <div class="fb-crm-body">
@@ -1226,7 +1235,7 @@ async function renderPanelContent() {
     const guessName = pageOfferedName(threadId) || 'Unknown';
     panelEl.innerHTML = `
       <div class="fb-crm-header">
-        <span>Messenger CRM</span>
+        <span>${PRODUCT_NAME}</span>
         <button class="fb-crm-close">✕</button>
       </div>
       <div class="fb-crm-body">
@@ -1252,7 +1261,7 @@ async function renderPanelContent() {
     // panel that looks like the contact has no tags.
     panelEl.innerHTML = `
       <div class="fb-crm-header">
-        <span>Messenger CRM</span>
+        <span>${PRODUCT_NAME}</span>
         <button class="fb-crm-close">✕</button>
       </div>
       <div class="fb-crm-body">
@@ -1272,7 +1281,7 @@ async function renderPanelContent() {
 
   panelEl.innerHTML = `
     <div class="fb-crm-header">
-      <span>Messenger CRM</span>
+      <span>${PRODUCT_NAME}</span>
       <button class="fb-crm-close">✕</button>
     </div>
     <div class="fb-crm-body">
@@ -1293,7 +1302,7 @@ async function renderPanelContent() {
       <div class="fb-crm-chips">
         ${convTags.length === 0 ? '<span class="fb-crm-muted">No tags yet</span>' : ''}
         ${convTags.map(t =>
-          `<span class="${chipClass(t)}" style="${chipStyle(t)}" title="${chipTitle(t)}">${escapeHtml(t.name)}<button class="fb-crm-chip-x" data-remove="${t.id}">✕</button></span>`
+          `<span class="${chipClass(t)}" style="${chipStyle(t)}" title="${chipTitle(t)}">${chipHiddenMark(t)}${escapeHtml(t.name)}<button class="fb-crm-chip-x" data-remove="${t.id}" aria-label="Remove tag ${escapeHtml(t.name)}">✕</button></span>`
         ).join('')}
       </div>
 
@@ -1301,7 +1310,7 @@ async function renderPanelContent() {
         <div class="fb-crm-section-title">Add existing tag</div>
         <div class="fb-crm-chips">
           ${availableTags.map(t =>
-            `<button class="${chipClass(t)} fb-crm-chip-add" style="${chipStyle(t)}" title="${chipTitle(t)}" data-add="${t.id}">+ ${escapeHtml(t.name)}</button>`
+            `<button class="${chipClass(t)} fb-crm-chip-add" style="${chipStyle(t)}" title="${chipTitle(t)}" data-add="${t.id}">${chipHiddenMark(t)}+ ${escapeHtml(t.name)}</button>`
           ).join('')}
         </div>` : ''}
 
@@ -1364,13 +1373,13 @@ function renderSignInPanel(): void {
 
   panelEl.innerHTML = `
     <div class="fb-crm-header">
-      <span>Messenger CRM</span>
+      <span>${PRODUCT_NAME}</span>
       <button class="fb-crm-close">✕</button>
     </div>
     <div class="fb-crm-body">
       <div class="fb-crm-name-row"><div class="fb-crm-name">Sign in to continue</div></div>
       <div class="fb-crm-muted" style="margin:6px 0 12px;line-height:1.5">
-        Social CRM needs an account before it can tag, save or sync anything.
+        ${PRODUCT_NAME} needs an account before it can tag, save or sync anything.
         Free accounts store up to 25 contacts.
       </div>
       <button class="fb-crm-pick-btn" id="fb-crm-signin">Sign in or create an account</button>
@@ -1386,21 +1395,34 @@ function renderSignInPanel(): void {
 //
 // A tag with hideInSidebar set doesn't get a chip on Messenger's conversation
 // rows, so the panel has to say so — otherwise applying it looks like nothing
-// happened. The striped fill is that signal, and it's drawn from the tag's own
-// colour so the tag is still recognisable at a glance.
+// happened. That marker used to be diagonal stripes; it is now an eye-off
+// icon, because the stripes' contrast depended on the tag's own colour and
+// they competed with the label for the same pixels.
+//
+// Both the fill and the label colour come from the same `readableFill` the
+// dashboard uses, so a chip for one tag looks identical on both surfaces —
+// and, more importantly, is legible on both. These chips previously hardcoded
+// white text over a user-chosen colour.
 
 function isHiddenTag(t: Tag): boolean {
   return !!t.hideInSidebar;
 }
 
 function chipClass(t: Tag): string {
-  return isHiddenTag(t) ? 'fb-crm-chip fb-crm-chip-hidden' : 'fb-crm-chip';
+  const { fg } = readableFill(t.color);
+  const onLight = fg !== ON_DARK ? ' fb-crm-chip-on-light' : '';
+  return `fb-crm-chip${onLight}`;
 }
 
 function chipStyle(t: Tag): string {
-  // background-COLOR for the hidden case, not the `background` shorthand: the
-  // shorthand would reset the background-image the stripes are painted with.
-  return isHiddenTag(t) ? `background-color:${t.color}` : `background:${t.color}`;
+  const { fill, fg, adjusted } = readableFill(t.color);
+  const border = adjusted ? `;border-color:${chipOutline(t.color)}` : '';
+  return `background:${fill};color:${fg}${border}`;
+}
+
+/** The eye-off marker, for tags kept out of the conversation rows. */
+function chipHiddenMark(t: Tag): string {
+  return isHiddenTag(t) ? eyeOffSvgMarkup('fb-crm-chip-icon') : '';
 }
 
 function chipTitle(t: Tag): string {

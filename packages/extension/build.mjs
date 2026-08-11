@@ -19,8 +19,8 @@
 import { build } from 'vite';
 import react from '@vitejs/plugin-react';
 import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
-import { readFileSync, watch as watchDir } from 'fs';
+import { fileURLToPath, pathToFileURL } from 'url';
+import { readFileSync, writeFileSync, unlinkSync, watch as watchDir } from 'fs';
 import { execSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -47,6 +47,38 @@ function buildInfo() {
     dirty: git('status --porcelain') !== '',
     builtAt: Date.now(),
   };
+}
+
+/**
+ * Bundle src/ui/stylesheet.ts, run it, and write the result to dist/ui.css.
+ *
+ * Bundled to a temporary file and imported rather than parsed, because the
+ * stylesheet is *computed* — the `:root` block is generated from the token
+ * objects, so there is nothing to read statically.
+ */
+async function emitUiStylesheet() {
+  const esbuild = await import('esbuild');
+  const tmp = r('dist/.ui-stylesheet.mjs');
+
+  await esbuild.build({
+    entryPoints: [r('src/ui/stylesheet.ts')],
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    outfile: tmp,
+    logLevel: 'warning',
+    // The contrast audit is dev-only and would otherwise be a bare
+    // `import.meta.env` reference in a plain node import.
+    define: { 'import.meta.env.DEV': 'false' },
+  });
+
+  try {
+    // Cache-busted, or a watch rebuild would re-run the first version forever.
+    const mod = await import(pathToFileURL(tmp).href + `?t=${Date.now()}`);
+    writeFileSync(r('dist/ui.css'), mod.uiStylesheet({ pageReset: true }), 'utf8');
+  } finally {
+    try { unlinkSync(tmp); } catch { /* already gone */ }
+  }
 }
 
 async function run() {
@@ -104,6 +136,16 @@ async function run() {
       },
     });
   }
+
+  // 4. ui.css — the design tokens and component rules, emitted from
+  //    src/ui/stylesheet.ts.
+  //
+  //    The dashboard injects the same stylesheet at runtime (it can import the
+  //    module), but the popup is a plain script that cannot. Generating the
+  //    file means the popup never holds a hand-copied second set of token
+  //    values — which is precisely the drift that left this extension with 100
+  //    distinct hex colours and four greys for "muted text".
+  await emitUiStylesheet();
 
   console.log('\n✓ Extension build complete (dashboard=ESM, content/background=IIFE)');
   console.log(
