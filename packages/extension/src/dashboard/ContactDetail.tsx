@@ -86,8 +86,10 @@ export function TagFilter({
   const buckets = bucketTags(capped, tagGroups, grouped);
   const withLabels = showsGroupLabels(buckets);
 
-  // Grouping only means something once there is more than one group in play.
-  const groupable = distinctGroupCount(offered, tagGroups) > 1;
+  // Grouping only means something once at least one offered tag actually
+  // belongs to a group — even a single tagged group produces a heading that
+  // flat mode wouldn't, so this is "any", not "more than one".
+  const groupable = offered.some((t) => t.groupId && tagGroups[t.groupId]);
 
   const activeTags = active.map((id) => tags.find((t) => t.id === id)).filter((t): t is Tag => !!t);
   const toggle = (id: string) => onChange(activeSet.has(id) ? active.filter((x) => x !== id) : [...active, id]);
@@ -255,13 +257,6 @@ function TagMatchToggle({ mode, onChange }: { mode: TagFilterMode; onChange: (mo
       {seg('any', 'OR', 'Show contacts that have any of the selected tags')}
     </div>
   );
-}
-
-/** How many distinct groups a set of tags lands in — including "ungrouped". */
-function distinctGroupCount(tags: Tag[], groups: Record<string, TagGroup>): number {
-  const seen = new Set<string>();
-  for (const t of tags) seen.add(t.groupId && groups[t.groupId] ? t.groupId : '');
-  return seen.size;
 }
 
 // --- ConvDetail sub-component ---

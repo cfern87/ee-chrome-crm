@@ -66,11 +66,13 @@ function getNameFromLink(link: HTMLAnchorElement): string {
   return extractNameFromLink(link);
 }
 
-// The first real name we managed to read off the profile page we are on.
+// The first CONFIRMED name we managed to read off the profile page we are on.
 //
-// Every profile-page name — the one the panel shows, and the one a save
-// writes — comes from here, so the two cannot disagree. They used to: both
-// called extractProfilePageName, but at different moments, and a Facebook
+// Every name that gets WRITTEN — a save, a repair — comes from here, so none
+// of them can disagree with each other. (The panel's live display, unlike a
+// write, is allowed to show an unconfirmed guess in the meantime — see
+// getProfilePageName.) The two used to be able to disagree with each OTHER:
+// both called extractProfilePageName, but at different moments, and a Facebook
 // profile gets HARDER to read as it hydrates, not easier. The extractor's
 // structural fallback anchors on the profile's follower/friend counters, and
 // once the timeline and the left rail have streamed in there are counters all
@@ -80,9 +82,28 @@ function getNameFromLink(link: HTMLAnchorElement): string {
 // header was the only name-shaped thing on it, and the save re-read it after
 // the rest of the page had arrived.
 //
-// An early read is the trustworthy one, so the first person-shaped answer for a
+// An early read is the trustworthy one, so the first CONFIRMED answer for a
 // profile is remembered and reused for as long as we are on that profile. Keyed
 // on the profile URL, so an SPA navigation to somebody else starts fresh.
+//
+// "Confirmed" is load-bearing, and is why this is only ever written inside
+// pollForProfileName: that's the one reader that requires the SAME name off
+// two reads, CONFIRM_MS apart, before it trusts one. A single unconfirmed
+// read can land on a page that hasn't hydrated yet — the header isn't up,
+// but something else name-shaped already is: a post or comment author
+// further down the page, a stale document.title/og:title still describing
+// whoever was on screen before this navigation (see ProfileNameOptions in
+// names.ts). Every one of those is a real person's name, so nothing about
+// its SHAPE marks it as wrong — only reading it again a moment later does.
+//
+// getProfilePageName used to write here too, off one unconfirmed read of its
+// own — the first call the panel happened to make, often before the header
+// existed. Once written, every later caller (a save, the repair pass below)
+// trusted it without ever looking again. That is how a click on "Add to CRM"
+// could save one profile's contact under an entirely different, unrelated
+// person's name: whichever page was on screen a moment earlier, or whoever's
+// name the still-loading timeline happened to show first, got pinned and
+// never reconsidered.
 let firstProfileName: { key: string; name: string } | null = null;
 
 function currentProfileKey(): string {
@@ -98,16 +119,23 @@ function isUsableProfileName(n: string | null | undefined): n is string {
 }
 
 /**
- * The profile page's name: whatever we first read for this profile, or a fresh
- * read while we haven't got one yet. Returns 'Unknown' — same as
- * extractProfilePageName — when the page has nothing to offer.
+ * The profile page's name: the CONFIRMED read for this profile if
+ * pollForProfileName has settled on one yet, otherwise a live, unconfirmed
+ * guess. Returns 'Unknown' — same as extractProfilePageName — when the page
+ * has nothing to offer.
+ *
+ * The guess is for DISPLAY ONLY — showing something while the confirmed
+ * answer is still a moment away — and is deliberately never written to
+ * firstProfileName. Anything that needs to be sure (a save, a repair) has to
+ * go through establishProfileName/pollForProfileName instead, which is what
+ * actually confirms a name before trusting it. See the comment on
+ * firstProfileName for what went wrong when this function did the pinning
+ * itself.
  */
 function getProfilePageName(): string {
   const key = currentProfileKey();
   if (firstProfileName && firstProfileName.key === key) return firstProfileName.name;
-  const n = extractProfilePageName();
-  if (isUsableProfileName(n)) firstProfileName = { key, name: n };
-  return n;
+  return extractProfilePageName();
 }
 
 /**
@@ -1106,8 +1134,14 @@ function tagSectionHtml(opts: {
   emptyHtml?: string;
 }): string {
   const { title, tags, groups, grouped, toggleKey, chip, emptyHtml } = opts;
-  const distinctGroups = new Set(tags.map((t) => (t.groupId && groups[t.groupId] ? t.groupId : ''))).size;
-  const toggle = distinctGroups > 1
+  // The toggle is only worth showing when it would actually change anything.
+  // That's true the moment ANY tag here belongs to a real group — even just
+  // one tag in one group gets a heading when grouped and none when flat, so
+  // this isn't "more than one group", it's "at least one". A threshold of
+  // "more than one" hid the button for exactly the case someone would reach
+  // for it: a single tag sitting under a group heading they'd rather not see.
+  const anyRealGroup = tags.some((t) => t.groupId && groups[t.groupId]);
+  const toggle = anyRealGroup
     ? `<button class="fb-crm-group-toggle" data-group-toggle="${toggleKey}" title="${grouped ? 'Show every tag in one list' : 'Split tags by tag group'}">${grouped ? 'Ungroup' : 'Group'}</button>`
     : '';
 
@@ -2005,7 +2039,10 @@ async function pollForProfileName(key: string, timeoutMs: number): Promise<strin
   let previous: string | null = null;
   try {
     for (;;) {
-      // Somebody else got there first — the panel rendering, say.
+      // Another poll for this same profile confirmed one while we slept —
+      // the establishInFlight de-dupe covers same-tick callers, this covers
+      // the rest. getProfilePageName's own guess never lands here: it's
+      // display-only and deliberately never writes firstProfileName.
       if (firstProfileName && firstProfileName.key === key) return firstProfileName.name;
       // Navigated off this profile mid-poll: whatever is on screen now belongs
       // to somebody else and must never be filed under this key.
