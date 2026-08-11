@@ -27,7 +27,7 @@ import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo, type DeviceO
 import { isDisconnected, type SyncStatusView, type SendHoldReason } from '../syncHealth';
 import { AppShell, type NavItem } from '../ui/AppShell';
 import {
-  Button, Card, Chip, EmptyState, Input, Option, Pager, Select, Stack, Text,
+  Banner, Button, Card, Chip, EmptyState, Input, Option, Pager, Select, Stack, Text, Toggle,
   // `Field` is already taken in this file by the CSV mapping type.
   Field as FormField,
   color, fontSize, fontWeight, radius, space,
@@ -276,12 +276,72 @@ type CampaignView = 'compose' | 'active' | 'past';
 /** Sub-views inside Tags & fields. */
 type SchemaView = 'tags' | 'fields';
 
+/**
+ * Sections of Settings.
+ *
+ * The old panel was one scroll of nine cards in this order: build info,
+ * preferences, contacts maintenance, Chrome Sync (legacy), account, Drive sync,
+ * machines, JSON backup, CSV import. Identity, storage, behaviour and build
+ * info were interleaved, and the two sync mechanisms sat either side of the
+ * account card. These five groups are the same components, re-parented.
+ */
+type SettingsView = 'account' | 'sync' | 'data' | 'behavior' | 'about';
+
 // Contact list column. The old layout pinned this at exactly 320px inside a
 // container capped at 1100px, which is why the two panes felt out of
 // proportion on anything wider than a laptop.
 const LIST_MIN = 280;
 const LIST_MAX = 560;
 const LIST_DEFAULT = 340;
+
+// --- Sending pace ---------------------------------------------------------
+//
+// The pace lived only inside the composer, so it was re-entered from the
+// shipped defaults for every campaign and there was nowhere to say "this is
+// how I always want to send". It's a standing preference, so it belongs in
+// Settings; the composer still overrides it per campaign.
+//
+// Stored in the CRM store (not localStorage) because unlike a pane width this
+// genuinely should follow you between machines — Facebook rate-limits the
+// account, not the browser.
+
+/** Pace in the units the UI uses: minutes, and a message count. */
+interface SendingPace {
+  minDelay: number;
+  maxDelay: number;
+  batchSize: number;
+  pauseMin: number;
+  pauseMax: number;
+}
+
+const SENDING_PACE_KEY = 'sendingPace';
+
+const DEFAULT_PACE: SendingPace = {
+  minDelay: DEFAULTS.minDelayMs / 60000,
+  maxDelay: DEFAULTS.maxDelayMs / 60000,
+  batchSize: DEFAULTS.batchSize,
+  pauseMin: DEFAULTS.pauseMinMs / 60000,
+  pauseMax: DEFAULTS.pauseMaxMs / 60000,
+};
+
+/** The saved pace, falling back per-field so a partial or older value from
+ *  another machine can't produce a NaN in a number input. */
+function readPace(store: Store): SendingPace {
+  const raw = (store.settings as Record<string, unknown>)?.[SENDING_PACE_KEY] as Partial<SendingPace> | undefined;
+  const num = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
+  return {
+    minDelay: num(raw?.minDelay, DEFAULT_PACE.minDelay),
+    maxDelay: num(raw?.maxDelay, DEFAULT_PACE.maxDelay),
+    batchSize: num(raw?.batchSize, DEFAULT_PACE.batchSize),
+    pauseMin: num(raw?.pauseMin, DEFAULT_PACE.pauseMin),
+    pauseMax: num(raw?.pauseMax, DEFAULT_PACE.pauseMax),
+  };
+}
+
+/** One-line summary of a pace, used in both the composer and Settings. */
+function describePace(p: SendingPace): string {
+  return `${p.minDelay}–${p.maxDelay} min between messages · pause ~${p.batchSize} messages for ${p.pauseMin}–${p.pauseMax} min`;
+}
 
 type DateFilter = 'all' | 'today' | 'week' | 'month';
 type SortBy = 'recent' | 'lastContacted' | 'lastOpened' | 'dateAdded' | 'lastTagged' | 'tagCount' | 'name';
@@ -2660,6 +2720,7 @@ interface SettingsPanelProps {
 
 function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onStoreReplaced }: SettingsPanelProps) {
   const settings = store.settings as Record<string, unknown>;
+  const [view, setView] = useLocalPref<SettingsView>('settingsView', 'account');
   const [syncStatus, setSyncStatus] = useState<{ type: 'success' | 'error' | 'info'; msg: string } | null>(null);
   const [pushConfirm, setPushConfirm] = useState(false);
   // Chrome Sync is legacy once Drive is canonical, so it starts collapsed.
@@ -2735,51 +2796,61 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
   };
 
   return (
-    <div style={{ maxWidth: 560 }}>
-      <AboutPanel />
+    <Stack gap="lg">
+      <SubNav<SettingsView>
+        label="Settings sections"
+        current={view}
+        onChange={setView}
+        items={[
+          { id: 'account', label: 'Account & plan' },
+          { id: 'sync', label: 'Sync & devices' },
+          { id: 'data', label: 'Data' },
+          { id: 'behavior', label: 'Behavior' },
+          { id: 'about', label: 'About' },
+        ]}
+      />
 
-      <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
-        <h3 style={{ margin: '0 0 16px', fontSize: 15, fontWeight: 600 }}>Preferences</h3>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ maxWidth: 620 }}>
+
+      {view === 'account' && <AccountPanel contactCount={conversations.length} />}
+
+      {view === 'behavior' && (
+      <>
+      <Card style={{ marginBottom: space.md }}>
+        <Text as="h3" size="strong" weight="semibold" style={{ margin: `0 0 ${space.lg}px` }}>Capture &amp; notifications</Text>
+        <Stack gap="xs">
           {[
             { key: 'autoCapture', label: 'Auto-capture conversations you open', default: false },
             { key: 'autoTagging', label: 'Auto-tagging', default: false },
             { key: 'notificationEnabled', label: 'Notifications', default: true },
           ].map(({ key, label, default: def }) => (
-            <div key={key} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 14px', background: '#f8f8f8', borderRadius: 8 }}>
-              <span style={{ fontSize: 14, fontWeight: 500 }}>{label}</span>
-              <label style={{ position: 'relative', width: 44, height: 24, cursor: 'pointer' }}>
-                <input
-                  type="checkbox"
-                  checked={(settings[key] as boolean) ?? def}
-                  onChange={(e) => toggleSetting(key, e.target.checked)}
-                  style={{ opacity: 0, width: 0, height: 0 }}
-                />
-                <span
-                  style={{
-                    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
-                    background: ((settings[key] as boolean) ?? def) ? '#065fd4' : '#ccc',
-                    borderRadius: 24, transition: '0.3s',
-                  }}
-                />
-                <span
-                  style={{
-                    position: 'absolute', width: 18, height: 18,
-                    left: ((settings[key] as boolean) ?? def) ? 23 : 3,
-                    top: 3, background: '#fff', borderRadius: '50%', transition: '0.3s',
-                  }}
-                />
-              </label>
+            <div key={key} style={{ padding: `${space.sm}px ${space.md}px`, background: color.surface.sunken, borderRadius: radius.sm }}>
+              <Toggle
+                label={label}
+                checked={(settings[key] as boolean) ?? def}
+                onChange={(e) => toggleSetting(key, e.target.checked)}
+              />
             </div>
           ))}
-        </div>
-        <p style={{ margin: '12px 0 0', fontSize: 11, color: '#aaa', lineHeight: 1.5 }}>
+        </Stack>
+        <Text as="p" size="micro" tone="muted" leading="relaxed" style={{ margin: `${space.md}px 0 0` }}>
           <strong>Auto-capture</strong> saves every conversation you open while the CRM panel is visible in Messenger. Turn it off to
           only add contacts you explicitly save (a "Save contact" button appears instead). It never adds anyone just from replying.
-        </p>
-      </div>
+        </Text>
+      </Card>
 
-      <ContactsMaintenance store={store} updateStore={updateStore} />
+      <SendingPaceSettings store={store} updateStore={updateStore} />
+      </>
+      )}
+
+      {view === 'sync' && (
+      <>
+      {/* Drive first: it is the supported path, and Chrome Sync is what it
+          replaced. The old order put a legacy mechanism above the current one
+          and separated the two with the Account card. */}
+      <DriveBackupPanel store={store} updateStore={updateStore} />
+
+      <MachinesPanel />
 
       <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
         <button
@@ -2795,8 +2866,8 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
         <div style={{ marginTop: 12 }}>
         <p style={{ margin: '0 0 14px', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
           Pull loads data from Chrome's sync storage into this machine. Push uploads this machine's data to Chrome sync so other machines pick it up.
-          {' '}<strong>Note:</strong> Chrome may not sync data for extensions installed in developer mode — if contacts are missing after pulling, try the Export/Import buttons below as a fallback.
-          {' '}Superseded by Google Drive sync below, which has no ~500-contact limit.
+          {' '}<strong>Note:</strong> Chrome may not sync data for extensions installed in developer mode — if contacts are missing after pulling, try the JSON backup under <strong>Data</strong> as a fallback.
+          {' '}Superseded by Google Drive sync above, which has no ~500-contact limit.
         </p>
         <div style={{ display: 'flex', gap: 10, marginBottom: syncStatus ? 10 : 0 }}>
           <button
@@ -2835,31 +2906,117 @@ function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onS
         </div>
         )}
       </div>
+      </>
+      )}
 
-      <AccountPanel contactCount={conversations.length} />
-
-      <DriveBackupPanel store={store} updateStore={updateStore} />
-
-      <MachinesPanel />
-
-
-      <div style={{ background: '#fff', borderRadius: 10, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
-        <h3 style={{ margin: '0 0 16px', fontSize: 15, fontWeight: 600 }}>Data</h3>
-        <div style={{ display: 'flex', gap: 10 }}>
-          <button onClick={exportData} style={{ flex: 1, background: '#065fd4', color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
-            Export Data
-          </button>
-          <button onClick={importData} style={{ flex: 1, background: '#4ECDC4', color: '#fff', border: 'none', padding: '10px 16px', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
-            Import Data
-          </button>
-        </div>
-        <p style={{ margin: '10px 0 0', fontSize: 11, color: '#aaa', lineHeight: 1.5 }}>
-          Export/Import here is a full JSON backup of everything. To import or export <strong>contacts as CSV</strong>, use the section below (and the <strong>Export CSV</strong> button on the Conversations tab for the current filtered view).
-        </p>
-      </div>
-
+      {view === 'data' && (
+      <>
+      {/* CSV first: importing a list is the common errand. The JSON backup is
+          a safety net you reach for rarely, and maintenance rarer still. */}
       <CsvImportPanel store={store} updateStore={updateStore} />
-    </div>
+
+      <Card style={{ marginBottom: space.md }}>
+        <Text as="h3" size="strong" weight="semibold" style={{ margin: `0 0 ${space.lg}px` }}>Full backup</Text>
+        <Stack direction="row" gap="sm">
+          <Button variant="primary" onClick={exportData} block>Export backup</Button>
+          <Button variant="secondary" onClick={importData} block>Import backup</Button>
+        </Stack>
+        <Text as="p" size="micro" tone="muted" leading="relaxed" style={{ margin: `${space.md}px 0 0` }}>
+          A complete JSON copy of everything — contacts, tags, fields, saved searches and settings.
+          For contacts as <strong>CSV</strong>, use the import above, or the <strong>CSV</strong> button on
+          the Contacts list to export whatever the current filters are showing.
+        </Text>
+      </Card>
+
+      <ContactsMaintenance store={store} updateStore={updateStore} />
+      </>
+      )}
+
+      {view === 'about' && <AboutPanel />}
+
+      </div>
+    </Stack>
+  );
+}
+
+/**
+ * The standing sending pace.
+ *
+ * This used to exist only inside the campaign composer, which meant there was
+ * no way to say "this is how I always send" — every campaign started from the
+ * shipped defaults and had to be re-typed. The composer still overrides it per
+ * campaign; this is what it starts from.
+ */
+function SendingPaceSettings({ store, updateStore }: { store: Store; updateStore: (s: Store) => Promise<SaveResult> }) {
+  const saved = readPace(store);
+  const [draft, setDraft] = useState<SendingPace>(saved);
+  const [status, setStatus] = useState<string | null>(null);
+
+  const dirty = describePace(draft) !== describePace(saved);
+  const invalid =
+    draft.minDelay > draft.maxDelay ? 'Minimum delay cannot be greater than the maximum.'
+    : draft.pauseMin > draft.pauseMax ? 'Minimum pause cannot be greater than the maximum.'
+    : draft.batchSize < 1 ? 'Pause every must be at least 1 message.'
+    : null;
+
+  const save = async () => {
+    if (invalid) return;
+    await updateStore({
+      ...store,
+      settings: { ...(store.settings as Record<string, unknown>), [SENDING_PACE_KEY]: draft },
+    });
+    setStatus('Saved. New campaigns start from this pace.');
+    window.setTimeout(() => setStatus(null), 3000);
+  };
+
+  const reset = () => { setDraft(DEFAULT_PACE); setStatus(null); };
+
+  const num = (label: string, key: keyof SendingPace, step: number, min: number) => (
+    <FormField label={label}>
+      {(p) => (
+        <Input
+          {...p}
+          type="number"
+          min={min}
+          step={step}
+          value={draft[key]}
+          onChange={(e) => setDraft({ ...draft, [key]: Number(e.target.value) })}
+          style={{ width: 96 }}
+        />
+      )}
+    </FormField>
+  );
+
+  return (
+    <Card style={{ marginBottom: space.md }}>
+      <Text as="h3" size="strong" weight="semibold" style={{ margin: 0 }}>Sending pace</Text>
+      <Text as="p" size="small" tone="muted" leading="relaxed" style={{ margin: `${space.xs}px 0 ${space.lg}px` }}>
+        How quickly bulk messages go out. Facebook rate-limits the account rather than the browser,
+        so this is deliberately slow and irregular. {describePace(saved)}.
+      </Text>
+
+      <Stack gap="md">
+        <Stack direction="row" gap="sm" align="flex-end" wrap>
+          {num('Delay from (min)', 'minDelay', 0.5, 0)}
+          {num('to (min)', 'maxDelay', 0.5, 0)}
+          {num('Pause every (msgs)', 'batchSize', 1, 1)}
+        </Stack>
+        <Stack direction="row" gap="sm" align="flex-end" wrap>
+          {num('Pause from (min)', 'pauseMin', 1, 0)}
+          {num('to (min)', 'pauseMax', 1, 0)}
+        </Stack>
+
+        {invalid && <Banner tone="danger" live>{invalid}</Banner>}
+        {status && <Banner tone="success" live>{status}</Banner>}
+
+        <Stack direction="row" gap="sm" align="center">
+          <Button variant="primary" onClick={save} disabled={!dirty || !!invalid}>Save pace</Button>
+          <Button variant="ghost" onClick={reset} disabled={describePace(draft) === describePace(DEFAULT_PACE)}>
+            Reset to defaults
+          </Button>
+        </Stack>
+      </Stack>
+    </Card>
   );
 }
 
@@ -4057,11 +4214,15 @@ function MessagingPanel({ conversations, tags, store, campaigns, queue, machines
   const [search, setSearch] = useState('');
   const [filterTag, setFilterTag] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [minDelay, setMinDelay] = useState(DEFAULTS.minDelayMs / 60000);
-  const [maxDelay, setMaxDelay] = useState(DEFAULTS.maxDelayMs / 60000);
-  const [batchSize, setBatchSize] = useState(DEFAULTS.batchSize);
-  const [pauseMin, setPauseMin] = useState(DEFAULTS.pauseMinMs / 60000);
-  const [pauseMax, setPauseMax] = useState(DEFAULTS.pauseMaxMs / 60000);
+  // Seeded from the saved pace in Settings, then editable for this campaign
+  // only. Read once on mount: re-syncing it mid-compose would overwrite an
+  // override the user had already typed.
+  const [pace] = useState(() => readPace(store));
+  const [minDelay, setMinDelay] = useState(pace.minDelay);
+  const [maxDelay, setMaxDelay] = useState(pace.maxDelay);
+  const [batchSize, setBatchSize] = useState(pace.batchSize);
+  const [pauseMin, setPauseMin] = useState(pace.pauseMin);
+  const [pauseMax, setPauseMax] = useState(pace.pauseMax);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dryRun, setDryRun] = useState(false);
@@ -4212,8 +4373,13 @@ function MessagingPanel({ conversations, tags, store, campaigns, queue, machines
             {showAdvanced ? '▾' : '▸'} Sending pace
           </button>
           <div style={{ fontSize: 12, color: '#888', marginTop: 6 }}>
-            {minDelay}–{maxDelay} min between messages · pause ~{batchSize} messages for {pauseMin}–{pauseMax} min
+            {describePace({ minDelay, maxDelay, batchSize, pauseMin, pauseMax })}
           </div>
+          {!showAdvanced && describePace({ minDelay, maxDelay, batchSize, pauseMin, pauseMax }) !== describePace(pace) && (
+            <Text as="div" size="micro" tone="warning" style={{ marginTop: space.xs }}>
+              Overridden for this campaign — your saved pace is unchanged.
+            </Text>
+          )}
           {showAdvanced && (
             <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, flexWrap: 'wrap' }}>
