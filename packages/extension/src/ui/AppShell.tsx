@@ -44,6 +44,13 @@ export interface AppShellProps<Id extends string = string> {
   /** Right-hand side of the top bar, before the bell. */
   actions?: React.ReactNode;
 
+  /**
+   * Whether the shell scrolls the content area. False for routes that manage
+   * their own scrolling — the Contacts workspace scrolls its list and its
+   * detail pane independently, and an outer scroller would fight both.
+   */
+  contentScroll?: boolean;
+
   /** Drawer contents. When absent the bell is still shown, with an empty state. */
   notifications?: React.ReactNode;
   notificationCount?: number;
@@ -61,6 +68,7 @@ export function AppShell<Id extends string>({
   nav, activeId, onNavigate,
   railCollapsed, onToggleRail,
   title, meta, actions,
+  contentScroll = true,
   notifications, notificationCount = 0, drawerOpen, onDrawerOpenChange,
   children,
 }: AppShellProps<Id>) {
@@ -98,9 +106,14 @@ export function AppShell<Id extends string>({
           onOpenDrawer={() => onDrawerOpenChange(true)}
         />
 
-        {/* The only scroll container the shell owns. Phase 3 replaces this for
-            the Contacts route with per-column scrolling. */}
-        <main style={{ minWidth: 0, minHeight: 0, overflow: 'auto', background: color.surface.page }}>
+        <main
+          style={{
+            minWidth: 0,
+            minHeight: 0,
+            overflow: contentScroll ? 'auto' : 'hidden',
+            background: color.surface.page,
+          }}
+        >
           {children}
         </main>
       </div>
@@ -241,7 +254,14 @@ function TopBar({
       }}
     >
       <Text as="div" size="strong" weight="bold" style={{ whiteSpace: 'nowrap' }}>{title}</Text>
-      {meta && <div style={{ display: 'flex', alignItems: 'center', gap: space.md, minWidth: 0 }}>{meta}</div>}
+      {meta && (
+        <div
+          className="crm-topbar__meta"
+          style={{ display: 'flex', alignItems: 'center', gap: space.md, minWidth: 0, overflow: 'hidden', whiteSpace: 'nowrap' }}
+        >
+          {meta}
+        </div>
+      )}
 
       <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: space.sm }}>
         {actions}

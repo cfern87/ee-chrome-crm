@@ -102,6 +102,53 @@ export function chipNeedsOutline(bg: string): boolean {
 }
 
 /**
+ * A fill guaranteed to carry a readable label, plus the foreground to use.
+ *
+ * There is a band of mid-tone colours — a plain 50% grey is the clearest case,
+ * at 4.49:1 — where neither white nor near-black reaches AA. Two foregrounds
+ * are simply not enough coverage for a colour the user picked out of an
+ * `<input type="color">`, so for those we move the *fill* instead: same hue,
+ * pushed lighter or darker until the label clears 4.5:1.
+ *
+ * `adjusted` reports whether that happened, so the caller can outline the chip
+ * and keep its shape honest about the colour that was chosen.
+ */
+export function readableFill(fill: string): { fill: string; fg: string; adjusted: boolean } {
+  const fg = onColor(fill);
+  if (contrastRatio(fg, fill) >= 4.5) return { fill, fg, adjusted: false };
+
+  // Move away from the foreground: toward black under white text, toward white
+  // under dark text. Whichever foreground already won is the one worth
+  // committing to — it was the closer of the two to begin with.
+  const toward = fg === ON_DARK ? '#000000' : '#ffffff';
+  for (let step = 1; step <= 24; step++) {
+    const candidate = tint(toward, step * 0.04, fill);
+    if (contrastRatio(fg, candidate) >= 4.5) return { fill: candidate, fg, adjusted: true };
+  }
+  // Unreachable for any sRGB colour, but never return something unreadable.
+  return { fill: toward, fg, adjusted: true };
+}
+
+/**
+ * Blend `fill` into `over` at `amount` opacity and return an **opaque** colour.
+ *
+ * Needed because the alpha shorthand (`tag.color + '33'`) produces a colour
+ * these functions cannot reason about: {@link parseHex} discards alpha, so
+ * `onColor` would pick a foreground for the full-strength colour while the eye
+ * sees a near-white tint. A pale tag would get white text on a white chip.
+ * Blending first means the value passed around is what actually gets drawn.
+ */
+export function tint(fill: string, amount: number, over = '#ffffff'): string {
+  const a = parseHex(fill);
+  const b = parseHex(over);
+  if (!a || !b) return fill;
+  const t = Math.min(1, Math.max(0, amount));
+  const mix = (x: number, y: number) => Math.round(y + (x - y) * t);
+  const hex = (n: number) => n.toString(16).padStart(2, '0');
+  return `#${hex(mix(a.r, b.r))}${hex(mix(a.g, b.g))}${hex(mix(a.b, b.b))}`;
+}
+
+/**
  * A same-hue outline for a chip, darker than the fill. Used for the mid-tone
  * band above and for pale fills that would otherwise dissolve into a white
  * surface. Returns a colour, not a full border shorthand.

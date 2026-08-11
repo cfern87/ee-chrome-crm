@@ -388,9 +388,40 @@ function componentRules(): string {
 `;
 }
 
+/**
+ * Page-level reset. Only for surfaces we own outright — the dashboard and the
+ * popup. Deliberately NOT applied by the content script: the Messenger panel is
+ * a guest on somebody else's page, and resetting their html/body would be
+ * vandalism.
+ *
+ * Without this the shell's `height: 100vh` sits inside body's default 8px
+ * margin, so the page overflows by 16px and grows a scrollbar the layout was
+ * specifically designed not to need.
+ */
+function pageResetRules(): string {
+  return `
+html, body { margin: 0; padding: 0; height: 100%; }
+body { background: var(--crm-surface-page); color: var(--crm-text-primary); font-family: var(--crm-font-sans); }
+#root { height: 100%; }
+
+/* The top bar's counts are useful but never essential — they yield before the
+   title or the notification bell do. */
+@media (max-width: 1080px) { .crm-topbar__meta { display: none; } }
+`;
+}
+
+export interface StylesheetOptions {
+  /** Include the html/body/#root reset. True for pages we own. */
+  pageReset?: boolean;
+}
+
 /** The whole stylesheet: token variables plus the component rules. */
-export function uiStylesheet(): string {
-  return `${cssRootBlock()}\n${componentRules()}`;
+export function uiStylesheet(options: StylesheetOptions = {}): string {
+  return [
+    cssRootBlock(),
+    componentRules(),
+    options.pageReset ? pageResetRules() : '',
+  ].join('\n');
 }
 
 /**
@@ -398,7 +429,7 @@ export function uiStylesheet(): string {
  * second call replaces the contents rather than stacking another <style>,
  * which matters for the content script, where navigation can re-run setup.
  */
-export function installUiStylesheet(doc: Document = document): void {
+export function installUiStylesheet(options: StylesheetOptions = {}, doc: Document = document): void {
   try {
     let el = doc.getElementById(STYLE_ELEMENT_ID) as HTMLStyleElement | null;
     if (!el) {
@@ -406,7 +437,7 @@ export function installUiStylesheet(doc: Document = document): void {
       el.id = STYLE_ELEMENT_ID;
       (doc.head || doc.documentElement).appendChild(el);
     }
-    el.textContent = uiStylesheet();
+    el.textContent = uiStylesheet(options);
   } catch {
     /* a missing stylesheet degrades the look; it must not break the app */
   }

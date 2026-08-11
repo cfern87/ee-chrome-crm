@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, addTagsTo, removeTagsFrom, lastTaggedAt, getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, isStoreChangeKey, isCrmSyncKey, touchDef } from '../storage';
 import { BUILD_INFO } from '../buildInfo';
 import { getEntitlement, PLATFORM_URL, FREE_CONTACT_LIMIT, isSignedIn, SESSION_KEY, EXTENSION_AUTH_PATH, type Entitlement } from '../license';
@@ -26,9 +26,17 @@ import { isDriveConfigured, getDriveStatus, getDriveAuthState, connectDrive, dis
 import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo, type DeviceOverview } from '../devices';
 import { isDisconnected, type SyncStatusView, type SendHoldReason } from '../syncHealth';
 import { AppShell, type NavItem } from '../ui/AppShell';
-import { Button, Card, EmptyState, Stack, Text, color, fontSize, fontWeight, radius, space } from '../ui/primitives';
+import {
+  Button, Card, Chip, EmptyState, Input, Option, Pager, Select, Stack, Text,
+  // `Field` is already taken in this file by the CSV mapping type.
+  Field as FormField,
+  color, fontSize, fontWeight, radius, space,
+} from '../ui/primitives';
 import { elevation } from '../ui/tokens';
 import { ICON_CONTACTS, ICON_CAMPAIGNS, ICON_TAGS, ICON_SETTINGS } from '../ui/icons';
+import { Resizer } from '../ui/SplitPane';
+import { useLocalPref } from '../ui/prefs';
+import { tint } from '../ui/contrast';
 
 // What GET_DEVICES answers with: the machine roster and lease from devices.ts,
 // plus the things only the background worker knows.
@@ -64,24 +72,6 @@ function downloadText(filename: string, mime: string, content: string) {
   a.download = filename;
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 0);
-}
-
-// Page numbers for the pager: always the first and last page plus a window
-// around the current one. `null` marks an elided run, rendered as "…".
-function pageWindow(current: number, total: number): (number | null)[] {
-  if (total <= 7) return Array.from({ length: total }, (_, i) => i);
-  const wanted = new Set<number>([0, total - 1]);
-  for (let p = current - 1; p <= current + 1; p++) {
-    if (p >= 0 && p < total) wanted.add(p);
-  }
-  const out: (number | null)[] = [];
-  let prev = -1;
-  for (const p of Array.from(wanted).sort((a, b) => a - b)) {
-    if (prev >= 0 && p - prev > 1) out.push(null);
-    out.push(p);
-    prev = p;
-  }
-  return out;
 }
 
 /**
@@ -196,20 +186,6 @@ function showsGroupLabels(buckets: TagBucket[]): boolean {
   return buckets.some((b) => b.key !== UNGROUPED_KEY);
 }
 
-function pagerBtnStyle(active: boolean, disabled: boolean): React.CSSProperties {
-  return {
-    minWidth: 26,
-    padding: '4px 7px',
-    borderRadius: 6,
-    fontSize: 11,
-    fontWeight: 600,
-    border: `1px solid ${active ? '#065fd4' : '#e0e0e0'}`,
-    background: active ? '#065fd4' : '#fff',
-    color: disabled ? '#ccc' : active ? '#fff' : '#555',
-    cursor: disabled ? 'not-allowed' : 'pointer',
-  };
-}
-
 function tsStamp(): string {
   return new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
 }
@@ -297,6 +273,16 @@ type Route = 'contacts' | 'campaigns' | 'tags' | 'settings';
 /** Sub-views inside Campaigns. */
 type CampaignView = 'compose' | 'active' | 'past';
 
+/** Sub-views inside Tags & fields. */
+type SchemaView = 'tags' | 'fields';
+
+// Contact list column. The old layout pinned this at exactly 320px inside a
+// container capped at 1100px, which is why the two panes felt out of
+// proportion on anything wider than a laptop.
+const LIST_MIN = 280;
+const LIST_MAX = 560;
+const LIST_DEFAULT = 340;
+
 type DateFilter = 'all' | 'today' | 'week' | 'month';
 type SortBy = 'recent' | 'lastContacted' | 'lastOpened' | 'dateAdded' | 'lastTagged' | 'tagCount' | 'name';
 
@@ -310,8 +296,16 @@ export default function DashboardApp() {
   const [store, setStore] = useState<Store>(EMPTY_STORE);
   const [route, setRoute] = useState<Route>('contacts');
   const [campaignView, setCampaignView] = useState<CampaignView>('compose');
-  const [railCollapsed, setRailCollapsed] = useState(false);
+  const [schemaView, setSchemaView] = useState<SchemaView>('tags');
+  const [railCollapsed, setRailCollapsed] = useLocalPref('railCollapsed', false);
   const [drawerOpen, setDrawerOpen] = useState(false);
+
+  // Contact list column width. Held in React state during a drag (so it tracks
+  // the pointer) and written to the per-machine preference only on release —
+  // persisting every pointermove would be dozens of writes per drag.
+  const [storedListWidth, setStoredListWidth] = useLocalPref('contactListWidth', LIST_DEFAULT);
+  const [listWidth, setListWidth] = useState(storedListWidth);
+  const commitListWidth = useCallback((w: number) => setStoredListWidth(w), [setStoredListWidth]);
 
   /** Go to a destination, optionally landing on a specific sub-view. */
   const go = useCallback((next: Route, view?: CampaignView) => {
@@ -590,6 +584,39 @@ export default function DashboardApp() {
   const pageIds = paged.map((c) => c.id);
   const pageSelectedCount = pageIds.reduce((n, id) => (selectedIds.has(id) ? n + 1 : n), 0);
   const offPageSelected = selectedIds.size - pageSelectedCount;
+
+  // --- Keyboard navigation of the contact list ---
+  //
+  // The rows are a listbox of buttons, so one row holds the tab stop and the
+  // arrows move between them (roving tabindex). Without this the list would be
+  // reachable but tedious: every contact its own tab stop.
+  const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const [focusedRow, setFocusedRow] = useState(0);
+  // Mirrors focusedRow, but updates synchronously. Held-down arrow keys can
+  // deliver two keydowns before React re-renders, and reading the state
+  // variable there would move one row for two presses.
+  const focusedRowRef = useRef(0);
+  const setRow = (i: number) => { focusedRowRef.current = i; setFocusedRow(i); };
+
+  const onListKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const last = paged.length - 1;
+    if (last < 0) return;
+    const from = focusedRowRef.current;
+    let next: number | null = null;
+    if (e.key === 'ArrowDown') next = Math.min(last, from + 1);
+    else if (e.key === 'ArrowUp') next = Math.max(0, from - 1);
+    else if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = last;
+    if (next === null) return;
+    e.preventDefault();
+    setRow(next);
+    rowRefs.current[next]?.focus();
+  };
+
+  // A changed page or filter can leave the roving index past the end.
+  useEffect(() => {
+    if (focusedRowRef.current > paged.length - 1) setRow(0);
+  }, [paged.length]);
 
   // Any change to the result set sends you back to page 1 — otherwise a
   // narrower filter can leave you stranded on a page that no longer exists.
@@ -1102,6 +1129,7 @@ export default function DashboardApp() {
       onToggleRail={() => setRailCollapsed((v) => !v)}
       title={ROUTE_TITLE[route]}
       meta={contactsMeta || undefined}
+      contentScroll={route !== 'contacts'}
       drawerOpen={drawerOpen}
       onDrawerOpenChange={setDrawerOpen}
       notificationCount={unseenFailures.length + (holdReason ? 1 : 0)}
@@ -1118,174 +1146,144 @@ export default function DashboardApp() {
         />
       }
     >
-      <div style={{ maxWidth: 1100, margin: '0 auto', padding: `${space.xl}px ${space.lg}px` }}>
+      {/* Contacts owns the full viewport and scrolls its two columns
+          independently. Every other route is a document, so it keeps the
+          centred, page-scrolling wrapper. */}
+      {route === 'contacts' ? (
+        <div style={{ display: 'flex', height: '100%', minHeight: 0, position: 'relative' }}>
 
-        {/* Advanced search — full width above the two-column layout, since the
-            query builder needs more room than the 320px contact column. */}
-        {route === 'contacts' && (
-          <>
-            <PinnedSearchChips
-              savedSearches={store.savedSearches}
-              activeId={activePresetId}
-              onApply={applyPreset}
-              onClear={clearPreset}
-              ctx={queryCtx}
-            />
-
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-              <button
-                onClick={() => setShowBuilder(!showBuilder)}
-                style={{
-                  display: 'inline-flex', alignItems: 'center', gap: 6,
-                  border: `1px solid ${showBuilder || !isQueryEmpty(query) ? '#065fd4' : '#d8d8d8'}`,
-                  background: showBuilder ? '#065fd4' : '#fff',
-                  color: showBuilder ? '#fff' : '#065fd4',
-                  borderRadius: 6, padding: '6px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
-                }}
-              >
-                {showBuilder ? '▾' : '▸'} Advanced search
-                {!isQueryEmpty(query) && (
-                  <span
-                    style={{
-                      background: showBuilder ? 'rgba(255,255,255,0.25)' : '#e8f0fe',
-                      color: showBuilder ? '#fff' : '#065fd4',
-                      borderRadius: 8, padding: '1px 7px', fontSize: 11, fontWeight: 700,
-                    }}
-                  >
-                    on
-                  </span>
+          {/* ---- List column ---------------------------------------------
+              A flex column, not a sticky block: the controls and the pager
+              stay put while only the rows scroll. Previously the whole list
+              scrolled the *page*, which dragged the filters out of reach and
+              fought the sticky detail pane for the same gesture. */}
+          <div
+            style={{
+              width: listWidth,
+              flex: '0 0 auto',
+              display: 'flex',
+              flexDirection: 'column',
+              minHeight: 0,
+              background: color.surface.raised,
+              borderRight: `1px solid ${color.border.subtle}`,
+            }}
+          >
+            <div style={{ flex: '0 0 auto', padding: space.md, borderBottom: `1px solid ${color.border.subtle}`, display: 'flex', flexDirection: 'column', gap: space.sm }}>
+              <FormField label="Search contacts" hideLabel>
+                {(p) => (
+                  <Input
+                    {...p}
+                    type="search"
+                    placeholder="Search contacts…"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                  />
                 )}
-              </button>
-              {!isQueryEmpty(query) && !showBuilder && (
-                <span style={{ fontSize: 11, color: '#888', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {describeQuery(query, queryCtx)}
-                </span>
-              )}
-              {!isQueryEmpty(query) && (
-                <button
-                  onClick={clearPreset}
-                  style={{ marginLeft: 'auto', border: 'none', background: 'none', color: '#e53e3e', fontSize: 11, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}
+              </FormField>
+
+              <div style={{ display: 'flex', gap: space.sm }}>
+                <FormField label="Archived" hideLabel>
+                  {(p) => (
+                    <Select {...p} value={archiveScope} onChange={(e) => setArchiveScope(e.target.value as ArchiveScope)}>
+                      <option value="active">Active only</option>
+                      <option value="archived">Archived only</option>
+                      <option value="all">Active + archived</option>
+                    </Select>
+                  )}
+                </FormField>
+                <FormField label="Time range" hideLabel>
+                  {(p) => (
+                    <Select {...p} value={dateFilter} onChange={(e) => setDateFilter(e.target.value as DateFilter)}>
+                      <option value="all">Any time</option>
+                      <option value="today">Last 24h</option>
+                      <option value="week">Last 7 days</option>
+                      <option value="month">Last 30 days</option>
+                    </Select>
+                  )}
+                </FormField>
+              </div>
+
+              <div style={{ display: 'flex', gap: space.xs, alignItems: 'center' }}>
+                <FormField label="Sort by" hideLabel>
+                  {(p) => (
+                    <Select {...p} value={sortBy} onChange={(e) => setSortBy(e.target.value as SortBy)}>
+                      <option value="recent">Recent activity</option>
+                      <option value="lastContacted">Last contacted</option>
+                      <option value="lastOpened">Last opened</option>
+                      <option value="dateAdded">Date added</option>
+                      <option value="lastTagged">Last tagged</option>
+                      <option value="tagCount">Number of tags</option>
+                      <option value="name">Name</option>
+                    </Select>
+                  )}
+                </FormField>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setSortDir(sortDir === 'asc' ? 'desc' : 'asc')}
+                  aria-label={`Sort ${sortDir === 'asc' ? 'ascending' : 'descending'}. Activate to reverse.`}
+                  title={sortDir === 'asc' ? 'Ascending' : 'Descending'}
                 >
-                  Clear
-                </button>
+                  {sortBy === 'name' ? (sortDir === 'asc' ? 'A→Z' : 'Z→A') : (sortDir === 'asc' ? '↑' : '↓')}
+                </Button>
+              </div>
+
+              {/* Advanced search moved out of the page flow. It needs more room
+                  than this column, so it opens as a sheet over the workspace
+                  instead of permanently displacing it. */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: space.sm }}>
+                <Button
+                  size="sm"
+                  variant={showBuilder || !isQueryEmpty(query) ? 'primary' : 'secondary'}
+                  aria-expanded={showBuilder}
+                  onClick={() => setShowBuilder(!showBuilder)}
+                >
+                  Advanced search{!isQueryEmpty(query) && ' · on'}
+                </Button>
+                {!isQueryEmpty(query) && (
+                  <Button size="sm" variant="link" onClick={clearPreset}>Clear</Button>
+                )}
+              </div>
+
+              {!isQueryEmpty(query) && !showBuilder && (
+                <Text size="micro" tone="muted" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {describeQuery(query, queryCtx)}
+                </Text>
               )}
+
+              <PinnedSearchChips
+                savedSearches={store.savedSearches}
+                activeId={activePresetId}
+                onApply={applyPreset}
+                onClear={clearPreset}
+                ctx={queryCtx}
+              />
             </div>
 
-            {showBuilder && (
-              <AdvancedSearch
-                query={query}
-                onQueryChange={setQuery}
-                tags={store.tags}
-                tagGroups={store.tagGroups}
-                fieldDefs={store.fieldDefs}
-                savedSearches={store.savedSearches}
-                activePresetId={activePresetId}
-                dirty={presetDirty}
-                matchCount={filtered.length}
-                totalCount={conversations.length}
-                onApplyPreset={applyPreset}
-                onSaveNewPreset={saveNewPreset}
-                onUpdateActivePreset={updateActivePreset}
-                onRenamePreset={(id, name) => patchPreset(id, { name })}
-                onTogglePinPreset={(id) => patchPreset(id, { pinned: !store.savedSearches[id]?.pinned })}
-                onDeletePreset={deletePreset}
-                onReorderPreset={reorderPreset}
-              />
-            )}
-          </>
-        )}
-
-        {/* Conversations tab */}
-        {route === 'contacts' && (
-          <div style={{ display: 'flex', gap: 14 }}>
-            {/* Left: list */}
-            <div style={{ flex: '0 0 320px' }}>
-              {/* Search */}
-              <div style={{ marginBottom: 12 }}>
-                <input
-                  type="text"
-                  placeholder="Search conversations..."
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  style={{ width: '100%', padding: '9px 12px', border: '1px solid #e0e0e0', borderRadius: 7, fontSize: 13, boxSizing: 'border-box', outline: 'none' }}
-                />
-              </div>
-
-              {/* Advanced filters */}
-              <div style={{ display: 'flex', gap: 8, marginBottom: 12, fontSize: 12, flexWrap: 'wrap' }}>
-                {/* Archive scope */}
-                <select
-                  value={archiveScope}
-                  onChange={(e) => setArchiveScope(e.target.value as ArchiveScope)}
-                  style={{ padding: '6px 8px', border: '1px solid #d0d0d0', borderRadius: 6, fontSize: 12, cursor: 'pointer', background: '#fff' }}
-                >
-                  <option value="active">Active only</option>
-                  <option value="archived">Archived only</option>
-                  <option value="all">Active + archived</option>
-                </select>
-
-                {/* Date filter */}
-                <select
-                  value={dateFilter}
-                  onChange={(e) => setDateFilter(e.target.value as DateFilter)}
-                  style={{ padding: '6px 8px', border: '1px solid #d0d0d0', borderRadius: 6, fontSize: 12, cursor: 'pointer', background: '#fff' }}
-                >
-                  <option value="all">Any time</option>
-                  <option value="today">Last 24h</option>
-                  <option value="week">Last 7 days</option>
-                  <option value="month">Last 30 days</option>
-                </select>
-              </div>
-
-              {/* Sort controls */}
-              <div style={{ display: 'flex', gap: 6, marginBottom: 12, fontSize: 12, alignItems: 'center' }}>
-                <span style={{ color: '#888', fontWeight: 500 }}>Sort:</span>
-                <select
-                  value={sortBy}
-                  onChange={(e) => setSortBy(e.target.value as SortBy)}
-                  style={{ flex: 1, padding: '6px 8px', border: '1px solid #d0d0d0', borderRadius: 6, fontSize: 12, cursor: 'pointer', background: '#fff' }}
-                >
-                  <option value="recent">Recent activity</option>
-                  <option value="lastContacted">Last contacted</option>
-                  <option value="lastOpened">Last opened</option>
-                  <option value="dateAdded">Date added</option>
-                  <option value="lastTagged">Last tagged</option>
-                  <option value="tagCount">Number of tags</option>
-                  <option value="name">Name</option>
-                </select>
-                <button
-                  onClick={() => setSortDir(sortDir === 'asc' ? 'desc' : 'asc')}
-                  title={sortDir === 'asc' ? 'Ascending' : 'Descending'}
-                  style={{ padding: '6px 10px', border: '1px solid #d0d0d0', borderRadius: 6, fontSize: 13, cursor: 'pointer', background: '#fff', fontWeight: 600, color: '#555' }}
-                >
-                  {sortBy === 'name'
-                    ? (sortDir === 'asc' ? 'A→Z' : 'Z→A')
-                    : (sortDir === 'asc' ? '↑' : '↓')}
-                </button>
-              </div>
-
+            {/* Only this scrolls. */}
+            <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: space.md }}>
               {/* Tag filter chips */}
               {tags.length > 0 && (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
-                  <button
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: space.xs, marginBottom: space.md }} role="group" aria-label="Filter by tag">
+                  <Button
+                    size="sm"
+                    variant={filterTag === null ? 'primary' : 'secondary'}
+                    aria-pressed={filterTag === null}
                     onClick={() => setFilterTag(null)}
-                    style={{ padding: '4px 10px', borderRadius: 12, border: '1px solid #ccc', background: filterTag === null ? '#065fd4' : '#fff', color: filterTag === null ? '#fff' : '#666', fontSize: 12, cursor: 'pointer', fontWeight: 500 }}
                   >
-                    All Tags
-                  </button>
+                    All tags
+                  </Button>
                   {tags.map((tag) => (
-                    <button
+                    <Chip
                       key={tag.id}
+                      label={tag.name}
+                      // Unselected chips are a blend, not an alpha — see tint().
+                      fill={filterTag === tag.id ? tag.color : tint(tag.color, 0.18)}
+                      hidden={tag.hideInSidebar}
+                      pressed={filterTag === tag.id}
+                      title={tag.hideInSidebar ? HIDDEN_TAG_TITLE : undefined}
                       onClick={() => setFilterTag(filterTag === tag.id ? null : tag.id)}
-                      style={{
-                        padding: '4px 10px', borderRadius: 12, border: 'none',
-                        background: filterTag === tag.id ? tag.color : tag.color + '33',
-                        color: filterTag === tag.id ? '#fff' : tag.color,
-                        fontSize: 12, cursor: 'pointer', fontWeight: 600,
-                      }}
-                    >
-                      {tag.name}
-                    </button>
+                    />
                   ))}
                 </div>
               )}
@@ -1431,149 +1429,146 @@ export default function DashboardApp() {
               )}
 
               {/* List header with count + CSV export of the current view */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, paddingBottom: 8, borderBottom: '1px solid #e8e8e8' }}>
-                <span style={{ fontSize: 12, fontWeight: 600, color: '#555' }}>Contacts</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span style={{ fontSize: 12, color: '#aaa', fontWeight: 500 }}>
-                    {filtered.length === 0
-                      ? '0 contacts'
-                      : pageCount > 1
-                        ? `${pageStart + 1}–${pageEnd} of ${filtered.length}`
-                        : `${filtered.length} ${filtered.length === 1 ? 'contact' : 'contacts'}`}
-                  </span>
-                  <select
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: space.sm, marginBottom: space.sm, paddingBottom: space.sm, borderBottom: `1px solid ${color.border.subtle}` }}>
+                <Text size="small" tone="muted" weight="medium">
+                  {filtered.length === 0
+                    ? '0 contacts'
+                    : pageCount > 1
+                      ? `${pageStart + 1}–${pageEnd} of ${filtered.length}`
+                      : `${filtered.length} ${filtered.length === 1 ? 'contact' : 'contacts'}`}
+                </Text>
+                <div style={{ display: 'flex', alignItems: 'center', gap: space.xs }}>
+                  <label className="crm-sr-only" htmlFor="crm-page-size">Contacts per page</label>
+                  <Select
+                    id="crm-page-size"
                     value={pageSize}
                     onChange={(e) => setPageSize(Number(e.target.value))}
                     title="Contacts per page"
-                    style={{ border: '1px solid #e0e0e0', borderRadius: 6, padding: '3px 4px', fontSize: 11, color: '#555', background: '#fff', cursor: 'pointer' }}
+                    style={{ width: 'auto', minHeight: 28, fontSize: fontSize.micro, padding: '2px 6px' }}
                   >
                     {[25, 50, 100, 250].map((n) => (
                       <option key={n} value={n}>{n} / page</option>
                     ))}
                     <option value={0}>All</option>
-                  </select>
-                  <button
+                  </Select>
+                  <Button
+                    size="sm"
+                    variant="secondary"
                     onClick={exportFilteredCsv}
                     disabled={filtered.length === 0}
                     title="Export the contacts currently shown (matching your advanced search, plus the search box, tag, date and archive filters) as a CSV"
-                    style={{
-                      background: filtered.length === 0 ? '#f0f0f0' : '#fff', color: filtered.length === 0 ? '#bbb' : '#065fd4',
-                      border: '1px solid #cfe0f5', padding: '4px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600,
-                      cursor: filtered.length === 0 ? 'not-allowed' : 'pointer',
-                    }}
                   >
-                    ⤓ Export CSV
-                  </button>
+                    ⤓ CSV
+                  </Button>
                 </div>
               </div>
 
-              {/* List */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                {filtered.length === 0 && (
-                  <div style={{ textAlign: 'center', padding: '24px 12px', color: '#aaa', fontSize: 12 }}>
-                    {conversations.length === 0
-                      ? 'No conversations yet. Open Messenger and visit some chats.'
-                      : 'No results match your search.'}
-                  </div>
-                )}
-                {paged.map((conv) => {
-                  const isDetailSelected = selectedConv?.id === conv.id;
-                  const isBulkSelected = selectedIds.has(conv.id);
-                  return (
-                    <div
-                      key={conv.id}
-                      style={{
-                        background: isDetailSelected ? '#e8f0fe' : '#fff',
-                        border: `1px solid ${isDetailSelected ? '#065fd4' : '#e0e0e0'}`,
-                        borderRadius: 6,
-                        padding: '8px 9px',
-                        cursor: 'pointer',
-                        transition: 'background 0.15s',
-                        display: 'flex',
-                        gap: 7,
-                        alignItems: 'flex-start',
-                      }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={isBulkSelected}
-                        onChange={() => handleToggleSelect(conv.id)}
-                        onClick={(e) => e.stopPropagation()}
-                        style={{ cursor: 'pointer', marginTop: 2, flexShrink: 0 }}
-                      />
-                      <div
-                        onClick={() => setSelectedConv(isDetailSelected ? null : conv)}
-                        style={{ flex: 1, minWidth: 0 }}
-                      >
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 6 }}>
-                          <div style={{ fontWeight: 600, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-                            {conv.participantName || 'Unknown'}
-                          </div>
-                          <div style={{ fontSize: 10, color: '#bbb', flexShrink: 0 }}>
-                            {conv.updatedAt ? formatRelativeTime(conv.updatedAt) : ''}
-                          </div>
-                        </div>
-                        <div style={{ fontSize: 11, color: '#999', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2 }}>
-                          {conv.lastMessage || ''}
-                        </div>
-                        {/* Chips are a preview, so tags marked "hide in
-                            previews" are left out. They still count for the tag
-                            filter, the sort options and the advanced query —
-                            those read conv.tags, not this list. */}
-                        {(() => {
-                          const chips = previewTags(conv.tags, store.tags);
-                          if (chips.length === 0) return null;
-                          return (
-                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginTop: 4 }}>
-                              {chips.map((tag) => (
-                                <span
-                                  key={tag.id}
-                                  style={{ background: tag.color, color: '#fff', fontSize: 9, padding: '2px 6px', borderRadius: 8, fontWeight: 600 }}
-                                >
-                                  {tag.name}
-                                </span>
-                              ))}
-                            </div>
-                          );
-                        })()}
+              {/* List. Real buttons in a listbox — these were <div onClick>,
+                  so selecting a contact was impossible without a mouse. Arrow
+                  keys move between rows; the bulk checkbox stays its own
+                  control so it can be reached separately. */}
+              {filtered.length === 0 ? (
+                <EmptyState
+                  title={conversations.length === 0 ? 'No contacts yet' : 'No contacts match these filters'}
+                  hint={conversations.length === 0
+                    ? 'Open Messenger and visit a chat — the CRM panel saves whoever you talk to. You can also import a CSV from Settings.'
+                    : 'Try clearing the search box, the tag filter, or the time range.'}
+                  action={conversations.length > 0 ? (
+                    <Button size="sm" variant="secondary" onClick={() => { setSearch(''); setFilterTag(null); setDateFilter('all'); clearPreset(); }}>
+                      Clear all filters
+                    </Button>
+                  ) : undefined}
+                />
+              ) : (
+                <div
+                  role="listbox"
+                  aria-label="Contacts"
+                  onKeyDown={onListKeyDown}
+                  style={{ display: 'flex', flexDirection: 'column', gap: space.xs }}
+                >
+                  {paged.map((conv, i) => {
+                    const isDetailSelected = selectedConv?.id === conv.id;
+                    const isBulkSelected = selectedIds.has(conv.id);
+                    return (
+                      <div key={conv.id} style={{ display: 'flex', gap: space.xs, alignItems: 'stretch' }}>
+                        <label
+                          style={{ display: 'flex', alignItems: 'flex-start', paddingTop: 10, cursor: 'pointer' }}
+                          title={`Select ${conv.participantName || 'contact'} for bulk actions`}
+                        >
+                          <span className="crm-sr-only">Select {conv.participantName || 'contact'}</span>
+                          <input
+                            type="checkbox"
+                            checked={isBulkSelected}
+                            onChange={() => handleToggleSelect(conv.id)}
+                            style={{ cursor: 'pointer' }}
+                          />
+                        </label>
+                        <Option
+                          ref={(el) => { rowRefs.current[i] = el; }}
+                          selected={isDetailSelected}
+                          tabIndex={i === focusedRow ? 0 : -1}
+                          onFocus={() => setRow(i)}
+                          onClick={() => setSelectedConv(isDetailSelected ? null : conv)}
+                          style={{ flex: 1, minWidth: 0, flexDirection: 'column', gap: 2 }}
+                        >
+                          <span style={{ display: 'flex', width: '100%', justifyContent: 'space-between', alignItems: 'baseline', gap: space.xs }}>
+                            <Text size="small" weight="semibold" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {conv.participantName || 'Unknown'}
+                            </Text>
+                            <Text size="micro" tone="muted" style={{ flexShrink: 0 }}>
+                              {conv.updatedAt ? formatRelativeTime(conv.updatedAt) : ''}
+                            </Text>
+                          </span>
+                          <Text as="span" size="micro" tone="muted" style={{ display: 'block', width: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {conv.lastMessage || ''}
+                          </Text>
+                          {/* Chips are a preview, so tags marked "hide in
+                              previews" are left out. They still count for the
+                              tag filter, the sort options and the advanced
+                              query — those read conv.tags, not this list. */}
+                          {(() => {
+                            const chips = previewTags(conv.tags, store.tags);
+                            if (chips.length === 0) return null;
+                            return (
+                              <span style={{ display: 'flex', flexWrap: 'wrap', gap: space.xxs, marginTop: space.xxs }}>
+                                {chips.map((tag) => (
+                                  <Chip key={tag.id} label={tag.name} fill={tag.color} />
+                                ))}
+                              </span>
+                            );
+                          })()}
+                        </Option>
                       </div>
-                    </div>
-                  );
-                })}
-              </div>
-
-              {/* Pager */}
-              {pageCount > 1 && (
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flexWrap: 'wrap', gap: 4, marginTop: 10, paddingTop: 10, borderTop: '1px solid #e8e8e8' }}>
-                  <button
-                    onClick={() => setPage(currentPage - 1)}
-                    disabled={currentPage === 0}
-                    style={pagerBtnStyle(false, currentPage === 0)}
-                  >
-                    ‹ Prev
-                  </button>
-                  {pageWindow(currentPage, pageCount).map((p, i) =>
-                    p === null ? (
-                      <span key={`gap-${i}`} style={{ color: '#bbb', fontSize: 11, padding: '0 2px' }}>…</span>
-                    ) : (
-                      <button key={p} onClick={() => setPage(p)} style={pagerBtnStyle(p === currentPage, false)}>
-                        {p + 1}
-                      </button>
-                    )
-                  )}
-                  <button
-                    onClick={() => setPage(currentPage + 1)}
-                    disabled={currentPage >= pageCount - 1}
-                    style={pagerBtnStyle(false, currentPage >= pageCount - 1)}
-                  >
-                    Next ›
-                  </button>
+                    );
+                  })}
                 </div>
               )}
             </div>
 
-            {/* Right: detail panel — sticky so it stays pinned in view while the contact list scrolls */}
-            <div style={{ flex: 1, minWidth: 0, position: 'sticky', top: 16, alignSelf: 'flex-start', maxHeight: 'calc(100vh - 32px)', overflowY: 'auto' }}>
+            {/* Pager sits below the scroll area, so it never scrolls away. */}
+            {pageCount > 1 && (
+              <div style={{ flex: '0 0 auto', padding: `0 ${space.md}px ${space.md}px` }}>
+                <Pager page={currentPage} pageCount={pageCount} onChange={setPage} itemLabel="Contacts" />
+              </div>
+            )}
+          </div>
+
+          <Resizer
+            width={listWidth}
+            onResize={setListWidth}
+            onCommit={commitListWidth}
+            min={LIST_MIN}
+            max={LIST_MAX}
+            label="Contact list width"
+          />
+
+          {/* ---- Detail column -------------------------------------------
+              Its own scroll container. The old version was `position: sticky`
+              inside a page that the list was scrolling, so the two fought over
+              the same gesture. The inner max-width keeps the reading measure
+              sane on a wide monitor without leaving a grey gutter. */}
+          <div style={{ flex: 1, minWidth: 0, overflowY: 'auto' }}>
+            <div style={{ maxWidth: 840, padding: space.xl }}>
               {selectedConv ? (
                 <ConvDetail
                   conv={selectedConv}
@@ -1596,50 +1591,108 @@ export default function DashboardApp() {
                   onCancelDelete={() => { setDeleteConfirm(null); setDeleteConfirm2(false); }}
                 />
               ) : (
-                <div style={{ background: '#fff', borderRadius: 10, padding: '48px 24px', textAlign: 'center', color: '#aaa', fontSize: 14, boxShadow: '0 1px 3px rgba(0,0,0,0.08)' }}>
-                  Select a conversation to view details
-                </div>
+                <Card>
+                  <EmptyState
+                    title="No contact selected"
+                    hint="Pick someone from the list to see their tags, custom fields, last message and profile links."
+                  />
+                </Card>
               )}
             </div>
           </div>
-        )}
+
+          {/* Advanced search opens over the workspace rather than pushing it
+              down. It needs far more width than the list column, which is why
+              it used to sit full-width above everything and cost that space
+              even when closed. */}
+          {showBuilder && (
+            <div
+              role="dialog"
+              aria-label="Advanced search"
+              style={{
+                position: 'absolute', top: space.md, left: space.md, zIndex: 20,
+                width: `min(680px, calc(100% - ${space.xxl}px))`,
+                maxHeight: `calc(100% - ${space.xxl}px)`, overflowY: 'auto',
+                background: color.surface.raised,
+                border: `1px solid ${color.border.subtle}`,
+                borderRadius: radius.md, boxShadow: elevation.lg, padding: space.lg,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', marginBottom: space.md }}>
+                <Text size="strong" weight="bold">Advanced search</Text>
+                <div style={{ marginLeft: 'auto' }}>
+                  <Button size="sm" variant="secondary" onClick={() => setShowBuilder(false)}>Done</Button>
+                </div>
+              </div>
+              <AdvancedSearch
+                query={query}
+                onQueryChange={setQuery}
+                tags={store.tags}
+                tagGroups={store.tagGroups}
+                fieldDefs={store.fieldDefs}
+                savedSearches={store.savedSearches}
+                activePresetId={activePresetId}
+                dirty={presetDirty}
+                matchCount={filtered.length}
+                totalCount={conversations.length}
+                onApplyPreset={applyPreset}
+                onSaveNewPreset={saveNewPreset}
+                onUpdateActivePreset={updateActivePreset}
+                onRenamePreset={(id, name) => patchPreset(id, { name })}
+                onTogglePinPreset={(id) => patchPreset(id, { pinned: !store.savedSearches[id]?.pinned })}
+                onDeletePreset={deletePreset}
+                onReorderPreset={reorderPreset}
+              />
+            </div>
+          )}
+        </div>
+      ) : (
+      <div style={{ maxWidth: 1100, margin: '0 auto', padding: `${space.xl}px ${space.lg}px` }}>
 
         {/* Tags & fields — one destination, two sections. Both define the
             shape of a contact, so splitting them across two tabs meant setting
             up "Stage" as a tag group and "Budget" as a field were unrelated
             errands. */}
         {route === 'tags' && (
-          <Stack gap="xxl">
-            <section aria-labelledby="sec-tags">
-              <Text as="h2" id="sec-tags" size="title" weight="bold" style={{ margin: `0 0 ${space.md}px` }}>Tags</Text>
+          <Stack gap="lg">
+            <SubNav<SchemaView>
+              label="Tags and fields views"
+              current={schemaView}
+              onChange={setSchemaView}
+              items={[
+                { id: 'tags', label: 'Tags', count: totalTags || undefined },
+                { id: 'fields', label: 'Custom fields', count: fieldDefs.length || undefined },
+              ]}
+            />
+
+            {schemaView === 'tags' && (
               <TagsPanel
-            tags={tags}
-            tagGroups={tagGroups}
-            conversations={conversations}
-            newTagName={newTagName}
-            setNewTagName={setNewTagName}
-            newTagColor={newTagColor}
-            setNewTagColor={setNewTagColor}
-            newTagGroup={newTagGroup}
-            setNewTagGroup={setNewTagGroup}
-            newGroupName={newGroupName}
-            setNewGroupName={setNewGroupName}
-            newGroupColor={newGroupColor}
-            setNewGroupColor={setNewGroupColor}
-            onAddTag={addTag}
-            onDeleteTag={deleteTag}
-            onRenameTag={renameTag}
-            onRecolorTag={recolorTag}
-            onSetTagGroup={setTagGroup}
-            onSetTagHidden={setTagHidden}
+                tags={tags}
+                tagGroups={tagGroups}
+                conversations={conversations}
+                newTagName={newTagName}
+                setNewTagName={setNewTagName}
+                newTagColor={newTagColor}
+                setNewTagColor={setNewTagColor}
+                newTagGroup={newTagGroup}
+                setNewTagGroup={setNewTagGroup}
+                newGroupName={newGroupName}
+                setNewGroupName={setNewGroupName}
+                newGroupColor={newGroupColor}
+                setNewGroupColor={setNewGroupColor}
+                onAddTag={addTag}
+                onDeleteTag={deleteTag}
+                onRenameTag={renameTag}
+                onRecolorTag={recolorTag}
+                onSetTagGroup={setTagGroup}
+                onSetTagHidden={setTagHidden}
                 onAddGroup={addTagGroup}
                 onRenameGroup={renameTagGroup}
                 onDeleteGroup={deleteTagGroup}
               />
-            </section>
+            )}
 
-            <section aria-labelledby="sec-fields">
-              <Text as="h2" id="sec-fields" size="title" weight="bold" style={{ margin: `0 0 ${space.md}px` }}>Custom fields</Text>
+            {schemaView === 'fields' && (
               <FieldsPanel
                 fieldDefs={fieldDefs}
                 conversations={conversations}
@@ -1647,7 +1700,7 @@ export default function DashboardApp() {
                 onDeleteField={deleteField}
                 onSetFieldInPanel={setFieldInPanel}
               />
-            </section>
+            )}
           </Stack>
         )}
 
@@ -1657,6 +1710,7 @@ export default function DashboardApp() {
         {route === 'campaigns' && (
           <Stack gap="lg">
             <SubNav<CampaignView>
+              label="Campaign views"
               current={campaignView}
               onChange={setCampaignView}
               items={[
@@ -1715,6 +1769,7 @@ export default function DashboardApp() {
           <SettingsPanel store={store} updateStore={updateStore} conversations={conversations} tags={tags} syncUsage={syncUsage} onStoreReplaced={async (s) => { setStore(s); getSyncUsage().then(setSyncUsage).catch(() => {}); }} />
         )}
       </div>
+      )}
     </AppShell>
   );
 }
@@ -1729,16 +1784,18 @@ interface SubNavItem<Id extends string> { id: Id; label: string; count?: number 
  * read as a control rather than as navigation.
  */
 function SubNav<Id extends string>({
-  items, current, onChange,
+  items, current, onChange, label,
 }: {
   items: SubNavItem<Id>[];
   current: Id;
   onChange: (id: Id) => void;
+  /** Names the group for assistive tech, e.g. "Campaign views". */
+  label: string;
 }) {
   return (
     <div
       role="tablist"
-      aria-label="Campaign views"
+      aria-label={label}
       style={{
         display: 'inline-flex', gap: space.xxs, padding: space.xxs,
         background: color.surface.sunken, border: `1px solid ${color.border.subtle}`,

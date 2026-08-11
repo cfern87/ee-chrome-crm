@@ -13,7 +13,7 @@
 
 import React from 'react';
 import { color, fontSize, fontWeight, lineHeight, radius, space } from './tokens';
-import { onColor, chipNeedsOutline, chipOutline, ON_DARK } from './contrast';
+import { readableFill, chipOutline, ON_DARK } from './contrast';
 import { EYE_OFF_INNER } from './icons';
 
 function cx(...parts: (string | false | null | undefined)[]): string {
@@ -325,14 +325,16 @@ interface ChipVisuals {
  * on anything pale: the default `#FF6B6B` tag rendered at 2.78:1, and a yellow
  * one far worse.
  */
-function chipVisuals(fill: string): ChipVisuals {
-  const fg = onColor(fill);
+function chipVisuals(requested: string): ChipVisuals {
+  const { fill, fg, adjusted } = readableFill(requested);
   return {
     className: fg === ON_DARK ? '' : 'crm-chip--on-light',
     style: {
       color: fg,
       background: fill,
-      borderColor: chipNeedsOutline(fill) ? chipOutline(fill) : 'transparent',
+      // Outlined when the fill had to move, so the chip still reads as the
+      // colour the user picked rather than looking like a different tag.
+      borderColor: adjusted ? chipOutline(requested) : 'transparent',
     },
   };
 }
