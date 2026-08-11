@@ -59,6 +59,12 @@
   font-weight: 700;
   font-size: 15px;
   flex-shrink: 0;
+  /* Explicit and box-sizing: border-box, so this is a known, fixed number —
+     .fb-crm-body's max-height below subtracts it directly rather than
+     trusting flexbox to work out the remaining space on its own. See the
+     comment there for why. */
+  box-sizing: border-box;
+  height: 50px;
 }
 
 .fb-crm-close {
@@ -81,6 +87,24 @@
   padding: 14px 14px 16px;
   overflow-y: auto;
   flex: 1;
+  /* A flex item's default min-height is `auto` — "never shrink below my
+     content" — which is exactly wrong for a scroll pane: it makes the body
+     grow to fit everything (all the tags, the delete confirmation, ...) past
+     the panel's max-height, and #fb-crm-panel's own `overflow: hidden` clips
+     the excess instead of this ever becoming tall enough to need scrolling
+     of its own. Overriding to 0 is what lets flexbox shrink the body at all. */
+  min-height: 0;
+  /* Belt-and-braces beyond flex:1 + min-height:0: confirmed via devtools on a
+     real page that this element can measure its full, unshrunk content
+     height (matching its own scrollHeight) instead of the space actually
+     left under the header — flex-shrink silently not applying, for reasons
+     that didn't reproduce in an isolated test page, even though min-height
+     computed correctly as 0px. flex-shrink is a negotiation between this
+     element, its siblings and the container; max-height is not — it caps
+     THIS box outright regardless of what the flex algorithm decided, so it
+     can't be defeated the same way. 50px matches .fb-crm-header's explicit
+     height above. */
+  max-height: calc(72vh - 50px);
 }
 
 .fb-crm-empty {

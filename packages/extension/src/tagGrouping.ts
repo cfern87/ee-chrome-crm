@@ -20,9 +20,30 @@ export interface TagBucket {
 const UNGROUPED_KEY = '__ungrouped__';
 
 /**
+ * Sort order for tags within a single group (or the ungrouped bucket).
+ *
+ * A tag carrying an explicit `order` (see storage.ts) always sorts ahead of
+ * one that doesn't — that's what lets a group be reordered a tag at a time
+ * rather than needing every tag backfilled before any of them can move.
+ * Between two explicitly-ordered tags, `order` decides; between two that
+ * have never been touched, `createdAt` does, which is exactly today's
+ * default (creation order) and so changes nothing for a group nobody has
+ * reordered yet.
+ */
+export function tagDisplayOrder(a: Tag, b: Tag): number {
+  if (a.order !== undefined && b.order !== undefined) return a.order - b.order || a.createdAt - b.createdAt;
+  if (a.order !== undefined) return -1;
+  if (b.order !== undefined) return 1;
+  return a.createdAt - b.createdAt;
+}
+
+/**
  * Bucket `tags` by their tag group, in the same order the Tags tab uses
- * (`order`, then `createdAt`), with ungrouped tags last. Input order is
- * preserved inside each bucket.
+ * (`order`, then `createdAt`), with ungrouped tags last. Tags within each
+ * bucket are sorted by tagDisplayOrder, so this is the one place that has to
+ * apply it for a grouped tag to "always show up in that order" — the contact
+ * detail, the tag filter, the in-page panel and the Tags admin panel all read
+ * their grouped lists through here.
  *
  * Empty buckets are dropped, so a profile shows headings only for groups the
  * contact actually has tags in. A `groupId` pointing at a deleted group counts
@@ -47,9 +68,9 @@ export function bucketTagsByGroup(tags: Tag[], groups: Record<string, TagGroup>)
   const out: TagBucket[] = [];
   for (const g of ordered) {
     const list = byGroup.get(g.id);
-    if (list?.length) out.push({ key: g.id, label: g.name, color: g.color, tags: list });
+    if (list?.length) out.push({ key: g.id, label: g.name, color: g.color, tags: list.sort(tagDisplayOrder) });
   }
-  if (ungrouped.length) out.push({ key: UNGROUPED_KEY, label: 'Ungrouped', tags: ungrouped });
+  if (ungrouped.length) out.push({ key: UNGROUPED_KEY, label: 'Ungrouped', tags: ungrouped.sort(tagDisplayOrder) });
   return out;
 }
 

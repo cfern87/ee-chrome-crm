@@ -294,10 +294,14 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
   const [nameDraft, setNameDraft] = useState('');
 
   // Tags on this contact, and the ones it could still be given, both bucketed by
-  // tag group. Applied tags keep conv.tags order inside each group, so adding a
-  // tag doesn't reshuffle the ones already there. Derived plainly rather than
-  // memoized — it's a handful of tags, and a memo keyed on freshly-built arrays
-  // would never hit anyway.
+  // tag group. In flat (ungrouped) mode, applied tags keep conv.tags order —
+  // adding a tag doesn't reshuffle the ones already there. Grouped mode
+  // instead sorts each bucket by the tag's own display order (tagDisplayOrder,
+  // in tagGrouping.ts): "always show up in that order when in a group" is the
+  // whole point of that field, so it overrides application order the same way
+  // here as it does in the tag filter and the in-page panel. Derived plainly
+  // rather than memoized — it's a handful of tags, and a memo keyed on
+  // freshly-built arrays would never hit anyway.
   const appliedTags = conv.tags.map((id) => store.tags[id]).filter((t): t is Tag => !!t);
   const appliedBuckets = bucketTags(appliedTags, store.tagGroups, grouped);
   const availableBuckets = bucketTags(availableTags, store.tagGroups, grouped);

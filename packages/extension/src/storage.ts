@@ -57,6 +57,16 @@ export interface Tag {
   // Optional grouping: the id of the TagGroup this tag belongs to. Absent =
   // ungrouped. Used to give tags order/structure in the dashboard.
   groupId?: string;
+  // Display position among the other tags in the SAME group. Optional and
+  // sparse rather than required like TagGroup.order: tags predate this field
+  // by a long way, so every tag in every existing store starts without one.
+  // Backfilling all of them at once was rejected in favor of the lazier rule
+  // in tagGrouping.ts's tagDisplayOrder: an explicit order sorts by that
+  // number; its absence falls back to createdAt (today's default — creation
+  // order). A group only gets real numbers once someone drags a tag in it,
+  // at which point every tag in that group is rewritten with one so the
+  // whole group becomes, and stays, explicitly ordered.
+  order?: number;
   // When true, this tag's chip is NOT drawn on Messenger's conversation rows.
   // It still exists everywhere else — the CRM panel, the dashboard, search — so
   // this is purely about keeping the sidebar readable when a tag is applied to

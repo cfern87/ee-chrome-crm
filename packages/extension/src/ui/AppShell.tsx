@@ -91,6 +91,20 @@ export function AppShell<Id extends string>({
   children,
 }: AppShellProps<Id>) {
   const bellRef = useRef<HTMLButtonElement>(null);
+  const mainRef = useRef<HTMLElement>(null);
+
+  // `main` is one persistent DOM node shared by every destination — only its
+  // children swap — so a scroll position from one route survives into the
+  // next. That's invisible on a route that scrolls itself right back into
+  // view, but Contacts sets `contentScroll={false}` (it manages its own two
+  // independent scrollers) and switches `main`'s `overflow` to `hidden`.
+  // `overflow: hidden` doesn't reset `scrollTop`, it just stops the user
+  // scrolling it back — so arriving from a route you'd scrolled down, the
+  // whole Contacts pane renders shifted up by however far Tags was scrolled,
+  // permanently, with no drag or wheel event able to move it back.
+  useEffect(() => {
+    if (mainRef.current) mainRef.current.scrollTop = 0;
+  }, [activeId]);
 
   return (
     <div
@@ -127,6 +141,7 @@ export function AppShell<Id extends string>({
         />
 
         <main
+          ref={mainRef}
           style={{
             minWidth: 0,
             minHeight: 0,

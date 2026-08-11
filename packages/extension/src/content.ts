@@ -1083,7 +1083,7 @@ const removedThreads = new Set<string>();
 // re-render can't disarm it (or leave it armed) mid-decision.
 let deleteArmed = false;
 
-// ---- Panel preferences (per-browser, via localStorage) -------------------
+// ---- Panel preferences (per-browser, via chrome.storage.local) -----------
 //
 // Whether each of the panel's two tag sections is split by tag group. Two
 // independent preferences, not one: "Tags on this conversation" is usually
@@ -1092,26 +1092,44 @@ let deleteArmed = false;
 // how you find one you half-remember. A user who wants one grouped and the
 // other flat shouldn't have to choose.
 //
-// localStorage rather than the CRM store: this is a per-browser reading
-// preference, not data — it shouldn't sync across machines or cost a Drive
-// write — and it needs to survive nothing more than navigating between
-// profiles, which localStorage does for free since the panel re-renders in
-// place rather than reloading the page.
+// chrome.storage.local, NOT window.localStorage — this content script runs on
+// two different origins (see manifest.json: www.facebook.com AND
+// www.messenger.com), and localStorage is scoped per ORIGIN, not per
+// extension. A preference set while looking at a profile on facebook.com is
+// invisible from messenger.com and vice versa — "grouped by default, click
+// ungroup, open another profile, it's grouped again" is exactly that: the
+// second profile was rendered on the other origin's OWN, untouched default.
+// chrome.storage.local has no such split — it belongs to the extension, not
+// to whichever page happens to be open — which is what "persisted between
+// profile views" actually needs here.
+//
+// Not the CRM store: this is a per-browser reading preference, not data — it
+// shouldn't sync across machines or cost a Drive write.
 const PANEL_PREF_PREFIX = 'fb_crm_panel_';
 
-function readPanelPref(key: string, fallback: boolean): boolean {
-  try {
-    const raw = window.localStorage.getItem(PANEL_PREF_PREFIX + key);
-    return raw === null ? fallback : raw === '1';
-  } catch {
-    return fallback; // localStorage disabled or unavailable — just don't persist
-  }
+function readPanelPref(key: string, fallback: boolean): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const storageKey = PANEL_PREF_PREFIX + key;
+      chrome.storage.local.get(storageKey, (res) => {
+        if (chrome.runtime.lastError) { resolve(fallback); return; }
+        const v = res?.[storageKey];
+        resolve(typeof v === 'boolean' ? v : fallback);
+      });
+    } catch {
+      resolve(fallback); // storage unavailable — just don't persist
+    }
+  });
 }
 
-function writePanelPref(key: string, value: boolean): void {
-  try {
-    window.localStorage.setItem(PANEL_PREF_PREFIX + key, value ? '1' : '0');
-  } catch { /* a preference that won't persist isn't worth failing the click over */ }
+function writePanelPref(key: string, value: boolean): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.set({ [PANEL_PREF_PREFIX + key]: value }, () => { void chrome.runtime.lastError; resolve(); });
+    } catch {
+      resolve(); // a preference that won't persist isn't worth failing the click over
+    }
+  });
 }
 
 /**
@@ -1394,8 +1412,10 @@ async function renderPanelContent() {
     .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
 
   // Independent per section — see the PANEL_PREF_PREFIX comment above.
-  const tagsGrouped = readPanelPref('tagsGrouped', true);
-  const addTagGrouped = readPanelPref('addTagGrouped', true);
+  const [tagsGrouped, addTagGrouped] = await Promise.all([
+    readPanelPref('tagsGrouped', true),
+    readPanelPref('addTagGrouped', true),
+  ]);
 
   panelEl.innerHTML = `
     <div class="fb-crm-header">
@@ -1631,7 +1651,8 @@ function wirePanelActions(threadId: string) {
   panelEl.querySelectorAll<HTMLElement>('[data-group-toggle]').forEach(btn => {
     btn.addEventListener('click', async () => {
       const key = btn.dataset.groupToggle!;
-      writePanelPref(key, !readPanelPref(key, true));
+      const current = await readPanelPref(key, true);
+      await writePanelPref(key, !current);
       await renderPanel(); // no store change — just re-read the preference and redraw
     });
   });

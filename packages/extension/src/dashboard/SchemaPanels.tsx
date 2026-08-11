@@ -7,6 +7,7 @@ import React, { useState } from 'react';
 import type { Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType } from '../storage';
 import { Button, Card, Chip, Input, Select, Stack, Text, color, fontSize, fontWeight, radius, space } from '../ui/primitives';
 import { HIDDEN_TAG_TITLE } from './shared';
+import { tagDisplayOrder } from '../tagGrouping';
 
 // --- Tags sub-component ---
 export interface TagsPanelProps {
@@ -29,6 +30,8 @@ export interface TagsPanelProps {
   onRecolorTag: (tagId: string, color: string) => void;
   onSetTagGroup: (tagId: string, groupId: string) => void;
   onSetTagHidden: (tagId: string, hidden: boolean) => void;
+  /** Persist a full reorder: every tag id in this group (or the ungrouped list), in its new order. */
+  onReorderTags: (orderedIds: string[]) => void;
   onAddGroup: () => void;
   onRenameGroup: (groupId: string, name: string) => void;
   onDeleteGroup: (groupId: string) => void;
@@ -39,17 +42,55 @@ export function TagsPanel(props: TagsPanelProps) {
     tags, tagGroups, conversations,
     newTagName, setNewTagName, newTagColor, setNewTagColor, newTagGroup, setNewTagGroup,
     newGroupName, setNewGroupName, newGroupColor, setNewGroupColor,
-    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onSetTagHidden, onAddGroup, onRenameGroup, onDeleteGroup,
+    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onSetTagHidden, onReorderTags, onAddGroup, onRenameGroup, onDeleteGroup,
   } = props;
 
   const usageOf = (tagId: string) => conversations.filter((c) => c.tags.includes(tagId)).length;
 
-  const tagRow = (tag: Tag) => {
+  // Drag-and-drop reorder within a single group's list. `dragId` is the tag
+  // being dragged; `overId` is whichever row the pointer is currently over,
+  // purely for the drop-target outline — the actual move only happens on
+  // drop, not as the pointer crosses rows, so a reorder can be abandoned
+  // mid-drag (Escape, or releasing outside any row) without writing anything.
+  //
+  // Native HTML5 drag-and-drop rather than a library: this app has no drag
+  // machinery anywhere else, and one draggable handle plus a dragover/drop
+  // pair on each row is the whole feature — pulling in a dependency for that
+  // would outweigh it.
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [overId, setOverId] = useState<string | null>(null);
+
+  // `listIds` is the group's full tag-id list in its CURRENT order; the drop
+  // target names where in that list the dragged tag lands.
+  const dropOnto = (listIds: string[], targetId: string) => {
+    if (dragId && dragId !== targetId) {
+      const from = listIds.indexOf(dragId);
+      const to = listIds.indexOf(targetId);
+      if (from !== -1 && to !== -1) {
+        const next = listIds.slice();
+        next.splice(from, 1);
+        next.splice(to, 0, dragId);
+        onReorderTags(next);
+      }
+    }
+    setDragId(null);
+    setOverId(null);
+  };
+
+  // `listIds` is null for the ungrouped section: only GROUPED tags get a
+  // display order (see Tag.order) — ungrouped ones keep sorting by creation
+  // time, so there is nothing here worth a drag handle.
+  const tagRow = (tag: Tag, listIds: string[] | null) => {
     const usageCount = usageOf(tag.id);
     const hidden = !!tag.hideInSidebar;
+    const reorderable = !!listIds && listIds.length > 1;
+    const isDropTarget = reorderable && overId === tag.id && dragId !== tag.id;
     return (
       <div
         key={tag.id}
+        onDragOver={(e) => { if (reorderable && dragId && dragId !== tag.id) { e.preventDefault(); setOverId(tag.id); } }}
+        onDragLeave={() => { if (overId === tag.id) setOverId(null); }}
+        onDrop={(e) => { if (reorderable) { e.preventDefault(); dropOnto(listIds!, tag.id); } }}
         style={{
           // Hidden tags used to get a faint striped fill across the whole row.
           // The marker is the chip's eye-off icon everywhere else now, and the
@@ -58,9 +99,27 @@ export function TagsPanel(props: TagsPanelProps) {
           background: color.surface.raised,
           borderRadius: radius.sm, padding: `${space.sm}px ${space.md}px`,
           display: 'flex', alignItems: 'center', gap: space.md,
-          border: `1px solid ${color.border.subtle}`,
+          border: `1px solid ${isDropTarget ? color.accent.base : color.border.subtle}`,
+          opacity: dragId === tag.id ? 0.5 : 1,
         }}
       >
+        {reorderable ? (
+          <span
+            draggable
+            onDragStart={(e) => { setDragId(tag.id); e.dataTransfer.effectAllowed = 'move'; }}
+            onDragEnd={() => { setDragId(null); setOverId(null); }}
+            title="Drag to reorder within this group"
+            aria-label={`Reorder ${tag.name} within its group`}
+            style={{ cursor: 'grab', color: color.text.muted, fontSize: 15, lineHeight: 1, flexShrink: 0, touchAction: 'none' }}
+          >
+            ⠿
+          </span>
+        ) : (
+          // A same-width spacer, not nothing — otherwise a group's last tag
+          // (nothing left to reorder against) and its first N-1 (which do get
+          // a handle) would misalign against each other.
+          <span aria-hidden="true" style={{ width: 15, flexShrink: 0 }} />
+        )}
         <input
           type="color"
           value={tag.color}
@@ -199,7 +258,8 @@ export function TagsPanel(props: TagsPanelProps) {
 
       {/* Grouped tags */}
       {tagGroups.map((group) => {
-        const groupTags = tags.filter((t) => t.groupId === group.id);
+        const groupTags = tags.filter((t) => t.groupId === group.id).sort(tagDisplayOrder);
+        const groupIds = groupTags.map((t) => t.id);
         return (
           <div key={group.id} style={{ marginBottom: 18 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
@@ -224,7 +284,7 @@ export function TagsPanel(props: TagsPanelProps) {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {groupTags.length === 0 ? (
                 <div style={{ fontSize: 12, color: color.text.muted, padding: '4px 2px' }}>No tags in this group yet.</div>
-              ) : groupTags.map(tagRow)}
+              ) : groupTags.map((t) => tagRow(t, groupIds))}
             </div>
           </div>
         );
@@ -237,7 +297,7 @@ export function TagsPanel(props: TagsPanelProps) {
             <div style={{ fontWeight: 700, fontSize: 14, color: color.text.primary, marginBottom: 8, padding: '0 6px' }}>Ungrouped</div>
           )}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {ungrouped.map(tagRow)}
+            {ungrouped.map((t) => tagRow(t, null))}
           </div>
         </div>
       )}

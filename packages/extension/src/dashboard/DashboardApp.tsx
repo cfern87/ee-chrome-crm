@@ -869,6 +869,26 @@ export default function DashboardApp() {
     await updateStore({ ...store, tags: { ...store.tags, [tagId]: touchDef(nextTag) } });
   };
 
+  // Persist a new relative order for every tag in one group (or the
+  // ungrouped bucket) after a drag-and-drop reorder in the Tags panel.
+  // `orderedIds` is the group's FULL tag list in its new order, and every one
+  // of those tags is rewritten with its index — not just the tag that moved.
+  // A group nobody has reordered yet has no explicit order on any of its
+  // tags (see Tag.order), so giving only the dropped tag one would leave it
+  // sorting against untouched siblings by creation time, which is not the
+  // position it was just dropped at. Writing the whole list makes the group
+  // explicitly and stably ordered from this point on.
+  const reorderTags = async (orderedIds: string[]) => {
+    const nextTags = { ...store.tags };
+    let changed = false;
+    orderedIds.forEach((id, index) => {
+      const t = nextTags[id];
+      if (t && t.order !== index) { nextTags[id] = touchDef({ ...t, order: index }); changed = true; }
+    });
+    if (!changed) return;
+    await updateStore({ ...store, tags: nextTags });
+  };
+
   // --- Tag groups ---
   const tagGroups = Object.values(store.tagGroups).sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
 
@@ -1623,6 +1643,7 @@ export default function DashboardApp() {
                 onRecolorTag={recolorTag}
                 onSetTagGroup={setTagGroup}
                 onSetTagHidden={setTagHidden}
+                onReorderTags={reorderTags}
                 onAddGroup={addTagGroup}
                 onRenameGroup={renameTagGroup}
                 onDeleteGroup={deleteTagGroup}
