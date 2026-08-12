@@ -3,6 +3,14 @@
 branch="$(git symbolic-ref --short HEAD 2>/dev/null)"
 
 if [ "$branch" = "main" ]; then
+  # Skip commits that only stage the Chrome Web Store upload zip(s) in the
+  # root dist/ dir — those are build artifacts of a version already bumped
+  # by the commit that changed the source, so bumping again would double-count.
+  staged="$(git diff --cached --name-only)"
+  if [ -n "$staged" ] && ! grep -qvE '^dist/' <<< "$staged"; then
+    exit 0
+  fi
+
   node "$(git rev-parse --show-toplevel)/scripts/bump-version.js" || exit 1
   # dist/manifest.json is bumped too, but it's gitignored — don't stage it.
   git add packages/extension/public/manifest.json \
