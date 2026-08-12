@@ -449,20 +449,37 @@ export default function DashboardApp() {
   // Filters get set once and read many times, so the header holding them open
   // permanently costs three or four contact rows on every screen. It collapses
   // to just the search box as soon as the list moves, and comes back at the
-  // top. A "Filters" button reaches them without scrolling up.
+  // top. A prominent toggle button can also close it manually.
+  //
+  // `filtersClosed` is sticky: unlike the scroll-driven `listScrolled`, it is
+  // never reset by a scroll event, including the scroll-to-top that used to
+  // silently reopen it. Without that, a list with just enough rows to skirt
+  // the fit/overflow boundary would hide the header, gain enough room to fit
+  // without scrolling, get its scrollTop clamped to 0 by the browser, and
+  // reopen the header on that synthetic event — reintroducing the overflow
+  // and looping. A manual close now overrides scroll position entirely, so
+  // there's nothing left to loop.
   const listScrollRef = useRef<HTMLDivElement>(null);
   const [listScrolled, setListScrolled] = useState(false);
-  /** null = follow the scroll position; true/false = the user overrode it. */
-  const [filtersForced, setFiltersForced] = useState<boolean | null>(null);
-  const filtersVisible = filtersForced ?? !listScrolled;
+  const [filtersClosed, setFiltersClosed] = useState(false);
+  const filtersVisible = !filtersClosed && !listScrolled;
 
   const onListScroll = (e: React.UIEvent<HTMLDivElement>) => {
     const top = e.currentTarget.scrollTop;
     // Different thresholds each way, or a header that changes height would
     // change the scroll position and flap against its own boundary.
     setListScrolled((was) => (was ? top > 8 : top > 48));
-    // Back at the top, drop any override and follow the scroll again.
-    if (top <= 8) setFiltersForced(null);
+  };
+
+  const toggleFilters = () => {
+    if (filtersVisible) {
+      setFiltersClosed(true);
+    } else {
+      // Reopening shows immediately even mid-scroll; the next scroll event
+      // still governs from there, so it can auto-hide again on its own.
+      setFiltersClosed(false);
+      setListScrolled(false);
+    }
   };
 
   const activeFilterCount =
@@ -1097,9 +1114,11 @@ export default function DashboardApp() {
             }}
           >
             {/* The header keeps the search box and nothing else once the list
-                is scrolled: the filters are set once and then read many times,
-                so holding ~150px of them open costs three or four contacts on
-                every screen. Scrolling back to the top brings them back. */}
+                is scrolled or the filters are closed manually: they're set
+                once and then read many times, so holding ~150px of them open
+                costs three or four contacts on every screen. The toggle
+                button below is always present so filters are reachable
+                without scrolling to the top. */}
             <div style={{ flex: '0 0 auto', padding: space.md, borderBottom: `1px solid ${color.border.subtle}`, display: 'flex', flexDirection: 'column', gap: space.sm }}>
               <div style={{ display: 'flex', gap: space.xs, alignItems: 'center' }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
@@ -1115,19 +1134,18 @@ export default function DashboardApp() {
                     )}
                   </FormField>
                 </div>
-                {/* Only offered while collapsed — expanded, the controls are
-                    right there and a toggle would just be another control. */}
-                {!filtersVisible && (
-                  <Button
-                    size="sm"
-                    variant={activeFilterCount > 0 ? 'primary' : 'secondary'}
-                    aria-expanded={false}
-                    onClick={() => setFiltersForced(true)}
-                    title="Show filters and sorting"
-                  >
-                    Filters{activeFilterCount > 0 ? ` · ${activeFilterCount}` : ''}
-                  </Button>
-                )}
+                {/* Always present — this is the only manual control for
+                    showing/hiding filters, so it can't be conditionally
+                    hidden along with the thing it toggles. */}
+                <Button
+                  size="sm"
+                  variant={activeFilterCount > 0 ? 'primary' : 'secondary'}
+                  aria-expanded={filtersVisible}
+                  onClick={toggleFilters}
+                  title={filtersVisible ? 'Hide filters and sorting' : 'Show filters and sorting'}
+                >
+                  {filtersVisible ? '▾' : '▸'} Filters{activeFilterCount > 0 ? ` · ${activeFilterCount}` : ''}
+                </Button>
               </div>
 
               {filtersVisible && (
@@ -1210,13 +1228,6 @@ export default function DashboardApp() {
                 ctx={queryCtx}
               />
 
-              {/* Only when held open against the scroll position — at the top
-                  they collapse on their own and this would be a dead control. */}
-              {filtersForced === true && listScrolled && (
-                <Button size="sm" variant="link" onClick={() => setFiltersForced(false)} style={{ alignSelf: 'flex-start' }}>
-                  Hide filters
-                </Button>
-              )}
               </>
               )}
             </div>
