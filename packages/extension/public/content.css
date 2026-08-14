@@ -190,6 +190,44 @@
   align-items: center;
 }
 
+/* ---- Preset actions ("Quick actions") ----
+   A wrap of small buttons, each applying a bundle of edits in one press. They
+   read as ACTIONS rather than as tags: square-ish corners and a border, not
+   the fully-rounded pill a tag chip uses, so a row of presets sitting a few
+   pixels above a row of tag chips can't be mistaken for more tags. */
+
+.fb-crm-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.fb-crm-preset-btn {
+  border: 1px solid #d2d6dc;
+  background: #f5f6f7;
+  color: #1c1e21;
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  font-family: inherit;
+}
+.fb-crm-preset-btn:hover { filter: brightness(0.96); }
+
+/* Only presets that DELETE get the danger treatment, and they still take two
+   clicks — the first only arms the confirmation below. */
+.fb-crm-preset-danger { border-color: #f0b7b7; color: #c53030; }
+
+.fb-crm-preset-armed {
+  background: #e53e3e;
+  border-color: #e53e3e;
+  color: #ffffff;
+}
+.fb-crm-preset-armed:hover { background: #c92f2f; }
+
 /* ---- Tag sections ("Tags on this conversation", "Add existing tag") ---- */
 
 .fb-crm-section-title-row {

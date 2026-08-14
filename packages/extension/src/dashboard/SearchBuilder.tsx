@@ -7,6 +7,8 @@
 
 import React, { useMemo, useState } from 'react';
 import { color } from '../ui/primitives';
+import { useLocalPref } from '../ui/prefs';
+import { bucketTags, showsGroupLabels } from '../tagGrouping';
 import type { Tag, TagGroup, CustomFieldDef } from '../storage';
 import {
   QueryGroup, QueryNode, Condition, Combinator, SavedSearch, DurationUnit,
@@ -14,6 +16,25 @@ import {
   buildFields, findField, operatorsFor, operatorDef,
   newGroup, newCondition, conditionIssue, describeQuery, isQueryEmpty, sortSavedSearches,
 } from '../search';
+
+/**
+ * Whether the tag pickers inside a search filter are split by tag group.
+ *
+ * Per-machine (localStorage, like every other reading preference — see
+ * ui/prefs.ts), and OFF by default, which is the opposite of the contact
+ * list's tag filter. That filter is a standing view you set once; a search
+ * condition is a picker you open, choose from, and close, and in that moment a
+ * heading per group is a row of chrome between you and the chip you came for.
+ * Grouping is still how you find a tag you only half-remember, so it's one
+ * click away — and one toggle covers every tag picker in the builder, because
+ * "grouped here but flat in the row below" is not a distinction anyone wants.
+ */
+export const SEARCH_TAGS_GROUPED_KEY = 'searchTagsGrouped';
+
+export function useSearchTagGrouping(): [boolean, () => void] {
+  const [grouped, setGrouped] = useLocalPref(SEARCH_TAGS_GROUPED_KEY, false);
+  return [grouped, () => setGrouped((v) => !v)];
+}
 
 // A raw enum option value is normally its own label — fine for something like
 // a custom-field dropdown, whose choices are already whatever the user typed.
@@ -57,13 +78,26 @@ const depthColor = (d: number) => DEPTH_COLORS[d % DEPTH_COLORS.length];
 
 interface Choice { value: string; label: string; color?: string; }
 
+/** A heading and the choices that fell under it. One bucket = a flat list. */
+interface ChoiceBucket { key: string; label: string; color?: string; choices: Choice[]; }
+
 /**
  * Chip-style multi-select. Selections stay visible as chips; the picker opens
  * inline (rather than as an overlay) so it can't be clipped by the surrounding
  * scroll container.
+ *
+ * `buckets` is how a tag picker gets split by tag group: the caller decides
+ * what the sections are (so this component never has to know what a TagGroup
+ * is), and passes `grouping` to render the Group/Ungroup control that switches
+ * between them. Everything else — enum options, tag groups themselves — passes
+ * one bucket and no grouping, and renders exactly as before.
  */
-function MultiChipSelect({ choices, selected, onChange, placeholder }: {
+function MultiChipSelect({ choices, buckets, showBucketLabels, grouping, selected, onChange, placeholder }: {
   choices: Choice[];
+  buckets?: ChoiceBucket[];
+  showBucketLabels?: boolean;
+  /** Absent when grouping would change nothing (no choice here belongs to a group). */
+  grouping?: { grouped: boolean; onToggle: () => void };
   selected: string[];
   onChange: (next: string[]) => void;
   placeholder: string;
@@ -74,9 +108,32 @@ function MultiChipSelect({ choices, selected, onChange, placeholder }: {
   const toggle = (v: string) =>
     onChange(selected.includes(v) ? selected.filter((x) => x !== v) : [...selected, v]);
 
-  const visible = filter
-    ? choices.filter((c) => c.label.toLowerCase().includes(filter.toLowerCase()))
-    : choices;
+  const needle = filter.trim().toLowerCase();
+  const match = (c: Choice) => !needle || c.label.toLowerCase().includes(needle);
+
+  // Filtering hides whole sections rather than leaving an empty heading behind.
+  const visibleBuckets: ChoiceBucket[] = (buckets ?? [{ key: '__all__', label: '', choices }])
+    .map((b) => ({ ...b, choices: b.choices.filter(match) }))
+    .filter((b) => b.choices.length > 0);
+  const visibleCount = visibleBuckets.reduce((n, b) => n + b.choices.length, 0);
+
+  const chipFor = (c: Choice) => {
+    const on = selected.includes(c.value);
+    return (
+      <button
+        key={c.value}
+        onClick={() => toggle(c.value)}
+        style={{
+          border: `1px solid ${on ? (c.color || color.accent.base) : color.border.subtle}`,
+          background: on ? (c.color || color.accent.base) : color.surface.raised,
+          color: on ? color.surface.raised : color.text.secondary,
+          borderRadius: 10, fontSize: 11, fontWeight: 600, padding: '3px 9px', cursor: 'pointer',
+        }}
+      >
+        {on ? '✓ ' : ''}{c.label}
+      </button>
+    );
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 170, flex: 1 }}>
@@ -114,34 +171,44 @@ function MultiChipSelect({ choices, selected, onChange, placeholder }: {
 
       {open && (
         <div style={{ border: `1px solid ${color.border.subtle}`, borderRadius: 6, padding: 6, background: color.surface.sunken }}>
-          {choices.length > 8 && (
-            <input
-              autoFocus
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              placeholder="Filter…"
-              style={{ ...control, width: '100%', boxSizing: 'border-box', marginBottom: 6 }}
-            />
-          )}
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: 150, overflowY: 'auto' }}>
-            {visible.length === 0 && <span style={{ fontSize: 11, color: color.text.muted }}>Nothing to choose from.</span>}
-            {visible.map((c) => {
-              const on = selected.includes(c.value);
-              return (
+          {(choices.length > 8 || grouping) && (
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6 }}>
+              {choices.length > 8 && (
+                <input
+                  autoFocus
+                  value={filter}
+                  onChange={(e) => setFilter(e.target.value)}
+                  placeholder="Filter…"
+                  style={{ ...control, flex: 1, minWidth: 0, boxSizing: 'border-box' }}
+                />
+              )}
+              {grouping && (
                 <button
-                  key={c.value}
-                  onClick={() => toggle(c.value)}
-                  style={{
-                    border: `1px solid ${on ? (c.color || color.accent.base) : color.border.subtle}`,
-                    background: on ? (c.color || color.accent.base) : color.surface.raised,
-                    color: on ? color.surface.raised : color.text.secondary,
-                    borderRadius: 10, fontSize: 11, fontWeight: 600, padding: '3px 9px', cursor: 'pointer',
-                  }}
+                  onClick={grouping.onToggle}
+                  aria-pressed={grouping.grouped}
+                  title={grouping.grouped ? 'Show every tag in one list' : 'Split the tags by tag group'}
+                  style={{ ...addBtn, padding: '4px 8px', whiteSpace: 'nowrap' }}
                 >
-                  {on ? '✓ ' : ''}{c.label}
+                  {grouping.grouped ? 'Ungroup' : 'Group'}
                 </button>
-              );
-            })}
+              )}
+            </div>
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 190, overflowY: 'auto' }}>
+            {visibleCount === 0 && <span style={{ fontSize: 11, color: color.text.muted }}>Nothing to choose from.</span>}
+            {visibleBuckets.map((b) => (
+              <div key={b.key}>
+                {showBucketLabels && b.label && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, margin: '2px 0 3px' }}>
+                    {b.color && <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: 2, background: b.color, flexShrink: 0 }} />}
+                    <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', color: color.text.muted }}>
+                      {b.label}
+                    </span>
+                  </div>
+                )}
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>{b.choices.map(chipFor)}</div>
+              </div>
+            ))}
           </div>
         </div>
       )}
@@ -151,15 +218,19 @@ function MultiChipSelect({ choices, selected, onChange, placeholder }: {
 
 // ---- condition row -------------------------------------------------------
 
+/** The Group/Ungroup state every tag picker in one builder shares. */
+export interface TagGrouping { grouped: boolean; onToggle: () => void; }
+
 interface ConditionRowProps {
   cond: Condition;
   fields: FieldDef[];
   ctx: QueryContext;
+  tagGrouping: TagGrouping;
   onChange: (next: Condition) => void;
   onRemove: () => void;
 }
 
-function ConditionRow({ cond, fields, ctx, onChange, onRemove }: ConditionRowProps) {
+function ConditionRow({ cond, fields, ctx, tagGrouping, onChange, onRemove }: ConditionRowProps) {
   const field = findField(fields, cond.field);
   const kind = field?.kind ?? 'text';
   const ops = operatorsFor(kind);
@@ -192,10 +263,38 @@ function ConditionRow({ cond, fields, ctx, onChange, onRemove }: ConditionRowPro
     return seen;
   }, [fields]);
 
-  const tagChoices: Choice[] = useMemo(
-    () => Object.values(ctx.tags).map((t: Tag) => ({ value: t.id, label: t.name, color: t.color })),
-    [ctx.tags]
-  );
+  // Tag choices come out of the same bucketing every other tag list in the app
+  // uses (tagGrouping.ts), so a tag sits in the same place — and in the same
+  // order within its group — here as it does in the panel and the tag filter.
+  // Flat mode is one bucket, which is also what the picker renders when the
+  // store has no tag groups at all.
+  const tagPicker = useMemo(() => {
+    const all = Object.values(ctx.tags);
+    const raw = bucketTags(all, ctx.tagGroups, tagGrouping.grouped);
+    const buckets: ChoiceBucket[] = raw.map((b) => ({
+      key: b.key,
+      label: b.label,
+      color: b.color,
+      choices: b.tags.map((t) => ({ value: t.id, label: t.name, color: t.color })),
+    }));
+    return {
+      buckets,
+      choices: buckets.flatMap((b) => b.choices),
+      showBucketLabels: showsGroupLabels(raw),
+      // Offer the toggle only when it would actually change something — one tag
+      // in one real group is enough, since that alone produces a heading flat
+      // mode wouldn't. Same rule as the panel's sections and the tag filter.
+      groupable: all.some((t: Tag) => t.groupId && ctx.tagGroups[t.groupId]),
+    };
+  }, [ctx.tags, ctx.tagGroups, tagGrouping.grouped]);
+
+  const tagChoices = tagPicker.choices;
+  const tagPickerProps = {
+    buckets: tagPicker.buckets,
+    showBucketLabels: tagPicker.showBucketLabels,
+    grouping: tagPicker.groupable ? { grouped: tagGrouping.grouped, onToggle: tagGrouping.onToggle } : undefined,
+  };
+
   const groupChoices: Choice[] = useMemo(
     () => Object.values(ctx.tagGroups).map((g: TagGroup) => ({ value: g.id, label: g.name, color: g.color })),
     [ctx.tagGroups]
@@ -258,6 +357,7 @@ function ConditionRow({ cond, fields, ctx, onChange, onRemove }: ConditionRowPro
         return (
           <MultiChipSelect
             choices={choices}
+            {...(kind === 'tags' ? tagPickerProps : {})}
             selected={cond.values || []}
             onChange={(values) => onChange({ ...cond, values })}
             placeholder={kind === 'tags' ? 'no tags chosen' : kind === 'tagGroups' ? 'no groups chosen' : 'no options chosen'}
@@ -296,6 +396,7 @@ function ConditionRow({ cond, fields, ctx, onChange, onRemove }: ConditionRowPro
         {kind === 'tagDate' && (
           <MultiChipSelect
             choices={tagChoices}
+            {...tagPickerProps}
             selected={cond.tagIds || []}
             onChange={(tagIds) => onChange({ ...cond, tagIds })}
             placeholder="any tag"
@@ -331,12 +432,13 @@ interface GroupEditorProps {
   group: QueryGroup;
   fields: FieldDef[];
   ctx: QueryContext;
+  tagGrouping: TagGrouping;
   depth: number;
   onChange: (next: QueryGroup) => void;
   onRemove?: () => void;
 }
 
-function GroupEditor({ group, fields, ctx, depth, onChange, onRemove }: GroupEditorProps) {
+function GroupEditor({ group, fields, ctx, tagGrouping, depth, onChange, onRemove }: GroupEditorProps) {
   const setChild = (index: number, next: QueryNode) => {
     const children = group.children.slice();
     children[index] = next;
@@ -424,6 +526,7 @@ function GroupEditor({ group, fields, ctx, depth, onChange, onRemove }: GroupEdi
                   group={child}
                   fields={fields}
                   ctx={ctx}
+                  tagGrouping={tagGrouping}
                   depth={depth + 1}
                   onChange={(next) => setChild(i, next)}
                   onRemove={() => removeChild(i)}
@@ -433,6 +536,7 @@ function GroupEditor({ group, fields, ctx, depth, onChange, onRemove }: GroupEdi
                   cond={child}
                   fields={fields}
                   ctx={ctx}
+                  tagGrouping={tagGrouping}
                   onChange={(next) => setChild(i, next)}
                   onRemove={() => removeChild(i)}
                 />
@@ -688,6 +792,9 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
   );
   const fields = useMemo(() => buildFields(fieldDefs), [fieldDefs]);
   const empty = isQueryEmpty(query);
+  // One toggle for every tag picker in this builder — see SEARCH_TAGS_GROUPED_KEY.
+  const [tagsGrouped, toggleTagsGrouped] = useSearchTagGrouping();
+  const tagGrouping: TagGrouping = { grouped: tagsGrouped, onToggle: toggleTagsGrouped };
 
   return (
     <div style={{ background: color.surface.raised, border: `1px solid ${color.border.subtle}`, borderRadius: 8, padding: 12, marginBottom: 12 }}>
@@ -709,6 +816,7 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
         group={query}
         fields={fields}
         ctx={ctx}
+        tagGrouping={tagGrouping}
         depth={0}
         onChange={onQueryChange}
       />

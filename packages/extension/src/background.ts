@@ -64,6 +64,7 @@ import {
   collectUnseenFailures,
   getFailedNoticeAck,
   getClearedFailures,
+  summarize,
 } from './campaigns';
 import {
   heartbeat,
@@ -83,6 +84,11 @@ import {
   type SendHoldReason,
 } from './syncHealth';
 import { ensureFreshToken } from './drive';
+import {
+  readWebhooks, subscribersOf, buildPayload, deliver, diffContactEvents,
+  WEBHOOKS_KEY,
+  type WebhookEvent, type PendingEvent, type WebhookConfig,
+} from './webhooks';
 
 const TICK_ALARM = 'crm-campaign-tick';
 const WATCHDOG_ALARM = 'crm-campaign-watchdog';
@@ -187,8 +193,122 @@ async function mutateStore(mutations: Mutation[]): Promise<MutateResponse> {
     const { store: next, changed, conversationId } = applyMutations(store, mutations);
     if (!changed) return { success: true, changed: false, store, conversationId };
     const result = await saveStore(next);
+    // After the save, and deliberately not awaited: a webhook endpoint that
+    // takes ten seconds to answer must not hold the store lock for ten seconds
+    // — every other tab's edits would queue behind it.
+    void fireContactWebhooks(store, next);
     return { success: true, changed: true, store: next, conversationId, result };
   });
+}
+
+// ---- webhooks ----
+//
+// Fired from the background because it is the only context with the host
+// permissions to reach an arbitrary endpoint, and the only one that sees every
+// write. See webhooks.ts for the delivery contract (best-effort, one attempt).
+
+/**
+ * Dispatch one event to every webhook subscribed to it.
+ *
+ * Never rejects, and never blocks anything: a webhook is an outbound courtesy,
+ * so a dead endpoint must not be able to fail a save or stall the send queue.
+ * The outcome is written back onto the webhook so Settings can show it — under
+ * the store lock, since that write is a store write like any other.
+ */
+type DeliveryRecord = { id: string; delivery: WebhookConfig['lastDelivery'] };
+
+async function dispatchWebhook(
+  event: WebhookEvent,
+  data: Record<string, unknown>,
+  hooks?: WebhookConfig[],
+  // When provided, the receipts are pushed here instead of being written
+  // immediately — the caller is dispatching a batch and will record once.
+  collect?: DeliveryRecord[],
+): Promise<void> {
+  try {
+    const subscribers = subscribersOf(hooks ?? readWebhooks(await loadStore()), event);
+    if (subscribers.length === 0) return;
+
+    const results = await Promise.all(
+      subscribers.map(async (hook) => ({ id: hook.id, delivery: await deliver(hook, buildPayload(hook, event, data)) }))
+    );
+
+    if (collect) collect.push(...results);
+    else await recordDeliveries(results);
+  } catch (e) {
+    console.warn('[CRM] webhook dispatch failed', e);
+  }
+}
+
+/**
+ * Persist the last-delivery result for each webhook that just fired.
+ *
+ * Takes a whole batch, because this is a store write and therefore (with Drive
+ * on) a sync: recording one receipt per event would mean a CSV import of 500
+ * contacts costing 500 writes purely in bookkeeping about the webhook. Within
+ * a batch only the LAST receipt per webhook is kept — that's what the field
+ * means, and it's the one the user is shown.
+ */
+async function recordDeliveries(results: DeliveryRecord[]): Promise<void> {
+  if (results.length === 0) return;
+  await withStoreLock(async () => {
+    const store = await loadStore();
+    const hooks = readWebhooks(store);
+    let touched = false;
+    const next = hooks.map((h) => {
+      // Last write wins within the batch.
+      const hit = [...results].reverse().find((r) => r.id === h.id);
+      if (!hit || !hit.delivery) return h;
+      touched = true;
+      return { ...h, lastDelivery: hit.delivery };
+    });
+    if (!touched) return;
+    // Written straight into settings rather than through a mutation, because a
+    // delivery receipt is bookkeeping about the webhook itself — it must never
+    // look like CRM activity and re-enter diffContactEvents.
+    await saveStore({ ...store, settings: { ...store.settings, [WEBHOOKS_KEY]: next } });
+  });
+}
+
+/**
+ * How many events one write may produce. A CSV import of a few thousand rows
+ * is one store write and one diff, and dispatching all of it — sequentially,
+ * each with a 10s timeout — could run for hours against a slow endpoint while
+ * the user has long since moved on.
+ *
+ * So a bulk change is reported as its first `MAX_EVENTS_PER_WRITE` events and
+ * then stops. That is a deliberate limitation of a best-effort notification
+ * channel rather than a bug: an endpoint that needs the whole import should
+ * reconcile against an export (this is exactly the case docs/WEBHOOKS.md tells
+ * receivers not to rely on webhooks for).
+ */
+const MAX_EVENTS_PER_WRITE = 50;
+
+/** Diff two store snapshots and fire whatever the change amounts to. */
+async function fireContactWebhooks(prev: Store, next: Store): Promise<void> {
+  try {
+    const hooks = readWebhooks(next);
+    if (hooks.length === 0) return;
+    const events: PendingEvent[] = diffContactEvents(prev, next);
+    if (events.length === 0) return;
+
+    if (events.length > MAX_EVENTS_PER_WRITE) {
+      console.warn(
+        `[CRM] ${events.length} webhook events from one write — sending the first ${MAX_EVENTS_PER_WRITE} and dropping the rest.`,
+      );
+    }
+
+    // Sequential rather than parallel: firing a hundred requests simultaneously
+    // at one endpoint is a self-inflicted flood the receiver will rate-limit us
+    // for. Receipts are collected and written once at the end.
+    const receipts: DeliveryRecord[] = [];
+    for (const e of events.slice(0, MAX_EVENTS_PER_WRITE)) {
+      await dispatchWebhook(e.event, e.data, hooks, receipts);
+    }
+    await recordDeliveries(receipts);
+  } catch (e) {
+    console.warn('[CRM] webhook diff failed', e);
+  }
 }
 
 // ---- sender tab bookkeeping (survives SW restarts) ----
@@ -496,6 +616,11 @@ interface Attempt { ok: boolean; error?: string; failureKind?: SendFailureKind }
 // delivered; see the DupGuard comment in content.ts. Only the retries pass one.
 type DupGuard = 'sent-only' | 'not-failed';
 
+// Campaign-level conditions on whether a send is allowed to happen at all, as
+// opposed to how it is performed. Threaded down to the content script, which is
+// the only place that can see the conversation and answer them.
+interface SendGate { skipIfUnread?: boolean }
+
 // A first attempt that read an explicit "Couldn't send" proves both that the
 // message didn't go out AND that status reading works on this page, so the
 // retry can insist on an explicit "Sent". Any other failure leaves us unable to
@@ -505,10 +630,10 @@ function dupGuardFor(first: Attempt): DupGuard {
 }
 
 // One send attempt against an already-open chat page.
-async function attemptSend(tabId: number, r: Campaign['recipients'][number], dryRun: boolean, skipIfDelivered: DupGuard | undefined, log: string[]): Promise<Attempt> {
+async function attemptSend(tabId: number, r: Campaign['recipients'][number], dryRun: boolean, skipIfDelivered: DupGuard | undefined, log: string[], opts: SendGate = {}): Promise<Attempt> {
   const res = await sendViaPort<SendResult>(tabId, {
     type: 'CRM_SEND_MESSAGE',
-    payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered },
+    payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered, skipIfUnread: opts.skipIfUnread },
   }, 120_000);
   if (!res) {
     log.push('send port closed without a response');
@@ -530,7 +655,7 @@ async function attemptSend(tabId: number, r: Campaign['recipients'][number], dry
 // stored id says. So we go there, take the id, retry the thread, and if that
 // still won't send, send through the drawer instead. Both retries pass
 // skipIfDelivered, so a message that did quietly go out is never sent twice.
-async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: boolean, guard: DupGuard, log: string[]): Promise<Attempt | null> {
+async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: boolean, guard: DupGuard, log: string[], opts: SendGate = {}): Promise<Attempt | null> {
   const profileUrl = await resolveProfileUrl(r, log);
   if (!profileUrl) {
     log.push('recovery: no profile URL for this contact — cannot recover');
@@ -558,7 +683,7 @@ async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: bool
     log.push(`recovery: retrying on resolved thread ${resolved.threadId}`);
     tabId = await ensureSenderTab(resolved.chatUrl, log);
     if (tabId != null && (await waitForContentReady(tabId, log, 'messages'))) {
-      const retry = await attemptSend(tabId, r, dryRun, guard, log);
+      const retry = await attemptSend(tabId, r, dryRun, guard, log, opts);
       if (retry.ok) return retry;
       log.push(`recovery: resolved-thread retry failed (${retry.error || 'unknown'}) — falling back to the profile drawer`);
     }
@@ -579,7 +704,7 @@ async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: bool
   const drawerTabId = tabId;
   const drawer = await sendViaPort<SendResult>(drawerTabId, {
     type: 'CRM_SEND_VIA_DRAWER',
-    payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered: guard },
+    payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered: guard, skipIfUnread: opts.skipIfUnread },
   }, 120_000);
   if (drawer) log.push(...(drawer.log || []));
 
@@ -594,7 +719,7 @@ async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: bool
     if (/\/messages\/t\//.test(url)) {
       log.push(`recovery: Message opened a full conversation (${url}) — sending there instead`);
       if (await waitForContentReady(drawerTabId, log, 'messages')) {
-        return await attemptSend(drawerTabId, r, dryRun, guard, log);
+        return await attemptSend(drawerTabId, r, dryRun, guard, log, opts);
       }
     }
   }
@@ -613,10 +738,14 @@ async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: bool
 // and the profile can't change that.
 function shouldRecover(a: Attempt): boolean {
   if (a.ok) return false;
-  return a.failureKind !== 'no-composer' && a.failureKind !== 'unavailable';
+  // 'unread' is a deliberate refusal, not a failure to reach the thread — the
+  // send went nowhere BECAUSE we decided it shouldn't. Recovering it would open
+  // the profile and send through the drawer, i.e. do the exact thing the option
+  // was ticked to prevent.
+  return a.failureKind !== 'no-composer' && a.failureKind !== 'unavailable' && a.failureKind !== 'unread';
 }
 
-async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolean): Promise<SendResult> {
+async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolean, gate: SendGate = {}): Promise<SendResult> {
   const log: string[] = [];
   const chatUrl = await resolveChatUrl(r, log);
   if (!chatUrl) {
@@ -631,14 +760,14 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
   } else if (!(await waitForContentReady(tabId, log, 'messages'))) {
     first = { ok: false, error: 'Content script not ready on the chat page' };
   } else {
-    first = await attemptSend(tabId, r, dryRun, undefined, log);
+    first = await attemptSend(tabId, r, dryRun, undefined, log, gate);
   }
   if (first.ok) return { ok: true, log };
   if (!shouldRecover(first)) return { ok: false, error: first.error, failureKind: first.failureKind, log };
 
   // Not confirmed sent. Try to repair the conversation link via the profile.
   log.push(`first attempt did not confirm as sent: ${first.error || 'unknown'}`);
-  const recovery = await recoverViaProfile(r, dryRun, dupGuardFor(first), log);
+  const recovery = await recoverViaProfile(r, dryRun, dupGuardFor(first), log, gate);
   if (recovery?.ok) return { ok: true, log };
 
   // Recovery couldn't run, or ran and also failed — either way this is a real
@@ -963,7 +1092,7 @@ async function processTick(): Promise<void> {
 
     // Perform the actual send (navigates a tab, types, validates). Minutes can
     // pass in here, so everything below re-reads from storage.
-    const result = await sendToRecipient(r, camp.dryRun);
+    const result = await sendToRecipient(r, camp.dryRun, { skipIfUnread: !!camp.skipIfUnread });
 
     q = await loadQueue();
     q.inFlight = undefined;
@@ -991,6 +1120,12 @@ async function processTick(): Promise<void> {
         rr.log = result.log;
         b.count += 1;
         q.sentSinceBatchPause += 1;
+        void dispatchWebhook('message.sent', {
+          campaign: { id: after.id, name: after.name, dryRun: after.dryRun },
+          contact: { id: rr.threadId, name: rr.participantName, chatUrl: rr.chatUrl },
+          message: rr.renderedMessage,
+          dryRun: after.dryRun,
+        });
       } else {
         rr.status = 'error';
         rr.error = result.error;
@@ -999,6 +1134,16 @@ async function processTick(): Promise<void> {
         rr.batchIndex = b.index;
         rr.log = result.log;
         // Errors don't count toward batch pacing — only confirmed sends do.
+        // The diagnostic log is deliberately NOT sent: it is long, it carries
+        // page text, and an endpoint that wants it can be asked for it by hand.
+        void dispatchWebhook('message.failed', {
+          campaign: { id: after.id, name: after.name, dryRun: after.dryRun },
+          contact: { id: rr.threadId, name: rr.participantName, chatUrl: rr.chatUrl },
+          error: rr.error || '',
+          reason: rr.errorKind || 'unconfirmed',
+          // Tells a receiver "held back on purpose" apart from "went wrong".
+          skipped: rr.errorKind === 'unread',
+        });
       }
       // The cursor tracks position, and the recipient list can have shifted
       // under us, so re-derive it from where this recipient actually sits now.
@@ -1065,6 +1210,13 @@ function finishCampaign(c: Campaign): void {
   const b = c.batches[c.batches.length - 1];
   if (b && !b.endedAt) b.endedAt = Date.now();
   console.log(`[CRM] Campaign "${c.name}" complete`);
+  const tally = summarize(c);
+  void dispatchWebhook('campaign.completed', {
+    campaign: { id: c.id, name: c.name, dryRun: c.dryRun, skipIfUnread: !!c.skipIfUnread },
+    total: tally.total,
+    sent: tally.sent,
+    failed: tally.errors,
+  });
 }
 
 // Before the central queue existed, pacing lived on the campaign itself and
@@ -1125,6 +1277,10 @@ async function startCampaign(input: NewCampaignInput): Promise<{ success: boolea
   const camp = createCampaign(input);
   camp.startedAt = Date.now();
   await upsertCampaign(camp);
+  void dispatchWebhook('campaign.started', {
+    campaign: { id: camp.id, name: camp.name, dryRun: camp.dryRun, skipIfUnread: !!camp.skipIfUnread },
+    recipientCount: camp.recipients.length,
+  });
   await kickQueue();
   return { success: true, campaignId: camp.id };
 }
@@ -1452,7 +1608,16 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           }
           // Whole-store replace (dashboard/popup import). Takes the same lock so
           // it can't interleave with a content script's mutation.
-          const result = await withStoreLock(() => saveStore(request.payload as Store));
+          const incoming = request.payload as Store;
+          const result = await withStoreLock(async () => {
+            // Read the outgoing store INSIDE the lock, so the "before" snapshot
+            // the webhook diff runs against is the one this write replaced and
+            // not whatever was there when the message arrived.
+            const before = await loadStore();
+            const saved = await saveStore(incoming);
+            void fireContactWebhooks(before, incoming);
+            return saved;
+          });
           sendResponse({ success: true, result });
           break;
         }
@@ -1629,6 +1794,27 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         }
         case 'REQUEUE_CAMPAIGN_RECIPIENT': {
           sendResponse(await requeueCampaignRecipient(request.payload.campaignId, request.payload.threadId));
+          break;
+        }
+
+        // ---- webhooks ----
+        //
+        // Sent from Settings so the user can prove an endpoint works before
+        // trusting it with real events. Deliberately a real POST of a real
+        // payload — a test that takes a different path than production is a
+        // test of the wrong thing — with `test: true` in the data so the
+        // receiver can discard it.
+        case 'TEST_WEBHOOK': {
+          const hook = readWebhooks(await loadStore()).find((h) => h.id === request.payload?.id);
+          if (!hook) { sendResponse({ ok: false, error: 'That webhook no longer exists.' }); break; }
+          const event: WebhookEvent = hook.events[0] || 'contact.created';
+          const delivery = await deliver(hook, buildPayload(hook, event, {
+            test: true,
+            note: 'Test delivery from Not Another Social CRM. No CRM data changed.',
+            contact: { id: 'test_contact', name: 'Test Contact', tags: ['example'], archived: false },
+          }));
+          await recordDeliveries([{ id: hook.id, delivery }]);
+          sendResponse({ ok: delivery.ok, status: delivery.status, error: delivery.error });
           break;
         }
 

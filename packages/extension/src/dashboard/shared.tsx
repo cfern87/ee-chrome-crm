@@ -7,7 +7,7 @@
 // places. Extracted when DashboardApp.tsx passed 5,500 lines and every one of
 // these was defined next to code that had nothing to do with it.
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import type { Store, Tag, TagGroup, SyncUsage } from '../storage';
 import { DRIVE_SYNC_ALARM } from '../storage';
 import { isSignedIn } from '../license';
@@ -289,6 +289,59 @@ export function SubNav<Id extends string>({
  * Used in the contact detail pane and in the messaging queue, so a wrong or
  * changed URL can be fixed right where a send failed, then requeued.
  */
+/**
+ * A text input over a value that lives in the CRM store, committed on blur
+ * rather than on every keystroke.
+ *
+ * Why this has to exist: writing the store on each character is not merely
+ * wasteful, it is CORRECTING — a save goes to chrome.storage and (with Drive
+ * on) queues a sync, the surrounding component re-renders from whatever
+ * snapshot came back, and a controlled input whose `value` prop is that
+ * snapshot gets reset mid-word. Typing a preset's name a second character at a
+ * time and watching it revert is exactly that race.
+ *
+ * So the draft is local while you are in the field, and the store is written
+ * once you leave it (or press Enter). Escape abandons the edit. While the
+ * field has focus, incoming `value` changes are IGNORED — that is the whole
+ * point; a sync landing mid-word must not touch what you are typing — and the
+ * draft re-seeds from the prop as soon as focus leaves, so an edit made on
+ * another machine still shows up.
+ */
+export function DraftInput({
+  value, onCommit, style, ...rest
+}: {
+  value: string;
+  onCommit: (next: string) => void;
+} & Omit<React.InputHTMLAttributes<HTMLInputElement>, 'value' | 'onChange' | 'onBlur' | 'onKeyDown'>) {
+  const [draft, setDraft] = useState(value);
+  const [focused, setFocused] = useState(false);
+
+  // Re-seed only while the user is not in the field.
+  useEffect(() => {
+    if (!focused) setDraft(value);
+  }, [value, focused]);
+
+  const commit = () => {
+    setFocused(false);
+    if (draft !== value) onCommit(draft);
+  };
+
+  return (
+    <Input
+      {...rest}
+      value={draft}
+      onFocus={() => setFocused(true)}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') { e.currentTarget.blur(); }
+        if (e.key === 'Escape') { setDraft(value); setFocused(false); e.currentTarget.blur(); }
+      }}
+      style={style}
+    />
+  );
+}
+
 export function ProfileUrlEditor({ value, onSave, compact }: { value?: string; onSave: (raw: string) => Promise<string | null>; compact?: boolean }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');

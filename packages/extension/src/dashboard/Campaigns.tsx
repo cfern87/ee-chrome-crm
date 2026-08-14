@@ -27,6 +27,8 @@ import {
   MachineView, describeHold, sendBg, previewTags, formatRelativeTime, formatDateTime,
   minutes, describePace, readPace, ProfileUrlEditor, CopyButton, type SendingPace,
 } from './shared';
+import { bucketTags, showsGroupLabels } from '../tagGrouping';
+import { useSearchTagGrouping } from './SearchBuilder';
 
 /**
  * A specific recipient line in Past sends, asked for from somewhere else.
@@ -89,6 +91,18 @@ export function StatusBadge({ status }: { status: Campaign['status'] }) {
   );
 }
 
+/** Marks a campaign that holds back anyone who hasn't read the last message. */
+export function UnreadGateChip() {
+  return (
+    <span
+      title="Skips any recipient whose last message isn't marked Read by Facebook"
+      style={{ background: color.surface.sunken, color: color.text.secondary, padding: '3px 9px', borderRadius: 12, fontSize: 11, fontWeight: 700, border: `1px solid ${color.border.control}` }}
+    >
+      👁 Read-only follow-up
+    </span>
+  );
+}
+
 export function DryRunChip() {
   return (
     <span style={{ background: color.warning.subtle, color: color.warning.base, padding: '3px 9px', borderRadius: 12, fontSize: 11, fontWeight: 700, border: `1px solid ${color.warning.base}` }}>
@@ -131,6 +145,14 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dryRun, setDryRun] = useState(false);
+  const [skipIfUnread, setSkipIfUnread] = useState(false);
+
+  // The recipient picker's tag filter, bucketed by tag group on the same
+  // preference the advanced-search pickers use (off by default).
+  const [tagsGrouped, toggleTagsGrouped] = useSearchTagGrouping();
+  const tagBuckets = useMemo(() => bucketTags(tags, store.tagGroups, tagsGrouped), [tags, store.tagGroups, tagsGrouped]);
+  const showTagBucketLabels = showsGroupLabels(tagBuckets);
+  const tagsGroupable = tags.some((t) => t.groupId && store.tagGroups[t.groupId]);
 
   // Adopt contacts pre-selected from the Conversations tab "Message" button.
   useEffect(() => {
@@ -194,6 +216,7 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
         template,
         recipients,
         dryRun,
+        skipIfUnread,
         config: {
           minDelayMs: Math.round(minDelay * 60000),
           maxDelayMs: Math.round(maxDelay * 60000),
@@ -341,6 +364,21 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
               <strong>Dry run</strong> — type the message into each chat but <strong>don't send it</strong>. Great for testing on one contact first. Marked "sent" once the text is confirmed in the composer.
             </span>
           </label>
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '10px 12px', background: color.surface.sunken, borderRadius: 7, marginBottom: 10, cursor: 'pointer', border: '1px solid transparent' }}>
+            <input type="checkbox" checked={skipIfUnread} onChange={(e) => setSkipIfUnread(e.target.checked)} style={{ marginTop: 2, cursor: 'pointer' }} />
+            <span style={{ fontSize: 12, color: color.text.secondary, lineHeight: 1.4 }}>
+              <strong>Only if they've read the last message</strong> — skip anyone whose last message in the
+              thread isn't marked <em>Read</em> by Facebook. For follow-ups: piling a second nudge onto
+              someone who never opened the first is what makes a campaign look automated.
+              {' '}Skipped people are listed in Past sends and can be requeued.
+              {skipIfUnread && (
+                <span style={{ display: 'block', marginTop: 4, color: color.warning.base }}>
+                  If Facebook shows no read status at all for a thread, that contact is skipped too —
+                  “can't tell” is treated as “not read”.
+                </span>
+              )}
+            </span>
+          </label>
           <button
             onClick={start}
             disabled={starting}
@@ -374,14 +412,41 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
             style={{ ...inputStyle, marginBottom: 10 }}
           />
           {tags.length > 0 && (
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
-              <button onClick={() => setFilterTag(null)} style={{ padding: '3px 9px', borderRadius: 12, border: `1px solid ${color.border.control}`, background: filterTag === null ? color.accent.base : color.surface.raised, color: filterTag === null ? color.surface.raised : color.text.secondary, fontSize: 11, cursor: 'pointer', fontWeight: 600 }}>
-                All
-              </button>
-              {tags.map((t) => (
-                <button key={t.id} onClick={() => setFilterTag(filterTag === t.id ? null : t.id)} style={{ padding: '3px 9px', borderRadius: 12, border: 'none', background: filterTag === t.id ? t.color : t.color + '33', color: filterTag === t.id ? color.surface.raised : t.color, fontSize: 11, cursor: 'pointer', fontWeight: 600 }}>
-                  {t.name}
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+                <button onClick={() => setFilterTag(null)} style={{ padding: '3px 9px', borderRadius: 12, border: `1px solid ${color.border.control}`, background: filterTag === null ? color.accent.base : color.surface.raised, color: filterTag === null ? color.surface.raised : color.text.secondary, fontSize: 11, cursor: 'pointer', fontWeight: 600 }}>
+                  All
                 </button>
+                {/* Same Group/Ungroup the advanced-search tag pickers get, on the
+                    same preference — this is a search filter too, and having one
+                    of them grouped and the other flat is just confusing. */}
+                {tagsGroupable && (
+                  <button
+                    onClick={toggleTagsGrouped}
+                    aria-pressed={tagsGrouped}
+                    title={tagsGrouped ? 'Show every tag in one list' : 'Split the tags by tag group'}
+                    style={{ marginLeft: 'auto', background: 'none', border: 'none', color: color.accent.base, fontSize: 11, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}
+                  >
+                    {tagsGrouped ? 'Ungroup' : 'Group'}
+                  </button>
+                )}
+              </div>
+              {tagBuckets.map((b) => (
+                <div key={b.key} style={{ marginTop: 6 }}>
+                  {showTagBucketLabels && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 3 }}>
+                      {b.color && <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: 2, background: b.color, flexShrink: 0 }} />}
+                      <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', color: color.text.muted }}>{b.label}</span>
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {b.tags.map((t) => (
+                      <button key={t.id} onClick={() => setFilterTag(filterTag === t.id ? null : t.id)} style={{ padding: '3px 9px', borderRadius: 12, border: 'none', background: filterTag === t.id ? t.color : t.color + '33', color: filterTag === t.id ? color.surface.raised : t.color, fontSize: 11, cursor: 'pointer', fontWeight: 600 }}>
+                        {t.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               ))}
             </div>
           )}
@@ -954,7 +1019,7 @@ export function ActiveCampaignCard({ campaign, queue, isNext, onChanged }: { cam
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{campaign.name}</div>
-          <div style={{ marginTop: 4, display: 'flex', gap: 6 }}><StatusBadge status={campaign.status} />{campaign.dryRun && <DryRunChip />}</div>
+          <div style={{ marginTop: 4, display: 'flex', gap: 6 }}><StatusBadge status={campaign.status} />{campaign.dryRun && <DryRunChip />}{campaign.skipIfUnread && <UnreadGateChip />}</div>
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
           {campaign.status === 'running' && (
@@ -1018,6 +1083,10 @@ export function HistoryPanel({ campaigns, onChanged, store, onViewProfile, onEdi
 export function FailedSendsNotice({ failures, onDismiss, onClear, onReview, onOpen }: { failures: FailedSend[]; onDismiss: () => void; onClear: (f: FailedSend) => void; onReview: () => void; onOpen?: (f: FailedSend) => void }) {
   const [expanded, setExpanded] = useState(false);
   const unavailable = failures.filter((f) => f.errorKind === 'unavailable');
+  // Not failures in any real sense — the campaign asked for them to be held
+  // back. Counted separately so a run that skipped 30 unread contacts doesn't
+  // read as 30 things having gone wrong.
+  const unread = failures.filter((f) => f.errorKind === 'unread');
   const shown = expanded ? failures : failures.slice(0, 5);
 
   return (
@@ -1026,11 +1095,20 @@ export function FailedSendsNotice({ failures, onDismiss, onClear, onReview, onOp
         <span style={{ fontSize: 16 }}>⚠️</span>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 14, color: color.danger.base }}>
-            {failures.length} message{failures.length !== 1 ? 's' : ''} failed to send
+            {failures.length - unread.length > 0 && (
+              <>{failures.length - unread.length} message{failures.length - unread.length !== 1 ? 's' : ''} failed to send</>
+            )}
+            {failures.length - unread.length > 0 && unread.length > 0 && ' · '}
+            {unread.length > 0 && <>{unread.length} skipped as unread</>}
           </div>
           {unavailable.length > 0 && (
             <div style={{ fontSize: 12, color: '#8a3a2f', marginTop: 2 }}>
               {unavailable.length} because the recipient isn't available on Messenger (blocked, deactivated, or restricted) — retrying won't help.
+            </div>
+          )}
+          {unread.length > 0 && (
+            <div style={{ fontSize: 12, color: '#8a3a2f', marginTop: 2 }}>
+              {unread.length} held back because the last message hadn't been read. Requeue them from Past sends once it has.
             </div>
           )}
         </div>
@@ -1154,6 +1232,7 @@ export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile,
           <span style={{ color: color.text.muted }}>{sum.pending}⏳</span>
           <span>/ {sum.total}</span>
           {campaign.dryRun && <DryRunChip />}
+          {campaign.skipIfUnread && <UnreadGateChip />}
           <StatusBadge status={campaign.status} />
         </div>
       </div>

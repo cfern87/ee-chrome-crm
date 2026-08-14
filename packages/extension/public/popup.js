@@ -108,18 +108,220 @@ function renderStatus() {
   });
 }
 
-// ---- Quick search --------------------------------------------------------
+// ---- Contact rows --------------------------------------------------------
 
 const MAX_RESULTS = 6;
+
+// Mirrors MAX_PINNED_CONTACTS in storage.ts. Hardcoded for the same reason
+// SESSION_KEY above is: this is a plain script and cannot import the module.
+// The background enforces the real cap; this only decides what to grey out.
+const MAX_PINNED = 5;
+const PINNED_KEY = 'pinnedContacts';
+
+function pinnedIds() {
+  const raw = store && store.settings ? store.settings[PINNED_KEY] : null;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((id) => typeof id === 'string' && store.conversations && store.conversations[id]).slice(0, MAX_PINNED);
+}
+
+/**
+ * The tags worth drawing on a preview row: the ones that aren't marked "hide
+ * in previews". Same rule as previewTags in the dashboard and as the chips the
+ * content script injects into Messenger's own sidebar — a tag that sits on
+ * nearly every contact is noise in a four-line list, which is exactly why the
+ * user hid it in the first place.
+ */
+function visibleTagsFor(conv) {
+  const tags = (store && store.tags) || {};
+  const out = [];
+  for (const id of conv.tags || []) {
+    const t = tags[id];
+    if (t && !t.hideInSidebar) out.push(t);
+  }
+  return out;
+}
+
+// Legible label over an arbitrary user-chosen tag colour. The dashboard and the
+// content script both compute this properly (ui/contrast.ts); this is the same
+// idea at the fidelity a plain script can manage — relative luminance of the
+// hex, then black or white.
+function tagTextColor(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m) return '#ffffff';
+  const n = parseInt(m[1], 16);
+  const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => {
+    const s = v / 255;
+    return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  });
+  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  return lum > 0.45 ? '#1c1e21' : '#ffffff';
+}
+
+/** The clickable part of a contact row: name, tag chips, and a sub-line. */
+function contactButton(c) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'pop-result';
+  btn.setAttribute('role', 'option');
+  btn.setAttribute('aria-selected', 'false');
+
+  const name = document.createElement('span');
+  name.className = 'pop-result-name';
+  name.textContent = c.participantName || 'Unknown';
+  btn.appendChild(name);
+
+  const tags = visibleTagsFor(c);
+  if (tags.length > 0) {
+    const row = document.createElement('span');
+    row.className = 'pop-result-tags';
+    for (const t of tags) {
+      const chip = document.createElement('span');
+      chip.className = 'pop-tag';
+      chip.textContent = t.name;
+      chip.style.background = t.color || '#8a8d91';
+      chip.style.color = tagTextColor(t.color);
+      row.appendChild(chip);
+    }
+    btn.appendChild(row);
+  }
+
+  const sub = document.createElement('span');
+  sub.className = 'pop-result-sub';
+  // No chat URL means this contact was imported or never opened, so there is
+  // nowhere to send them — say so rather than opening a dead tab.
+  sub.textContent = c.chatUrl ? (c.lastMessage || 'Open conversation') : 'No saved chat link';
+  btn.appendChild(sub);
+
+  if (!c.chatUrl) {
+    btn.disabled = true;
+    btn.style.opacity = '0.55';
+    btn.style.cursor = 'not-allowed';
+  } else {
+    btn.addEventListener('click', () => {
+      chrome.tabs.create({ url: c.chatUrl });
+      window.close();
+    });
+  }
+  return btn;
+}
+
+/**
+ * The pin toggle. Writes through the background's mutation channel rather than
+ * saving a store: this popup's snapshot is up to 5s old (it polls), and writing
+ * that back wholesale is precisely the clobber the mutation layer exists to
+ * prevent — a tag added in Messenger a second ago would be undone by a pin.
+ */
+function pinButton(c, isPinned) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'pop-pin-btn';
+  btn.textContent = isPinned ? '★' : '☆';
+  btn.setAttribute('aria-pressed', String(isPinned));
+  const atCap = !isPinned && pinnedIds().length >= MAX_PINNED;
+  btn.title = isPinned
+    ? 'Unpin from the top of this popup'
+    : atCap
+      ? `Pin — the oldest of your ${MAX_PINNED} pins drops off`
+      : 'Pin to the top of this popup';
+
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    btn.disabled = true;
+    send({
+      type: 'MUTATE_STORE',
+      payload: { mutations: [{ op: 'setPinned', conversationId: c.id, pinned: !isPinned }] },
+    }, (res) => {
+      btn.disabled = false;
+      // The response carries the post-mutation store, so the popup repaints
+      // from what actually landed rather than from an optimistic guess.
+      if (res && res.store) store = res.store;
+      renderPinned();
+      renderResults($('quickSearch').value);
+    });
+  });
+  return btn;
+}
+
+/**
+ * The pinned list: one small chip per contact, name only.
+ *
+ * Compact on purpose. This sits above the search box in a 340px popup, so it
+ * competes directly with the reason people opened it — rendering five pinned
+ * contacts as full result rows (name, tags, last message) filled most of the
+ * window with things the user already knows. A pinned contact is one you
+ * recognize by name, which is the only thing worth showing.
+ */
+function renderPinned() {
+  const block = $('pinnedBlock');
+  const list = $('pinnedList');
+  list.textContent = '';
+
+  const ids = pinnedIds();
+  show(block, ids.length > 0);
+  if (ids.length === 0) return;
+
+  for (const id of ids) {
+    const c = store.conversations[id];
+
+    const chip = document.createElement('div');
+    chip.className = 'pop-pin-chip';
+
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'pop-pin-name';
+    open.textContent = c.participantName || 'Unknown';
+    if (c.chatUrl) {
+      open.title = `Open chat with ${c.participantName || 'this contact'}`;
+      open.addEventListener('click', () => {
+        chrome.tabs.create({ url: c.chatUrl });
+        window.close();
+      });
+    } else {
+      // Pinned but unreachable — imported, or never opened in Messenger. Say so
+      // on hover rather than opening a dead tab.
+      open.disabled = true;
+      open.title = 'No saved chat link for this contact yet';
+    }
+
+    const unpin = document.createElement('button');
+    unpin.type = 'button';
+    unpin.className = 'pop-pin-x';
+    unpin.textContent = '✕';
+    unpin.title = `Unpin ${c.participantName || 'this contact'}`;
+    unpin.setAttribute('aria-label', `Unpin ${c.participantName || 'this contact'}`);
+    unpin.addEventListener('click', (e) => {
+      e.stopPropagation();
+      unpin.disabled = true;
+      send({
+        type: 'MUTATE_STORE',
+        payload: { mutations: [{ op: 'setPinned', conversationId: c.id, pinned: false }] },
+      }, (res) => {
+        if (res && res.store) store = res.store;
+        renderPinned();
+        renderResults($('quickSearch').value);
+      });
+    });
+
+    chip.appendChild(open);
+    chip.appendChild(unpin);
+    list.appendChild(chip);
+  }
+}
 
 function renderResults(term) {
   const box = $('quickResults');
   const hint = $('quickHint');
+  const pinHint = $('pinHint');
   box.textContent = '';
+  show(pinHint, false);
 
   const q = term.trim().toLowerCase();
   if (!q) {
     hint.textContent = 'Type a name to open that conversation in Messenger.';
+    if (pinnedIds().length === 0) {
+      pinHint.textContent = `Search for someone and press ☆ to keep them at the top (up to ${MAX_PINNED}).`;
+      show(pinHint, true);
+    }
     return;
   }
 
@@ -136,38 +338,16 @@ function renderResults(term) {
 
   hint.textContent = matches.length === 1 ? '1 match' : `${matches.length} matches`;
 
+  const pinned = new Set(pinnedIds());
   for (const c of matches) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'pop-result';
-    btn.setAttribute('role', 'option');
-    btn.setAttribute('aria-selected', 'false');
-
-    const name = document.createElement('span');
-    name.className = 'pop-result-name';
-    name.textContent = c.participantName || 'Unknown';
-
-    const sub = document.createElement('span');
-    sub.className = 'pop-result-sub';
-    // No chat URL means this contact was imported or never opened, so there is
-    // nowhere to send them — say so rather than opening a dead tab.
-    sub.textContent = c.chatUrl ? (c.lastMessage || 'Open conversation') : 'No saved chat link';
-
-    btn.appendChild(name);
-    btn.appendChild(sub);
-
-    if (!c.chatUrl) {
-      btn.disabled = true;
-      btn.style.opacity = '0.55';
-      btn.style.cursor = 'not-allowed';
-    } else {
-      btn.addEventListener('click', () => {
-        chrome.tabs.create({ url: c.chatUrl });
-        window.close();
-      });
-    }
-
-    box.appendChild(btn);
+    // The fuller row — name, tags, last message — unlike the pinned chips
+    // above. You are scanning unfamiliar names here, so those details are what
+    // tell two similar results apart; a pinned contact needs none of it.
+    const row = document.createElement('div');
+    row.className = 'pop-pin-row';
+    row.appendChild(contactButton(c));
+    row.appendChild(pinButton(c, pinned.has(c.id)));
+    box.appendChild(row);
   }
 }
 
@@ -212,7 +392,7 @@ function loadAccount() {
     applyGate(isIn);
 
     if (isIn && was !== true) {
-      loadStoreThen(() => { renderStatus(); renderResults($('quickSearch').value); });
+      loadStoreThen(() => { renderStatus(); renderPinned(); renderResults($('quickSearch').value); });
     }
   });
 }
@@ -277,6 +457,8 @@ try {
 }
 
 // The popup is short-lived, so this only ticks while it is actually open.
+// The pinned list is repainted too: a contact deleted or renamed elsewhere
+// shouldn't sit here stale for as long as the popup stays open.
 setInterval(() => {
-  if (signedIn) loadStoreThen(renderStatus);
+  if (signedIn) loadStoreThen(() => { renderStatus(); renderPinned(); });
 }, 5000);

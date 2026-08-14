@@ -12,6 +12,7 @@ import {
   Store, Conversation, Tag, SaveResult, SyncUsage,
   forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled,
   getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES,
+  DIAG_TTL_MS,
 } from '../storage';
 import { BUILD_INFO } from '../buildInfo';
 import { getEntitlement, PLATFORM_URL, FREE_CONTACT_LIMIT, type Entitlement } from '../license';
@@ -40,6 +41,8 @@ import {
   SubNav, CopyButton,
 } from './shared';
 import { OnlineDot } from './Campaigns';
+import { PresetActionsSettings } from './PresetActionsSettings';
+import { WebhookSettings } from './WebhookSettings';
 
 /** Sections of Settings. */
 export type SettingsView = 'account' | 'sync' | 'data' | 'behavior' | 'about';
@@ -191,6 +194,8 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
         </Text>
       </Card>
 
+      <PresetActionsSettings store={store} updateStore={updateStore} />
+
       <SendingPaceSettings store={store} updateStore={updateStore} />
       </>
       )}
@@ -284,6 +289,10 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
           the Contacts list to export whatever the current filters are showing.
         </Text>
       </Card>
+
+      <CaptureDiagnostics store={store} />
+
+      <WebhookSettings store={store} updateStore={updateStore} />
 
       <ContactsMaintenance store={store} updateStore={updateStore} />
       </>
@@ -1621,5 +1630,67 @@ export function SyncMeter({ usage, convCount, tagCount }: { usage: SyncUsage | n
         </div>
       )}
     </div>
+  );
+}
+
+
+/**
+ * Settings → Data → Capture diagnostics.
+ *
+ * The bulk counterpart to the ⌗ button on a single contact: copy every
+ * diagnostic currently held, for sending in as one bug report.
+ *
+ * Sits low in Data, under a plain heading, and says out loud that these expire.
+ * A user who never has a wrong name should be able to read this once, conclude
+ * it isn't for them, and never think about it again.
+ */
+export function CaptureDiagnostics({ store }: { store: Store }) {
+  const [copied, setCopied] = useState(false);
+
+  const withDiag = Object.values(store.conversations).filter((c) => c.nameDiag);
+
+  const copyAll = async () => {
+    const blob = withDiag
+      // Newest first: the mistake someone just noticed is the one they want.
+      .sort((a, b) => (b.nameDiag?.at || 0) - (a.nameDiag?.at || 0))
+      .map((c) => ({
+        currentName: c.participantName,
+        contactId: c.id,
+        source: c.source || 'messenger',
+        nameManual: !!c.nameManual,
+        capturedAt: new Date(c.nameDiag!.at).toISOString(),
+        diag: c.nameDiag,
+      }));
+    try {
+      await navigator.clipboard.writeText(JSON.stringify({ contacts: blob }, null, 2));
+    } catch {
+      return;
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <Card style={{ marginBottom: space.md }}>
+      <Text as="h3" size="strong" weight="semibold" style={{ margin: 0 }}>Capture diagnostics</Text>
+      <Text as="p" size="small" tone="muted" leading="relaxed" style={{ margin: `${space.xs}px 0 ${space.md}px` }}>
+        When a contact first enters the CRM, the extension records which of its name readers produced
+        the name and what the alternatives were. If someone comes in under the <strong>wrong</strong> name,
+        copying this and sending it in is what makes the cause fixable rather than guessable.
+        Each record is deleted automatically after {Math.round(DIAG_TTL_MS / (24 * 60 * 60 * 1000))} days,
+        so there is nothing to clean up.
+      </Text>
+
+      <Stack direction="row" gap="sm" align="center" wrap>
+        <Button variant="secondary" size="sm" onClick={copyAll} disabled={withDiag.length === 0}>
+          {copied ? 'Copied ✓' : `Copy ${withDiag.length} diagnostic${withDiag.length === 1 ? '' : 's'}`}
+        </Button>
+        <Text size="micro" tone="muted">
+          {withDiag.length === 0
+            ? 'Nothing recorded right now — every contact captured recently has already expired, or none have been added.'
+            : 'For one contact only, use the small ⌗ next to their name in the contact detail.'}
+        </Text>
+      </Stack>
+    </Card>
   );
 }

@@ -61,7 +61,13 @@ export type CampaignStatus = 'running' | 'paused' | 'completed' | 'cancelled';
 // means it never reported the message as sent either way. Both are only
 // recorded after the profile-resolution recovery has been tried and also
 // failed — see background.ts.
-export type SendFailureKind = 'unavailable' | 'no-composer' | 'not-delivered' | 'unconfirmed';
+// 'unread' is the one kind here that is not a failure at all in the ordinary
+// sense: the campaign asked to skip anyone who hasn't read the last message
+// (see Campaign.skipIfUnread), and this recipient hadn't. Recorded as an error
+// so the person is visible and requeueable rather than silently dropped, but
+// never retried and never recovered — the profile can't change whether someone
+// has read their messages.
+export type SendFailureKind = 'unavailable' | 'no-composer' | 'not-delivered' | 'unconfirmed' | 'unread';
 
 export interface CampaignRecipient {
   threadId: string;
@@ -102,6 +108,14 @@ export interface Campaign {
   name: string;                 // user-facing label (e.g. first line of template)
   template: string;
   dryRun: boolean;              // type the message but never actually send
+  // Don't message anyone whose last message in the thread hasn't been read.
+  // Follow-ups are the reason this exists: sending a second nudge to someone
+  // who hasn't opened the first one is the fastest way to read as a bot, and
+  // Facebook already tells us — it labels the last outgoing bubble "Read"/
+  // "Seen" once it has been. Off by default; when it's on and no read label
+  // can be found, the send is REFUSED rather than assumed (see
+  // readStateOfLastOutgoing in content.ts for why "can't tell" is not "yes").
+  skipIfUnread?: boolean;
   createdAt: number;
   startedAt?: number;
   completedAt?: number;
@@ -182,6 +196,7 @@ export interface NewCampaignInput {
   config?: Partial<CampaignConfig>;
   name?: string;
   dryRun?: boolean;
+  skipIfUnread?: boolean;
 }
 
 export function createCampaign(input: NewCampaignInput): Campaign {
@@ -192,6 +207,7 @@ export function createCampaign(input: NewCampaignInput): Campaign {
     name: (input.name && input.name.trim()) || shortName(input.template),
     template: input.template,
     dryRun: !!input.dryRun,
+    skipIfUnread: !!input.skipIfUnread,
     createdAt: now,
     status: 'running',
     recipients: input.recipients.map((r) => ({
@@ -314,7 +330,7 @@ export function stampCampaigns(prev: Campaign[], next: Campaign[], now = Date.no
 
 function campaignScalars(c: Campaign): string {
   return JSON.stringify({
-    name: c.name, template: c.template, dryRun: c.dryRun, status: c.status,
+    name: c.name, template: c.template, dryRun: c.dryRun, skipIfUnread: !!c.skipIfUnread, status: c.status,
     cursor: c.cursor, config: c.config, startedAt: c.startedAt, completedAt: c.completedAt,
     removedRecipients: c.removedRecipients || {},
   });

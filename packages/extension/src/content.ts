@@ -18,6 +18,7 @@ import {
 } from './storage';
 import type { Store, Tag, Conversation, CustomFieldDef, TagGroup } from './storage';
 import { bucketTags, showsGroupLabels, type TagBucket } from './tagGrouping';
+import { readPresetActions, stepsFor, describePreset, isDestructive, type PresetAction } from './presets';
 import { PRODUCT_NAME } from './product';
 import { readableFill, chipOutline, ON_DARK } from './ui/contrast';
 import { eyeOffSvgMarkup } from './ui/icons';
@@ -496,7 +497,45 @@ function findConversationForThread(store: Store, threadId: string): Conversation
   return threadIndex.get(threadId.toLowerCase()) || null;
 }
 
+/**
+ * Snapshot every name this page could offer, for the capture diagnostic.
+ *
+ * Read at capture time and never again: the whole class of bug this exists to
+ * explain is "a later read saw something different", so a record assembled
+ * afterwards would be evidence of the wrong moment. Each reader is called
+ * inside its own try/catch — a diagnostic must never be the thing that breaks
+ * a save.
+ */
+function nameCandidates(threadId: string | null, link?: HTMLAnchorElement): Record<string, string> {
+  const out: Record<string, string> = {};
+  const safe = (key: string, fn: () => string) => {
+    try {
+      const v = fn();
+      if (v) out[key] = v;
+    } catch (e) {
+      out[key] = `<threw: ${String(e)}>`;
+    }
+  };
+  safe('pageOffered', () => pageOfferedName(threadId));
+  if (link) safe('sidebarLink', () => getNameFromLink(link));
+  safe('activeThread', () => getActiveThreadName());
+  if (isProfilePage()) {
+    safe('profilePage', () => getProfilePageName());
+    safe('profileExtractorLive', () => extractProfilePageName());
+    if (firstProfileName) out.firstProfileNamePinned = firstProfileName.name;
+  }
+  safe('documentTitle', () => document.title);
+  return out;
+}
+
 async function ensureConversation(threadId: string, link?: HTMLAnchorElement): Promise<Conversation | null> {
+  // Only assembled when this could be a FIRST capture — an already-saved
+  // contact re-asserting its chat URL on the sidebar's 2s pass is the common
+  // case by a wide margin, and building a diagnostic for it every time would
+  // be pure waste. The mutation drops it when the contact turns out to exist.
+  const known = !!findConversationForThread(await getStore(), threadId);
+  const offered = link ? getNameFromLink(link) : pageOfferedName(threadId);
+
   const next = await mutate([
     {
       op: 'upsertContact',
@@ -506,8 +545,23 @@ async function ensureConversation(threadId: string, link?: HTMLAnchorElement): P
       // '' when it isn't one); whether the offer is actually taken depends on
       // how the record was matched and whether the name was hand-set, and that
       // rule lives in the mutation so it runs against the real store.
-      name: link ? getNameFromLink(link) : pageOfferedName(threadId),
+      name: offered,
       allowCreate: true,
+      ...(known ? {} : {
+        diag: {
+          at: Date.now(),
+          via: 'messenger' as const,
+          saved: offered || 'Unknown',
+          url: window.location.href,
+          urlThreadId: getActiveThreadId() || undefined,
+          threadId,
+          candidates: nameCandidates(threadId, link),
+          notes: [
+            link ? 'name read from the sidebar row that was clicked' : 'no sidebar row — name came from pageOfferedName',
+            threadId === getActiveThreadId() ? 'panel is on the open conversation' : 'panel is on a DIFFERENT conversation than the open one',
+          ],
+        },
+      }),
     },
   ]);
   return findConversationForThread(next, threadId);
@@ -560,6 +614,21 @@ async function addProfileContact(profileUrl: string, name: string): Promise<Conv
       pageThreadId: pageThread,
       urlThreadId: thread?.threadId ?? null,
       urlThreadNumeric: thread?.numeric,
+      diag: {
+        at: Date.now(),
+        via: 'profile' as const,
+        saved: name,
+        url: window.location.href,
+        threadId: pageThread || thread?.threadId || undefined,
+        candidates: nameCandidates(null),
+        // The confirmed read is the one the panel pinned for this profile —
+        // see firstProfileName. Its ABSENCE here is itself the finding: it
+        // means the name was saved off an unconfirmed read.
+        confirmed: !!firstProfileName && firstProfileName.key === currentProfileKey(),
+        notes: [
+          pageThread ? `numeric fbid read off the page: ${pageThread}` : 'no numeric fbid could be read off the page',
+        ],
+      },
     },
   ]);
   return findConversationForProfile(next, profileUrl);
@@ -1083,6 +1152,10 @@ const removedThreads = new Set<string>();
 // re-render can't disarm it (or leave it armed) mid-decision.
 let deleteArmed = false;
 
+// Same two-step shape for a preset action that deletes the contact (see
+// presets.ts). Holds the id of the preset awaiting confirmation, or null.
+let presetArmed: string | null = null;
+
 // ---- Panel preferences (per-browser, via chrome.storage.local) -----------
 //
 // Whether each of the panel's two tag sections is split by tag group. Two
@@ -1186,6 +1259,47 @@ function tagSectionHtml(opts: {
     ${body}`;
 }
 
+/**
+ * The preset-action buttons: one small button per preset, applying the whole
+ * bundle of edits in one press (see presets.ts).
+ *
+ * Rendered high in the panel, above the tag sections, because that is the
+ * ordering of the work — the presets are the reason most people open this at
+ * all, and the tag chips below are the manual fallback for whatever the preset
+ * didn't cover.
+ *
+ * A preset that deletes gets an armed confirmation, the same two-control shape
+ * as the footer's Remove: the first press only arms it. Nothing else does,
+ * because everything else a preset can do is reversible from this same panel.
+ */
+function presetActionsHtml(presets: PresetAction[], store: Store, armedId: string | null): string {
+  if (presets.length === 0) return '';
+
+  const buttons = presets.map((p) => {
+    const armed = armedId === p.id;
+    const destructive = isDestructive(p);
+    const title = escapeHtml(p.description || describePreset(p, store));
+    if (armed) {
+      return `<button class="fb-crm-preset-btn fb-crm-preset-armed" data-preset-confirm="${p.id}" title="${title}">Apply “${escapeHtml(p.label)}”?</button>
+        <button class="fb-crm-preset-btn" data-preset-cancel="1" title="Cancel">✕</button>`;
+    }
+    const style = p.color ? ` style="${chipFillStyle(p.color)}"` : '';
+    return `<button class="fb-crm-preset-btn${destructive ? ' fb-crm-preset-danger' : ''}" data-preset="${p.id}"${style} title="${title}">${escapeHtml(p.label)}</button>`;
+  }).join('');
+
+  return `
+    <div class="fb-crm-section-title-row">
+      <div class="fb-crm-section-title">Quick actions</div>
+    </div>
+    <div class="fb-crm-presets">${buttons}</div>`;
+}
+
+/** A preset button's own colour, using the same readable-fill rules as tag chips. */
+function chipFillStyle(hex: string): string {
+  const { fill, fg } = readableFill(hex);
+  return `background:${fill};color:${fg};border-color:${chipOutline(hex)}`;
+}
+
 function buildLauncher() {
   const existing = document.getElementById('fb-crm-launcher');
   if (existing) {
@@ -1237,6 +1351,7 @@ async function togglePanel() {
     await renderPanel();
   } else {
     deleteArmed = false; // never leave a delete armed behind a closed panel
+    presetArmed = null;
     panelEl.style.display = 'none';
   }
 }
@@ -1290,6 +1405,7 @@ async function renderPanelContent() {
   // edits go with it, for the same reason.
   if (threadId !== lastRenderedThread) {
     deleteArmed = false;
+    presetArmed = null;
     fieldDrafts.clear();
     focusedFieldId = null;
   }
@@ -1417,6 +1533,8 @@ async function renderPanelContent() {
     readPanelPref('addTagGrouped', true),
   ]);
 
+  const presets = readPresetActions(store);
+
   panelEl.innerHTML = `
     <div class="fb-crm-header">
       <span>${PRODUCT_NAME}</span>
@@ -1429,6 +1547,8 @@ async function renderPanelContent() {
       </div>
       <div class="fb-crm-meta">📨 Last contacted: <strong>${formatRelative(conv.lastContactedAt)}</strong></div>
       ${isProfilePage() ? '' : '<button class="fb-crm-pick-btn">🎯 Select different conversation</button>'}
+
+      ${presetActionsHtml(presets, store, presetArmed)}
 
       ${panelFields.length > 0 ? `
         <div class="fb-crm-section-title">Details</div>
@@ -1510,6 +1630,7 @@ function renderSignInPanel(): void {
   if (!panelEl) return;
   // A locked panel has no contact and no armed delete to carry forward.
   deleteArmed = false;
+  presetArmed = null;
   fieldDrafts.clear();
   focusedFieldId = null;
   lastRenderedThread = null;
@@ -1641,6 +1762,7 @@ function wirePanelFields(threadId: string, conv: Conversation, defs: CustomField
 function wireClose() {
   panelEl?.querySelector('.fb-crm-close')?.addEventListener('click', () => {
     deleteArmed = false; // never leave a delete armed behind a closed panel
+    presetArmed = null;
     if (panelEl) panelEl.style.display = 'none';
   });
 }
@@ -1655,6 +1777,59 @@ function wirePanelActions(threadId: string) {
       await writePanelPref(key, !current);
       await renderPanel(); // no store change — just re-read the preference and redraw
     });
+  });
+
+  // Preset actions. `stepsFor` turns the preset into the same mutations the
+  // manual controls emit, so a preset can never do something the panel itself
+  // couldn't — and the background applies them under its usual lock.
+  const applyPreset = async (presetId: string) => {
+    const store = await getStore();
+    const preset = readPresetActions(store).find((p) => p.id === presetId);
+    const conv = store.conversations[threadId];
+    if (!preset || !conv) return;
+
+    // A preset that deletes has to mark the contact removed before the write,
+    // for the same reason the footer's delete does: auto-capture and the
+    // sidebar pass both run the moment the mutation resolves, and would put
+    // the contact straight back.
+    if (isDestructive(preset)) {
+      removedThreads.add(threadId);
+      for (const alias of threadAliases(conv)) removedThreads.add(alias);
+      const active = getActiveThreadId();
+      if (active) removedThreads.add(active);
+    }
+
+    const mutations = stepsFor(preset, conv, store);
+    presetArmed = null;
+    if (mutations.length) {
+      await mutate(mutations);
+      console.info(`[CRM] Applied preset "${preset.label}" to ${threadId}: ${describePreset(preset, store)}`);
+    }
+    await renderPanel();
+    await injectSidebarTags();
+  };
+
+  panelEl.querySelectorAll<HTMLElement>('[data-preset]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.preset!;
+      const store = await getStore();
+      const preset = readPresetActions(store).find((p) => p.id === id);
+      if (preset && isDestructive(preset)) {
+        presetArmed = id;
+        await renderPanel();
+        return;
+      }
+      await applyPreset(id);
+    });
+  });
+
+  panelEl.querySelector<HTMLElement>('[data-preset-confirm]')?.addEventListener('click', (e) => {
+    void applyPreset((e.currentTarget as HTMLElement).dataset.presetConfirm!);
+  });
+
+  panelEl.querySelector<HTMLElement>('[data-preset-cancel]')?.addEventListener('click', async () => {
+    presetArmed = null;
+    await renderPanel();
   });
 
   panelEl.querySelectorAll<HTMLElement>('[data-remove]').forEach(btn => {
@@ -2697,6 +2872,84 @@ function hasDeliveredCopy(scope: HTMLElement, target: string, guard: DupGuard): 
   return guard === 'sent-only' ? all.some((s) => s === 'sent') : all.some((s) => s !== 'failed');
 }
 
+// ---- Has the last thing we sent been read? ----
+//
+// Facebook labels the most recent outgoing bubble with its state — "Sent",
+// "Delivered", then "Read"/"Seen" once the recipient has opened it. That last
+// label is the only signal available here for "did my previous message land
+// with a person", and a campaign can be told to require it before sending a
+// follow-up (Campaign.skipIfUnread).
+//
+// Read as its OWN patterns rather than by reusing DELIVERY_SENT_PATTERNS,
+// which deliberately treats "seen" as just another confirmation that the
+// message went out. The two questions are different: that one asks "did this
+// leave", this one asks "did somebody open it".
+const READ_PATTERNS: RegExp[] = [/^read\b/i, /^seen\b/i, /^opened\b/i];
+
+// Everything Facebook attaches to the tail of a thread that is a STATUS rather
+// than message content. Anchored at the fragment start, same as every other
+// status match here — "Read" as the first word of a message body is a sentence,
+// not a receipt.
+const ANY_STATUS_PATTERNS: RegExp[] = [
+  ...READ_PATTERNS,
+  ...DELIVERY_SENT_PATTERNS,
+  ...DELIVERY_PENDING_PATTERNS,
+  ...DELIVERY_FAILED_PATTERNS,
+];
+
+type ReadState = 'read' | 'unread' | 'unknown';
+
+/**
+ * Whether the LAST outgoing message in `scope` has been read.
+ *
+ * There is no message text to anchor on here — the previous message was sent
+ * by some earlier campaign, or by hand, and we don't know what it said. So
+ * this reads the thread's trailing status labels instead: every separately-
+ * labelled fragment in the pane, in document order, filtered down to the ones
+ * that are actually delivery statuses, and the last of those is the state of
+ * the newest outgoing bubble. Anything Facebook renders as an icon is caught
+ * through its aria-label, which is how "Seen" usually appears.
+ *
+ * Returns 'unknown' rather than guessing when no status label can be found at
+ * all: an empty thread, a layout change, or a pane that hasn't finished
+ * hydrating all produce that, and the caller — not this function — decides
+ * what an unreadable thread means. (For skipIfUnread it means DON'T SEND: the
+ * whole point of the option is not to pile a second message onto someone who
+ * hasn't looked at the first, and "I couldn't tell" is not "they have".)
+ */
+function readStateOfLastOutgoing(scope: HTMLElement): { state: ReadState; label: string } {
+  const fragments: string[] = [];
+  const push = (raw: string) => {
+    for (const piece of (raw || '').split(/[\n\r·•|]+/)) {
+      const s = normalizeText(piece);
+      // Statuses are short. The cap is what keeps a message body that happens
+      // to begin with "Seen you around" from being read as a receipt.
+      if (s && s.length <= 40) fragments.push(s);
+    }
+  };
+
+  // Document order matters: the last status in the pane belongs to the newest
+  // message. querySelectorAll returns document order, and the aria-label of an
+  // element is pushed with it, so the two stay interleaved correctly.
+  for (const el of Array.from(scope.querySelectorAll<HTMLElement>('[aria-label], span, div'))) {
+    // Only leaf-ish nodes: a container repeats its children's text, which would
+    // put an old status after a newer one.
+    if (el.querySelector('span, div')) {
+      const label = el.getAttribute('aria-label');
+      if (label) push(label);
+      continue;
+    }
+    push(el.textContent || '');
+    const label = el.getAttribute('aria-label');
+    if (label) push(label);
+  }
+
+  const statuses = fragments.filter((f) => ANY_STATUS_PATTERNS.some((re) => re.test(f)));
+  const last = statuses[statuses.length - 1];
+  if (!last) return { state: 'unknown', label: '' };
+  return { state: READ_PATTERNS.some((re) => re.test(last)) ? 'read' : 'unread', label: last };
+}
+
 interface SendResult {
   ok: boolean;
   error?: string;
@@ -2710,6 +2963,9 @@ interface SendOptions {
   // this thread counts as success instead of being sent again. See DupGuard for
   // what each mode treats as "delivered".
   skipIfDelivered?: DupGuard;
+  // Refuse the send unless the thread's last outgoing message reads as read.
+  // See readStateOfLastOutgoing, and Campaign.skipIfUnread for the why.
+  skipIfUnread?: boolean;
 }
 
 // Type into `composer`, send, and confirm delivery by watching `scope` (the
@@ -2732,6 +2988,22 @@ async function typeSendAndConfirm(
   if (opts.skipIfDelivered && hasDeliveredCopy(scope, target, opts.skipIfDelivered)) {
     stamp(`message already present in this thread (guard=${opts.skipIfDelivered}) — treating as delivered, not re-sending`);
     return { ok: true, deliveryStatus: 'sent' };
+  }
+
+  // "Only if they've read the last one." Checked BEFORE anything is typed, so a
+  // refusal leaves the composer exactly as it was found.
+  if (opts.skipIfUnread) {
+    const { state, label } = readStateOfLastOutgoing(scope);
+    stamp(`skipIfUnread: last outgoing status=${state}${label ? ` ("${label}")` : ' (no status label found)'}`);
+    if (state !== 'read') {
+      return {
+        ok: false,
+        error: state === 'unknown'
+          ? "Skipped — couldn't tell whether the last message had been read"
+          : `Skipped — the last message hasn't been read${label ? ` (status: ${label})` : ''}`,
+        failureKind: 'unread',
+      };
+    }
   }
 
   // Snapshot the thread so we can detect the NEW outgoing bubble afterwards.
@@ -3282,11 +3554,12 @@ function handleCrmRequest(request: any): Promise<unknown> | null {
   const payload = request?.payload || {};
   const guard: DupGuard | undefined =
     payload.skipIfDelivered === 'sent-only' || payload.skipIfDelivered === 'not-failed' ? payload.skipIfDelivered : undefined;
+  const skipIfUnread = !!payload.skipIfUnread;
   switch (request?.type) {
     case 'CRM_SEND_MESSAGE':
-      return performAutomatedSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard });
+      return performAutomatedSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard, skipIfUnread });
     case 'CRM_SEND_VIA_DRAWER':
-      return performDrawerSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard });
+      return performDrawerSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard, skipIfUnread });
     case 'CRM_RESOLVE_PROFILE':
       return resolveProfileThreadFor(String(payload.threadId || ''));
     default:

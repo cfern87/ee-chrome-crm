@@ -18,6 +18,65 @@ import {
 
 export const TAG_FILTER_VISIBLE = 12;
 
+/**
+ * The capture diagnostic, as one click that puts it on the clipboard.
+ *
+ * Deliberately almost invisible: a tiny grey glyph next to the name, no label,
+ * shown only on contacts that still HAVE a diagnostic (they expire after a few
+ * days — see NameDiag). It is a bug-report affordance, not a feature, and the
+ * contact detail is not the place to explain what it is to someone who will
+ * never need it.
+ *
+ * What it copies is a JSON blob meant to be pasted straight into a bug report:
+ * every name the page could offer at capture time, which one won, and where.
+ */
+function NameDiagButton({ conv }: { conv: Conversation }) {
+  const [copied, setCopied] = useState(false);
+  if (!conv.nameDiag) return null;
+
+  const copy = async () => {
+    const blob = {
+      currentName: conv.participantName,
+      contactId: conv.id,
+      source: conv.source || 'messenger',
+      nameManual: !!conv.nameManual,
+      capturedAt: new Date(conv.nameDiag!.at).toISOString(),
+      diag: conv.nameDiag,
+    };
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(blob, null, 2));
+    } catch {
+      return;
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <button
+      onClick={copy}
+      title={
+        `Copy the capture diagnostic for this contact.\n\n` +
+        `Recorded when they first entered the CRM (${formatRelativeTime(conv.nameDiag.at)}), ` +
+        `kept for a few days, then deleted automatically. If this contact came in under the ` +
+        `wrong name, copy this and send it in — it says which reader produced the name and ` +
+        `what the alternatives were.`
+      }
+      style={{
+        background: 'none',
+        border: 'none',
+        cursor: 'pointer',
+        fontSize: 10,
+        lineHeight: 1,
+        padding: 2,
+        color: copied ? color.success.base : color.border.control,
+      }}
+    >
+      {copied ? '✓' : '⌗'}
+    </button>
+  );
+}
+
 /** How several selected tags combine: every one of them, or any of them. */
 export type TagFilterMode = 'all' | 'any';
 
@@ -337,6 +396,7 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
               <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis' }}>{conv.participantName || 'Unknown'}</h2>
               <button onClick={startRename} title="Rename contact" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14, color: color.text.muted, padding: 2, lineHeight: 1 }}>✎</button>
               {conv.nameManual && <span title="Custom name — kept even when this chat is reopened" style={{ fontSize: 10, color: '#7b3fb8', background: '#f3eafb', padding: '2px 6px', borderRadius: 8, fontWeight: 600 }}>custom</span>}
+              <NameDiagButton conv={conv} />
             </div>
           )}
           <div style={{ fontSize: 12, color: color.text.muted, marginTop: 4 }}>

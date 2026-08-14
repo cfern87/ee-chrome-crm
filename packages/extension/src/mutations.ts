@@ -23,8 +23,11 @@
 // Everything here is pure: no chrome, no DOM, no I/O. The background owns the
 // load/save around it.
 
-import type { Store, Conversation, Tag } from './storage';
-import { addTagsTo, removeTagsFrom, tombstone } from './storage';
+import type { Store, Conversation, Tag, NameDiag } from './storage';
+import {
+  addTagsTo, removeTagsFrom, tombstone,
+  readPinnedContacts, PINNED_CONTACTS_KEY, MAX_PINNED_CONTACTS,
+} from './storage';
 import { buildThreadIndex } from './contacts';
 import { looksLikeName, isDamagedName } from './names';
 import { profileKey } from './csv';
@@ -38,6 +41,10 @@ export type Mutation =
       chatUrl?: string;
       name?: string;
       allowCreate: boolean;
+      // Capture diagnostics, recorded ONLY when this actually creates the
+      // contact — see NameDiag. Ignored on an update, where the interesting
+      // moment has already passed.
+      diag?: NameDiag;
     }
   // Attach a legacy/vanity-keyed contact to the real Messenger thread id.
   | { op: 'bindThread'; conversationId: string; threadId: string; chatUrl?: string }
@@ -50,6 +57,7 @@ export type Mutation =
       pageThreadId?: string | null;
       urlThreadId?: string | null;
       urlThreadNumeric?: boolean;
+      diag?: NameDiag;
     }
   | { op: 'addTags'; conversationId: string; tagIds: string[] }
   | { op: 'removeTags'; conversationId: string; tagIds: string[] }
@@ -60,6 +68,14 @@ export type Mutation =
   // Replace a stored name that isn't a name (a heading scraped before the
   // profile header rendered, or the 'Unknown' sentinel) with a real one.
   | { op: 'repairName'; conversationId: string; name: string }
+  // Archive or unarchive a contact. Exists because preset actions (presets.ts)
+  // can include it; the dashboard still archives through a whole-store write.
+  | { op: 'setArchived'; conversationId: string; archived: boolean }
+  // Pin/unpin a contact in the toolbar popup. A mutation rather than a
+  // whole-store write because the popup is the only thing that sends it, and
+  // the popup's snapshot of the store is up to 5s stale (it polls) — writing
+  // that back wholesale is exactly the clobber mutations.ts exists to stop.
+  | { op: 'setPinned'; conversationId: string; pinned: boolean }
   | { op: 'deleteContact'; conversationId: string }
   | { op: 'markContacted'; conversationId: string }
   | { op: 'setResolvedThread'; conversationId: string; threadId: string; chatUrl?: string }
@@ -173,6 +189,7 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
         createdAt: now,
         updatedAt: now,
         chatUrl: m.chatUrl,
+        ...(m.diag ? { nameDiag: m.diag } : {}),
       };
       // Re-adding someone clears their tombstone, so the merge can't undo it.
       delete next.deleted[m.threadId];
@@ -271,6 +288,7 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
         archived: false,
         createdAt: now,
         updatedAt: now,
+        ...(m.diag ? { nameDiag: m.diag } : {}),
       };
       delete next.deleted[id];
       return { store: next, changed: true, conversationId: id };
@@ -365,6 +383,32 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
       const next = copy(store);
       next.conversations[m.conversationId] = { ...conv, participantName: name, updatedAt: now };
       return { store: next, changed: true, conversationId: m.conversationId };
+    }
+
+    case 'setArchived': {
+      const conv = store.conversations[m.conversationId];
+      if (!conv) return { store, changed: false };
+      if (!!conv.archived === m.archived) return { store, changed: false, conversationId: m.conversationId };
+      const next = copy(store);
+      next.conversations[m.conversationId] = { ...conv, archived: m.archived, updatedAt: now };
+      return { store: next, changed: true, conversationId: m.conversationId };
+    }
+
+    case 'setPinned': {
+      if (m.pinned && !store.conversations[m.conversationId]) return { store, changed: false };
+      const current = readPinnedContacts(store);
+      // Newest pin goes to the FRONT, and the cap drops the oldest. Pinning a
+      // sixth person silently doing nothing would look broken; pushing the
+      // least recently pinned one out is what the gesture obviously means.
+      const next = m.pinned
+        ? [m.conversationId, ...current.filter((id) => id !== m.conversationId)].slice(0, MAX_PINNED_CONTACTS)
+        : current.filter((id) => id !== m.conversationId);
+      if (next.length === current.length && next.every((id, i) => id === current[i])) {
+        return { store, changed: false, conversationId: m.conversationId };
+      }
+      const out = copy(store);
+      out.settings = { ...out.settings, [PINNED_CONTACTS_KEY]: next };
+      return { store: out, changed: true, conversationId: m.conversationId };
     }
 
     case 'deleteContact': {

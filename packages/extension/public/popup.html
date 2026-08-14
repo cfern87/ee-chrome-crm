@@ -84,6 +84,100 @@
     .pop-result-name { font-size: var(--crm-text-small); font-weight: var(--crm-weight-semibold); color: var(--crm-text-primary); }
     .pop-result-sub { font-size: var(--crm-text-micro); color: var(--crm-text-muted); }
 
+    /* A result row is the name, then its tags, then the last message. The tags
+       go on their own line rather than beside the name: a contact with four of
+       them would otherwise push the name into an ellipsis, and the name is the
+       thing being searched for. */
+    .pop-result-tags { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 2px; }
+
+    .pop-tag {
+      font-size: 9px;
+      font-weight: var(--crm-weight-semibold);
+      line-height: 1.4;
+      padding: 0 5px;
+      border-radius: 7px;
+      white-space: nowrap;
+    }
+
+    /* Pinned contacts.
+       Deliberately NOT the search-result row shape. This sits above the search
+       box in a 340px popup, so every pixel it takes is a pixel of the thing
+       people actually came here for. Five pinned contacts as full rows is most
+       of the popup; as a wrap of name links it is one or two lines.
+       No tags, no last message, no avatar — you pinned them, you know who they
+       are. The name IS the link. */
+    .pop-pinned { display: flex; flex-wrap: wrap; gap: var(--crm-space-xxs, 3px); }
+
+    .pop-pin-chip {
+      display: inline-flex;
+      align-items: center;
+      max-width: 100%;
+      border: 1px solid var(--crm-border-subtle);
+      border-radius: 11px;
+      background: var(--crm-surface-raised);
+      overflow: hidden;
+    }
+    .pop-pin-chip:hover { background: var(--crm-surface-sunken); }
+
+    .pop-pin-name {
+      min-width: 0;
+      max-width: 150px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      padding: 3px 2px 3px 9px;
+      border: none;
+      background: none;
+      font: inherit;
+      font-size: var(--crm-text-micro);
+      font-weight: var(--crm-weight-semibold);
+      color: var(--crm-text-primary);
+      cursor: pointer;
+    }
+    .pop-pin-name:disabled { color: var(--crm-text-muted); cursor: not-allowed; }
+
+    /* The unpin control. Low-contrast until the chip is hovered, so a row of
+       pins reads as names rather than as a row of ×s. */
+    .pop-pin-x {
+      flex-shrink: 0;
+      border: none;
+      background: none;
+      padding: 3px 7px 3px 3px;
+      font-size: 11px;
+      line-height: 1;
+      cursor: pointer;
+      color: transparent;
+    }
+    .pop-pin-chip:hover .pop-pin-x { color: var(--crm-text-muted); }
+    .pop-pin-x:hover { color: var(--crm-text-primary); }
+    .pop-pin-x:focus-visible { color: var(--crm-text-muted); }
+
+    /* Search results keep the fuller row — you are scanning unfamiliar names
+       there, so the tags and the last message earn their space. */
+    .pop-pin-row {
+      display: flex;
+      align-items: center;
+      gap: var(--crm-space-xs);
+      border-radius: var(--crm-radius-sm);
+    }
+    .pop-pin-row:hover { background: var(--crm-surface-sunken); }
+    .pop-pin-row .pop-result { flex: 1; min-width: 0; }
+    .pop-pin-row .pop-result:hover { background: none; }
+
+    .pop-pin-btn {
+      flex-shrink: 0;
+      background: none;
+      border: none;
+      padding: var(--crm-space-xs);
+      font-size: 12px;
+      line-height: 1;
+      cursor: pointer;
+      color: var(--crm-text-muted);
+      border-radius: var(--crm-radius-sm);
+    }
+    .pop-pin-btn:hover { color: var(--crm-text-primary); background: var(--crm-surface-raised); }
+    .pop-pin-btn[aria-pressed="true"] { color: var(--crm-warning-base, #b7791f); }
+
     .pop-account {
       padding: var(--crm-space-md) var(--crm-space-lg);
       border-top: 1px solid var(--crm-border-subtle);
@@ -156,12 +250,20 @@
         <div class="crm-banner crm-banner--warning" id="statusWarning" style="margin-top:var(--crm-space-sm)" hidden></div>
       </div>
 
+      <!-- Pinned contacts. Hidden entirely until something is pinned, so the
+           popup doesn't grow an empty section for a feature nobody uses. -->
+      <div id="pinnedBlock" hidden>
+        <div class="pop-section-label">Pinned</div>
+        <div class="pop-pinned" id="pinnedList"></div>
+      </div>
+
       <div>
         <div class="pop-section-label">Jump to a chat</div>
         <label class="crm-sr-only" for="quickSearch">Search contacts</label>
         <input class="crm-input" type="search" id="quickSearch" placeholder="Search contacts…" autocomplete="off">
         <div class="pop-results" id="quickResults" role="listbox" aria-label="Matching contacts" style="margin-top:var(--crm-space-xs)"></div>
         <div class="pop-hint" id="quickHint">Type a name to open that conversation in Messenger.</div>
+        <div class="pop-hint" id="pinHint" hidden></div>
       </div>
     </div>
 

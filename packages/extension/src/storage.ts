@@ -126,6 +126,78 @@ export interface CustomFieldDef {
   updatedAt?: number; // see Tag.updatedAt — same reason, same fallback
 }
 
+/**
+ * What the name extractors saw at the moment a contact FIRST entered the CRM.
+ *
+ * Contacts occasionally land under the wrong name — a post author from a
+ * still-hydrating timeline, a section heading, another person's thread (the
+ * long comments on `firstProfileName` and `pageOfferedName` in content.ts are
+ * the accumulated history of this). Every one of those bugs was diagnosed the
+ * same slow way: reproduce it, guess which of half a dozen readers won, add a
+ * console.log, wait for it to happen again.
+ *
+ * This records the answer at capture time instead, so a wrong name can be
+ * explained after the fact from the contact itself. It exists to be COPIED OUT
+ * and sent to whoever is fixing the bug — that is the whole feature.
+ *
+ * Deliberately short-lived (DIAG_TTL_MS) because it is debris, not data: it is
+ * only interesting while the mistake is still on screen, and it rides in the
+ * same Drive blob as everything else, so it must not accumulate.
+ */
+export interface NameDiag {
+  /** When the contact was captured. */
+  at: number;
+  /** Which capture path ran. */
+  via: 'messenger' | 'profile';
+  /** The name that was actually written. */
+  saved: string;
+  /** Page the capture happened on. */
+  url?: string;
+  /** Thread id in the URL at capture time, when there was one. */
+  urlThreadId?: string;
+  /** Thread id the contact was keyed under. */
+  threadId?: string;
+  /**
+   * What each reader offered, keyed by reader. The point of the whole record:
+   * when they disagree, this says who won and what the alternatives were.
+   */
+  candidates?: Record<string, string>;
+  /** True when the profile name passed the two-read confirmation. */
+  confirmed?: boolean;
+  /** Anything else worth a line — which branch ran, why a read was rejected. */
+  notes?: string[];
+}
+
+/**
+ * How long a capture diagnostic is kept. A few days: long enough to notice a
+ * wrong name, open the dashboard and copy it out, short enough that a store
+ * with thousands of contacts never carries thousands of these.
+ */
+export const DIAG_TTL_MS = 5 * 24 * 60 * 60 * 1000; // 5 days
+
+/**
+ * Drop expired capture diagnostics. Called on every save, so the cleanup is a
+ * consequence of ordinary use rather than something that needs its own alarm
+ * (and so a store that is never written is never rewritten just to prune).
+ */
+export function pruneDiagnostics(store: Store, now = Date.now()): Store {
+  let changed = false;
+  const conversations: Record<string, Conversation> = {};
+  for (const [id, conv] of Object.entries(store.conversations)) {
+    if (conv.nameDiag && now - conv.nameDiag.at > DIAG_TTL_MS) {
+      // Deliberately does NOT bump updatedAt: expiring debris is not an edit to
+      // the contact, and stamping it would make every machine's prune look like
+      // a change worth winning a merge with.
+      const { nameDiag: _expired, ...rest } = conv;
+      conversations[id] = rest;
+      changed = true;
+    } else {
+      conversations[id] = conv;
+    }
+  }
+  return changed ? { ...store, conversations } : store;
+}
+
 export interface Conversation {
   id: string;
   participantName: string;
@@ -172,6 +244,9 @@ export interface Conversation {
   updatedAt: number;
   lastOpenedAt?: number;
   lastContactedAt?: number;
+  // Capture-time name diagnostics. Absent on everything captured before this
+  // existed, and on anything older than DIAG_TTL_MS — see NameDiag.
+  nameDiag?: NameDiag;
   // The canonical thread id Facebook redirected us to when this contact's
   // saved chat URL turned out to be a stale/legacy link (the kind that renders
   // a "Continue" interstitial instead of the conversation). The store key and
@@ -247,6 +322,36 @@ export function removeTagsFrom(conv: Conversation, tagIds: string[], ts = Date.n
   if (Object.keys(stamps).length) next.tagAddedAt = stamps;
   else delete next.tagAddedAt;
   return next;
+}
+
+// ---- Pinned contacts ----
+//
+// The handful of people you reach for constantly, shown at the top of the
+// toolbar popup so getting to them isn't "remember the name, type enough of
+// it, pick from the results" every single time.
+//
+// In `settings` (and therefore synced) rather than in chrome.storage.local
+// with the panel's reading preferences: which four people you are working
+// today is not a property of a machine, and it is the one thing on that popup
+// that would be genuinely annoying to re-pin on the laptop.
+//
+// Deliberately a SMALL cap. The popup is 340px wide and the pinned list sits
+// above the search box, so past a handful it stops being a shortcut and starts
+// being the thing you have to scroll past to reach the search box.
+export const PINNED_CONTACTS_KEY = 'pinnedContacts';
+export const MAX_PINNED_CONTACTS = 5;
+
+/**
+ * The pinned contact ids that still resolve to a live contact, capped.
+ * Filtering here rather than at the pin site is what keeps a contact deleted
+ * on another machine from leaving a dead row in the popup forever.
+ */
+export function readPinnedContacts(store: Pick<Store, 'settings' | 'conversations'>): string[] {
+  const raw = (store.settings as Record<string, unknown>)?.[PINNED_CONTACTS_KEY];
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((id): id is string => typeof id === 'string' && !!store.conversations[id])
+    .slice(0, MAX_PINNED_CONTACTS);
 }
 
 /** Most recent tag application on this contact, or undefined when no dates are recorded. */
@@ -1132,9 +1237,9 @@ export async function saveStore(input: Store): Promise<SaveResult> {
   // the cache BEFORE the plan limit runs — applyContactLimit also removes
   // conversations, and those are refusals to store, not deletions.
   const previous = (await chromeLocalGet()) || (await idbGet());
-  const withTombstones = previous
+  const withTombstones = pruneDiagnostics(previous
     ? tombstone(normalize(input), removedConversationIds(previous, input))
-    : pruneTombstones(normalize(input));
+    : pruneTombstones(normalize(input)));
 
   const { store, blocked } = await applyContactLimit(withTombstones);
 
