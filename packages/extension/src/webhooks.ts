@@ -26,6 +26,10 @@
 // what happened without knowing how it gets sent.
 
 import type { Store, Conversation } from './storage';
+// Value import into settingsMerge.ts, which imports WEBHOOK_COLLECTION back out
+// of here. Safe because nothing crosses at module-evaluation time — see the
+// same note in presets.ts.
+import { writeCollection, type SettingsBag, type SettingsCollection } from './settingsMerge';
 
 // ---------------------------------------------------------------------------
 // Events
@@ -98,6 +102,14 @@ export interface WebhookConfig {
 }
 
 export const WEBHOOKS_KEY = 'webhooks';
+
+/**
+ * Deletion tombstones for webhooks: id → when it was deleted (epoch ms). Sits
+ * beside the list in `settings` so a delete survives a cross-machine merge —
+ * see settingsMerge.ts.
+ */
+export const WEBHOOKS_DELETED_KEY = 'webhooksDeleted';
+
 export const MAX_WEBHOOKS = 10;
 
 /** The payload version. Bumped only for a breaking change to the envelope. */
@@ -130,7 +142,20 @@ export function isValidWebhookUrl(raw: string): string | null {
 }
 
 export function readWebhooks(store: Pick<Store, 'settings'>): WebhookConfig[] {
-  const raw = (store.settings as Record<string, unknown>)?.[WEBHOOKS_KEY];
+  return allWebhooksIn(store.settings as SettingsBag).slice(0, MAX_WEBHOOKS);
+}
+
+/**
+ * Every stored webhook, WITHOUT the cap. The merge and the writer both need
+ * this: capping here would let a write drop the eleventh without tombstoning
+ * it, and the next merge would pull it back from the other machine forever.
+ *
+ * Sorted by creation so two machines merging the same set agree on the order —
+ * which for webhooks is also the order they were added in, i.e. what the array
+ * position used to mean.
+ */
+function allWebhooksIn(settings: SettingsBag | undefined): WebhookConfig[] {
+  const raw = settings?.[WEBHOOKS_KEY];
   if (!Array.isArray(raw)) return [];
   const known = new Set(WEBHOOK_EVENTS.map((e) => e.event));
   const out: WebhookConfig[] = [];
@@ -157,7 +182,51 @@ export function readWebhooks(store: Pick<Store, 'settings'>): WebhookConfig[] {
         : {}),
     });
   }
-  return out.slice(0, MAX_WEBHOOKS);
+  return out.sort(compareWebhooks);
+}
+
+/** Creation order — which for webhooks is also the order they were added in. */
+function compareWebhooks(a: WebhookConfig, b: WebhookConfig): number {
+  return a.createdAt - b.createdAt;
+}
+
+/** How a webhook reconciles across machines. See SettingsCollection. */
+export const WEBHOOK_COLLECTION: SettingsCollection<WebhookConfig> = {
+  key: WEBHOOKS_KEY,
+  deletedKey: WEBHOOKS_DELETED_KEY,
+  max: MAX_WEBHOOKS,
+  readAll: allWebhooksIn,
+  id: (h) => h.id,
+  compare: compareWebhooks,
+  revision: (h) => h.updatedAt ?? h.createdAt ?? 0,
+  stamp: (h, now) => ({ ...h, updatedAt: now }),
+  // `lastDelivery` is excluded along with the stamp, so recording a receipt is
+  // NOT an edit. It is one machine's observation of its own last POST — if it
+  // counted, every delivery would outrank a real configuration change waiting
+  // on another machine, and a busy endpoint would keep overwriting it.
+  content: (h) => {
+    const { updatedAt: _rev, lastDelivery: _seen, ...rest } = normalizeWebhook(h);
+    return JSON.stringify(rest);
+  },
+};
+
+/** A webhook in a fixed key order, so an equal one never reads as an edit. */
+function normalizeWebhook(h: WebhookConfig): WebhookConfig {
+  return allWebhooksIn({ [WEBHOOKS_KEY]: [h] })[0] ?? h;
+}
+
+/**
+ * Put `next` into a settings bag — the only supported way to save webhooks.
+ * Stamps what actually changed and tombstones what disappeared, so an edit
+ * here reaches the other machines instead of the whole list being overwritten
+ * by whichever machine happened to save last. See writeCollection.
+ */
+export function writeWebhooks(
+  settings: SettingsBag | undefined,
+  next: WebhookConfig[],
+  now = Date.now(),
+): SettingsBag {
+  return writeCollection(WEBHOOK_COLLECTION, settings, next, now);
 }
 
 export function newWebhook(url: string): WebhookConfig {

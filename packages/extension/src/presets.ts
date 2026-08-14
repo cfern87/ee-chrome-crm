@@ -17,11 +17,23 @@
 // The panel renders them as a row of small buttons; Settings → Behavior is
 // where they're built.
 //
+// Living in `settings` is not by itself enough to make them SYNC, though: the
+// store's merge resolves settings per key, and a key holding a list needs to be
+// reconciled per preset or the machine doing the merge silently keeps its own
+// copy of the whole list. PRESET_COLLECTION below is what teaches settingsMerge
+// how to do that, and writePresetActions is how they must be saved for it to
+// work.
+//
 // Pure module: no chrome, no DOM. The panel turns `stepsFor` into store
 // mutations and the background applies them, exactly like every other edit.
 
 import type { Conversation, Store } from './storage';
 import type { Mutation } from './mutations';
+// Value import into settingsMerge.ts, which imports the collection below back
+// out of here. Safe because nothing crosses at module-evaluation time: this
+// module only calls in from function bodies, and that one only reads the
+// collection from inside a function. Same arrangement as storage.ts ↔ drive.ts.
+import { writeCollection, type SettingsBag, type SettingsCollection } from './settingsMerge';
 
 /** One edit inside a preset. */
 export type PresetStep =
@@ -64,6 +76,13 @@ export function isDestructive(p: PresetAction): boolean {
 
 export const PRESET_ACTIONS_KEY = 'presetActions';
 
+/**
+ * Deletion tombstones for presets: preset id → when it was deleted (epoch ms).
+ * Sits beside the list in `settings` for the same reason `Store.deleted` sits
+ * beside the conversations — see settingsMerge.ts.
+ */
+export const PRESET_ACTIONS_DELETED_KEY = 'presetActionsDeleted';
+
 /** Cap on how many presets the panel will show. A row of buttons, not a menu. */
 export const MAX_PRESET_ACTIONS = 12;
 
@@ -74,14 +93,29 @@ export const MAX_PRESET_ACTIONS = 12;
  * otherwise become a button that throws when pressed.
  */
 export function readPresetActions(store: Pick<Store, 'settings'>): PresetAction[] {
-  const raw = (store.settings as Record<string, unknown>)?.[PRESET_ACTIONS_KEY];
+  return allPresetsIn(store.settings as SettingsBag).slice(0, MAX_PRESET_ACTIONS);
+}
+
+/**
+ * Every stored preset, sorted, WITHOUT the display cap. The merge and the
+ * writer both need this: capping here would let a preset past the twelfth be
+ * dropped by a write that never tombstoned it, and the next merge would pull
+ * it back from the other machine forever.
+ */
+function allPresetsIn(settings: SettingsBag | undefined): PresetAction[] {
+  const raw = settings?.[PRESET_ACTIONS_KEY];
   if (!Array.isArray(raw)) return [];
   const out: PresetAction[] = [];
   for (const item of raw) {
     const p = normalizePreset(item);
     if (p) out.push(p);
   }
-  return out.sort((a, b) => a.order - b.order || a.createdAt - b.createdAt).slice(0, MAX_PRESET_ACTIONS);
+  return out.sort(comparePresets);
+}
+
+/** Display order: explicit position, then creation for anything that ties. */
+function comparePresets(a: PresetAction, b: PresetAction): number {
+  return a.order - b.order || a.createdAt - b.createdAt;
 }
 
 function normalizePreset(raw: unknown): PresetAction | null {
@@ -124,6 +158,59 @@ function normalizeStep(raw: unknown): PresetStep | null {
     default:
       return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-machine merge
+// ---------------------------------------------------------------------------
+//
+// `settings` used to reconcile as one shallow spread — `{...remote, ...local}` —
+// which meant the local machine's ENTIRE presetActions array won every merge.
+// Two machines that had each ever saved a preset could then never see the
+// other's: each one's reconcile put its own list back and uploaded it, and the
+// next reconcile on the other machine did exactly the same in reverse. That is
+// what "preset actions don't sync" was.
+//
+// So presets merge like every other record in the store: per id, newest
+// revision wins, with tombstones to carry deletes. The mechanism is generic and
+// lives in settingsMerge.ts; what belongs here is only what is specific to a
+// preset — how to read one, what counts as an edit to one, and that `order` is
+// bookkeeping the writer owns rather than something a user types.
+
+/** How a preset reconciles across machines. See SettingsCollection. */
+export const PRESET_COLLECTION: SettingsCollection<PresetAction> = {
+  key: PRESET_ACTIONS_KEY,
+  deletedKey: PRESET_ACTIONS_DELETED_KEY,
+  max: MAX_PRESET_ACTIONS,
+  readAll: allPresetsIn,
+  id: (p) => p.id,
+  compare: comparePresets,
+  revision: (p) => p.updatedAt ?? p.createdAt ?? 0,
+  stamp: (p, now) => ({ ...p, updatedAt: now }),
+  // Through normalizePreset so the comparison is against a fixed key order —
+  // an equal preset assembled by a different code path (`{...p, ...patch}`)
+  // must not read as an edit purely because its keys landed in another order.
+  content: (p) => {
+    const { updatedAt: _rev, ...rest } = normalizePreset(p) as PresetAction;
+    return JSON.stringify(rest);
+  },
+  // Position IS content for a preset: the panel draws them in this order, so
+  // moving one is an edit that has to reach the other machines. Renumbering
+  // before the content comparison is what makes it count as one.
+  arrange: (list) => list.map((p, i) => (p.order === i ? p : { ...p, order: i })),
+};
+
+/**
+ * Put `next` into a settings bag — the only supported way to save presets.
+ * Renumbers, stamps what actually changed, and tombstones what disappeared;
+ * see writeCollection.
+ */
+export function writePresetActions(
+  settings: SettingsBag | undefined,
+  next: PresetAction[],
+  now = Date.now(),
+): SettingsBag {
+  return writeCollection(PRESET_COLLECTION, settings, next, now);
 }
 
 export function newPresetAction(label: string, order: number): PresetAction {

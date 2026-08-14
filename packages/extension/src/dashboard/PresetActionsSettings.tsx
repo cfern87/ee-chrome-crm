@@ -15,7 +15,7 @@ import type { Store, SaveResult } from '../storage';
 import {
   PresetAction, PresetStep, PresetStepKind,
   readPresetActions, newPresetAction, describePreset, isDestructive,
-  PRESET_ACTIONS_KEY, MAX_PRESET_ACTIONS,
+  writePresetActions, MAX_PRESET_ACTIONS,
 } from '../presets';
 import {
   Banner, Button, Card, ColorInput, Select, Stack, Text,
@@ -66,20 +66,17 @@ export function PresetActionsSettings({ store, updateStore }: {
   const tags = Object.values(store.tags).sort((a, b) => a.name.localeCompare(b.name));
   const fields = Object.values(store.fieldDefs).sort((a, b) => a.order - b.order);
 
+  // writePresetActions owns the bookkeeping every save needs: `order` is
+  // renumbered so it stays dense (the up/down buttons just swap positions in
+  // this array), each changed preset is stamped, and a removed one leaves a
+  // tombstone. All three are what let the merge carry this machine's edit to
+  // the others instead of the whole list being overwritten — see ../presets.ts.
   const persist = async (next: PresetAction[]) => {
-    await updateStore({
-      ...store,
-      settings: {
-        ...(store.settings as Record<string, unknown>),
-        // Re-numbered on every write so `order` stays dense — the up/down
-        // buttons just swap positions in this array and let it be renumbered.
-        [PRESET_ACTIONS_KEY]: next.map((p, i) => ({ ...p, order: i })),
-      },
-    });
+    await updateStore({ ...store, settings: writePresetActions(store.settings, next) });
   };
 
   const update = async (id: string, patch: Partial<PresetAction>) => {
-    await persist(presets.map((p) => (p.id === id ? { ...p, ...patch, updatedAt: Date.now() } : p)));
+    await persist(presets.map((p) => (p.id === id ? { ...p, ...patch } : p)));
   };
 
   const addPreset = async () => {

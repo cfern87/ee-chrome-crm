@@ -86,7 +86,7 @@ import {
 import { ensureFreshToken } from './drive';
 import {
   readWebhooks, subscribersOf, buildPayload, deliver, diffContactEvents,
-  WEBHOOKS_KEY,
+  writeWebhooks,
   type WebhookEvent, type PendingEvent, type WebhookConfig,
 } from './webhooks';
 
@@ -265,8 +265,11 @@ async function recordDeliveries(results: DeliveryRecord[]): Promise<void> {
     if (!touched) return;
     // Written straight into settings rather than through a mutation, because a
     // delivery receipt is bookkeeping about the webhook itself — it must never
-    // look like CRM activity and re-enter diffContactEvents.
-    await saveStore({ ...store, settings: { ...store.settings, [WEBHOOKS_KEY]: next } });
+    // look like CRM activity and re-enter diffContactEvents. It also must not
+    // read as an EDIT to the webhook: writeWebhooks leaves the revision alone
+    // for a change that is only `lastDelivery`, so this machine's receipt can't
+    // outrank a configuration change made on another one.
+    await saveStore({ ...store, settings: writeWebhooks(store.settings, next) });
   });
 }
 

@@ -87,6 +87,16 @@
   padding: 14px 14px 16px;
   overflow-y: auto;
   flex: 1;
+  /* Required for the max-height below to mean what it says. Under the default
+     content-box, that max-height caps only the CONTENT box, so this element's
+     border box came out 30px taller (14px + 16px of padding) — header 50px +
+     body (72vh - 50px + 30px) = 72vh + 30px inside a panel capped at 72vh with
+     `overflow: hidden`. The panel sheared those 30px off the bottom, which is
+     almost exactly the footer: "Remove from CRM" was clipped out of sight and
+     unreachable by scrolling (the body scrolled, but the bottom of its
+     scrollport sat outside the panel). Tabbing to the link still revealed it,
+     because focus scrolls ancestors including an `overflow: hidden` box. */
+  box-sizing: border-box;
   /* A flex item's default min-height is `auto` — "never shrink below my
      content" — which is exactly wrong for a scroll pane: it makes the body
      grow to fit everything (all the tags, the delete confirmation, ...) past

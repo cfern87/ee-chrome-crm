@@ -22,6 +22,7 @@
 //     person costs a single write.
 
 import { readStore as driveReadStore, writeStore as driveWriteStore, mergeStores } from './drive';
+import { mergeSettingsWithBase, reconcileCollections, type SettingsBag } from './settingsMerge';
 import { getEntitlement, isSignedIn, FREE_CONTACT_LIMIT } from './license';
 import type { SavedSearch } from './search';
 
@@ -612,6 +613,24 @@ function syncGetAll(): Promise<Store | null> {
   });
 }
 
+// Read back just the settings item. Used to reconcile against what sync holds
+// right now, rather than against what this context last saw — see
+// reconcileSettingsWithSync.
+function syncGetSettings(): Promise<SettingsBag | null> {
+  if (!syncAvailable()) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.sync.get(SETTINGS_KEY, (items) => {
+        if (!isExtensionAlive() || chrome.runtime.lastError || !items) { resolve(null); return; }
+        const s = items[SETTINGS_KEY];
+        resolve(s && typeof s === 'object' ? (s as SettingsBag) : null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
 // A single sync write attempt. Reports whether it actually landed: a rejected
 // write (quota / rate limit) sets chrome.runtime.lastError, which we must NOT
 // swallow — otherwise saveStore reports success for data that never persisted,
@@ -679,6 +698,39 @@ async function syncSetBatch(batch: Record<string, unknown>): Promise<{ ok: boole
 
 // Snapshot of what we last pushed to sync, so saveStore can write only deltas.
 let lastSyncSnapshot: Store = clone(EMPTY_STORE);
+
+/**
+ * Reconcile this machine's settings against what sync holds right now.
+ *
+ * Legacy mode keeps the whole bag in ONE item, so a write publishes all of it —
+ * including the keys this machine hasn't looked at since before another machine
+ * changed them. That is a silent rollback: toggle something here, and any
+ * setting changed elsewhere in the meantime quietly reverts to the value this
+ * context happens to be holding. It is not a narrow race either, since the
+ * store a dashboard is rendering can be minutes old.
+ *
+ * The delta snapshot is the ancestor that fixes it: it says what this machine
+ * last saw in sync, so a three-way merge can tell "I changed this" from "I just
+ * haven't heard about it". Collections merge per record on top of that.
+ *
+ * Also rebases the snapshot's settings onto the live item, so that merely
+ * ADOPTING a remote value doesn't read as a local change and cost a redundant
+ * write — sync writes are rate-limited, and this runs on every save.
+ *
+ * With no ancestor — a context that somehow saves before it has ever loaded —
+ * every key reads as changed here and this degrades to the whole-bag write it
+ * replaced. That is the old behaviour rather than a new failure, and it doesn't
+ * arise in practice: a caller needs a store to save, and getting one goes
+ * through loadStore, which sets the snapshot. The collections are unaffected
+ * either way; they never consult the ancestor.
+ */
+async function reconcileSettingsWithSync(store: Store): Promise<Store> {
+  const remote = await syncGetSettings();
+  if (!remote) return store;
+  const merged = mergeSettingsWithBase(lastSyncSnapshot.settings, store.settings, remote);
+  lastSyncSnapshot = { ...lastSyncSnapshot, settings: clone(remote) };
+  return { ...store, settings: merged };
+}
 
 // Outcome of pushing a delta to chrome.storage.sync, so callers can tell a
 // fully-synced write from one that only landed on this device.
@@ -1133,10 +1185,20 @@ async function loadStoreUncached(): Promise<Store> {
   const fromSync = await syncGetAll();
   if (hasData(fromSync)) {
     lastSyncSnapshot = clone(fromSync);
+    // Sync stays canonical for everything else — letting the cache win a scalar
+    // setting is the whole-key bug again, and would pin this machine to its own
+    // stale toggles. But a settings COLLECTION can safely be unioned with the
+    // cache, and has to be: a sync write rejected for quota leaves records
+    // durable only in the cache, and this read would otherwise be what loses
+    // them. Their revisions and tombstones make the union safe.
+    const cached = await chromeLocalGet();
+    const store = cached
+      ? { ...fromSync, settings: reconcileCollections(fromSync.settings, cached.settings) }
+      : fromSync;
     // Keep local backups fresh for this machine.
-    chromeLocalSet(fromSync);
-    idbSet(fromSync);
-    return fromSync;
+    chromeLocalSet(store);
+    idbSet(store);
+    return store;
   }
 
   // 2. Sync empty — migrate from local backups if present.
@@ -1241,11 +1303,18 @@ export async function saveStore(input: Store): Promise<SaveResult> {
     ? tombstone(normalize(input), removedConversationIds(previous, input))
     : pruneTombstones(normalize(input)));
 
-  const { store, blocked } = await applyContactLimit(withTombstones);
+  const { store: limited, blocked } = await applyContactLimit(withTombstones);
 
   const planLimit = blocked > 0
     ? { planLimitReached: true, blockedContacts: blocked, reason: `Free plan is limited to ${FREE_CONTACT_LIMIT} contacts.` }
     : {};
+
+  // Settings are reconciled BEFORE the local write, not after, so the cache and
+  // the canonical copy hold the same bag. Writing the unreconciled one locally
+  // and the merged one to sync would leave this machine believing its stale
+  // values, and the next save would publish them right back over the merge.
+  const driveMode = await isDriveEnabled();
+  const store = driveMode ? limited : await reconcileSettingsWithSync(limited);
 
   // Local cache first — durable even if the network write below fails.
   await Promise.all([chromeLocalSet(store), idbSet(store)]);
@@ -1255,7 +1324,7 @@ export async function saveStore(input: Store): Promise<SaveResult> {
   loadedAt = Date.now();
   await bumpStoreRev();
 
-  if (await isDriveEnabled()) {
+  if (driveMode) {
     // Mark dirty up front; queueDriveWrite clears it once the upload lands.
     // Drive has no item ceiling and retries on its own, so a save is "ok" once
     // it's durable locally and queued.

@@ -15,8 +15,8 @@
 import React, { useState } from 'react';
 import type { Store, SaveResult } from '../storage';
 import {
-  WebhookConfig, WEBHOOK_EVENTS, WEBHOOKS_KEY, MAX_WEBHOOKS,
-  readWebhooks, newWebhook, isValidWebhookUrl, type WebhookEvent,
+  WebhookConfig, WEBHOOK_EVENTS, MAX_WEBHOOKS,
+  readWebhooks, newWebhook, writeWebhooks, isValidWebhookUrl, type WebhookEvent,
 } from '../webhooks';
 import {
   Banner, Button, Card, Input, Select, Stack, Text, Toggle,
@@ -56,15 +56,16 @@ export function WebhookSettings({ store, updateStore }: {
   const [testing, setTesting] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
+  // writeWebhooks owns the bookkeeping the cross-machine merge depends on:
+  // stamping the hooks that actually changed, and leaving a tombstone for one
+  // that's removed. Without it a save publishes the whole list and rolls back
+  // whatever another machine changed in the meantime — see ../settingsMerge.ts.
   const persist = async (next: WebhookConfig[]) => {
-    await updateStore({
-      ...store,
-      settings: { ...(store.settings as Record<string, unknown>), [WEBHOOKS_KEY]: next },
-    });
+    await updateStore({ ...store, settings: writeWebhooks(store.settings, next) });
   };
 
   const update = (id: string, patch: Partial<WebhookConfig>) =>
-    persist(hooks.map((h) => (h.id === id ? { ...h, ...patch, updatedAt: Date.now() } : h)));
+    persist(hooks.map((h) => (h.id === id ? { ...h, ...patch } : h)));
 
   const add = async () => {
     setStatus(null);

@@ -23,6 +23,10 @@ import type { Store } from './storage';
 // modules have evaluated. Shared rather than re-derived on purpose — the writer
 // stamping the revision and the merge comparing it must agree.
 import { defRevision } from './storage';
+// Settings merge per key, EXCEPT the keys holding a list of records (presets,
+// webhooks), which reconcile per record — see settingsMerge.ts. Same
+// cycle-safety note as above: nothing there imports from here.
+import { mergeSettings } from './settingsMerge';
 import { DriveError, recordSyncOk, recordSyncFailure } from './syncHealth';
 
 // Files we keep in the app-data folder.
@@ -913,7 +917,7 @@ export function mergeStores(a: Store, b: Store): Store {
     fieldDefs: { ...a.fieldDefs },
     savedSearches: { ...a.savedSearches },
     notes: { ...a.notes, ...b.notes },
-    settings: { ...a.settings, ...b.settings },
+    settings: mergeSettings(a.settings, b.settings),
     deleted,
   };
   for (const [id, conv] of Object.entries(b.conversations)) {
