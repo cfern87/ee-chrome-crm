@@ -7,7 +7,7 @@
 // places. Extracted when DashboardApp.tsx passed 5,500 lines and every one of
 // these was defined next to code that had nothing to do with it.
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import type { Store, Tag, TagGroup, SyncUsage } from '../storage';
 import { DRIVE_SYNC_ALARM } from '../storage';
 import { isSignedIn } from '../license';
@@ -325,6 +325,23 @@ export function DraftInput({
     setFocused(false);
     if (draft !== value) onCommit(draft);
   };
+
+  // Commit on unmount too. Blur is not enough on its own: React does not fire
+  // onBlur for an input that is REMOVED while focused, so anything half-typed
+  // was silently dropped whenever the surrounding row went away — a preset
+  // being re-rendered out from under the editor, the editor being closed, a
+  // route change. Typing a new preset's name and watching it come back as
+  // "New action" was this, not the store write failing.
+  //
+  // Refs because the cleanup runs once, at unmount, and a cleanup closure
+  // captured on the first render would otherwise commit that render's stale
+  // draft over the real one.
+  const latest = useRef({ draft, value, onCommit });
+  latest.current = { draft, value, onCommit };
+  useEffect(() => () => {
+    const { draft: d, value: v, onCommit: fn } = latest.current;
+    if (d !== v) fn(d);
+  }, []);
 
   return (
     <Input

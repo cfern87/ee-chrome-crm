@@ -1060,7 +1060,13 @@ function exitPickMode() {
 let panelEl: HTMLElement | null = null;
 let currentPanelThreadId: string | null = null;
 let lastRenderedThread: string | null = null;
+// Rename draft. null means the name row is showing the name; a string (possibly
+// empty) means the row is showing its inline editor, and this is what has been
+// typed so far. Kept at module scope so a re-render mid-edit doesn't drop it.
+// Deliberately an in-panel editor rather than prompt(): a native dialog blocks
+// the page and can't be driven by scripted/automated input.
 let editingName: string | null = null;
+let editingNameFocused = false;
 
 // ---- Panel placement ----
 //
@@ -1408,6 +1414,8 @@ async function renderPanelContent() {
     presetArmed = null;
     fieldDrafts.clear();
     focusedFieldId = null;
+    editingName = null;
+    editingNameFocused = false;
   }
   currentPanelThreadId = threadId;
   lastRenderedThread = threadId;
@@ -1541,10 +1549,7 @@ async function renderPanelContent() {
       <button class="fb-crm-close">✕</button>
     </div>
     <div class="fb-crm-body">
-      <div class="fb-crm-name-row">
-        <div class="fb-crm-name">${escapeHtml(conv.participantName)}</div>
-        <button class="fb-crm-name-edit" title="Edit name">✎</button>
-      </div>
+      ${nameRowHtml(conv.participantName)}
       <div class="fb-crm-meta">📨 Last contacted: <strong>${formatRelative(conv.lastContactedAt)}</strong></div>
       ${isProfilePage() ? '' : '<button class="fb-crm-pick-btn">🎯 Select different conversation</button>'}
 
@@ -1633,6 +1638,8 @@ function renderSignInPanel(): void {
   presetArmed = null;
   fieldDrafts.clear();
   focusedFieldId = null;
+  editingName = null;
+  editingNameFocused = false;
   lastRenderedThread = null;
 
   panelEl.innerHTML = `
@@ -1691,6 +1698,28 @@ function chipHiddenMark(t: Tag): string {
 
 function chipTitle(t: Tag): string {
   return isHiddenTag(t) ? 'Hidden from the Messenger sidebar' : '';
+}
+
+// The contact's name, either displayed with an edit button or — once editing
+// starts — as an inline text input with save/cancel. Like the Details rows
+// below, the input's value is set on the live element by wirePanelActions
+// rather than baked into a value="…" attribute, because escapeHtml escapes
+// text, not attribute quotes.
+function nameRowHtml(participantName: string): string {
+  if (editingName === null) {
+    return `
+      <div class="fb-crm-name-row">
+        <div class="fb-crm-name">${escapeHtml(participantName)}</div>
+        <button class="fb-crm-name-edit" title="Edit name">✎</button>
+      </div>`;
+  }
+  return `
+    <div class="fb-crm-name-row fb-crm-name-row-editing">
+      <input type="text" class="fb-crm-name-input" id="fb-crm-name-input"
+             placeholder="Contact name" aria-label="Contact name" />
+      <button class="fb-crm-name-save" id="fb-crm-name-save" title="Save name">✓</button>
+      <button class="fb-crm-name-cancel" id="fb-crm-name-cancel" title="Cancel rename">✕</button>
+    </div>`;
 }
 
 // One row of the panel's "Details" section. Values are deliberately NOT baked
@@ -1763,6 +1792,8 @@ function wireClose() {
   panelEl?.querySelector('.fb-crm-close')?.addEventListener('click', () => {
     deleteArmed = false; // never leave a delete armed behind a closed panel
     presetArmed = null;
+    editingName = null;  // ...nor a half-typed rename
+    editingNameFocused = false;
     if (panelEl) panelEl.style.display = 'none';
   });
 }
@@ -1916,21 +1947,61 @@ function wirePanelActions(threadId: string) {
     await injectSidebarTags();
   });
 
-  // Name edit button
+  // Name edit button — opens the inline editor below.
   panelEl.querySelector('.fb-crm-name-edit')?.addEventListener('click', async () => {
-    const nameEl = panelEl?.querySelector('.fb-crm-name');
+    const nameEl = panelEl?.querySelector<HTMLElement>('.fb-crm-name');
     if (!nameEl) return;
+    editingName = nameEl.textContent || '';
+    editingNameFocused = true;
+    await renderPanel();
+  });
 
-    editingName = (panelEl?.querySelector('.fb-crm-name') as HTMLElement)?.textContent || '';
+  // Inline rename editor. The draft lives in `editingName` so a re-render
+  // can't lose it, but commit reads the input's live value: that way a name
+  // set programmatically (automation, tests) commits even if no `input` event
+  // was dispatched to update the draft.
+  const nameInputEl = panelEl.querySelector<HTMLInputElement>('#fb-crm-name-input');
+  if (nameInputEl) {
+    nameInputEl.value = editingName ?? '';
 
-    const newName = prompt('Enter conversation name:', editingName);
-    if (newName !== null && newName.trim()) {
-      await mutate([{ op: 'renameContact', conversationId: threadId, name: newName.trim() }]);
+    const cancelRename = async () => {
       editingName = null;
+      editingNameFocused = false;
+      await renderPanel();
+    };
+
+    const commitRename = async () => {
+      const name = nameInputEl.value.trim();
+      // An empty name would leave the contact unidentifiable; keep the editor
+      // open with the field focused instead of silently discarding the edit.
+      if (!name) { nameInputEl.focus(); return; }
+      editingName = null;
+      editingNameFocused = false;
+      await mutate([{ op: 'renameContact', conversationId: threadId, name }]);
       await renderPanel();
       await injectSidebarTags();
+    };
+
+    nameInputEl.addEventListener('input', () => { editingName = nameInputEl.value; });
+    nameInputEl.addEventListener('focus', () => { editingNameFocused = true; });
+    nameInputEl.addEventListener('blur', () => { editingNameFocused = false; });
+    nameInputEl.addEventListener('keydown', e => {
+      const key = (e as KeyboardEvent).key;
+      if (key === 'Enter') { e.preventDefault(); void commitRename(); }
+      else if (key === 'Escape') { e.preventDefault(); void cancelRename(); }
+    });
+
+    panelEl.querySelector('#fb-crm-name-save')?.addEventListener('click', commitRename);
+    panelEl.querySelector('#fb-crm-name-cancel')?.addEventListener('click', cancelRename);
+
+    // Same as the Details inputs: a re-render rebuilt the field the user was
+    // typing in, so put the caret back at the end of what they'd typed.
+    if (editingNameFocused) {
+      nameInputEl.focus();
+      const v = nameInputEl.value;
+      try { nameInputEl.setSelectionRange(v.length, v.length); } catch { /* ignore */ }
     }
-  });
+  }
 }
 
 // ---- Last-contacted tracking ----

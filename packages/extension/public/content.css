@@ -161,6 +161,52 @@
   color: #065fd4;
 }
 
+/* Inline rename editor, shown in place of .fb-crm-name while editing. */
+.fb-crm-name-row-editing { gap: 6px; }
+
+.fb-crm-name-input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid #065fd4;
+  border-radius: 6px;
+  font-size: 15px;
+  font-weight: 600;
+  font-family: inherit;
+  color: #050505;
+  background: #fff;
+  outline: none;
+}
+
+.fb-crm-name-save,
+.fb-crm-name-cancel {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  font-size: 13px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: all 0.2s;
+}
+
+.fb-crm-name-save {
+  background: #065fd4;
+  border: 1px solid #065fd4;
+  color: #fff;
+}
+.fb-crm-name-save:hover { background: #0450b4; }
+
+.fb-crm-name-cancel {
+  background: transparent;
+  border: 1px solid #ccd0d5;
+  color: #65676b;
+}
+.fb-crm-name-cancel:hover { background: #f0f2f5; }
+
 .fb-crm-meta {
   font-size: 12px;
   color: #65676b;

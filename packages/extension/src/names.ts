@@ -51,6 +51,11 @@ const UI_CHROME = new Set([
   // Feed chrome
   'sponsored', 'suggested for you', 'people you may know', 'story', 'stories',
   "what's on your mind",
+  // The profile's own tab strip and header links. These are links to the
+  // profile's OWN url, so extractProfileNameByOwnerLink reads them alongside
+  // the name itself and they have to be recognizable as chrome — "All" is the
+  // first thing that scan meets on a real profile page.
+  'all', 'profile', 'new',
   // Post-card chrome. These sit in the timeline BELOW the profile header, and
   // the ancestor climb in extractProfileNameByStats can reach a container that
   // includes the first post — so on a page whose header hasn't rendered yet,
@@ -144,7 +149,12 @@ export function cleanName(raw: string | null | undefined): string {
   // Leading unread count "(3) Name".
   s = s.replace(/^\(\d+\)\s*/, '');
   // Cut at a separator that introduces a preview/metadata segment.
-  s = s.split(/\s*[·•|]\s*|\n|·|\s[–—]\s/)[0].trim();
+  //
+  // The spaced hyphen is in here with the en/em dashes because Facebook display
+  // names carry taglines — "Jay Thooft - Building Elite Sales Teams" is one
+  // person's actual profile name — and the tagline is not part of who they are.
+  // SPACED only: "Auger-Chrétien" and "Jean-Luc" must survive untouched.
+  s = s.split(/\s*[·•|]\s*|\n|·|\s[–—-]\s/)[0].trim();
   // Drop "You: …" / "Name: message" previews — keep nothing past a colon that
   // looks like a sender prefix.
   if (/^[^:]{0,40}:\s/.test(s) && /:/.test(s)) {
@@ -353,6 +363,149 @@ export function extractActiveThreadName(threadId: string | null, doc: Document =
   return 'Unknown';
 }
 
+// ---- Whose profile is this? ------------------------------------------------
+//
+// Every extractor above this line is POSITIONAL: it finds the name-shaped text
+// that sits in the most name-like place. That is guesswork, and on a profile
+// page it is guesswork against a page densely populated with OTHER people's
+// names — the Friends card, the timeline's post authors and commenters, the
+// People You May Know rail. When the guess lands on one of those, nothing about
+// the result marks it as wrong: it is a real person's name, and it holds still
+// across a confirmation re-read because that card isn't going anywhere.
+//
+// The URL is the one thing on the page that says who this profile actually
+// belongs to, and Facebook links the owner's own name back to their own URL —
+// in the header, in the sticky header, on their own posts. A friend tile links
+// to the FRIEND's url instead. So a name found inside a link is checkable
+// against the address bar, which turns "the most name-shaped text" into "the
+// name this page says belongs to this url".
+
+// Path segments Facebook puts UNDER a person's own profile
+// (facebook.com/<user>/friends, /photos, …). A second segment that isn't one of
+// these means the link left the profile entirely — /groups/<id>, /photo/,
+// /watch/ — and identifies nobody.
+const PROFILE_SUBPAGES = new Set([
+  'friends', 'friends_mutual', 'followers', 'following', 'photos', 'photos_by',
+  'photos_of', 'videos', 'reels', 'about', 'posts', 'map', 'sports', 'music',
+  'movies', 'tv', 'books', 'games', 'likes', 'events', 'groups', 'reviews',
+  'about_profile_transparency', 'about_work_and_education', 'about_places',
+  'about_contact_and_basic_info', 'about_family_and_relationships',
+  'about_details', 'about_life_events', 'about_overview',
+]);
+
+// Facebook's own single-segment app paths. facebook.com/<x> is a username only
+// when <x> isn't one of these — /photo/?fbid=…, /watch, /groups sit at the same
+// depth as a vanity URL and would otherwise each read as a different "person",
+// which is enough to make a link look like it belongs to somebody else.
+//
+// csv.ts has a longer RESERVED_FB_PATHS for URL parsing. Deliberately NOT
+// imported: names.ts has no imports at all, by design (it is the one module the
+// content script and the dashboard both pull in as pure logic), and importing
+// that one would drag storage.ts and its chain in behind it. This copy only has
+// to cover what turns up as an href on a profile page.
+const FB_APP_PATHS = new Set([
+  'messages', 'profile.php', 'pages', 'page', 'pg', 'groups', 'group', 'watch',
+  'marketplace', 'events', 'event', 'gaming', 'games', 'photo', 'photo.php',
+  'story.php', 'permalink.php', 'media', 'sharer', 'sharer.php', 'share',
+  'login', 'recover', 'settings', 'bookmarks', 'friends', 'notifications',
+  'search', 'home.php', 'public', 'people', 'policies', 'privacy', 'terms',
+  'help', 'business', 'developers', 'careers', 'about', 'reel', 'reels',
+  'stories', 'hashtag', 'ads', 'saved', 'memories', 'live', 'plugins',
+]);
+
+/**
+ * Which profile a Facebook URL identifies, as a comparable key — the vanity
+ * username ('jay.thooft') or 'id:<n>' for profile.php?id=<n>. Null for anything
+ * that isn't one person's profile.
+ *
+ * Relative hrefs (which is how Facebook writes nearly all of them) resolve
+ * against facebook.com rather than the document, so this reads the same in a
+ * test fixture as it does on the live page.
+ */
+export function profileOwnerKey(href: string | null | undefined): string | null {
+  const raw = (href || '').trim();
+  if (!raw || raw.startsWith('#')) return null;
+  let u: URL;
+  try { u = new URL(raw, 'https://www.facebook.com'); } catch { return null; }
+  if (!/(^|\.)facebook\.com$/i.test(u.hostname)) return null;
+
+  const segs = u.pathname.split('/').filter(Boolean);
+  if (!segs.length) return null;
+  const first = segs[0].toLowerCase();
+  if (/^profile\.php$/i.test(first)) {
+    const id = u.searchParams.get('id');
+    return id && /^\d+$/.test(id) ? `id:${id}` : null;
+  }
+  if (FB_APP_PATHS.has(first)) return null;
+  if (segs.length > 1 && !PROFILE_SUBPAGES.has(segs[1].toLowerCase())) return null;
+  return first;
+}
+
+/**
+ * Is `el` inside a link that points at a DIFFERENT person than `ownerKey`?
+ *
+ * This is the check that keeps the positional scans honest. A friend tile's
+ * name, a post author's byline and a PYMK card's name are each wrapped in a
+ * link to THAT person — so on the profile whose Friends card starts with Kelsey
+ * O'Neal, this is what stops "Kelsey O'Neal" being read as the profile owner.
+ */
+function belongsToAnotherProfile(el: Element, ownerKey: string | null | undefined): boolean {
+  if (!ownerKey) return false;
+  const link = el.closest?.('a[href]');
+  if (!link) return false;
+  const key = profileOwnerKey(link.getAttribute('href'));
+  return !!key && key !== ownerKey;
+}
+
+/**
+ * The profile owner's name, read from the links this page makes back to its own
+ * URL. `ownerKey` defaults to the document's own address.
+ *
+ * Ranked by how many of those links carry the same name, because the owner's
+ * name is the one that repeats (header, sticky header, their own posts) while
+ * the tab strip's one-off labels appear once each. Document order can't be used
+ * for this: the first own-url link on a real profile is the "All" tab, not the
+ * name.
+ */
+export function extractProfileNameByOwnerLink(
+  doc: Document = document,
+  ownerKey?: string | null,
+): string {
+  const owner = ownerKey === undefined ? profileOwnerKey(doc.location?.href) : ownerKey;
+  if (!owner) return '';
+  const root = doc.querySelector('[role="main"]') || doc.body;
+  if (!root) return '';
+
+  const counts = new Map<string, number>();
+  const order: string[] = [];
+  for (const link of Array.from(root.querySelectorAll('a[href]'))) {
+    if (isOwnUi(link)) continue;
+    if (profileOwnerKey(link.getAttribute('href')) !== owner) continue;
+
+    // The link's own text, else a photo alt inside it ("Jay Thooft, profile
+    // picture" — cleanName drops the suffix).
+    let name = personNameFrom(pageTextOf(link));
+    if (!name) {
+      for (const img of Array.from(link.querySelectorAll('img[alt]'))) {
+        if (isOwnUi(img)) continue;
+        const n = personNameFrom(img.getAttribute('alt'));
+        if (n) { name = n; break; }
+      }
+    }
+    if (!name) continue;
+    if (!counts.has(name)) order.push(name);
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+
+  let best = '';
+  let bestCount = 0;
+  for (const name of order) {
+    const c = counts.get(name) || 0;
+    if (c > bestCount) { best = name; bestCount = c; }
+  }
+  return best;
+}
+
 // The lowest DOM node that is an ancestor of both `a` and `b`, or null.
 function commonAncestor(a: Element, b: Element): Element | null {
   const seen = new Set<Element>();
@@ -372,10 +525,15 @@ function elementDepth(el: Element | null): number {
 
 // The best name-shaped string found anywhere inside `container`, used to read
 // the profile owner's name out of the header block around the stat counters.
-function bestNameIn(container: Element): string {
+function bestNameIn(container: Element, ownerKey?: string | null): string {
   // Our own panel shows a contact's name too, and the climb in
   // extractProfileNameByStats can reach an ancestor that contains it — so every
   // scan here skips the extension's injected UI, same as extractNameFromLink.
+  //
+  // `skip` also drops anything wrapped in a link to somebody ELSE's profile:
+  // the container this climbed to is frequently the Friends card or a post,
+  // and every name in there is linked to its own owner.
+  const skip = (el: Element) => isOwnUi(el) || belongsToAnotherProfile(el, ownerKey);
 
   // 1. The <h1>. On a profile page there is exactly one, and it is the owner's
   //    name. Checked on its own, ahead of the weaker heading levels: those were
@@ -384,13 +542,13 @@ function bestNameIn(container: Element): string {
   //    The name is never an h2 and a card label is never an h1, so splitting
   //    them is what settles that contest correctly rather than by position.
   for (const el of Array.from(container.querySelectorAll('h1'))) {
-    if (isOwnUi(el)) continue;
+    if (skip(el)) continue;
     const n = personNameFrom(pageTextOf(el));
     if (n) return n;
   }
   // 2. The profile photo's alt text is usually exactly the name.
   for (const img of Array.from(container.querySelectorAll('img[alt]'))) {
-    if (isOwnUi(img)) continue;
+    if (skip(img)) continue;
     const n = personNameFrom(img.getAttribute('alt'));
     if (n) return n;
   }
@@ -399,7 +557,7 @@ function bestNameIn(container: Element): string {
   //    rendered — "Ariel Wright is feeling motivated." — so personNameFrom
   //    earning its keep here is what stops the timeline winning over the header.
   for (const el of Array.from(container.querySelectorAll('h2, [role="heading"]'))) {
-    if (isOwnUi(el)) continue;
+    if (skip(el)) continue;
     const n = personNameFrom(pageTextOf(el));
     if (n) return n;
   }
@@ -416,7 +574,7 @@ function bestNameIn(container: Element): string {
   //    same loop) and it is what makes a half-rendered page return no name
   //    rather than a plausible-looking fabrication.
   for (const el of Array.from(container.querySelectorAll('span, div, a'))) {
-    if (isOwnUi(el) || !isTextLeaf(el)) continue;
+    if (skip(el) || !isTextLeaf(el)) continue;
     const n = personNameFrom(pageTextOf(el));
     if (n) return n;
   }
@@ -490,7 +648,7 @@ function collectStatEls(doc: Document): Element[] {
  * or the page <title>, both of which Facebook now serves as a generic
  * "Facebook" on logged-in profile pages.
  */
-export function extractProfileNameByStats(doc: Document = document): string {
+export function extractProfileNameByStats(doc: Document = document, ownerKey?: string | null): string {
   const stats = collectStatEls(doc);
   if (!stats.length) return '';
 
@@ -516,7 +674,7 @@ export function extractProfileNameByStats(doc: Document = document): string {
   // Climb from the counters' container outward; the name heading is a
   // sibling/near-ancestor of the counts, so the first name we hit is it.
   for (let el: Element | null = anchor, i = 0; el && i < 6; el = el.parentElement, i++) {
-    const name = bestNameIn(el);
+    const name = bestNameIn(el, ownerKey);
     if (name) return name;
   }
   return '';
@@ -525,13 +683,13 @@ export function extractProfileNameByStats(doc: Document = document): string {
 /**
  * Best name for a Facebook profile page (not a Messenger thread).
  *
- * Primary strategy is a structural page scan around the profile's stat counters
- * (extractProfileNameByStats — "followers"/"following" or "friends"/"mutual
- * friends"): Facebook no longer exposes the profile name via og:title or the
- * page <title> on logged-in profile pages — both now read a generic "Facebook"
- * — so we read the name straight out of the profile header DOM. The meta/title
- * sources remain only as last-ditch fallbacks for layouts where the counters
- * aren't present.
+ * Facebook exposes the profile name nowhere convenient: og:title and the page
+ * <title> both read a generic "Facebook" on logged-in profile pages, and the
+ * name is no longer an <h1> either. So the primary strategy is the ownership
+ * scan (extractProfileNameByOwnerLink) — the name this page links back to its
+ * own URL under, which is the only read here that can be CHECKED against whose
+ * profile this is rather than merely looking name-shaped. The stat-counter
+ * scan and the meta/title reads remain behind it as fallbacks.
  */
 export interface ProfileNameOptions {
   /**
@@ -545,37 +703,60 @@ export interface ProfileNameOptions {
    * about whose page this is: it either says the name or it isn't there yet.
    */
   domOnly?: boolean;
+
+  /**
+   * Which profile this page belongs to (see profileOwnerKey). Defaults to the
+   * document's own address, which is what the content script wants; tests and
+   * fixtures pass it explicitly because a fixture's document URL isn't
+   * facebook.com. Pass null to opt out of the ownership checks entirely.
+   */
+  owner?: string | null;
 }
 
 export function extractProfilePageName(doc: Document = document, opts: ProfileNameOptions = {}): string {
-  // 1. The <h1> inside the main content region. A profile page has exactly one
-  //    and it is the owner's name; scoping to [role="main"] keeps the nav bar's
-  //    headings out of it.
+  // 1. The <h1> inside the main content region, on layouts that still have one.
+  //    Kept first because when a profile DOES head itself with an h1, that h1 is
+  //    the owner's name and there is nothing better to read.
   //
-  //    This runs BEFORE the stat-counter scan, which is a change worth being
-  //    explicit about. The scan anchors on the tightest pair of follower/friend
-  //    counters — and a profile timeline contains counters of its own (the
-  //    Friends card, and posts that say "with 3 friends"), so once the timeline
-  //    renders, the tightest pair can sit down IN the timeline rather than in the
-  //    header. The climb from there reaches a post card, and the post's author
-  //    line gets read as the name. That is why the panel showed the right name
-  //    and then saved the wrong one: the first paint happened before the timeline
-  //    existed, the click happened after.
-  //
-  //    The scan is still valuable — it is what handles a page whose header hasn't
-  //    rendered — but it is a fallback for when the h1 is absent, not a better
-  //    source than the h1 itself.
+  //    Current Facebook is not such a layout. Checked against four live
+  //    profiles: [role="main"] contains no h1 at all, and the document's only
+  //    h1 is the nav bar's "Notifications" — which this never sees, because
+  //    scoping to [role="main"] keeps the nav chrome out. So this step is
+  //    effectively dormant today; step 2 below is what answers.
+  const owner = opts.owner === undefined ? profileOwnerKey(doc.location?.href) : opts.owner;
+
   const main = doc.querySelector('[role="main"]');
   if (main) {
     for (const el of Array.from(main.querySelectorAll('h1'))) {
-      if (isOwnUi(el)) continue;
+      if (isOwnUi(el) || belongsToAnotherProfile(el, owner)) continue;
       const n = personNameFrom(pageTextOf(el));
       if (n) return n;
     }
   }
 
-  // 2. Structural scan anchored on the profile's stat counters.
-  const byStats = extractProfileNameByStats(doc);
+  // 2. The name this page links back to its own URL under.
+  //
+  // In practice this is now the source that answers, because step 1 no longer
+  // fires at all: Facebook stopped rendering the profile name as an <h1>, and
+  // on a current profile page the only h1 in the whole document is the nav
+  // bar's "Notifications" — outside [role="main"], so not even read.
+  //
+  // That left step 3 deciding every capture, and step 3 anchors on stat
+  // counters. A profile's Friends card gives every tile in it a "N mutual
+  // friends" caption — 40-plus counters, all sitting closer together than the
+  // header's single "500 followers · 53 following" line — so the climb landed
+  // in that card and returned the FIRST FRIEND'S name. Stable text in a stable
+  // card, so re-reading to confirm it (pollForProfileName) agreed with itself
+  // and pinned it. That is the whole of the "saved as someone else" bug: the
+  // contacts came out named after the first tile in their own Friends card.
+  const byOwnerLink = extractProfileNameByOwnerLink(doc, owner);
+  if (looksLikePersonName(byOwnerLink)) return byOwnerLink;
+
+  // 3. Structural scan anchored on the profile's stat counters. Now a genuine
+  //    last-resort DOM read: it only has to cover layouts where the owner links
+  //    back to nothing, and its answers are filtered by the same ownership
+  //    check, so it can no longer return a linked stranger.
+  const byStats = extractProfileNameByStats(doc, owner);
   if (looksLikePersonName(byStats)) return byStats;
 
   // Everything below reads the DOCUMENT rather than this profile's header, and

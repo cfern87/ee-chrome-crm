@@ -40,6 +40,8 @@ import {
   extractNameFromLink,
   extractProfilePageName,
   extractProfileNameByStats,
+  extractProfileNameByOwnerLink,
+  profileOwnerKey,
   isDamagedName,
   nameKey,
 } from './names';
@@ -202,6 +204,26 @@ describe('isDamagedName', () => {
   });
 });
 
+describe('profileOwnerKey', () => {
+  it('reads the profile a link identifies', () => {
+    expect(profileOwnerKey('/jay.thooft')).toBe('jay.thooft');
+    expect(profileOwnerKey('https://www.facebook.com/JamesNaleski')).toBe('jamesnaleski');
+    expect(profileOwnerKey('/profile.php?id=1234')).toBe('id:1234');
+  });
+
+  it('treats a profile’s own sub-pages as the same person', () => {
+    expect(profileOwnerKey('/jay.thooft/friends')).toBe('jay.thooft');
+    expect(profileOwnerKey('/jay.thooft/followers/')).toBe('jay.thooft');
+  });
+
+  it('identifies nobody for links that leave the profile', () => {
+    expect(profileOwnerKey('/groups/12345')).toBeNull();
+    expect(profileOwnerKey('/photo/?fbid=99')).toBeNull();
+    expect(profileOwnerKey('https://example.com/jay.thooft')).toBeNull();
+    expect(profileOwnerKey('')).toBeNull();
+  });
+});
+
 describe('nameKey', () => {
   it('is case, spacing and accent insensitive', () => {
     expect(nameKey('Nicolas Auger-Chrétien')).toBe(nameKey('nicolas   auger chretien'));
@@ -287,6 +309,58 @@ describe('extractProfilePageName / extractProfileNameByStats', () => {
       </div>`;
     expect(extractProfileNameByStats(document)).toBe('');
     expect(extractProfilePageName(document, { domOnly: true })).toBe('');
+  });
+
+  it('reads the name off the page’s links back to its own URL when there is no h1', () => {
+    // The shape of a real, current profile page: no h1 anywhere in [role=main]
+    // (Facebook stopped using one), the owner's name repeated across links to
+    // their own URL, and a Friends card full of OTHER people — each tile
+    // linking to that friend, each captioned with a mutual-friends counter.
+    document.body.innerHTML = `
+      <div role="main">
+        <a href="/jay.thooft"><span>All</span></a>
+        <a href="/jay.thooft"><span>Jay Thooft</span></a>
+        <a href="/jay.thooft/followers/"><span>500 followers</span></a>
+        <a href="/jay.thooft/following/"><span>53 following</span></a>
+        <div>
+          <a href="/kelseymoneal"><img alt="Kelsey O’Neal" /><span>Kelsey O’Neal</span></a>
+          <span>98 mutual friends</span>
+          <a href="/zachbrown"><img alt="Zach Brown" /><span>Zach Brown</span></a>
+          <span>325 mutual friends</span>
+        </div>
+        <a href="/jay.thooft"><span>Jay Thooft</span></a>
+      </div>`;
+    expect(extractProfileNameByOwnerLink(document, 'jay.thooft')).toBe('Jay Thooft');
+    expect(extractProfilePageName(document, { owner: 'jay.thooft' })).toBe('Jay Thooft');
+  });
+
+  it('never returns the first tile of the profile’s own Friends card', () => {
+    // The reported bug, reduced: jay.thooft was saved as "Kelsey O’Neal", the
+    // first friend shown on his profile. Each tile carries a mutual-friends
+    // counter, so the tightest pair of counters — what the stat scan anchors
+    // on — sits INSIDE that card, and the climb from there used to return the
+    // tile's own name. Every name in there is linked to its owner, which is
+    // what makes it recognizable as somebody else's.
+    document.body.innerHTML = `
+      <div role="main">
+        <div><span>500 followers • 53 following</span></div>
+        <div id="friends-card">
+          <a href="/kelseymoneal"><img alt="Kelsey O’Neal" /><span>Kelsey O’Neal</span></a>
+          <span>98 mutual friends</span>
+          <a href="/zachbrown"><img alt="Zach Brown" /><span>Zach Brown</span></a>
+          <span>325 mutual friends</span>
+        </div>
+      </div>`;
+    expect(extractProfileNameByStats(document, 'jay.thooft')).not.toBe('Kelsey O’Neal');
+    expect(extractProfilePageName(document, { owner: 'jay.thooft', domOnly: true }))
+      .not.toBe('Kelsey O’Neal');
+  });
+
+  it('strips a tagline from a display name, keeping hyphenated names intact', () => {
+    // "Jay Thooft - Building Elite Sales Teams" is genuinely his profile name;
+    // the tagline still isn't the contact's name.
+    expect(cleanName('Jay Thooft - Building Elite Sales Teams')).toBe('Jay Thooft');
+    expect(cleanName('Nicolas Auger-Chrétien')).toBe('Nicolas Auger-Chrétien');
   });
 
   it('reports failure honestly as Unknown rather than guessing, when nothing is usable', () => {

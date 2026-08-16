@@ -125,6 +125,8 @@ function viewSignature(query: QueryGroup, sortBy: SortBy, sortDir: 'asc' | 'desc
 
 export default function DashboardApp() {
   const [store, setStore] = useState<Store>(EMPTY_STORE);
+  // Ordering ticket for store reads — see `refresh` below.
+  const storeSeqRef = useRef(0);
   const [route, setRoute] = useState<Route>('contacts');
   const [campaignView, setCampaignView] = useState<CampaignView>('compose');
   const [schemaView, setSchemaView] = useState<SchemaView>('tags');
@@ -309,9 +311,26 @@ export default function DashboardApp() {
     // `fresh` bypasses loadStore's freshness window. Used when something has
     // told us the store changed — otherwise the refresh could serve the cached
     // snapshot from just before the change and visibly undo what just happened.
+    //
+    // The sequence guard covers the OTHER half of that problem: ordering. Reads
+    // and writes are both async and several are routinely in flight at once
+    // (the onChanged handler, the 3s fallback poll, and every optimistic
+    // updateStore), and nothing makes them come back in the order they were
+    // started. A read that began BEFORE a write can land AFTER it and put the
+    // pre-write snapshot back on screen.
+    //
+    // That is visible, not theoretical: adding a preset action made the new row
+    // appear, vanish when a slower in-flight read landed, then reappear when the
+    // next read caught up. Anything being typed into the row at the time was
+    // unmounted along with it (see DraftInput, which now commits on unmount).
+    //
+    // So every read takes a ticket, and a read whose ticket has been superseded
+    // — by a newer read, or by a local write — throws its result away.
+    const seq = ++storeSeqRef.current;
     const s = await loadStore(fresh ? { maxAgeMs: 0 } : {});
-    setStore(s);
     setLoading(false);
+    if (seq !== storeSeqRef.current) return; // superseded while in flight
+    setStore(s);
     getSyncUsage().then(setSyncUsage).catch(() => setSyncUsage(null));
   }, []);
 
@@ -345,6 +364,11 @@ export default function DashboardApp() {
   // content scripts: both sides load, both save the whole store, and the later
   // save silently discards the earlier one's edits.
   const updateStore = async (next: Store): Promise<SaveResult> => {
+    // Invalidate every read already in flight before showing the new state: one
+    // of them is older than this edit, and letting it land would undo the edit
+    // on screen. The write below triggers an onChanged refresh of its own,
+    // which takes a fresh ticket and applies normally.
+    storeSeqRef.current++;
     setStore(next); // optimistic — the write is confirmed below
     const res = await new Promise<{ success?: boolean; result?: SaveResult } | null>((resolve) => {
       try {
