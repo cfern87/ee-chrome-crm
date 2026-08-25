@@ -167,6 +167,61 @@ export function formatRelativeTime(ts: number): string {
   return new Date(ts).toLocaleDateString();
 }
 
+// --- Read receipts --------------------------------------------------------
+//
+// Whether the last message you sent someone has been opened. Recorded by the
+// content script from Messenger's own receipt (messageStatus.ts) as you
+// browse, so it is an OBSERVATION with an age, never a live query — which is
+// why the chip is dated and why "unknown" is offered as a real answer rather
+// than being dressed up as "not read".
+
+export type ContactReadState = 'read' | 'unread' | 'unknown';
+
+export function readStateOf(conv: { readState?: 'read' | 'unread' }): ContactReadState {
+  return conv.readState ?? 'unknown';
+}
+
+const READ_STATE_CHIP: Record<ContactReadState, { label: string; short: string; fg: string; bg: string }> = {
+  read: { label: 'Read', short: '✓✓', fg: '#1a7f4b', bg: '#e6f4ec' },
+  unread: { label: 'Not read', short: '✓', fg: '#8a6100', bg: '#fdf1d8' },
+  unknown: { label: 'Unknown', short: '·', fg: '#6b6b6b', bg: '#eeeeee' },
+};
+
+/**
+ * Why the chip says what it says, spelled out on hover.
+ *
+ * The date is when this state was first SEEN, not when it was last confirmed:
+ * a sweep that finds the same answer again writes nothing (see the
+ * observeReadStates mutation), so there is no record of the last look. "Since"
+ * rather than "checked" keeps the chip honest about that.
+ */
+function readStateTitle(state: ContactReadState, at?: number): string {
+  const when = at ? ` (since ${formatRelativeTime(at)})` : '';
+  if (state === 'read') return `They have opened your last message${when}`;
+  if (state === 'unread') return `Your last message hasn't been opened yet${when}`;
+  return 'No read receipt has been seen for this contact yet — open their conversation in Messenger and it will be recorded';
+}
+
+export function ReadStateChip({ conv, compact }: {
+  conv: { readState?: 'read' | 'unread'; readStateAt?: number };
+  compact?: boolean;
+}) {
+  const state = readStateOf(conv);
+  const c = READ_STATE_CHIP[state];
+  return (
+    <span
+      title={readStateTitle(state, conv.readStateAt)}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 4, flex: '0 0 auto',
+        padding: compact ? '1px 5px' : '2px 7px', borderRadius: 8,
+        fontSize: compact ? 10 : 11, fontWeight: 700, color: c.fg, background: c.bg,
+      }}
+    >
+      {compact ? c.short : `${c.short} ${c.label}`}
+    </span>
+  );
+}
+
 // --- Sending pace ---------------------------------------------------------
 //
 // The pace lived only inside the composer, so it was re-entered from the

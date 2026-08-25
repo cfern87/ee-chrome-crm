@@ -29,6 +29,17 @@ import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_
 import { buildThreadIndex, isUnboundOrphan, planOrphanBinds, threadAliases } from './contacts';
 import type { ThreadRow } from './contacts';
 import { extractNameFromLink, extractActiveThreadName, extractProfilePageName, looksLikePersonName, isDamagedName } from './names';
+import { normalizeText } from './text';
+import {
+  DELIVERY_FAILED_PATTERNS,
+  DELIVERY_SENT_PATTERNS,
+  DELIVERY_PENDING_PATTERNS,
+  ALT_FRAGMENT_MAX,
+  readStateOfLastOutgoing,
+  hasReadReceipt,
+} from './messageStatus';
+import type { ReadState } from './messageStatus';
+import type { ReadStateObservation } from './mutations';
 import type { SendFailureKind } from './campaigns';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
@@ -2084,6 +2095,10 @@ function handleSendFrom(composer: Element | null): void {
   const threadId = resolveSendThreadId(composer);
   if (!threadId) return;
   markContacted(threadId).catch(() => { /* storage hiccup — ignore */ });
+  // A message we just sent has not been read. Said here rather than left to the
+  // next sweep so the CRM doesn't keep showing the PREVIOUS message's receipt
+  // as though it belonged to this one.
+  noteReadState(threadId, 'unread');
 }
 
 function watchOutgoingMessages() {
@@ -2416,6 +2431,12 @@ function init() {
   // (see applyPendingThreadResolve). No-op unless a marker is waiting.
   void applyPendingThreadResolve();
 
+  // Read-state observer. The first pass waits for the thread pane to hydrate —
+  // a status is the last thing in a conversation to render — and after that it
+  // is a timer that usually finds nothing new to say. See sweepReadStates.
+  setTimeout(() => { void sweepReadStates(); }, 6000);
+  setInterval(() => { void sweepReadStates(); }, READ_STATE_SWEEP_MS);
+
   if (shouldShowLauncher()) {
     console.log('[CRM] On Messenger/profile page, building launcher...');
     buildLauncher();
@@ -2477,15 +2498,6 @@ function init() {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-// Collapse whitespace so DOM text (which wraps/reflows) compares cleanly
-// against the message we intended to send. Also strip zero-width characters
-// (ZWSP/ZWNJ/ZWJ/word-joiner) that Messenger's composer inserts around line
-// breaks — they aren't matched by \s, so left in they cause the composer text
-// to differ from the target by one invisible character per line break.
-function normalizeText(s: string): string {
-  return (s || '').replace(/[\u200B\u200C\u200D\u2060\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
 }
 
 // Count non-overlapping occurrences of needle in haystack.
@@ -2794,29 +2806,10 @@ function blockMicAccess(): () => void {
 
 type DeliveryStatus = 'sent' | 'failed' | 'pending' | 'unknown';
 
-// Status wording is matched per FRAGMENT (one label, one line, one bullet-
-// separated field) and anchored at the start of it, never as a substring of the
-// row's whole text. Messenger labels an outgoing row something like "You sent:
-// <message>", which a loose /\bsent\b/ would read as delivery confirmation on a
-// message that plainly failed — the exact mistake being fixed here.
-//
-// Failures are checked first: several of them contain the word "sent" ("Not
-// sent") and would otherwise land in the success bucket.
-const DELIVERY_FAILED_PATTERNS: RegExp[] = [
-  /^(?:message\s+)?couldn['’]?t\s+(?:be\s+)?sen[dt]\b/i,
-  /^(?:this\s+)?message\s+(?:wasn['’]?t|was\s+not|not)\s+sent\b/i,
-  /^not\s+sent\b/i,
-  /^(?:message\s+)?failed\s+to\s+send\b/i,
-  /^(?:message\s+)?didn['’]?t\s+send\b/i,
-  /^unable\s+to\s+send\b/i,
-  /^message\s+failed\b/i,
-  /^(?:tap|click)\s+to\s+(?:retry|try\s+again)\b/i,
-];
-
-const DELIVERY_SENT_PATTERNS: RegExp[] = [/^(?:message\s+)?(?:sent|delivered|seen)\b/i];
-
-// Transient — the send is still in flight, so keep polling rather than judging.
-const DELIVERY_PENDING_PATTERNS: RegExp[] = [/^(?:sending|queued)\b/i];
+// The status vocabularies themselves live in messageStatus.ts, next to the
+// read-receipt reader that shares them. Failures are checked first here:
+// several of them contain the word "sent" ("Not sent") and would otherwise
+// land in the success bucket.
 
 // What we actually search the DOM for. A bubble does not always contain the
 // whole message: Messenger truncates long ones behind a "See more", and the
@@ -2856,6 +2849,18 @@ function statusFragments(el: HTMLElement, target: string): string[] {
     const l = n.getAttribute('aria-label');
     if (l) push(l);
   });
+  // alt text, because a message that has ALREADY been read carries no status
+  // text at all — just the reader's avatar, an <img alt="Seen by <name> at
+  // <time>">. Without this, re-checking an old delivered message reads
+  // 'unknown', and the recovery path's 'sent-only' guard would send it twice.
+  // Long alts are dropped: attachment descriptions are the only other alt in a
+  // thread, and they'd blow the size cap in statusForMessageNode before a real
+  // status was reached.
+  const pushAlt = (raw: string | null) => {
+    if (raw && normalizeText(raw).length <= ALT_FRAGMENT_MAX) push(raw);
+  };
+  pushAlt(el.getAttribute('alt'));
+  el.querySelectorAll('[alt]').forEach((n) => pushAlt(n.getAttribute('alt')));
   return out;
 }
 
@@ -2945,80 +2950,111 @@ function hasDeliveredCopy(scope: HTMLElement, target: string, guard: DupGuard): 
 
 // ---- Has the last thing we sent been read? ----
 //
-// Facebook labels the most recent outgoing bubble with its state — "Sent",
-// "Delivered", then "Read"/"Seen" once the recipient has opened it. That last
-// label is the only signal available here for "did my previous message land
-// with a person", and a campaign can be told to require it before sending a
-// follow-up (Campaign.skipIfUnread).
+// See messageStatus.ts: readStateOfLastOutgoing does the reading, and the
+// comment there explains why the answer arrives as an avatar rather than a
+// word. The gate that uses it is in typeSendAndConfirm below.
+
+// How long that gate waits for the thread to say anything about its last
+// outgoing message before giving up and calling the state unknown.
+const READ_STATE_TIMEOUT_MS = 4000;
+
+// ---- Recording read state onto the contacts themselves ----
 //
-// Read as its OWN patterns rather than by reusing DELIVERY_SENT_PATTERNS,
-// which deliberately treats "seen" as just another confirmation that the
-// message went out. The two questions are different: that one asks "did this
-// leave", this one asks "did somebody open it".
-const READ_PATTERNS: RegExp[] = [/^read\b/i, /^seen\b/i, /^opened\b/i];
+// The gate above answers the question for one thread at the moment of a send.
+// This does the same reading as the user browses, so the CRM can say whether
+// someone has opened your last message without a campaign having to discover
+// it one refusal at a time.
+//
+// It is a passive observer, and everything below follows from that being the
+// whole point:
+//
+//   * It reads only what is ALREADY on screen and never opens a conversation.
+//     Opening one marks it read on the user's own account — it clears their
+//     unread badge and tells the other person you've seen their message. A
+//     background job with side effects on somebody's inbox is not one.
+//   * The open thread and any chat drawer are read in full, so they can report
+//     'read' or 'unread'.
+//   * A sidebar row can only ever report 'read'. It renders the reader's
+//     avatar but has no status line, so no receipt might mean unread, might
+//     mean it's our turn to reply, might mean the row hasn't finished
+//     rendering — see hasReadReceipt.
+//   * Nothing is reported twice: each thread's last reported answer is kept
+//     here, so a tab sitting on an unchanged screen sends no messages at all.
+const READ_STATE_SWEEP_MS = 20_000;
+const reportedReadState = new Map<string, ReadState>();
 
-// Everything Facebook attaches to the tail of a thread that is a STATUS rather
-// than message content. Anchored at the fragment start, same as every other
-// status match here — "Read" as the first word of a message body is a sentence,
-// not a receipt.
-const ANY_STATUS_PATTERNS: RegExp[] = [
-  ...READ_PATTERNS,
-  ...DELIVERY_SENT_PATTERNS,
-  ...DELIVERY_PENDING_PATTERNS,
-  ...DELIVERY_FAILED_PATTERNS,
-];
-
-type ReadState = 'read' | 'unread' | 'unknown';
-
-/**
- * Whether the LAST outgoing message in `scope` has been read.
- *
- * There is no message text to anchor on here — the previous message was sent
- * by some earlier campaign, or by hand, and we don't know what it said. So
- * this reads the thread's trailing status labels instead: every separately-
- * labelled fragment in the pane, in document order, filtered down to the ones
- * that are actually delivery statuses, and the last of those is the state of
- * the newest outgoing bubble. Anything Facebook renders as an icon is caught
- * through its aria-label, which is how "Seen" usually appears.
- *
- * Returns 'unknown' rather than guessing when no status label can be found at
- * all: an empty thread, a layout change, or a pane that hasn't finished
- * hydrating all produce that, and the caller — not this function — decides
- * what an unreadable thread means. (For skipIfUnread it means DON'T SEND: the
- * whole point of the option is not to pile a second message onto someone who
- * hasn't looked at the first, and "I couldn't tell" is not "they have".)
- */
-function readStateOfLastOutgoing(scope: HTMLElement): { state: ReadState; label: string } {
-  const fragments: string[] = [];
-  const push = (raw: string) => {
-    for (const piece of (raw || '').split(/[\n\r·•|]+/)) {
-      const s = normalizeText(piece);
-      // Statuses are short. The cap is what keeps a message body that happens
-      // to begin with "Seen you around" from being read as a receipt.
-      if (s && s.length <= 40) fragments.push(s);
-    }
+function collectReadStateObservations(at: number): ReadStateObservation[] {
+  const seen = new Map<string, ReadState>();
+  const note = (threadId: string | null | undefined, state: ReadState) => {
+    if (!threadId || state === 'unknown') return;
+    // Within one pass 'read' outranks 'unread': the sidebar and the open pane
+    // can both describe the same thread, and a receipt is positive evidence
+    // where its absence is not.
+    if (seen.get(threadId) === 'read') return;
+    seen.set(threadId, state);
   };
 
-  // Document order matters: the last status in the pane belongs to the newest
-  // message. querySelectorAll returns document order, and the aria-label of an
-  // element is pushed with it, so the two stay interleaved correctly.
-  for (const el of Array.from(scope.querySelectorAll<HTMLElement>('[aria-label], span, div'))) {
-    // Only leaf-ish nodes: a container repeats its children's text, which would
-    // put an old status after a newer one.
-    if (el.querySelector('span, div')) {
-      const label = el.getAttribute('aria-label');
-      if (label) push(label);
-      continue;
-    }
-    push(el.textContent || '');
-    const label = el.getAttribute('aria-label');
-    if (label) push(label);
+  if (isMessagesPage()) {
+    const main = document.querySelector<HTMLElement>('[role="main"]');
+    if (main) note(getActiveThreadId(), readStateOfLastOutgoing(main).state);
   }
 
-  const statuses = fragments.filter((f) => ANY_STATUS_PATTERNS.some((re) => re.test(f)));
-  const last = statuses[statuses.length - 1];
-  if (!last) return { state: 'unknown', label: '' };
-  return { state: READ_PATTERNS.some((re) => re.test(last)) ? 'read' : 'unread', label: last };
+  for (const composer of findDrawerComposers()) {
+    const scope = drawerScope(composer);
+    const ids = drawerIdentity(scope).threadIds;
+    // Only a drawer that names exactly one thread. An ambiguous one would
+    // attribute one conversation's receipt to somebody else.
+    if (ids.length !== 1) continue;
+    note(ids[0], readStateOfLastOutgoing(scope).state);
+  }
+
+  for (const row of Array.from(document.querySelectorAll<HTMLElement>('[role="row"]'))) {
+    const link = row.querySelector<HTMLAnchorElement>('a[href*="/t/"]');
+    if (link && hasReadReceipt(row)) note(extractThreadId(link.href), 'read');
+  }
+
+  const out: ReadStateObservation[] = [];
+  for (const [threadId, state] of seen) {
+    if (reportedReadState.get(threadId) !== state) out.push({ threadId, state, at });
+  }
+  return out;
+}
+
+/**
+ * One pass of the observer. Safe to call as often as you like: it reads the
+ * DOM, drops everything it has already said, and returns without a message
+ * when there is nothing new — which is the normal outcome.
+ */
+async function sweepReadStates(): Promise<void> {
+  if (!isMessagesPage() && !isProfilePage()) return;
+  const observations = collectReadStateObservations(Date.now());
+  if (!observations.length) return;
+  // Recorded BEFORE the round trip, or a second tick during a slow one would
+  // send the same batch again.
+  for (const ob of observations) reportedReadState.set(ob.threadId, ob.state);
+  try {
+    await mutate([{ op: 'observeReadStates', observations }]);
+  } catch (e) {
+    // Nothing here is worth retrying or telling the user about: the next pass
+    // re-reads the same DOM and says the same thing. Forget the batch so it
+    // can, and leave the contact alone until then.
+    for (const ob of observations) reportedReadState.delete(ob.threadId);
+    console.info('[CRM] read-state sweep not recorded (harmless, will retry):', e);
+  }
+}
+
+/**
+ * Report what we know about ONE thread right now, out of band from the sweep.
+ * Used straight after a send: the message we just delivered is by definition
+ * unread, and waiting up to a sweep interval to say so would leave the CRM
+ * showing the previous message's receipt as if it were this one's.
+ */
+function noteReadState(threadId: string | null | undefined, state: ReadState): void {
+  if (!threadId || state === 'unknown') return;
+  if (reportedReadState.get(threadId) === state) return;
+  reportedReadState.set(threadId, state);
+  void mutate([{ op: 'observeReadStates', observations: [{ threadId, state, at: Date.now() }] }])
+    .catch(() => { reportedReadState.delete(threadId); });
 }
 
 interface SendResult {
@@ -3037,6 +3073,11 @@ interface SendOptions {
   // Refuse the send unless the thread's last outgoing message reads as read.
   // See readStateOfLastOutgoing, and Campaign.skipIfUnread for the why.
   skipIfUnread?: boolean;
+  // Which contact to file the gate's reading against. The gate reads a thread
+  // that a campaign has just navigated to, which is the most authoritative
+  // look anything gets — worth keeping rather than throwing away once it has
+  // answered this one send's question.
+  observeAs?: string;
 }
 
 // Type into `composer`, send, and confirm delivery by watching `scope` (the
@@ -3064,8 +3105,19 @@ async function typeSendAndConfirm(
   // "Only if they've read the last one." Checked BEFORE anything is typed, so a
   // refusal leaves the composer exactly as it was found.
   if (opts.skipIfUnread) {
-    const { state, label } = readStateOfLastOutgoing(scope);
+    // Polled, not read once. The status is the last thing in a thread to
+    // render — the read receipt is an avatar image, so it also has to LOAD —
+    // and a single early read comes back 'unknown', which this gate treats as
+    // "don't send". That turns a slow paint into a skipped contact, so give
+    // the pane a few seconds to produce an answer before believing there
+    // isn't one. A thread with genuinely no status pays the full wait once.
+    const settled = await pollFor(() => {
+      const r = readStateOfLastOutgoing(scope);
+      return r.state === 'unknown' ? null : r;
+    }, READ_STATE_TIMEOUT_MS, 300);
+    const { state, label } = settled || readStateOfLastOutgoing(scope);
     stamp(`skipIfUnread: last outgoing status=${state}${label ? ` ("${label}")` : ' (no status label found)'}`);
+    noteReadState(opts.observeAs, state);
     if (state !== 'read') {
       return {
         ok: false,
@@ -3317,6 +3369,10 @@ async function performAutomatedSend(threadId: string, rawMessage: string, dryRun
 
   // Stamp lastContacted on the saved contact, mirroring manual sends.
   try { await markContacted(threadId); } catch { /* non-fatal */ }
+  // Nothing was actually sent in a dry run, so the thread's read state is still
+  // whatever it was — saying 'unread' here would be a lie the next campaign
+  // would act on.
+  if (!dryRun) noteReadState(threadId, 'unread');
 
   return { ok: true, deliveryStatus: res.deliveryStatus, log };
 }
@@ -3576,6 +3632,7 @@ async function performDrawerSend(threadId: string, rawMessage: string, dryRun = 
     return { ok: false, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus, log };
   }
   try { await markContacted(threadId); } catch { /* non-fatal */ }
+  if (!dryRun) noteReadState(threadId, 'unread');
   return { ok: true, deliveryStatus: res.deliveryStatus, log };
 }
 
@@ -3628,9 +3685,9 @@ function handleCrmRequest(request: any): Promise<unknown> | null {
   const skipIfUnread = !!payload.skipIfUnread;
   switch (request?.type) {
     case 'CRM_SEND_MESSAGE':
-      return performAutomatedSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard, skipIfUnread });
+      return performAutomatedSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard, skipIfUnread, observeAs: String(payload.threadId) });
     case 'CRM_SEND_VIA_DRAWER':
-      return performDrawerSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard, skipIfUnread });
+      return performDrawerSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard, skipIfUnread, observeAs: String(payload.threadId) });
     case 'CRM_RESOLVE_PROFILE':
       return resolveProfileThreadFor(String(payload.threadId || ''));
     default:

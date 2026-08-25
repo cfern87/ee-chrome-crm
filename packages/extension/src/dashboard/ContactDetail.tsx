@@ -13,7 +13,7 @@ import {
 import { tint } from '../ui/contrast';
 import { useLocalPref } from '../ui/prefs';
 import {
-  HIDDEN_TAG_TITLE, bucketTags, showsGroupLabels, formatRelativeTime, ProfileUrlEditor,
+  HIDDEN_TAG_TITLE, bucketTags, showsGroupLabels, formatRelativeTime, ProfileUrlEditor, ReadStateChip,
 } from './shared';
 
 export const TAG_FILTER_VISIBLE = 12;
@@ -396,6 +396,7 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
               <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis' }}>{conv.participantName || 'Unknown'}</h2>
               <button onClick={startRename} title="Rename contact" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14, color: color.text.muted, padding: 2, lineHeight: 1 }}>✎</button>
               {conv.nameManual && <span title="Custom name — kept even when this chat is reopened" style={{ fontSize: 10, color: '#7b3fb8', background: '#f3eafb', padding: '2px 6px', borderRadius: 8, fontWeight: 600 }}>custom</span>}
+              <ReadStateChip conv={conv} />
               <NameDiagButton conv={conv} />
             </div>
           )}

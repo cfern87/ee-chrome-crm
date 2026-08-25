@@ -111,10 +111,11 @@ export interface Campaign {
   // Don't message anyone whose last message in the thread hasn't been read.
   // Follow-ups are the reason this exists: sending a second nudge to someone
   // who hasn't opened the first one is the fastest way to read as a bot, and
-  // Facebook already tells us — it labels the last outgoing bubble "Read"/
-  // "Seen" once it has been. Off by default; when it's on and no read label
-  // can be found, the send is REFUSED rather than assumed (see
-  // readStateOfLastOutgoing in content.ts for why "can't tell" is not "yes").
+  // Facebook already tells us — once the recipient opens a message, the
+  // "Sent"/"Delivered" label under it is replaced by a tiny avatar of them.
+  // Off by default; when it's on and no receipt can be found, the send is
+  // REFUSED rather than assumed (see readStateOfLastOutgoing in
+  // messageStatus.ts for why "can't tell" is not "yes").
   skipIfUnread?: boolean;
   createdAt: number;
   startedAt?: number;

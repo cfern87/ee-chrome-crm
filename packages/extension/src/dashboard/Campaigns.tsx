@@ -367,8 +367,9 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
           <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '10px 12px', background: color.surface.sunken, borderRadius: 7, marginBottom: 10, cursor: 'pointer', border: '1px solid transparent' }}>
             <input type="checkbox" checked={skipIfUnread} onChange={(e) => setSkipIfUnread(e.target.checked)} style={{ marginTop: 2, cursor: 'pointer' }} />
             <span style={{ fontSize: 12, color: color.text.secondary, lineHeight: 1.4 }}>
-              <strong>Only if they've read the last message</strong> — skip anyone whose last message in the
-              thread isn't marked <em>Read</em> by Facebook. For follow-ups: piling a second nudge onto
+              <strong>Only if they've read the last message</strong> — skip anyone who hasn't opened the last
+              message in the thread. That's the little photo of them Facebook tucks under the message once
+              they've seen it. For follow-ups: piling a second nudge onto
               someone who never opened the first is what makes a campaign look automated.
               {' '}Skipped people are listed in Past sends and can be requeued.
               {skipIfUnread && (

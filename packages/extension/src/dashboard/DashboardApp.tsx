@@ -5,7 +5,7 @@ import { getEntitlement, PLATFORM_URL, FREE_CONTACT_LIMIT, isSignedIn, SESSION_K
 
 import {
   QueryGroup, SavedSearch, ArchiveScope, QueryContext,
-  emptyQuery, isQueryEmpty, filterByQuery, normalizeQuery, newSavedSearch, sortSavedSearches, describeQuery,
+  emptyQuery, isQueryEmpty, filterByQuery, normalizeQuery, newSavedSearch, sortSavedSearches, applyPresetOrder, describeQuery,
 } from '../search';
 import AdvancedSearch, { PinnedSearchChips } from './SearchBuilder';
 import {
@@ -42,7 +42,7 @@ import {
   type HistoryFocus,
 } from './Campaigns';
 import {
-  MachineView, sendBg, ensureSignedIn, downloadText, tsStamp, formatRelativeTime, previewTags, SubNav,
+  MachineView, sendBg, ensureSignedIn, downloadText, tsStamp, formatRelativeTime, previewTags, SubNav, ReadStateChip,
 } from './shared';
 import { SettingsPanel } from './SettingsPanel';
 import { TagFilter, ConvDetail, type TagFilterMode } from './ContactDetail';
@@ -123,10 +123,25 @@ function viewSignature(query: QueryGroup, sortBy: SortBy, sortDir: 'asc' | 'desc
   return JSON.stringify([query, sortBy, sortDir, scope]);
 }
 
+// How long a preset reorder waits for the next click before it is written.
+// Long enough to swallow a burst of ↑/↓ clicks into one write, short enough
+// that the reorder is durable by the time the user has looked away.
+const PRESET_ORDER_WRITE_MS = 600;
+
 export default function DashboardApp() {
   const [store, setStore] = useState<Store>(EMPTY_STORE);
   // Ordering ticket for store reads — see `refresh` below.
   const storeSeqRef = useRef(0);
+  // The newest store, reachable from a callback that runs LATER than the render
+  // it was created in. `store` in a closure is frozen at that render, so a
+  // deferred write — one behind a debounce, or after an await — would build its
+  // next store from a snapshot that predates every edit since, and writing that
+  // back undoes them. Kept in step by the effect below.
+  const storeRef = useRef(store);
+  // A reorder the user has made but that hasn't been written yet, as the id
+  // order they asked for, and the timer that will write it. See reorderPreset.
+  const pendingPresetOrderRef = useRef<string[] | null>(null);
+  const presetOrderTimerRef = useRef<number | null>(null);
   const [route, setRoute] = useState<Route>('contacts');
   const [campaignView, setCampaignView] = useState<CampaignView>('compose');
   const [schemaView, setSchemaView] = useState<SchemaView>('tags');
@@ -330,9 +345,20 @@ export default function DashboardApp() {
     const s = await loadStore(fresh ? { maxAgeMs: 0 } : {});
     setLoading(false);
     if (seq !== storeSeqRef.current) return; // superseded while in flight
-    setStore(s);
+    // An unwritten reorder is re-applied on top of whatever arrives, so a store
+    // that predates it can't put the old order back under the cursor. The
+    // ticket above can't cover this: the read may be legitimately newer than
+    // the reorder and still not contain it, because it hasn't been written yet.
+    const next = pendingPresetOrderRef.current
+      ? { ...s, savedSearches: applyPresetOrder(s.savedSearches, pendingPresetOrderRef.current) }
+      : s;
+    storeRef.current = next;
+    setStore(next);
     getSyncUsage().then(setSyncUsage).catch(() => setSyncUsage(null));
   }, []);
+
+  // Keep the deferred-write snapshot in step with what's on screen.
+  useEffect(() => { storeRef.current = store; }, [store]);
 
   useEffect(() => {
     refresh();
@@ -384,6 +410,33 @@ export default function DashboardApp() {
     if (!res?.success) return saveStore(next);
     return res.result ?? { ok: true, pending: 0, itemLimitReached: false };
   };
+
+  // Write a debounced preset reorder now. Writes the CURRENT store rather than
+  // one captured when the timer was set, so a preset renamed or added during
+  // the burst survives the reorder's write — and clears the pending order only
+  // once it is on its way, so a refresh racing the write still re-applies it.
+  const flushPresetOrder = useCallback(() => {
+    if (presetOrderTimerRef.current !== null) {
+      window.clearTimeout(presetOrderTimerRef.current);
+      presetOrderTimerRef.current = null;
+    }
+    if (!pendingPresetOrderRef.current) return;
+    pendingPresetOrderRef.current = null;
+    void updateStore(storeRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- updateStore closes over refs only
+  }, []);
+
+  // Don't lose a reorder that is still sitting in the debounce when the tab
+  // goes away. Neither hook can await the write, but both start it, and the
+  // background worker outlives this page.
+  useEffect(() => {
+    const onHide = () => flushPresetOrder();
+    window.addEventListener('beforeunload', onHide);
+    return () => {
+      window.removeEventListener('beforeunload', onHide);
+      flushPresetOrder();
+    };
+  }, [flushPresetOrder]);
 
   // --- Conversations ---
   const conversations = Object.values(store.conversations);
@@ -828,17 +881,49 @@ export default function DashboardApp() {
 
   // Move a preset one slot up or down, renumbering the whole list so the orders
   // stay dense even after deletions.
-  const reorderPreset = async (id: string, delta: number) => {
-    const ordered = sortSavedSearches(store.savedSearches);
+  //
+  // Reordering is the one preset edit that arrives in bursts — moving a preset
+  // three places is three clicks in about a second — and it used to write the
+  // whole store on each click. Two things went wrong with that.
+  //
+  // The write storm: every click was a background save, a Drive upload, a
+  // storage event and a full reload, five or six of them racing each other for
+  // one drag's worth of intent.
+  //
+  // The revert: each click planned its move from the `store` its own render had
+  // closed over. A click made before the previous write's reload came back
+  // therefore planned from the PRE-move list and wrote that order straight back
+  // over the newer one — and a reload landing between two clicks put the old
+  // order under the cursor just as the user aimed at it. Same shape as the
+  // write-back loop the settings collections and DraftInput already fix, and
+  // fixed the same three ways:
+  //
+  //   * every click computes from storeRef, so each one stacks on the last
+  //     rather than on whatever the last render happened to hold;
+  //   * the order the user asked for is remembered until it is written, and
+  //     re-applied on top of any store that arrives in the meantime (refresh);
+  //   * the write itself is debounced, so a burst costs one write.
+  const reorderPreset = (id: string, delta: number) => {
+    const current = storeRef.current;
+    const ordered = sortSavedSearches(current.savedSearches);
     const from = ordered.findIndex((p) => p.id === id);
     const to = from + delta;
     if (from < 0 || to < 0 || to >= ordered.length) return;
     const [moved] = ordered.splice(from, 1);
     ordered.splice(to, 0, moved);
-    const ts = Date.now();
-    const next: Record<string, SavedSearch> = {};
-    ordered.forEach((p, i) => { next[p.id] = p.order === i ? p : { ...p, order: i, updatedAt: ts }; });
-    await updateStore({ ...store, savedSearches: next });
+    const wanted = ordered.map((p) => p.id);
+
+    const next = { ...current, savedSearches: applyPresetOrder(current.savedSearches, wanted) };
+    // Optimistic: the list has to keep up with the cursor. Invalidating the
+    // read tickets is what stops a load already in flight from undoing it —
+    // the same guard updateStore applies to every other edit.
+    storeSeqRef.current++;
+    pendingPresetOrderRef.current = wanted;
+    storeRef.current = next;
+    setStore(next);
+
+    if (presetOrderTimerRef.current !== null) window.clearTimeout(presetOrderTimerRef.current);
+    presetOrderTimerRef.current = window.setTimeout(flushPresetOrder, PRESET_ORDER_WRITE_MS);
   };
 
   // --- Tags ---
@@ -1506,9 +1591,17 @@ export default function DashboardApp() {
                             <Text size="small" weight="semibold" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                               {conv.participantName || 'Unknown'}
                             </Text>
-                            <Text size="micro" tone="muted" style={{ flexShrink: 0 }}>
-                              {conv.updatedAt ? formatRelativeTime(conv.updatedAt) : ''}
-                            </Text>
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: space.xxs, flexShrink: 0 }}>
+                              {/* Compact: a tick pair in the row, the full
+                                  wording on hover and in the detail pane. A
+                                  contact nobody has observed shows the muted
+                                  dot rather than nothing, so "not checked yet"
+                                  and "checked, not read" stay distinguishable. */}
+                              <ReadStateChip conv={conv} compact />
+                              <Text size="micro" tone="muted">
+                                {conv.updatedAt ? formatRelativeTime(conv.updatedAt) : ''}
+                              </Text>
+                            </span>
                           </span>
                           <Text as="span" size="micro" tone="muted" style={{ display: 'block', width: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                             {conv.lastMessage || ''}

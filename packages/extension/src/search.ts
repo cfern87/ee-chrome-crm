@@ -133,6 +133,25 @@ export const BUILTIN_FIELDS: FieldDef[] = [
   { key: 'archived', label: 'Archived', kind: 'boolean', category: 'Status' },
   { key: 'source', label: 'Source', kind: 'enum', category: 'Status', options: ['messenger', 'import', 'profile'] },
   { key: 'nameManual', label: 'Name edited by hand', kind: 'boolean', category: 'Status' },
+  {
+    key: 'readState',
+    label: 'Read your last message',
+    kind: 'enum',
+    category: 'Status',
+    options: ['read', 'unread', 'unknown'],
+    hint: 'What Messenger last showed for your most recent message to them. "unknown" means no receipt has been seen yet — it is not the same as "not read".',
+  },
+  {
+    key: 'readStateAt',
+    label: 'Read state changed',
+    kind: 'date',
+    category: 'Dates',
+    // Deliberately not "last checked". The stamp is only written when the
+    // state actually changes — a sweep that confirms what we already knew
+    // writes nothing at all, which is what keeps a passive observer from
+    // being a source of store churn. There is no record of the last look.
+    hint: 'When their read state last CHANGED — e.g. when they opened your message. Not when it was last checked.',
+  },
 ];
 
 const CUSTOM_PREFIX = 'custom:';
@@ -412,6 +431,7 @@ function dateOf(conv: Conversation, key: string): number | undefined {
     case 'lastMessageTime': return conv.lastMessageTime || undefined;
     case 'lastTagAt': return lastTaggedAt(conv);
     case 'firstTagAt': return firstTaggedAt(conv);
+    case 'readStateAt': return conv.readStateAt || undefined;
     default: return undefined;
   }
 }
@@ -626,8 +646,11 @@ function evaluateCondition(conv: Conversation, cond: Condition, fields: FieldDef
 
     case 'enum': {
       // Contacts captured before `source` existed came from Messenger.
+      // An absent readState is 'unknown' — a real answer here, and the one
+      // every contact starts with, so it has to be selectable.
       const raw = isCustom ? customValue(conv, cond.field)
         : cond.field === 'source' ? (conv.source || 'messenger')
+        : cond.field === 'readState' ? (conv.readState || 'unknown')
         : '';
       return matchesEnum(raw, cond);
     }
@@ -744,4 +767,45 @@ export function newSavedSearch(name: string, query: QueryGroup, order: number): 
 
 export function sortSavedSearches(searches: Record<string, SavedSearch>): SavedSearch[] {
   return Object.values(searches).sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
+}
+
+/**
+ * Renumber `searches` so they sort in the order `orderedIds` lists them.
+ *
+ * Expressed as "here is the order I want" rather than "here is the new store"
+ * on purpose, because a reorder has to survive being replayed. The dashboard
+ * applies a reorder to the screen immediately but writes it a moment later
+ * (see reorderPreset), and in that gap a store can arrive from storage — a
+ * sync, another tab, this machine's own save coming back — carrying the
+ * PREVIOUS order. Re-applying the wanted order to whatever store arrives is
+ * what stops that from putting the old list back under the cursor.
+ *
+ * Ids that no longer exist are ignored, and presets missing from `orderedIds`
+ * (created elsewhere while the reorder was pending) keep their existing
+ * relative order at the end rather than being dropped or shuffled.
+ *
+ * Only records whose `order` actually changes are rewritten, and only those
+ * get a new `updatedAt`: re-stamping an unchanged record would make every
+ * replay look like a fresh edit to the cross-machine merge, and two machines
+ * replaying at each other is a write-back loop with no fixed point.
+ */
+export function applyPresetOrder(
+  searches: Record<string, SavedSearch>,
+  orderedIds: string[],
+  now = Date.now()
+): Record<string, SavedSearch> {
+  const wanted = orderedIds.filter((id) => searches[id]);
+  const rest = sortSavedSearches(searches)
+    .filter((p) => !wanted.includes(p.id))
+    .map((p) => p.id);
+  const ids = [...wanted, ...rest];
+  const out: Record<string, SavedSearch> = {};
+  let changed = false;
+  ids.forEach((id, index) => {
+    const p = searches[id];
+    if (p.order === index) { out[id] = p; return; }
+    out[id] = { ...p, order: index, updatedAt: now };
+    changed = true;
+  });
+  return changed ? out : searches;
 }

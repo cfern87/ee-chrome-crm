@@ -254,6 +254,23 @@ export interface Conversation {
   // `id` stay as originally captured — campaign recipients and every other
   // reference are keyed on those — so this records the real id separately.
   resolvedThreadId?: string;
+  // Whether the last message WE sent in this thread has been read, as last
+  // OBSERVED in Messenger's own DOM (readStateOfLastOutgoing in
+  // messageStatus.ts). Absent means unknown, and unknown is a real answer here,
+  // not a missing one: the thread may never have been looked at since this
+  // field existed, may have no outgoing message, or may simply not have been
+  // showing a status when we passed by.
+  //
+  // Only ever written from an observation or from our own confirmed send — a
+  // send makes it 'unread' by definition. Never inferred from anything else,
+  // because a wrong "they've read it" is the one answer that would make the
+  // campaign gate send exactly the follow-up it exists to hold back.
+  readState?: 'read' | 'unread';
+  // When that observation was made. Separate from updatedAt because it answers
+  // a different question — "how current is this?" rather than "when did this
+  // record last change?" — and the dashboard shows it, so a week-old reading
+  // can be read as the guess it is.
+  readStateAt?: number;
 }
 
 export interface Store {

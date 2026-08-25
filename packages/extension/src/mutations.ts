@@ -79,9 +79,36 @@ export type Mutation =
   | { op: 'deleteContact'; conversationId: string }
   | { op: 'markContacted'; conversationId: string }
   | { op: 'setResolvedThread'; conversationId: string; threadId: string; chatUrl?: string }
+  // Record what Messenger last showed about OUR last message in one or more
+  // threads. Batched because the sweep that produces these reports everything
+  // it can see in one pass, and one mutation is one store lock rather than
+  // twenty.
+  | { op: 'observeReadStates'; observations: ReadStateObservation[] }
   // Upgrade every contact whose stored profile URL matches this page with the
   // canonical thread id read off it.
   | { op: 'resolveProfileThread'; profileKey: string; threadId: string; chatUrl: string };
+
+/**
+ * One sighting of a thread's read state, as seen in the Messenger DOM.
+ *
+ * `state: 'unknown'` is worth sending rather than dropping at the source: it
+ * is how the applier learns that a thread WAS looked at and had nothing to
+ * say, which is different from a thread nobody has passed by. It still never
+ * overwrites a recorded state — see the op.
+ */
+export interface ReadStateObservation {
+  threadId: string;
+  state: 'read' | 'unread' | 'unknown';
+  /** When it was seen (epoch ms). */
+  at: number;
+}
+
+// Most contacts one pass may rewrite. A sweep sees everything on screen at
+// once, and the first sweep after this feature ships has an opinion about
+// every one of them — several hundred contacts would be several hundred sync
+// item writes in one go, which is how you trip chrome.storage's write quota.
+// The pass is idempotent and runs again, so a cap costs nothing but time.
+const MAX_READ_STATE_WRITES = 25;
 
 export interface MutationOutcome {
   store: Store;
@@ -228,6 +255,51 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
         updatedAt: now,
       };
       return { store: next, changed: true, conversationId: m.conversationId };
+    }
+
+    // Fold a batch of read-state sightings into the contacts they belong to.
+    //
+    // Three rules, and all three exist to keep an observational field from
+    // becoming a source of churn or of confident wrong answers:
+    //
+    //   * A sighting NEVER creates a contact. The sweep sees every thread in
+    //     the sidebar, including people who aren't in the CRM and shouldn't be
+    //     dragged into it by having glanced at them.
+    //   * 'unknown' never overwrites a state we already have. It means "the
+    //     thread didn't say", which is not the same as "not read" — treating
+    //     it as one would flip half the CRM to unknown every time a pane was
+    //     read before it finished rendering.
+    //   * An observation that agrees with what's stored writes nothing. That
+    //     is the common case by a wide margin: the sweep re-reports the same
+    //     answer every pass, and each no-op costs one comparison instead of a
+    //     store write, a sync item and a Drive upload.
+    //
+    // The write does bump `updatedAt`. It has to: that stamp is what the
+    // cross-machine merge resolves records by, and a change that didn't move
+    // it could be silently reverted by another machine's older copy — then
+    // re-observed here, then reverted again. A field that flaps between two
+    // machines forever is the write-back loop, just wearing a different hat.
+    case 'observeReadStates': {
+      let next: Store | null = null;
+      let writes = 0;
+      for (const ob of m.observations) {
+        if (writes >= MAX_READ_STATE_WRITES) break;
+        if (ob.state === 'unknown') continue;
+        const ownerId = ownerIdFor(next || store, ob.threadId);
+        if (!ownerId) continue;
+        const conv = (next || store).conversations[ownerId];
+        if (conv.readState === ob.state) continue;
+        next = next || copy(store);
+        next.conversations[ownerId] = {
+          ...conv,
+          readState: ob.state,
+          readStateAt: ob.at,
+          updatedAt: now,
+        };
+        writes++;
+      }
+      if (!next) return { store, changed: false };
+      return { store: next, changed: true };
     }
 
     case 'addProfileContact': {
