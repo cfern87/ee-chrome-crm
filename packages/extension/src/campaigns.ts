@@ -25,6 +25,7 @@
 // already persisted and stamp whatever actually changed (see stampCampaigns).
 
 import { getDeviceId } from './devices';
+import { pickVariation } from './variations';
 
 export const CAMPAIGNS_KEY = 'facebook_crm_campaigns';
 
@@ -146,6 +147,17 @@ export interface Campaign {
   // removal, so without this a recipient dropped on the laptop reappears from
   // the desktop's copy on the next sync.
   removedRecipients?: Record<string, number>;
+  // Filed away out of Past sends. Not a delete and not a status: a finished
+  // campaign is still finished, this only says the user is done looking at it.
+  //
+  // History is the heaviest screen in the dashboard — every campaign is a card,
+  // and the list re-renders on the 3s poll — so the point of archiving is that
+  // an archived campaign isn't rendered at all unless asked for. Its failures
+  // also stop being reported, which is the other half of "I'm done with this
+  // one" (see collectUnseenFailures).
+  //
+  // Part of campaignScalars, so archiving on one machine archives everywhere.
+  archived?: boolean;
 }
 
 // ---- Pure helpers ----
@@ -216,7 +228,12 @@ export function createCampaign(input: NewCampaignInput): Campaign {
       participantName: r.participantName,
       chatUrl: r.chatUrl,
       status: 'pending' as RecipientStatus,
-      renderedMessage: renderTemplate(input.template, r.participantName),
+      // Rolled per recipient, not once for the campaign: {a|b} exists so that
+      // fifty people don't all get the identical message, which only works if
+      // the dice are thrown for each of them. The result is FROZEN onto the
+      // recipient here — a requeue re-sends the same wording rather than
+      // rolling again, so what the history shows is what actually went out.
+      renderedMessage: renderTemplate(pickVariation(input.template), r.participantName),
       attempts: 0,
     })),
     cursor: 0,
@@ -334,6 +351,7 @@ function campaignScalars(c: Campaign): string {
     name: c.name, template: c.template, dryRun: c.dryRun, skipIfUnread: !!c.skipIfUnread, status: c.status,
     cursor: c.cursor, config: c.config, startedAt: c.startedAt, completedAt: c.completedAt,
     removedRecipients: c.removedRecipients || {},
+    archived: !!c.archived,
   });
 }
 
@@ -388,6 +406,71 @@ export async function getCampaign(id: string): Promise<Campaign | null> {
 // cares about the 'running' subset.
 export function activeCampaigns(all: Campaign[]): Campaign[] {
   return all.filter((c) => c.status === 'running' || c.status === 'paused');
+}
+
+// ---- Searching history ----
+//
+// "Who did I send the September offer to?" is the question history exists to
+// answer, and scrolling fifty collapsed cards is not an answer. The search runs
+// over two different haystacks because a hit means two different things:
+//
+//   * the CAMPAIGN's own text (its name, its template) — every recipient is a
+//     hit, because the whole send matched;
+//   * a RECIPIENT's text (their name, the exact message they were sent, the
+//     error it failed with) — only those rows are hits, and the card should
+//     open on them rather than on 200 unrelated names.
+//
+// Terms are ANDed and each may land in either haystack, so "dana september"
+// finds the September campaign that included Dana.
+
+function terms(query: string): string[] {
+  return (query || '').toLowerCase().split(/\s+/).filter(Boolean);
+}
+
+function campaignHaystack(c: Campaign): string {
+  return `${c.name}\n${c.template}`.toLowerCase();
+}
+
+function recipientHaystack(r: CampaignRecipient): string {
+  return `${r.participantName}\n${r.renderedMessage}\n${r.error || ''}`.toLowerCase();
+}
+
+/** Does this campaign match every term, in its own text or in any recipient's? */
+export function campaignMatchesQuery(c: Campaign, query: string): boolean {
+  const t = terms(query);
+  if (t.length === 0) return true;
+  const own = campaignHaystack(c);
+  const rest = t.filter((term) => !own.includes(term));
+  if (rest.length === 0) return true;
+  // Every remaining term has to be satisfied by the SAME recipient — otherwise
+  // "dana september" would match a campaign that mentions September and,
+  // separately, has a recipient called Dana in a different one.
+  return c.recipients.some((r) => {
+    const hay = recipientHaystack(r);
+    return rest.every((term) => hay.includes(term));
+  });
+}
+
+/**
+ * The recipients worth showing for this query. A campaign matched on its own
+ * name or template shows everyone (nothing about the query singles anyone out);
+ * otherwise only the rows that matched.
+ */
+export function matchingRecipients(c: Campaign, query: string): CampaignRecipient[] {
+  const t = terms(query);
+  if (t.length === 0) return c.recipients;
+  const own = campaignHaystack(c);
+  const rest = t.filter((term) => !own.includes(term));
+  if (rest.length === 0) return c.recipients;
+  return c.recipients.filter((r) => {
+    const hay = recipientHaystack(r);
+    return rest.every((term) => hay.includes(term));
+  });
+}
+
+/** Everyone in this campaign whose send failed and could be tried again. */
+export function failedRecipients(c: Campaign): CampaignRecipient[] {
+  return c.recipients.filter((r) => r.status === 'error');
 }
 
 // =====================================================================
@@ -787,6 +870,10 @@ export function collectFailureKeys(campaigns: Campaign[]): string[] {
 export function collectUnseenFailures(campaigns: Campaign[], ackAt: number, cleared: Set<string> = new Set()): FailedSend[] {
   const out: FailedSend[] = [];
   for (const c of campaigns) {
+    // Archiving a campaign is the user saying they're done with it, which
+    // includes its failures — otherwise filing one away would leave its
+    // banner on screen and there'd be no way to make it stop.
+    if (c.archived) continue;
     for (const r of c.recipients) {
       if (r.status !== 'error' || !r.failedAt || r.failedAt <= ackAt) continue;
       const fs: FailedSend = {

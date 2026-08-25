@@ -15,7 +15,9 @@ import {
   FailedSend, failureKey,
   QueueState, QueueMode, activeCampaigns, queueDepth,
   pendingRecipientIndex, runnableCampaigns,
+  campaignMatchesQuery, matchingRecipients, failedRecipients,
 } from '../campaigns';
+import { pickVariation, countVariations, variationIssue, VARIATION_COUNT_CAP } from '../variations';
 import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo } from '../devices';
 import { isDisconnected } from '../syncHealth';
 import { IS_UNPACKED } from '../devMode';
@@ -29,6 +31,9 @@ import {
 } from './shared';
 import { bucketTags, showsGroupLabels } from '../tagGrouping';
 import { useSearchTagGrouping } from './SearchBuilder';
+
+// Inline code sample in the composer's help text.
+const codeStyle: React.CSSProperties = { background: color.surface.sunken, padding: '1px 5px', borderRadius: 4 };
 
 /**
  * A specific recipient line in Past sends, asked for from somewhere else.
@@ -111,6 +116,31 @@ export function DryRunChip() {
   );
 }
 
+/**
+ * A composer opened with something already in it, from elsewhere in the
+ * dashboard: the Contacts tab's "Message" button, or "Resend to failed" on a
+ * past campaign.
+ *
+ * Richer than the list of ids it replaced because resending needs the composer
+ * to be a CONFIRMATION as much as a starting point — the same message, the
+ * people it failed for, and the chance to strike some of them off before it
+ * goes out again.
+ */
+export interface ComposeSeed {
+  /** Contacts to select. */
+  threadIds: string[];
+  /** Message to put in the box. Absent leaves whatever is there. */
+  template?: string;
+  /**
+   * Show ONLY these contacts in the picker. A resend of nine failed sends
+   * lands as nine ticked rows to review, not as nine ticks lost somewhere in
+   * eight hundred contacts. The user can drop the filter with one click.
+   */
+  restrict?: boolean;
+  /** One line saying where this came from, shown above the picker. */
+  note?: string;
+}
+
 export interface MessagingPanelProps {
   conversations: Conversation[];
   tags: Tag[];
@@ -118,8 +148,8 @@ export interface MessagingPanelProps {
   campaigns: Campaign[];
   queue: QueueState;
   machines: MachineView | null;
-  preselected: string[];
-  onConsumePreselected: () => void;
+  seed: ComposeSeed | null;
+  onConsumeSeed: () => void;
   onChanged: () => void;
   onViewHistory: () => void;
   /** Draw the queue and in-flight campaign cards above the composer. False
@@ -127,7 +157,7 @@ export interface MessagingPanelProps {
   showQueue?: boolean;
 }
 
-export function MessagingPanel({ conversations, tags, store, campaigns, queue, machines, preselected, onConsumePreselected, onChanged, onViewHistory, showQueue = true }: MessagingPanelProps) {
+export function MessagingPanel({ conversations, tags, store, campaigns, queue, machines, seed, onConsumeSeed, onChanged, onViewHistory, showQueue = true }: MessagingPanelProps) {
   const [template, setTemplate] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState('');
@@ -146,6 +176,13 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
   const [error, setError] = useState<string | null>(null);
   const [dryRun, setDryRun] = useState(false);
   const [skipIfUnread, setSkipIfUnread] = useState(false);
+  // Set by a seed that wants the picker narrowed to its own people — see
+  // ComposeSeed.restrict. Null means the whole contact list.
+  const [restrictTo, setRestrictTo] = useState<Set<string> | null>(null);
+  const [seedNote, setSeedNote] = useState<string | null>(null);
+  // Bumped to re-roll the {a|b} preview. The preview is one sample of many
+  // possible messages, so it needs to be re-rollable to be worth anything.
+  const [previewRoll, setPreviewRoll] = useState(0);
 
   // The recipient picker's tag filter, bucketed by tag group on the same
   // preference the advanced-search pickers use (off by default).
@@ -154,13 +191,17 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
   const showTagBucketLabels = showsGroupLabels(tagBuckets);
   const tagsGroupable = tags.some((t) => t.groupId && store.tagGroups[t.groupId]);
 
-  // Adopt contacts pre-selected from the Conversations tab "Message" button.
+  // Adopt whatever opened this composer — a selection from Contacts, or a
+  // resend of a past campaign's failures. Consumed immediately so a later
+  // re-render can't re-apply it over edits the user has since made.
   useEffect(() => {
-    if (preselected.length > 0) {
-      setSelected(new Set(preselected));
-      onConsumePreselected();
-    }
-  }, [preselected, onConsumePreselected]);
+    if (!seed) return;
+    setSelected(new Set(seed.threadIds));
+    if (seed.template !== undefined) setTemplate(seed.template);
+    setRestrictTo(seed.restrict ? new Set(seed.threadIds) : null);
+    setSeedNote(seed.note || null);
+    onConsumeSeed();
+  }, [seed, onConsumeSeed]);
 
   // Everything currently in the queue — several campaigns can be live at once.
   const active = activeCampaigns(campaigns);
@@ -171,7 +212,7 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
   // also the easy way to message somebody twice by accident, so say so.
   const alreadyQueued = useMemo(() => pendingRecipientIndex(campaigns), [campaigns]);
 
-  const sendable = conversations.filter((c) => !c.archived);
+  const sendable = conversations.filter((c) => !c.archived && (!restrictTo || restrictTo.has(c.id)));
   const filtered = sendable.filter((c) => {
     const matchesSearch = !search || (c.participantName || '').toLowerCase().includes(search.toLowerCase());
     const matchesTag = !filterTag || c.tags.includes(filterTag);
@@ -199,7 +240,18 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
   };
 
   const previewName = selectedConvs[0]?.participantName || 'Jane Doe';
-  const preview = template ? renderTemplate(template, previewName) : '';
+  // The preview goes through the same two steps a real send does — roll the
+  // {a|b} groups, then substitute {{name}} — so what's on screen is a message
+  // that could actually go out, not an approximation of one.
+  const preview = useMemo(
+    () => (template ? renderTemplate(pickVariation(template), previewName) : ''),
+    // previewRoll is the re-roll button; it belongs in the deps precisely
+    // because it doesn't appear in the body.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [template, previewName, previewRoll]
+  );
+  const variationCount = useMemo(() => (template ? countVariations(template) : 1), [template]);
+  const variationWarning = useMemo(() => (template ? variationIssue(template) : null), [template]);
 
   const start = async () => {
     setError(null);
@@ -269,9 +321,13 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
 
         <div style={{ background: color.surface.raised, borderRadius: 10, padding: 18, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
           <h3 style={{ margin: '0 0 6px', fontSize: 15, fontWeight: 700 }}>Compose template</h3>
-          <p style={{ margin: '0 0 12px', fontSize: 12, color: color.text.muted }}>
-            Use <code style={{ background: color.surface.sunken, padding: '1px 5px', borderRadius: 4 }}>{'{{name}}'}</code> or{' '}
-            <code style={{ background: color.surface.sunken, padding: '1px 5px', borderRadius: 4 }}>{'{{firstName}}'}</code> to personalize each message.
+          <p style={{ margin: '0 0 12px', fontSize: 12, color: color.text.muted, lineHeight: 1.6 }}>
+            Use <code style={codeStyle}>{'{{name}}'}</code> or{' '}
+            <code style={codeStyle}>{'{{firstName}}'}</code> to personalize each message.
+            <br />
+            Use <code style={codeStyle}>{'{Hey|Hi}'}</code> to vary the wording — each person gets one of
+            the options at random, and they nest:{' '}
+            <code style={codeStyle}>{'{Hope you\'re {well|good}|How are you}'}</code>.
           </p>
           <textarea
             value={template}
@@ -280,10 +336,34 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
             rows={6}
             style={{ ...inputStyle, resize: 'vertical', fontFamily: 'inherit', lineHeight: 1.5 }}
           />
+          {variationWarning && (
+            <div style={{ marginTop: 10 }}>
+              {/* A warning, not a block. "}" is a character people legitimately
+                  type, and refusing to send over one would be worse than
+                  saying so — the preview below shows exactly what goes out. */}
+              <Banner tone="warning">{variationWarning}</Banner>
+            </div>
+          )}
           {preview && (
             <div style={{ marginTop: 10 }}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: color.text.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>
-                Preview ({previewName})
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                <div style={{ fontSize: 11, fontWeight: 600, color: color.text.muted, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  Preview ({previewName})
+                </div>
+                {variationCount > 1 && (
+                  <>
+                    <span style={{ fontSize: 11, color: color.text.muted }}>
+                      · 1 of {variationCount >= VARIATION_COUNT_CAP ? `${VARIATION_COUNT_CAP.toLocaleString()}+` : variationCount.toLocaleString()} possible message{variationCount !== 1 ? 's' : ''}
+                    </span>
+                    <button
+                      onClick={() => setPreviewRoll((n) => n + 1)}
+                      title="Show another of the messages this template can produce"
+                      style={{ marginLeft: 'auto', background: 'none', border: 'none', color: color.accent.base, fontSize: 11, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}
+                    >
+                      Shuffle
+                    </button>
+                  </>
+                )}
               </div>
               <div style={{ background: color.surface.sunken, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: color.text.secondary, whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>
                 {preview}
@@ -405,6 +485,23 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
               Toggle all shown
             </button>
           </div>
+          {/* A seeded, narrowed picker. Says where the list came from and how
+              to get out of it — a filtered picker with no way back would look
+              like the rest of the contacts had gone missing. */}
+          {restrictTo && (
+            <div style={{ background: '#eef4ff', borderRadius: 7, padding: '8px 12px', marginBottom: 10, fontSize: 12, color: color.accent.hover, lineHeight: 1.5 }}>
+              <div style={{ fontWeight: 600 }}>{seedNote || 'Showing a chosen group'}</div>
+              <div style={{ marginTop: 2 }}>
+                Untick anyone you'd rather not message, then start.{' '}
+                <button
+                  onClick={() => { setRestrictTo(null); setSeedNote(null); }}
+                  style={{ background: 'none', border: 'none', padding: 0, color: color.accent.base, fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}
+                >
+                  Show all contacts
+                </button>
+              </div>
+            </div>
+          )}
           <input
             type="text"
             placeholder="Search contacts…"
@@ -1048,9 +1145,49 @@ export function ActiveCampaignCard({ campaign, queue, isNext, onChanged }: { cam
   );
 }
 
-export function HistoryPanel({ campaigns, onChanged, store, onViewProfile, onEditProfileUrl, onCompose, focus }: { campaigns: Campaign[]; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null>; onCompose: () => void; focus?: HistoryFocus | null }) {
-  const sorted = campaigns.slice().sort((a, b) => b.createdAt - a.createdAt);
-  if (sorted.length === 0) {
+// Campaigns per page in history. History is the heaviest screen in the
+// dashboard — every card subscribes to the same 3s campaign poll — and ten is
+// about a screen's worth, so nothing is rendered that nobody is looking at.
+const HISTORY_PAGE_SIZE = 10;
+
+export function HistoryPanel({ campaigns, onChanged, store, onViewProfile, onEditProfileUrl, onCompose, onResendFailed, focus }: { campaigns: Campaign[]; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null>; onCompose: () => void; onResendFailed: (c: Campaign) => void; focus?: HistoryFocus | null }) {
+  const [query, setQuery] = useState('');
+  const [showArchived, setShowArchived] = useState(false);
+  const [page, setPage] = useState(0);
+
+  const archivedCount = campaigns.filter((c) => c.archived).length;
+
+  const visible = useMemo(() => campaigns
+    .filter((c) => (showArchived ? true : !c.archived))
+    .filter((c) => campaignMatchesQuery(c, query))
+    .sort((a, b) => b.createdAt - a.createdAt),
+  [campaigns, showArchived, query]);
+
+  const pageCount = Math.max(1, Math.ceil(visible.length / HISTORY_PAGE_SIZE));
+  const currentPage = Math.min(page, pageCount - 1);
+  const shown = visible.slice(currentPage * HISTORY_PAGE_SIZE, currentPage * HISTORY_PAGE_SIZE + HISTORY_PAGE_SIZE);
+
+  useEffect(() => { setPage(0); }, [query, showArchived]);
+
+  // Arriving from a failure notification has to land on the campaign it names,
+  // which may be on any page — and may be archived, or filtered out by a search
+  // left in the box. Clear what's hiding it, then page to it.
+  useEffect(() => {
+    if (!focus) return;
+    const target = campaigns.find((c) => c.id === focus.campaignId);
+    if (!target) return;
+    if (target.archived && !showArchived) setShowArchived(true);
+    const list = campaigns
+      .filter((c) => (target.archived ? true : !c.archived))
+      .sort((a, b) => b.createdAt - a.createdAt);
+    const i = list.findIndex((c) => c.id === focus.campaignId);
+    if (i >= 0) { setQuery(''); setPage(Math.floor(i / HISTORY_PAGE_SIZE)); }
+    // Only when the focus itself moves — re-running this on every campaign poll
+    // would drag the user back to this page every three seconds.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus]);
+
+  if (campaigns.length === 0) {
     return (
       <Card>
         <EmptyState
@@ -1061,9 +1198,47 @@ export function HistoryPanel({ campaigns, onChanged, store, onViewProfile, onEdi
       </Card>
     );
   }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {sorted.map((c) => (
+      <div style={{ background: color.surface.raised, borderRadius: 10, padding: 12, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+        <input
+          type="search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search past sends — a name, a campaign, or words from the message…"
+          style={{ flex: '1 1 260px', minWidth: 200, padding: '9px 12px', border: `1px solid ${color.border.subtle}`, borderRadius: 7, fontSize: 13, boxSizing: 'border-box', outline: 'none' }}
+        />
+        {archivedCount > 0 && (
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, color: color.text.secondary, cursor: 'pointer', whiteSpace: 'nowrap' }}>
+            <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} style={{ cursor: 'pointer' }} />
+            Show archived ({archivedCount})
+          </label>
+        )}
+        <Text size="micro" tone="muted" style={{ whiteSpace: 'nowrap' }}>
+          {visible.length === 0
+            ? 'no matches'
+            : pageCount > 1
+              ? `${currentPage * HISTORY_PAGE_SIZE + 1}–${currentPage * HISTORY_PAGE_SIZE + shown.length} of ${visible.length}`
+              : `${visible.length} campaign${visible.length !== 1 ? 's' : ''}`}
+        </Text>
+      </div>
+
+      {visible.length === 0 && (
+        <Card>
+          <EmptyState
+            title="Nothing matches that"
+            hint={
+              query
+                ? `No past send mentions “${query}”. Searches cover the campaign name, the message template, and each recipient's name, message and error.`
+                : 'Every campaign here is archived. Tick "Show archived" to see them.'
+            }
+            action={query ? <Button variant="secondary" onClick={() => setQuery('')}>Clear search</Button> : undefined}
+          />
+        </Card>
+      )}
+
+      {shown.map((c) => (
         <CampaignHistoryCard
           key={c.id}
           campaign={c}
@@ -1071,9 +1246,19 @@ export function HistoryPanel({ campaigns, onChanged, store, onViewProfile, onEdi
           store={store}
           onViewProfile={onViewProfile}
           onEditProfileUrl={onEditProfileUrl}
+          onResendFailed={() => onResendFailed(c)}
+          query={query}
           focus={focus?.campaignId === c.id ? focus : null}
         />
       ))}
+
+      {pageCount > 1 && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'center', padding: '4px 0' }}>
+          <Button size="sm" variant="secondary" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>← Newer</Button>
+          <Text size="micro" tone="muted">Page {currentPage + 1} of {pageCount}</Text>
+          <Button size="sm" variant="secondary" disabled={currentPage >= pageCount - 1} onClick={() => setPage(currentPage + 1)}>Older →</Button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1172,7 +1357,7 @@ export function FailedSendsNotice({ failures, onDismiss, onClear, onReview, onOp
   );
 }
 
-export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile, onEditProfileUrl, focus }: { campaign: Campaign; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null>; focus?: HistoryFocus | null }) {
+export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile, onEditProfileUrl, onResendFailed, query = '', focus }: { campaign: Campaign; onChanged: () => void; store: Store; onViewProfile: (threadId: string) => void; onEditProfileUrl: (threadId: string, raw: string) => Promise<string | null>; onResendFailed?: () => void; query?: string; focus?: HistoryFocus | null }) {
   const [expanded, setExpanded] = useState(false);
   // A card arrived at from a notification opens itself — the recipient rows
   // don't exist until it does, so the row below can't scroll to anything while
@@ -1181,6 +1366,15 @@ export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile,
   useEffect(() => {
     if (focus) setExpanded(true);
   }, [focus]);
+
+  // A search that matched people rather than the campaign itself opens the card
+  // on them: the answer to "who did I send this to" is a list of names, and
+  // leaving it collapsed would hide the only thing the user asked for.
+  const rows = useMemo(() => matchingRecipients(campaign, query), [campaign, query]);
+  const narrowed = query.trim().length > 0 && rows.length < campaign.recipients.length;
+  useEffect(() => {
+    if (narrowed) setExpanded(true);
+  }, [narrowed]);
   // A refused queue change is shown on the campaign it belongs to, rather than
   // in a browser alert that gives no clue which card it came from.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -1211,7 +1405,19 @@ export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile,
     onChanged();
   };
 
+  const setArchived = async (archived: boolean) => {
+    setActionError(null);
+    const res = await sendBg<{ success: boolean; error?: string }>({
+      type: 'SET_CAMPAIGN_ARCHIVED',
+      payload: { campaignId: campaign.id, archived },
+    });
+    if (res && !res.success && res.error) setActionError(res.error);
+    onChanged();
+  };
+
   const canRemove = campaign.status === 'running' || campaign.status === 'paused';
+  const isLive = canRemove;
+  const failed = failedRecipients(campaign);
 
   return (
     <div style={{ background: color.surface.raised, borderRadius: 10, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', overflow: 'hidden' }}>
@@ -1234,6 +1440,11 @@ export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile,
           <span>/ {sum.total}</span>
           {campaign.dryRun && <DryRunChip />}
           {campaign.skipIfUnread && <UnreadGateChip />}
+          {campaign.archived && (
+            <span title="Filed away — hidden from Past sends by default, and its failures are no longer reported" style={{ background: color.surface.sunken, color: color.text.muted, padding: '3px 9px', borderRadius: 12, fontSize: 11, fontWeight: 700 }}>
+              Archived
+            </span>
+          )}
           <StatusBadge status={campaign.status} />
         </div>
       </div>
@@ -1246,13 +1457,39 @@ export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile,
             </div>
           )}
           {/* Controls for an in-flight campaign */}
-          {(campaign.status === 'running' || campaign.status === 'paused') && (
+          {isLive && (
             <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
               {campaign.status === 'running' && <button onClick={() => control('PAUSE_CAMPAIGN')} style={{ background: color.surface.raised, color: color.warning.base, border: `1px solid ${color.warning.base}`, padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Pause</button>}
               {campaign.status === 'paused' && <button onClick={() => control('RESUME_CAMPAIGN')} style={{ background: color.success.base, color: color.surface.raised, border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Resume</button>}
               <button onClick={() => control('CANCEL_CAMPAIGN')} style={{ background: color.danger.subtle, color: color.danger.base, border: `1px solid ${color.danger.base}`, padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Cancel</button>
             </div>
           )}
+
+          {/* Controls for a finished one */}
+          <div style={{ display: 'flex', gap: 8, marginBottom: 14, flexWrap: 'wrap' }}>
+            {failed.length > 0 && onResendFailed && (
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={onResendFailed}
+                title="Open the composer with this message and the people it failed for, so you can check the list before sending again"
+              >
+                Resend to {failed.length} failed →
+              </Button>
+            )}
+            {!isLive && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setArchived(!campaign.archived)}
+                title={campaign.archived
+                  ? 'Put this back in Past sends'
+                  : 'Hide this from Past sends and stop reporting its failures. Nothing is deleted.'}
+              >
+                {campaign.archived ? 'Unarchive' : 'Archive'}
+              </Button>
+            )}
+          </div>
 
           {/* Template */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
@@ -1282,9 +1519,16 @@ export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile,
           )}
 
           {/* Recipients */}
-          <div style={{ fontSize: 11, fontWeight: 600, color: color.text.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>Recipients</div>
+          <div style={{ fontSize: 11, fontWeight: 600, color: color.text.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+            Recipients
+            {narrowed && (
+              <span style={{ textTransform: 'none', letterSpacing: 0, fontWeight: 500 }}>
+                {' '}— {rows.length} of {campaign.recipients.length} matching “{query}”
+              </span>
+            )}
+          </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            {campaign.recipients.map((r, i) => (
+            {rows.map((r, i) => (
               <RecipientRow
                 key={r.threadId + i}
                 r={r}

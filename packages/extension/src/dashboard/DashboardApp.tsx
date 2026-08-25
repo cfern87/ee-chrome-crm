@@ -13,7 +13,7 @@ import {
   FailedSend, collectUnseenFailures, getFailedNoticeAck, setFailedNoticeAck,
   failureKey, getClearedFailures, setClearedFailures, collectFailureKeys,
   QueueState, QueueMode, defaultQueueState, activeCampaigns, queueDepth,
-  pendingRecipientIndex, runnableCampaigns,
+  pendingRecipientIndex, runnableCampaigns, failedRecipients,
 } from '../campaigns';
 import {
   parseContactsCsv, applyContacts, contactsToCsv, sampleCsv,
@@ -39,7 +39,7 @@ import { useLocalPref } from '../ui/prefs';
 import { tint } from '../ui/contrast';
 import {
   MessagingPanel, ActiveCampaignsView, HistoryPanel, NotificationsDrawer, holdOf, OnlineDot, QueuePreview,
-  type HistoryFocus,
+  type HistoryFocus, type ComposeSeed,
 } from './Campaigns';
 import {
   MachineView, sendBg, ensureSignedIn, downloadText, tsStamp, formatRelativeTime, previewTags, SubNav, ReadStateChip,
@@ -213,7 +213,9 @@ export default function DashboardApp() {
 
   // Pagination of the contact list. `pageSize === 0` means "show everything".
   const [page, setPage] = useState(0);
-  const [pageSize, setPageSize] = useState(50);
+  // Remembered per machine: how many contacts fit on screen is a property of
+  // the screen, so re-picking it every visit is pure friction.
+  const [pageSize, setPageSize] = useLocalPref('contactsPageSize', 50);
 
   const [syncUsage, setSyncUsage] = useState<SyncUsage | null>(null);
 
@@ -248,7 +250,9 @@ export default function DashboardApp() {
   // Bulk messaging
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [queue, setQueue] = useState<QueueState>(defaultQueueState);
-  const [preselectedRecipients, setPreselectedRecipients] = useState<string[]>([]);
+  // What the composer should open with, when something else opened it. See
+  // ComposeSeed.
+  const [composeSeed, setComposeSeed] = useState<ComposeSeed | null>(null);
 
   const refreshCampaigns = useCallback(async () => {
     const res = await sendBg<{ campaigns: Campaign[]; queue?: QueueState }>({ type: 'GET_CAMPAIGNS' });
@@ -805,6 +809,36 @@ export default function DashboardApp() {
     if (!conv) return "This contact is no longer in your CRM, so its URL can't be edited here.";
     return setContactProfileUrl(conv, raw);
   };
+
+  /**
+   * "Resend to failed" on a past campaign.
+   *
+   * Routes through the COMPOSER rather than requeueing in place, because a
+   * failed send usually failed for a reason that hasn't changed — blocked,
+   * deactivated, no chat URL, held back as unread — and firing the whole list
+   * off again unread is how you message the same dead thread nine more times.
+   * The composer already is the review step: the same message, those people
+   * ticked, and a picker narrowed to them so unticking somebody is one click.
+   *
+   * It starts a NEW campaign. The original's history is left exactly as it
+   * was, which is what makes "failed, then retried" distinguishable from
+   * "failed twice".
+   */
+  const resendFailed = useCallback((c: Campaign) => {
+    const failed = failedRecipients(c);
+    // Only people still in the CRM can be shown in the picker at all. The rest
+    // are counted in the note rather than silently dropped.
+    const known = failed.filter((r) => store.conversations[r.threadId]);
+    const missing = failed.length - known.length;
+    setComposeSeed({
+      threadIds: known.map((r) => r.threadId),
+      template: c.template,
+      restrict: true,
+      note: `${known.length} failed send${known.length !== 1 ? 's' : ''} from “${c.name}”`
+        + (missing > 0 ? ` · ${missing} no longer in your CRM, so they can't be re-sent from here` : ''),
+    });
+    go('campaigns', 'compose');
+  }, [store, go]);
 
   const addTagToConv = async (conv: Conversation, tagId: string) => {
     if (conv.tags.includes(tagId)) return;
@@ -1392,7 +1426,7 @@ export default function DashboardApp() {
                       Open All
                     </button>
                     <button
-                      onClick={() => { setPreselectedRecipients(Array.from(selectedIds)); go('campaigns', 'compose'); }}
+                      onClick={() => { setComposeSeed({ threadIds: Array.from(selectedIds) }); go('campaigns', 'compose'); }}
                       style={{ background: color.success.base, color: color.surface.raised, border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
                     >
                       💬 Message ({selectedIds.size})
@@ -1522,7 +1556,7 @@ export default function DashboardApp() {
                     title="Contacts per page"
                     style={{ width: 'auto', minHeight: 28, fontSize: fontSize.micro, padding: '2px 6px' }}
                   >
-                    {[25, 50, 100, 250].map((n) => (
+                    {[10, 25, 50, 100, 250].map((n) => (
                       <option key={n} value={n}>{n} / page</option>
                     ))}
                     <option value={0}>All</option>
@@ -1802,7 +1836,9 @@ export default function DashboardApp() {
               items={[
                 { id: 'compose', label: 'Compose' },
                 { id: 'active', label: 'Active', count: activeCampaigns(campaigns).length || undefined },
-                { id: 'past', label: 'Past sends', count: campaigns.length || undefined },
+                // Archived campaigns are absent from the list by default, so
+                // counting them here would contradict what the tab opens.
+                { id: 'past', label: 'Past sends', count: campaigns.filter((c) => !c.archived).length || undefined },
               ]}
             />
 
@@ -1814,8 +1850,8 @@ export default function DashboardApp() {
                 campaigns={campaigns}
                 queue={queue}
                 machines={machines}
-                preselected={preselectedRecipients}
-                onConsumePreselected={() => setPreselectedRecipients([])}
+                seed={composeSeed}
+                onConsumeSeed={() => setComposeSeed(null)}
                 onChanged={refreshCampaigns}
                 onViewHistory={() => setCampaignView('past')}
                 showQueue={false}
@@ -1841,6 +1877,7 @@ export default function DashboardApp() {
                 focus={historyFocus}
                 onEditProfileUrl={editRecipientProfileUrl}
                 onCompose={() => setCampaignView('compose')}
+                onResendFailed={resendFailed}
                 onViewProfile={(threadId) => {
                   const conv = store.conversations[threadId];
                   if (!conv) return;

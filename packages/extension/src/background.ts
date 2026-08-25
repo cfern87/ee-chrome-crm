@@ -1322,6 +1322,25 @@ async function cancelCampaign(id: string): Promise<{ success: boolean }> {
   return { success: true };
 }
 
+/**
+ * File a campaign away from Past sends, or bring it back.
+ *
+ * Refused while the campaign is still live. Archiving hides it and silences
+ * its failure notices, which for something still sending would mean messages
+ * going out with no way to see them — pause or cancel it first.
+ */
+async function setCampaignArchived(id: string, archived: boolean): Promise<{ success: boolean; error?: string }> {
+  const c = await getCampaign(id);
+  if (!c) return { success: false, error: 'That campaign no longer exists.' };
+  if (archived && (c.status === 'running' || c.status === 'paused')) {
+    return { success: false, error: 'Cancel or finish this campaign before archiving it.' };
+  }
+  if (!!c.archived === archived) return { success: true };
+  c.archived = archived;
+  await upsertCampaign(c);
+  return { success: true };
+}
+
 // ---- queue control ----
 //
 // Distinct from pausing a campaign: this stops the processor itself, so
@@ -1797,6 +1816,10 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         }
         case 'REQUEUE_CAMPAIGN_RECIPIENT': {
           sendResponse(await requeueCampaignRecipient(request.payload.campaignId, request.payload.threadId));
+          break;
+        }
+        case 'SET_CAMPAIGN_ARCHIVED': {
+          sendResponse(await setCampaignArchived(request.payload.campaignId, !!request.payload.archived));
           break;
         }
 
