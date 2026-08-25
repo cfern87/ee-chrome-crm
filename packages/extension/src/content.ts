@@ -30,6 +30,7 @@ import { buildThreadIndex, isUnboundOrphan, planOrphanBinds, threadAliases } fro
 import type { ThreadRow } from './contacts';
 import { extractNameFromLink, extractActiveThreadName, extractProfilePageName, looksLikePersonName, isDamagedName } from './names';
 import { normalizeText } from './text';
+import { hasConversationRows, mutationsAddedRows } from './sidebarTargets';
 import {
   DELIVERY_FAILED_PATTERNS,
   DELIVERY_SENT_PATTERNS,
@@ -934,8 +935,6 @@ async function diagnoseSidebarMatching(): Promise<void> {
 
 function startSidebarObserver() {
   const obs = new MutationObserver(mutations => {
-    // Script now runs on all of facebook.com; only do work on Messenger pages.
-    if (!isMessagesPage()) return;
     // Only react to mutations that don't originate from our own injections
     const ours = mutations.every(m =>
       m.addedNodes.length > 0 &&
@@ -944,7 +943,17 @@ function startSidebarObserver() {
         return el.nodeType === 1 && (el.hasAttribute?.('data-crm-chips') || el.closest?.('[data-crm-chips]'));
       })
     );
-    if (!ours) scheduleSidebarInject();
+    if (ours) return;
+
+    // On Messenger, react to everything: the list virtualizes, so a row can
+    // change occupant without a single node being added.
+    if (isMessagesPage()) { scheduleSidebarInject(); return; }
+
+    // Anywhere else, the script is running alongside the news feed and every
+    // other part of facebook.com, which mutate constantly and have nothing to
+    // do with us. React only when conversation rows actually arrive — which is
+    // exactly what opening the chat dropdown, and scrolling it, do.
+    if (mutationsAddedRows(mutations)) scheduleSidebarInject();
   });
   obs.observe(document.body, { childList: true, subtree: true });
 }
@@ -2458,16 +2467,21 @@ function init() {
   // AJAX as you scroll and the MutationObserver can miss bursts on a
   // constantly-mutating page. Both operations are idempotent and cheap.
   setInterval(() => {
-    if (!shouldShowLauncher()) return;
-    buildLauncher();        // no-op if it already exists; self-heals if removed
-    const exists = document.getElementById('fb-crm-launcher');
-    if (!exists) {
-      // Only worth saying when something is actually wrong — the routine
-      // "still there, injecting" chatter every 2s just buries real messages.
-      console.warn('[CRM] Launcher button not found after buildLauncher() call!');
-    } else if (isMessagesPage()) {
-      injectSidebarTags();
+    if (shouldShowLauncher()) {
+      buildLauncher();      // no-op if it already exists; self-heals if removed
+      if (!document.getElementById('fb-crm-launcher')) {
+        // Only worth saying when something is actually wrong — the routine
+        // "still there, injecting" chatter every 2s just buries real messages.
+        console.warn('[CRM] Launcher button not found after buildLauncher() call!');
+      }
     }
+    // Injection is a separate question from the launcher. The chat dropdown
+    // puts conversation rows on pages that get no launcher at all, and on a
+    // profile page (which does get one) isMessagesPage() is false — so keying
+    // this off either of those left the dropdown's rows bare. Ask about the
+    // rows instead. The URL test comes first so Messenger never pays for the
+    // DOM scan.
+    if (isMessagesPage() || hasConversationRows()) injectSidebarTags();
   }, 2000);
 
   // Re-inject on scroll too, so freshly lazy-loaded rows get chips immediately
@@ -2477,10 +2491,14 @@ function init() {
   document.addEventListener(
     'scroll',
     () => {
-      if (!isMessagesPage()) return;
+      // Throttle FIRST, so the row check below runs at most a few times a
+      // second no matter how fast the page is scrolling.
       const now = Date.now();
       if (now - scrollThrottle < 300) return;
       scrollThrottle = now;
+      // Same reasoning as the interval above: the chat dropdown is a scrollable
+      // conversation list that isn't on a Messenger URL.
+      if (!isMessagesPage() && !hasConversationRows()) return;
       scheduleSidebarInject();
     },
     true

@@ -141,6 +141,38 @@ export interface ComposeSeed {
   note?: string;
 }
 
+/**
+ * Everything the user has typed into the composer.
+ *
+ * Owned by the dashboard rather than by MessagingPanel, because the panel
+ * unmounts the moment you switch to Active or Past sends — so a message being
+ * written was thrown away by a glance at the queue, which is a bug people hit
+ * about ten seconds after discovering the other two sub-views.
+ *
+ * Scoped to the tab: kept across navigation inside the dashboard, cleared when
+ * a campaign actually starts, and gone when the tab closes. Deliberately NOT
+ * persisted to storage — a draft that outlives the window would need its own
+ * "discard" affordance, and a stale one silently pre-filling the composer weeks
+ * later is worse than retyping.
+ */
+export interface ComposerDraft {
+  template: string;
+  /** Selected contact ids. An array rather than a Set so the draft stays a plain value. */
+  selected: string[];
+  dryRun: boolean;
+  skipIfUnread: boolean;
+  /** Pace for THIS campaign, seeded from the saved one in Settings. */
+  pace: SendingPace;
+  /** Picker narrowed to these ids (see ComposeSeed.restrict), or null for everyone. */
+  restrictTo: string[] | null;
+  /** Where a narrowed picker came from, shown above it. */
+  note: string | null;
+}
+
+export function emptyComposerDraft(pace: SendingPace): ComposerDraft {
+  return { template: '', selected: [], dryRun: false, skipIfUnread: false, pace, restrictTo: null, note: null };
+}
+
 export interface MessagingPanelProps {
   conversations: Conversation[];
   tags: Tag[];
@@ -150,6 +182,10 @@ export interface MessagingPanelProps {
   machines: MachineView | null;
   seed: ComposeSeed | null;
   onConsumeSeed: () => void;
+  /** The draft so far, or null before anything has been typed. */
+  draft: ComposerDraft | null;
+  /** Report an edit. Null resets the composer to empty (used after a send). */
+  onDraftChange: (draft: ComposerDraft | null) => void;
   onChanged: () => void;
   onViewHistory: () => void;
   /** Draw the queue and in-flight campaign cards above the composer. False
@@ -157,29 +193,37 @@ export interface MessagingPanelProps {
   showQueue?: boolean;
 }
 
-export function MessagingPanel({ conversations, tags, store, campaigns, queue, machines, seed, onConsumeSeed, onChanged, onViewHistory, showQueue = true }: MessagingPanelProps) {
-  const [template, setTemplate] = useState('');
-  const [selected, setSelected] = useState<Set<string>>(new Set());
+export function MessagingPanel({ conversations, tags, store, campaigns, queue, machines, seed, onConsumeSeed, draft: draftProp, onDraftChange, onChanged, onViewHistory, showQueue = true }: MessagingPanelProps) {
+  // Everything typed into the composer lives in `draft`, which the DASHBOARD
+  // owns — see ComposerDraft. Held there because this panel unmounts the moment
+  // you switch to Active or Past sends, and a half-written message should
+  // survive a glance at the queue.
+  //
+  // Absent means "nothing typed yet", so the defaults are computed fresh on
+  // each render until the first edit. That is deliberately better than reading
+  // the pace once on mount: the store loads asynchronously, and an early mount
+  // used to pin the shipped defaults instead of the pace the user had saved.
+  const pace = useMemo(() => readPace(store), [store]);
+  const draft = draftProp ?? emptyComposerDraft(pace);
+  const patch = (p: Partial<ComposerDraft>) => onDraftChange({ ...draft, ...p });
+
+  const { template, dryRun, skipIfUnread } = draft;
+  const { minDelay, maxDelay, batchSize, pauseMin, pauseMax } = draft.pace;
+  const setPace = (p: Partial<SendingPace>) => patch({ pace: { ...draft.pace, ...p } });
+  // Stored as arrays (a draft has to be a plain object), used as sets.
+  const selected = useMemo(() => new Set(draft.selected), [draft.selected]);
+  const restrictTo = useMemo(() => (draft.restrictTo ? new Set(draft.restrictTo) : null), [draft.restrictTo]);
+  const seedNote = draft.note;
+  const setSelected = (next: Set<string>) => patch({ selected: Array.from(next) });
+
+  // Transient, and deliberately NOT part of the draft: which tag the picker is
+  // filtered by, or whether the pace section is open, is about looking rather
+  // than about the message, and none of it is a loss to re-do.
   const [search, setSearch] = useState('');
   const [filterTag, setFilterTag] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
-  // Seeded from the saved pace in Settings, then editable for this campaign
-  // only. Read once on mount: re-syncing it mid-compose would overwrite an
-  // override the user had already typed.
-  const [pace] = useState(() => readPace(store));
-  const [minDelay, setMinDelay] = useState(pace.minDelay);
-  const [maxDelay, setMaxDelay] = useState(pace.maxDelay);
-  const [batchSize, setBatchSize] = useState(pace.batchSize);
-  const [pauseMin, setPauseMin] = useState(pace.pauseMin);
-  const [pauseMax, setPauseMax] = useState(pace.pauseMax);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [dryRun, setDryRun] = useState(false);
-  const [skipIfUnread, setSkipIfUnread] = useState(false);
-  // Set by a seed that wants the picker narrowed to its own people — see
-  // ComposeSeed.restrict. Null means the whole contact list.
-  const [restrictTo, setRestrictTo] = useState<Set<string> | null>(null);
-  const [seedNote, setSeedNote] = useState<string | null>(null);
   // Bumped to re-roll the {a|b} preview. The preview is one sample of many
   // possible messages, so it needs to be re-rollable to be worth anything.
   const [previewRoll, setPreviewRoll] = useState(0);
@@ -196,11 +240,17 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
   // re-render can't re-apply it over edits the user has since made.
   useEffect(() => {
     if (!seed) return;
-    setSelected(new Set(seed.threadIds));
-    if (seed.template !== undefined) setTemplate(seed.template);
-    setRestrictTo(seed.restrict ? new Set(seed.threadIds) : null);
-    setSeedNote(seed.note || null);
+    onDraftChange({
+      ...draft,
+      selected: seed.threadIds,
+      ...(seed.template !== undefined ? { template: seed.template } : {}),
+      restrictTo: seed.restrict ? seed.threadIds : null,
+      note: seed.note || null,
+    });
     onConsumeSeed();
+    // `draft` is read, not depended on: re-running this when the draft changes
+    // would re-apply a consumed seed over the user's own edits.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seed, onConsumeSeed]);
 
   // Everything currently in the queue — several campaigns can be live at once.
@@ -280,8 +330,10 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
     });
     setStarting(false);
     if (res?.success) {
-      setSelected(new Set());
-      setTemplate('');
+      // Sent, so the draft is spent — back to an empty composer, ready for the
+      // next group. This is the only thing that clears it besides closing the
+      // tab; navigating between sub-views deliberately does not.
+      onDraftChange(null);
       onChanged();
       // Deliberately stay on the composer rather than jumping to History: the
       // whole point of the queue is that you can line up the next group
@@ -331,7 +383,7 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
           </p>
           <textarea
             value={template}
-            onChange={(e) => setTemplate(e.target.value)}
+            onChange={(e) => patch({ template: e.target.value })}
             placeholder="Hi {{firstName}}, just wanted to reach out…"
             rows={6}
             style={{ ...inputStyle, resize: 'vertical', fontFamily: 'inherit', lineHeight: 1.5 }}
@@ -392,19 +444,19 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
             <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, flexWrap: 'wrap' }}>
                 <span style={{ width: 150, color: color.text.secondary }}>Delay between (min):</span>
-                <input type="number" min={0} step={0.5} value={minDelay} onChange={(e) => setMinDelay(Number(e.target.value))} style={numStyle} />
+                <input type="number" min={0} step={0.5} value={minDelay} onChange={(e) => setPace({ minDelay: Number(e.target.value) })} style={numStyle} />
                 <span>to</span>
-                <input type="number" min={0} step={0.5} value={maxDelay} onChange={(e) => setMaxDelay(Number(e.target.value))} style={numStyle} />
+                <input type="number" min={0} step={0.5} value={maxDelay} onChange={(e) => setPace({ maxDelay: Number(e.target.value) })} style={numStyle} />
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, flexWrap: 'wrap' }}>
                 <span style={{ width: 150, color: color.text.secondary }}>Pause every (msgs):</span>
-                <input type="number" min={1} step={1} value={batchSize} onChange={(e) => setBatchSize(Number(e.target.value))} style={numStyle} />
+                <input type="number" min={1} step={1} value={batchSize} onChange={(e) => setPace({ batchSize: Number(e.target.value) })} style={numStyle} />
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, flexWrap: 'wrap' }}>
                 <span style={{ width: 150, color: color.text.secondary }}>Pause length (min):</span>
-                <input type="number" min={0} step={1} value={pauseMin} onChange={(e) => setPauseMin(Number(e.target.value))} style={numStyle} />
+                <input type="number" min={0} step={1} value={pauseMin} onChange={(e) => setPace({ pauseMin: Number(e.target.value) })} style={numStyle} />
                 <span>to</span>
-                <input type="number" min={0} step={1} value={pauseMax} onChange={(e) => setPauseMax(Number(e.target.value))} style={numStyle} />
+                <input type="number" min={0} step={1} value={pauseMax} onChange={(e) => setPace({ pauseMax: Number(e.target.value) })} style={numStyle} />
               </div>
             </div>
           )}
@@ -439,13 +491,13 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
             </div>
           )}
           <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '10px 12px', background: dryRun ? color.warning.subtle : color.surface.sunken, borderRadius: 7, marginBottom: 10, cursor: 'pointer', border: dryRun ? `1px solid ${color.warning.base}` : '1px solid transparent' }}>
-            <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} style={{ marginTop: 2, cursor: 'pointer' }} />
+            <input type="checkbox" checked={dryRun} onChange={(e) => patch({ dryRun: e.target.checked })} style={{ marginTop: 2, cursor: 'pointer' }} />
             <span style={{ fontSize: 12, color: color.text.secondary, lineHeight: 1.4 }}>
               <strong>Dry run</strong> — type the message into each chat but <strong>don't send it</strong>. Great for testing on one contact first. Marked "sent" once the text is confirmed in the composer.
             </span>
           </label>
           <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '10px 12px', background: color.surface.sunken, borderRadius: 7, marginBottom: 10, cursor: 'pointer', border: '1px solid transparent' }}>
-            <input type="checkbox" checked={skipIfUnread} onChange={(e) => setSkipIfUnread(e.target.checked)} style={{ marginTop: 2, cursor: 'pointer' }} />
+            <input type="checkbox" checked={skipIfUnread} onChange={(e) => patch({ skipIfUnread: e.target.checked })} style={{ marginTop: 2, cursor: 'pointer' }} />
             <span style={{ fontSize: 12, color: color.text.secondary, lineHeight: 1.4 }}>
               <strong>Only if they've read the last message</strong> — skip anyone who hasn't opened the last
               message in the thread. That's the little photo of them Facebook tucks under the message once
@@ -494,7 +546,7 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
               <div style={{ marginTop: 2 }}>
                 Untick anyone you'd rather not message, then start.{' '}
                 <button
-                  onClick={() => { setRestrictTo(null); setSeedNote(null); }}
+                  onClick={() => patch({ restrictTo: null, note: null })}
                   style={{ background: 'none', border: 'none', padding: 0, color: color.accent.base, fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}
                 >
                   Show all contacts

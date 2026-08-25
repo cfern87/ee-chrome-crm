@@ -39,7 +39,7 @@ import { useLocalPref } from '../ui/prefs';
 import { tint } from '../ui/contrast';
 import {
   MessagingPanel, ActiveCampaignsView, HistoryPanel, NotificationsDrawer, holdOf, OnlineDot, QueuePreview,
-  type HistoryFocus, type ComposeSeed,
+  type HistoryFocus, type ComposeSeed, type ComposerDraft,
 } from './Campaigns';
 import {
   MachineView, sendBg, ensureSignedIn, downloadText, tsStamp, formatRelativeTime, previewTags, SubNav, ReadStateChip,
@@ -253,6 +253,11 @@ export default function DashboardApp() {
   // What the composer should open with, when something else opened it. See
   // ComposeSeed.
   const [composeSeed, setComposeSeed] = useState<ComposeSeed | null>(null);
+  // The message being written, held HERE rather than inside MessagingPanel:
+  // the panel unmounts whenever the user switches to Active or Past sends, so
+  // anything it owned was lost by looking at the queue. Lives as long as this
+  // tab does, and is cleared when a campaign starts. See ComposerDraft.
+  const [composerDraft, setComposerDraft] = useState<ComposerDraft | null>(null);
 
   const refreshCampaigns = useCallback(async () => {
     const res = await sendBg<{ campaigns: Campaign[]; queue?: QueueState }>({ type: 'GET_CAMPAIGNS' });
@@ -1852,6 +1857,8 @@ export default function DashboardApp() {
                 machines={machines}
                 seed={composeSeed}
                 onConsumeSeed={() => setComposeSeed(null)}
+                draft={composerDraft}
+                onDraftChange={setComposerDraft}
                 onChanged={refreshCampaigns}
                 onViewHistory={() => setCampaignView('past')}
                 showQueue={false}
