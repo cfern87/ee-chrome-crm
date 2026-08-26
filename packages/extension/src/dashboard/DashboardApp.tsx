@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, addTagsTo, removeTagsFrom, lastTaggedAt, getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, isStoreChangeKey, isCrmSyncKey, touchDef } from '../storage';
+import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, removeTagsFrom, lastTaggedAt, getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, isStoreChangeKey, isCrmSyncKey, touchDef } from '../storage';
 import { BUILD_INFO } from '../buildInfo';
 import { getEntitlement, PLATFORM_URL, FREE_CONTACT_LIMIT, isSignedIn, SESSION_KEY, EXTENSION_AUTH_PATH, type Entitlement } from '../license';
 
@@ -10,8 +10,9 @@ import {
 import AdvancedSearch, { PinnedSearchChips } from './SearchBuilder';
 import {
   Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS,
-  FailedSend, collectUnseenFailures, getFailedNoticeAck, setFailedNoticeAck,
-  failureKey, getClearedFailures, setClearedFailures, collectFailureKeys,
+  FailedSend, collectUnseenFailures, failureKey,
+  noticeAckIn, clearedFailureKeysIn, readLegacyNoticeState, clearLegacyNoticeState,
+  writeFailedNoticeAck, writeClearedFailures, type LegacyNoticeState,
   QueueState, QueueMode, defaultQueueState, activeCampaigns, queueDepth,
   pendingRecipientIndex, runnableCampaigns, failedRecipients,
 } from '../campaigns';
@@ -22,6 +23,9 @@ import {
   normalizeProfileUrl, extractThreadFromProfileUrl,
 } from '../csv';
 import { mergeConversations, findDuplicateGroups, cleanStoredNames, pickPrimary, DuplicateGroup } from '../contacts';
+import { applyMutations, type Mutation } from '../mutations';
+import { notePendingEdits, overlayPendingEdits, type PendingEdits } from './pendingEdits';
+import { stageEditsFor, isNoOpStageEdit, type FunnelView } from '../funnel';
 import { isDriveConfigured, getDriveStatus, getDriveAuthState, connectDrive, disconnectDrive, getAuthRedirectUri, readStore as driveReadStore, writeStore as driveWriteStore, DriveStatus, DriveAuthState } from '../drive';
 import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo, type DeviceOverview } from '../devices';
 import { isDisconnected, type SyncStatusView, type SendHoldReason } from '../syncHealth';
@@ -33,7 +37,7 @@ import {
   color, fontSize, fontWeight, radius, space,
 } from '../ui/primitives';
 import { elevation } from '../ui/tokens';
-import { ICON_CONTACTS, ICON_CAMPAIGNS, ICON_TAGS, ICON_SETTINGS } from '../ui/icons';
+import { ICON_DASHBOARD, ICON_CONTACTS, ICON_CAMPAIGNS, ICON_TAGS, ICON_SETTINGS } from '../ui/icons';
 import { Resizer } from '../ui/SplitPane';
 import { useLocalPref } from '../ui/prefs';
 import { tint } from '../ui/contrast';
@@ -47,6 +51,7 @@ import {
 import { SettingsPanel } from './SettingsPanel';
 import { TagFilter, ConvDetail, type TagFilterMode } from './ContactDetail';
 import { TagsPanel, FieldsPanel } from './SchemaPanels';
+import { DashboardPanel } from './DashboardPanel';
 import { PRODUCT_NAME, PRODUCT_SLUG } from '../product';
 
 
@@ -78,7 +83,7 @@ import { PRODUCT_NAME, PRODUCT_SLUG } from '../product';
  * absorbed the old Fields tab: both define the shape of a contact rather than
  * being places you work.
  */
-type Route = 'contacts' | 'campaigns' | 'tags' | 'settings';
+type Route = 'dashboard' | 'contacts' | 'campaigns' | 'tags' | 'settings';
 
 /** Sub-views inside Campaigns. */
 type CampaignView = 'compose' | 'active' | 'past';
@@ -142,6 +147,8 @@ export default function DashboardApp() {
   // order they asked for, and the timer that will write it. See reorderPreset.
   const pendingPresetOrderRef = useRef<string[] | null>(null);
   const presetOrderTimerRef = useRef<number | null>(null);
+  // Contacts written here that a read hasn't confirmed yet. See pendingEdits.ts.
+  const pendingEditsRef = useRef<PendingEdits>(new Map());
   const [route, setRoute] = useState<Route>('contacts');
   const [campaignView, setCampaignView] = useState<CampaignView>('compose');
   const [schemaView, setSchemaView] = useState<SchemaView>('tags');
@@ -301,34 +308,87 @@ export default function DashboardApp() {
 
   // Failed-message notice. Campaigns run unattended in a background window, so
   // failures that happened while this dashboard was closed get surfaced here on
-  // open rather than only inside an expanded campaign in History. `null` while
-  // the acknowledgement timestamp is still loading, so the banner can't flash
-  // up for failures the user already dismissed.
-  const [failedAck, setFailedAck] = useState<number | null>(null);
-  const [clearedFailures, setClearedFailuresState] = useState<string[]>([]);
-  useEffect(() => { getFailedNoticeAck().then(setFailedAck).catch(() => setFailedAck(0)); }, []);
-  useEffect(() => { getClearedFailures().then(setClearedFailuresState).catch(() => setClearedFailuresState([])); }, []);
+  // open rather than only inside an expanded campaign in History.
+  //
+  // Both halves of the dismissal state — the "seen everything up to here"
+  // watermark and the individually-cleared keys — are DERIVED FROM THE STORE
+  // rather than held in their own state. That is what makes clearing on one
+  // machine clear on the others: the store is what syncs, so a dismissal
+  // arriving from another machine lands here through the ordinary refresh with
+  // nothing extra to wire up. Holding a private copy is precisely what left 79
+  // cleared failures sitting on the second machine.
+  //
+  // `noticeFloor` is everything THIS machine knows has been dismissed but that
+  // the store may not reflect yet. Two sources feed it, and both need the same
+  // treatment:
+  //
+  //   * this machine's pre-sync local copy, read once on mount, so upgrading
+  //     doesn't resurface what was already dismissed here;
+  //   * every dismissal made in this tab, held until a read confirms it.
+  //
+  // The second is the same problem the pending-edit overlay solves for
+  // contacts — a read that sampled the store before the write reached it would
+  // otherwise put the banner straight back — and it is solved more cheaply
+  // here, because both values are MONOTONIC. An ack only moves forward and a
+  // dismissal is never undone, so folding by max and union can't ever be wrong
+  // and needs no confirmation, no expiry and no tombstones.
+  //
+  // `null` while the local copy loads, which keeps the original no-flash
+  // property: the banner can't appear for failures already cleared.
+  const [noticeFloor, setNoticeFloor] = useState<LegacyNoticeState | null>(null);
+  useEffect(() => {
+    readLegacyNoticeState()
+      .then(setNoticeFloor)
+      .catch(() => setNoticeFloor({ ack: 0, cleared: [] }));
+  }, []);
+
+  const failedAck = useMemo(
+    () => (noticeFloor === null ? null : Math.max(noticeAckIn(store), noticeFloor.ack)),
+    [store, noticeFloor]
+  );
+  const clearedFailures = useMemo(
+    () => (noticeFloor === null ? [] : Array.from(new Set([...clearedFailureKeysIn(store), ...noticeFloor.cleared]))),
+    [store, noticeFloor]
+  );
 
   const unseenFailures: FailedSend[] = useMemo(
     () => (failedAck === null ? [] : collectUnseenFailures(campaigns, failedAck, new Set(clearedFailures))),
     [campaigns, failedAck, clearedFailures]
   );
 
-  // Dismiss every current failure at once (bumps the ack timestamp).
+  /**
+   * Persist a dismissal: raise the local floor, write the store, then drop this
+   * machine's pre-sync copies.
+   *
+   * The legacy keys go only AFTER the write, and what gets written already
+   * includes them, so both interruptible states are safe: crash before the
+   * write and the local copy still holds the dismissal, crash after and the
+   * store does.
+   */
+  const writeNoticeSettings = async (settings: Record<string, unknown>, floor: LegacyNoticeState) => {
+    setNoticeFloor(floor);
+    await updateStore({ ...storeRef.current, settings });
+    await clearLegacyNoticeState();
+  };
+
+  // Dismiss every current failure at once (bumps the ack watermark).
   const dismissFailures = async () => {
     const ts = Date.now();
-    setFailedAck(ts);
-    await setFailedNoticeAck(ts);
+    await writeNoticeSettings(
+      writeFailedNoticeAck(storeRef.current.settings, ts),
+      { ack: Math.max(failedAck ?? 0, ts), cleared: clearedFailures }
+    );
   };
 
   // Clear a single person's failure from the notice, leaving the rest.
+  // writeClearedFailures does the bounding (by age, and by the collection's own
+  // cap) as well as the stamping the cross-machine merge needs.
   const clearFailure = async (f: FailedSend) => {
-    // Prune to keys that still correspond to a live failure, then add this one,
-    // so the cleared list stays bounded as campaigns age out of history.
-    const live = new Set(collectFailureKeys(campaigns));
-    const next = Array.from(new Set([...clearedFailures.filter((k) => live.has(k)), failureKey(f)]));
-    setClearedFailuresState(next);
-    await setClearedFailures(next);
+    const next = Array.from(new Set([...clearedFailures, failureKey(f)]));
+    await writeNoticeSettings(
+      writeClearedFailures(storeRef.current.settings, next),
+      { ack: failedAck ?? 0, cleared: next }
+    );
   };
 
   const refresh = useCallback(async (fresh = false) => {
@@ -358,9 +418,12 @@ export default function DashboardApp() {
     // that predates it can't put the old order back under the cursor. The
     // ticket above can't cover this: the read may be legitimately newer than
     // the reorder and still not contain it, because it hasn't been written yet.
-    const next = pendingPresetOrderRef.current
+    const reordered = pendingPresetOrderRef.current
       ? { ...s, savedSearches: applyPresetOrder(s.savedSearches, pendingPresetOrderRef.current) }
       : s;
+    // Same argument, applied to contacts: a read that sampled the canonical
+    // layer before this tab's write reached it must not paint the edit away.
+    const next = overlayPendingEdits(reordered, pendingEditsRef.current, Date.now());
     storeRef.current = next;
     setStore(next);
     getSyncUsage().then(setSyncUsage).catch(() => setSyncUsage(null));
@@ -404,6 +467,10 @@ export default function DashboardApp() {
     // on screen. The write below triggers an onChanged refresh of its own,
     // which takes a fresh ticket and applies normally.
     storeSeqRef.current++;
+    // Remember what this write made of each contact it touched, so a read that
+    // sampled the canonical layer too early is patched rather than believed.
+    notePendingEdits(storeRef.current, next, pendingEditsRef.current, Date.now());
+    storeRef.current = next;
     setStore(next); // optimistic — the write is confirmed below
     const res = await new Promise<{ success?: boolean; result?: SaveResult } | null>((resolve) => {
       try {
@@ -418,6 +485,67 @@ export default function DashboardApp() {
     // content script, it holds a snapshot it loaded itself moments ago.
     if (!res?.success) return saveStore(next);
     return res.result ?? { ok: true, pending: 0, itemLimitReached: false };
+  };
+
+  /**
+   * Write a batch of typed edits, rather than a whole store.
+   *
+   * WHY THIS EXISTS ALONGSIDE updateStore: `SET_STORE` replaces the entire
+   * store with a snapshot this tab built. The background serializes the WRITES
+   * behind its lock, but it cannot rescue the PAYLOADS — a second bulk action
+   * started before the first resolved carries a full store assembled from a
+   * base that predates it, and replacing with that silently reverts the first.
+   * Bulk-tagging ten contacts, then ten more before the round-trip finished,
+   * lost the first ten. This is the failure mutations.ts was written to end;
+   * content scripts stopped writing whole stores years ago and the dashboard
+   * never did.
+   *
+   * A mutation says only what changed, so the background applies it against a
+   * store it has just loaded and there is no stale base to overwrite with. It
+   * answers with the resulting store, which is authoritative — so unlike
+   * updateStore, this doesn't have to guess and then be corrected by a refresh.
+   */
+  const mutateStore = async (mutations: Mutation[]): Promise<Store> => {
+    if (!mutations.length) return storeRef.current;
+
+    // Optimistic first, applying the SAME code the background will run so the
+    // preview can't disagree with the result. Built from storeRef, not the
+    // render closure's `store`, which is frozen at the render this handler was
+    // created in — the whole reason storeRef exists.
+    const now = Date.now();
+    const base = storeRef.current;
+    const { store: predicted } = applyMutations(base, mutations, now);
+    const ticket = ++storeSeqRef.current;
+    notePendingEdits(base, predicted, pendingEditsRef.current, now);
+    storeRef.current = predicted;
+    setStore(predicted);
+
+    const res = await sendBg<{ success?: boolean; store?: Store }>({
+      type: 'MUTATE_STORE',
+      payload: { mutations },
+    }, 30_000);
+
+    // Worker asleep or too slow. The optimistic state stands and the pending
+    // overlay keeps it on screen; the next refresh reconciles it. Deliberately
+    // NOT falling back to a whole-store write here — that would reintroduce
+    // exactly the clobber this function exists to avoid.
+    if (!res?.success || !res.store) {
+      console.warn('[CRM] Mutation batch got no answer from the background — keeping the local result.');
+      return storeRef.current;
+    }
+
+    // The background's answer is the post-write truth AS OF THIS BATCH — which
+    // is not the same as "current" if another batch has been sent since. The
+    // background serializes writes but nothing serializes the replies, so a
+    // slow answer to an earlier batch can arrive after a fast answer to a later
+    // one, and taking it would put the earlier state back on screen. The ticket
+    // says whether anything has been written here in the meantime.
+    if (ticket !== storeSeqRef.current) return storeRef.current;
+
+    const settled = overlayPendingEdits(res.store, pendingEditsRef.current, Date.now());
+    storeRef.current = settled;
+    setStore(settled);
+    return settled;
   };
 
   // Write a debounced preset reorder now. Writes the CURRENT store rather than
@@ -678,32 +806,31 @@ export default function DashboardApp() {
     if (toOpen.length > 0) markOpened(toOpen.map((c) => c.id));
   };
 
+  // The three bulk writes go through mutateStore rather than assembling a whole
+  // store, so two of them overlapping can't discard each other — see the
+  // comment on mutateStore. `selectedIds` is read straight through: an id that
+  // no longer names a contact is a no-op mutation, not an error.
   const handleBulkAssignTag = async (tagId: string) => {
-    const nextConvs = { ...store.conversations };
-    const ts = Date.now();
-    for (const id of selectedIds) {
-      const c = nextConvs[id];
-      if (c) nextConvs[id] = addTagsTo(c, [tagId], ts);
-    }
-    await updateStore({ ...store, conversations: nextConvs });
+    await mutateStore(
+      Array.from(selectedIds, (id): Mutation => ({ op: 'addTags', conversationId: id, tagIds: [tagId] }))
+    );
     setBulkTagMenu(null);
   };
 
   const handleBulkRemoveTag = async (tagId: string) => {
-    const nextConvs = { ...store.conversations };
-    const ts = Date.now();
-    for (const id of selectedIds) {
-      const c = nextConvs[id];
-      if (c) nextConvs[id] = removeTagsFrom(c, [tagId], ts);
-    }
-    await updateStore({ ...store, conversations: nextConvs });
+    await mutateStore(
+      Array.from(selectedIds, (id): Mutation => ({ op: 'removeTags', conversationId: id, tagIds: [tagId] }))
+    );
     setBulkTagMenu(null);
   };
 
   const handleBulkDelete = async () => {
-    const nextConvs = { ...store.conversations };
-    for (const id of selectedIds) delete nextConvs[id];
-    await updateStore({ ...store, conversations: nextConvs });
+    // `deleteContact` tombstones as it removes, so the delete survives a merge
+    // against a replica that still has the contact. The whole-store write this
+    // replaced relied on saveStore inferring the tombstones from a diff.
+    await mutateStore(
+      Array.from(selectedIds, (id): Mutation => ({ op: 'deleteContact', conversationId: id }))
+    );
     if (selectedConv && selectedIds.has(selectedConv.id)) setSelectedConv(null);
     setSelectedIds(new Set());
     setBulkDeleteConfirm(false);
@@ -741,10 +868,8 @@ export default function DashboardApp() {
   };
 
   const removeTagFromConv = async (conv: Conversation, tagId: string) => {
-    const updated = removeTagsFrom(conv, [tagId]);
-    const next = { ...store, conversations: { ...store.conversations, [conv.id]: updated } };
-    await updateStore(next);
-    if (selectedConv?.id === conv.id) setSelectedConv(updated);
+    const next = await mutateStore([{ op: 'removeTags', conversationId: conv.id, tagIds: [tagId] }]);
+    if (selectedConv?.id === conv.id) setSelectedConv(next.conversations[conv.id] ?? null);
   };
 
   const renameConversation = async (conv: Conversation, newName: string) => {
@@ -847,10 +972,22 @@ export default function DashboardApp() {
 
   const addTagToConv = async (conv: Conversation, tagId: string) => {
     if (conv.tags.includes(tagId)) return;
-    const updated = addTagsTo(conv, [tagId]);
-    const next = { ...store, conversations: { ...store.conversations, [conv.id]: updated } };
-    await updateStore(next);
-    if (selectedConv?.id === conv.id) setSelectedConv(updated);
+    const next = await mutateStore([{ op: 'addTags', conversationId: conv.id, tagIds: [tagId] }]);
+    if (selectedConv?.id === conv.id) setSelectedConv(next.conversations[conv.id] ?? null);
+  };
+
+  // Move a contact along a funnel. The remove goes FIRST and both ops travel in
+  // one batch, so the contact is never momentarily at two stages of the same
+  // group — a state the dashboard's funnel counts would double-count and the
+  // bar itself would render as a jump forwards and back.
+  const setConvStage = async (conv: Conversation, view: FunnelView, index: number) => {
+    const edits = stageEditsFor(view, conv, index);
+    if (isNoOpStageEdit(edits)) return;
+    const mutations: Mutation[] = [];
+    if (edits.remove.length) mutations.push({ op: 'removeTags', conversationId: conv.id, tagIds: edits.remove });
+    if (edits.add.length) mutations.push({ op: 'addTags', conversationId: conv.id, tagIds: edits.add });
+    const next = await mutateStore(mutations);
+    if (selectedConv?.id === conv.id) setSelectedConv(next.conversations[conv.id] ?? null);
   };
 
   // --- Saved searches ---
@@ -909,6 +1046,52 @@ export default function DashboardApp() {
     if (!existing) return;
     const next = { ...existing, ...patch, updatedAt: Date.now() };
     await updateStore({ ...store, savedSearches: { ...store.savedSearches, [id]: next } });
+  };
+
+  // --- Dashboard tiles ---
+  //
+  // A tile IS a saved search carrying `onDashboard`, so these are thin wrappers
+  // over the preset handlers above rather than a parallel set of writes. The
+  // only thing that would justify a second write path is a second kind of
+  // record, and deliberately there isn't one.
+  const dashboardTiles = useMemo(
+    () => sortSavedSearches(store.savedSearches).filter((s) => s.onDashboard),
+    [store.savedSearches]
+  );
+
+  const createDashboardTile = async (name: string, q: QueryGroup) => {
+    const order = Object.keys(store.savedSearches).length;
+    // Saved with the scope the workspace is currently on, matching what
+    // saveNewPreset captures — a tile counting archived contacts is a real
+    // thing to want, and it has to be recorded or the count means something
+    // different from the list behind it.
+    const preset: SavedSearch = {
+      ...newSavedSearch(name, q, order),
+      archiveScope,
+      onDashboard: true,
+    };
+    await updateStore({ ...store, savedSearches: { ...store.savedSearches, [preset.id]: preset } });
+  };
+
+  const updateDashboardTile = async (id: string, q: QueryGroup) => {
+    await patchPreset(id, { query: JSON.parse(JSON.stringify(q)) });
+  };
+
+  // Takes the tile off the Dashboard WITHOUT deleting the query — it stays a
+  // preset in the contact list. Deleting a query you spent ten minutes building
+  // because you wanted one fewer tile would be a bad trade, and the preset bar
+  // already has a delete for when you really mean it.
+  const removeDashboardTile = async (id: string) => {
+    await patchPreset(id, { onDashboard: false });
+  };
+
+  // Open a tile's query in the contact list. Same path as applying any preset,
+  // so the list, the sort and the scope all match what the tile counted.
+  const openTileInContacts = (preset: SavedSearch) => {
+    applyPreset(preset);
+    setSelectedIds(new Set());
+    setPage(0);
+    go('contacts');
   };
 
   const deletePreset = async (id: string) => {
@@ -1073,6 +1256,16 @@ export default function DashboardApp() {
     await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: touchDef({ ...g, name: name.trim() }) } });
   };
 
+  // Turn funnel mode on or off for a group. Purely a change of reading — no
+  // tag is added, removed or reordered, so a group switched on and straight
+  // back off is exactly where it started, and a contact holding two of its
+  // tags keeps holding both until someone picks a stage (see funnel.ts).
+  const setTagGroupFunnel = async (groupId: string, funnel: boolean) => {
+    const g = store.tagGroups[groupId];
+    if (!g || !!g.funnel === funnel) return;
+    await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: touchDef({ ...g, funnel }) } });
+  };
+
   // Deleting a group leaves its tags intact but ungrouped.
   const deleteTagGroup = async (groupId: string) => {
     const ts = Date.now();
@@ -1175,6 +1368,7 @@ export default function DashboardApp() {
   // visit and leave, so it's pinned to the foot of the rail instead of sitting
   // in the list as a fourth peer.
   const NAV: NavItem<Route>[] = [
+    { id: 'dashboard', label: 'Dashboard', icon: ICON_DASHBOARD, count: dashboardTiles.length },
     { id: 'contacts', label: 'Contacts', icon: ICON_CONTACTS, count: totalConvs },
     { id: 'campaigns', label: 'Campaigns', icon: ICON_CAMPAIGNS, count: campaigns.length },
     { id: 'tags', label: 'Tags & fields', icon: ICON_TAGS, count: totalTags + fieldDefs.length },
@@ -1185,6 +1379,7 @@ export default function DashboardApp() {
   ];
 
   const ROUTE_TITLE: Record<Route, string> = {
+    dashboard: 'Dashboard',
     contacts: 'Contacts',
     campaigns: 'Campaigns',
     tags: 'Tags & fields',
@@ -1707,6 +1902,7 @@ export default function DashboardApp() {
                   onOpen={() => markOpened([selectedConv.id])}
                   onRemoveTag={(tagId) => removeTagFromConv(selectedConv, tagId)}
                   onAddTag={(tagId) => addTagToConv(selectedConv, tagId)}
+                  onSetStage={(view, index) => setConvStage(selectedConv, view, index)}
                   onSetCustomField={(fieldId, value) => setCustomField(selectedConv, fieldId, value)}
                   onRename={(name) => renameConversation(selectedConv, name)}
                   onSetProfileUrl={(raw) => setContactProfileUrl(selectedConv, raw)}
@@ -1764,6 +1960,7 @@ export default function DashboardApp() {
                 onUpdateActivePreset={updateActivePreset}
                 onRenamePreset={(id, name) => patchPreset(id, { name })}
                 onTogglePinPreset={(id) => patchPreset(id, { pinned: !store.savedSearches[id]?.pinned })}
+                onToggleDashboardPreset={(id) => patchPreset(id, { onDashboard: !store.savedSearches[id]?.onDashboard })}
                 onDeletePreset={deletePreset}
                 onReorderPreset={reorderPreset}
               />
@@ -1772,6 +1969,22 @@ export default function DashboardApp() {
         </div>
       ) : (
       <div style={{ maxWidth: 1100, margin: '0 auto', padding: `${space.xl}px ${space.lg}px` }}>
+
+        {/* Dashboard — saved queries as live counts. Reads the same store and
+            runs the same filterByQuery the contact list does, so a tile can
+            never report a number the list behind it disagrees with. */}
+        {route === 'dashboard' && (
+          <DashboardPanel
+            conversations={conversations}
+            savedSearches={store.savedSearches}
+            tags={store.tags}
+            ctx={queryCtx}
+            onOpenInContacts={openTileInContacts}
+            onCreateTile={createDashboardTile}
+            onUpdateTile={updateDashboardTile}
+            onRemoveTile={removeDashboardTile}
+          />
+        )}
 
         {/* Tags & fields — one destination, two sections. Both define the
             shape of a contact, so splitting them across two tabs meant setting
@@ -1813,6 +2026,7 @@ export default function DashboardApp() {
                 onReorderTags={reorderTags}
                 onAddGroup={addTagGroup}
                 onRenameGroup={renameTagGroup}
+                onSetGroupFunnel={setTagGroupFunnel}
                 onDeleteGroup={deleteTagGroup}
               />
             )}

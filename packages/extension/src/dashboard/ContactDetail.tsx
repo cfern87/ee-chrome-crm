@@ -10,13 +10,92 @@ import {
   Button, Card, Chip, Input, SectionTitle, Select, Stack, Text,
   color, fontSize, fontWeight, radius, space,
 } from '../ui/primitives';
-import { tint } from '../ui/contrast';
+import { tint, onColor } from '../ui/contrast';
 import { useLocalPref } from '../ui/prefs';
 import {
   HIDDEN_TAG_TITLE, bucketTags, showsGroupLabels, formatRelativeTime, ProfileUrlEditor, ReadStateChip,
 } from './shared';
+import { funnelsFor, describeStage, type FunnelView } from '../funnel';
 
 export const TAG_FILTER_VISIBLE = 12;
+
+/**
+ * One tag group read as a funnel: a horizontal bar of ordered stages, filled up
+ * to where this contact has reached.
+ *
+ * Filled-to-here rather than just marking the one current stage, because that
+ * is what makes it readable at a glance across a list of contacts — you see
+ * PROGRESS, not a dot in a row of dots. The current stage still gets a heavier
+ * treatment so "reached stage 3" and "is at stage 3" don't collapse into the
+ * same picture.
+ *
+ * Every segment is a button, including ones behind the current stage: moving
+ * someone backwards is an ordinary correction, not an exception, and making it
+ * take a detour through the tag chips below would be the kind of asymmetry
+ * people work around by never using the bar.
+ */
+function FunnelBar({ view, onSetStage }: { view: FunnelView; onSetStage: (index: number) => void }) {
+  const accent = view.group.color || color.accent.base;
+  const { stages, currentIndex } = view;
+
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+        <div style={{ width: 9, height: 9, borderRadius: 2, background: accent, flexShrink: 0 }} />
+        <span style={{ fontSize: 11, fontWeight: 700, color: color.text.muted, textTransform: 'uppercase', letterSpacing: 0.4 }}>
+          {view.group.name}
+        </span>
+        <span style={{ fontSize: 11, color: color.text.muted }}>
+          {currentIndex < 0 ? 'Not started' : `${currentIndex + 1} of ${stages.length}`}
+        </span>
+      </div>
+
+      <div
+        role="group"
+        aria-label={describeStage(view)}
+        style={{ display: 'flex', gap: 2, borderRadius: radius.sm, overflow: 'hidden' }}
+      >
+        {stages.map((stage, i) => {
+          const reached = i <= currentIndex;
+          const current = i === currentIndex;
+          // A reached segment carries the group's accent, deepening to full
+          // strength at the current stage; everything after it stays neutral.
+          const fill = current ? accent : reached ? tint(accent, 0.45) : color.surface.sunken;
+          return (
+            <button
+              key={stage.id}
+              onClick={() => onSetStage(i)}
+              title={
+                current
+                  ? `Currently at "${stage.name}" — click to clear ${view.group.name}`
+                  : `Move to "${stage.name}"`
+              }
+              aria-pressed={current}
+              style={{
+                flex: 1,
+                minWidth: 0,
+                border: 'none',
+                borderRight: i < stages.length - 1 ? `1px solid ${color.surface.raised}` : 'none',
+                background: fill,
+                color: reached ? onColor(fill) : color.text.muted,
+                fontSize: 11,
+                fontWeight: current ? 700 : 600,
+                padding: '7px 8px',
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                textAlign: 'center',
+              }}
+            >
+              {stage.name}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 /**
  * The capture diagnostic, as one click that puts it on the clipboard.
@@ -332,6 +411,8 @@ export interface ConvDetailProps {
   onOpen: () => void;
   onRemoveTag: (tagId: string) => void;
   onAddTag: (tagId: string) => void;
+  /** Move this contact to a stage of a funnel group — see funnel.ts. */
+  onSetStage: (view: FunnelView, index: number) => void;
   onSetCustomField: (fieldId: string, value: string) => void;
   onRename: (name: string) => void;
   onSetProfileUrl: (raw: string) => Promise<string | null>;
@@ -346,7 +427,7 @@ export interface ConvDetailProps {
   grouped: boolean;
 }
 
-export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm2, grouped, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onSetCustomField, onRename, onSetProfileUrl, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
+export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm2, grouped, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onSetStage, onSetCustomField, onRename, onSetProfileUrl, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
   const availableTags = tags.filter((t) => !conv.tags.includes(t.id));
   const [addingTag, setAddingTag] = useState(false);
   const [editingName, setEditingName] = useState(false);
@@ -362,6 +443,11 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
   // rather than memoized — it's a handful of tags, and a memo keyed on
   // freshly-built arrays would never hit anyway.
   const appliedTags = conv.tags.map((id) => store.tags[id]).filter((t): t is Tag => !!t);
+  // Funnel groups are drawn as their own bars ABOVE the tag list. Their tags
+  // still appear in the list below as ordinary chips — the bar is a second,
+  // faster way to reach the same tags, not a replacement for them, so removing
+  // a stage chip by hand keeps working exactly as it did.
+  const funnels = funnelsFor(conv, store.tags, store.tagGroups);
   const appliedBuckets = bucketTags(appliedTags, store.tagGroups, grouped);
   const availableBuckets = bucketTags(availableTags, store.tagGroups, grouped);
   const showAppliedLabels = showsGroupLabels(appliedBuckets);
@@ -477,6 +563,17 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
           <div style={{ background: color.surface.sunken, borderRadius: 8, padding: '10px 14px', fontSize: 14, color: color.text.secondary, lineHeight: 1.5 }}>
             {conv.lastMessage}
           </div>
+        </div>
+      )}
+
+      {/* Funnels — one bar per tag group in funnel mode, above the tag list
+          because "where is this person" is the question you open a contact to
+          answer, and the chips below are the detail behind it. */}
+      {funnels.length > 0 && (
+        <div style={{ marginBottom: 18 }}>
+          {funnels.map((view) => (
+            <FunnelBar key={view.group.id} view={view} onSetStage={(i) => onSetStage(view, i)} />
+          ))}
         </div>
       )}
 

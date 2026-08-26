@@ -62,8 +62,7 @@ import {
   runnableCampaigns,
   queueDepth,
   collectUnseenFailures,
-  getFailedNoticeAck,
-  getClearedFailures,
+  readNoticeState,
   summarize,
 } from './campaigns';
 import {
@@ -1714,13 +1713,20 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         // messages will never go out, and it reported every failure ever
         // recorded, including the ones the user had already cleared.
         case 'GET_NOTIFICATIONS': {
-          const [campaigns, queue, ackAt, cleared] = await Promise.all([
-            loadCampaigns(), loadQueue(), getFailedNoticeAck(), getClearedFailures(),
+          // The dismissal state rides in the CRM store now, so that clearing a
+          // notice on one machine clears it on all of them — see the note above
+          // FAILED_NOTICE_ACK_KEY. Read through loadStore like any other
+          // setting, which means it also benefits from the freshness window
+          // rather than costing a Drive round-trip per popup open.
+          const store = await loadStore();
+          const [campaigns, queue, notice] = await Promise.all([
+            loadCampaigns(), loadQueue(), readNoticeState(store),
           ]);
+          const { ackAt, cleared } = notice;
           // queueDepth counts running and paused campaigns only — the same
           // rule the dashboard's queue card uses.
           const depth = queueDepth(campaigns);
-          const unseen = collectUnseenFailures(campaigns, ackAt, new Set(cleared));
+          const unseen = collectUnseenFailures(campaigns, ackAt, cleared);
           sendResponse({
             queued: depth.pending,
             queuedCampaigns: depth.campaigns,

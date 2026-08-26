@@ -561,13 +561,15 @@ interface PresetBarProps {
   onUpdateActive: () => void;
   onRename: (id: string, name: string) => void;
   onTogglePin: (id: string) => void;
+  /** Show or hide this query as a count tile on the Dashboard. */
+  onToggleDashboard: (id: string) => void;
   onDelete: (id: string) => void;
   onReorder: (id: string, delta: number) => void;
 }
 
 function PresetBar({
   savedSearches, activeId, dirty, ctx,
-  onApply, onSaveNew, onUpdateActive, onRename, onTogglePin, onDelete, onReorder,
+  onApply, onSaveNew, onUpdateActive, onRename, onTogglePin, onToggleDashboard, onDelete, onReorder,
 }: PresetBarProps) {
   const [naming, setNaming] = useState(false);
   const [draftName, setDraftName] = useState('');
@@ -702,6 +704,16 @@ function PresetBar({
                   >
                     {p.pinned ? '★' : '☆'}
                   </button>
+                  {/* A preset and a Dashboard tile are the same record asked in
+                      two moods — "show me" and "how many" — so a query built
+                      here can be counted without being rebuilt there. */}
+                  <button
+                    onClick={() => onToggleDashboard(p.id)}
+                    title={p.onDashboard ? 'Remove this count tile from the Dashboard' : 'Show a live count of this query on the Dashboard'}
+                    style={{ ...iconBtn, color: p.onDashboard ? color.accent.base : color.text.muted, fontWeight: p.onDashboard ? 700 : 600 }}
+                  >
+                    {p.onDashboard ? '▦ On dashboard' : '▦ Dashboard'}
+                  </button>
                   <button onClick={() => { setRenamingId(p.id); setRenameDraft(p.name); }} style={iconBtn}>Rename</button>
                   {confirmDelete === p.id ? (
                     <>
@@ -779,8 +791,19 @@ export interface AdvancedSearchProps {
   onUpdateActivePreset: () => void;
   onRenamePreset: (id: string, name: string) => void;
   onTogglePinPreset: (id: string) => void;
+  onToggleDashboardPreset: (id: string) => void;
   onDeletePreset: (id: string) => void;
   onReorderPreset: (id: string, delta: number) => void;
+  /**
+   * Hide the saved-preset bar, leaving just the query editor.
+   *
+   * For callers that own the saving themselves — the Dashboard's tile editor,
+   * which has its own Save button. Showing both would put two save controls
+   * with different meanings on one screen ("save this as a preset" vs "save
+   * this as a tile"), and the manage/pin/reorder controls next to them would
+   * be editing a list that screen doesn't show.
+   */
+  hidePresetBar?: boolean;
 }
 
 export default function AdvancedSearch(props: AdvancedSearchProps) {
@@ -798,19 +821,22 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
 
   return (
     <div style={{ background: color.surface.raised, border: `1px solid ${color.border.subtle}`, borderRadius: 8, padding: 12, marginBottom: 12 }}>
-      <PresetBar
-        savedSearches={props.savedSearches}
-        activeId={props.activePresetId}
-        dirty={props.dirty}
-        ctx={ctx}
-        onApply={props.onApplyPreset}
-        onSaveNew={props.onSaveNewPreset}
-        onUpdateActive={props.onUpdateActivePreset}
-        onRename={props.onRenamePreset}
-        onTogglePin={props.onTogglePinPreset}
-        onDelete={props.onDeletePreset}
-        onReorder={props.onReorderPreset}
-      />
+      {!props.hidePresetBar && (
+        <PresetBar
+          savedSearches={props.savedSearches}
+          activeId={props.activePresetId}
+          dirty={props.dirty}
+          ctx={ctx}
+          onApply={props.onApplyPreset}
+          onSaveNew={props.onSaveNewPreset}
+          onUpdateActive={props.onUpdateActivePreset}
+          onRename={props.onRenamePreset}
+          onTogglePin={props.onTogglePinPreset}
+          onToggleDashboard={props.onToggleDashboardPreset}
+          onDelete={props.onDeletePreset}
+          onReorder={props.onReorderPreset}
+        />
+      )}
 
       <GroupEditor
         group={query}

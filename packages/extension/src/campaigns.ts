@@ -26,6 +26,12 @@
 
 import { getDeviceId } from './devices';
 import { pickVariation } from './variations';
+import type { Store } from './storage';
+// Value import into settingsMerge.ts, which imports CLEARED_FAILURES_COLLECTION
+// back out of here. Safe for the same reason presets.ts gives: nothing crosses
+// at module-evaluation time — this module only calls in from function bodies,
+// and that one only reads the collection from inside a function.
+import { writeCollection, type SettingsBag, type SettingsCollection } from './settingsMerge';
 
 export const CAMPAIGNS_KEY = 'facebook_crm_campaigns';
 
@@ -274,6 +280,16 @@ function localSet(key: string, value: unknown): Promise<void> {
   return new Promise((resolve) => {
     try {
       chrome.storage.local.set({ [key]: value }, () => { void chrome.runtime.lastError; resolve(); });
+    } catch {
+      resolve();
+    }
+  });
+}
+
+function localRemove(key: string): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.remove(key, () => { void chrome.runtime.lastError; resolve(); });
     } catch {
       resolve();
     }
@@ -806,8 +822,33 @@ export function mergeQueueStates(a: QueueState, b: QueueState, senderDeviceId: s
 // while the dashboard is closed would otherwise only be found by expanding the
 // right campaign in History. Instead we track when the user last acknowledged
 // the failure notice and surface everything that failed since.
+//
+// WHY THIS LIVES IN store.settings AND NOT chrome.storage.local:
+//
+// Campaigns themselves sync across machines (queueSync.ts), so a send that
+// failed on the laptop is reported by the desktop too — correctly, it is the
+// same failure. What did NOT sync was the DISMISSAL. Clearing 79 failed sends
+// on one machine left all 79 sitting on the other, and clearing them there
+// again did nothing for the first: two machines each keeping their own private
+// idea of what had been read, about one shared list of events.
+//
+// So both records now sit in the store's settings bag, which is what already
+// carries per-machine-editable state across machines. Neither merges as an
+// ordinary scalar, and both reasons are in settingsMerge.ts: the ack is a
+// WATERMARK (Math.max, because an older ack is a stale reading and not a
+// competing opinion), and the cleared list is a COLLECTION (per-record, because
+// dismissing this person here and that person there are two changes that should
+// both survive).
 
-export const FAILED_NOTICE_ACK_KEY = 'facebook_crm_failed_notice_ack';
+export const FAILED_NOTICE_ACK_KEY = 'failedNoticeAck';
+
+/**
+ * Where the ack used to live, per machine. Still READ — folded into the value
+ * below — so upgrading doesn't resurface everything a user already dismissed,
+ * and cleared on the next write. See readFailedNoticeAck.
+ */
+const LEGACY_ACK_KEY = 'facebook_crm_failed_notice_ack';
+const LEGACY_CLEARED_KEY = 'facebook_crm_failed_notice_cleared';
 
 export interface FailedSend {
   campaignId: string;
@@ -819,18 +860,35 @@ export interface FailedSend {
   failedAt: number;
 }
 
-export async function getFailedNoticeAck(): Promise<number> {
-  const v = await localGet<number>(FAILED_NOTICE_ACK_KEY);
-  return typeof v === 'number' ? v : 0;
-}
-
-export async function setFailedNoticeAck(ts: number): Promise<void> {
-  await localSet(FAILED_NOTICE_ACK_KEY, ts);
+/** The dismiss-everything watermark the store carries. */
+export function noticeAckIn(store: Store): number {
+  const stored = store.settings?.[FAILED_NOTICE_ACK_KEY];
+  return typeof stored === 'number' && Number.isFinite(stored) ? stored : 0;
 }
 
 // Individually-cleared failures. The ack timestamp above dismisses everything at
 // once; this lets the user clear one person at a time from the notice instead.
-export const FAILED_NOTICE_CLEARED_KEY = 'facebook_crm_failed_notice_cleared';
+export const FAILED_NOTICE_CLEARED_KEY = 'clearedFailures';
+export const FAILED_NOTICE_CLEARED_DELETED_KEY = 'clearedFailuresDeleted';
+
+/** One dismissed failure: its key, and when it was dismissed. */
+export interface ClearedFailure {
+  id: string;
+  at: number;
+}
+
+// Enough to absorb a bad night's sending several times over without the list
+// itself becoming the problem — in legacy mode it shares one 8 KB sync item
+// with everything else in `settings`.
+const MAX_CLEARED_FAILURES = 300;
+
+// How long a dismissal is remembered. Pruning by AGE rather than by "is this
+// failure still in the campaign history" is deliberate: campaign history syncs
+// on its own schedule, so a machine that hasn't caught up yet would read a
+// still-live failure as gone, drop the dismissal, and un-clear the notice on
+// every other machine. Age is something both machines agree on without having
+// to agree about anything else first.
+const CLEARED_FAILURE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 
 // Stable identity for a single failed send. `failedAt` is part of the key so a
 // FRESH failure by the same recipient (a later attempt, a new timestamp) still
@@ -839,28 +897,130 @@ export function failureKey(f: { campaignId: string; threadId: string; failedAt: 
   return `${f.campaignId}|${f.threadId}|${f.failedAt}`;
 }
 
-export async function getClearedFailures(): Promise<string[]> {
-  const v = await localGet<string[]>(FAILED_NOTICE_CLEARED_KEY);
-  return Array.isArray(v) ? v : [];
-}
-
-export async function setClearedFailures(keys: string[]): Promise<void> {
-  await localSet(FAILED_NOTICE_CLEARED_KEY, keys);
-}
-
-// Keys for every failure currently on record (any error recipient), used to
-// prune the cleared list so it can't grow without bound as old campaigns age
-// out of history.
-export function collectFailureKeys(campaigns: Campaign[]): string[] {
-  const keys: string[] = [];
-  for (const c of campaigns) {
-    for (const r of c.recipients) {
-      if (r.status === 'error' && r.failedAt) {
-        keys.push(failureKey({ campaignId: c.id, threadId: r.threadId, failedAt: r.failedAt }));
-      }
-    }
+/** Every dismissal in a settings bag, normalized. Uncapped — see readAll. */
+function allClearedIn(settings: SettingsBag | undefined): ClearedFailure[] {
+  const raw = settings?.[FAILED_NOTICE_CLEARED_KEY];
+  if (!Array.isArray(raw)) return [];
+  const out: ClearedFailure[] = [];
+  for (const item of raw) {
+    // Tolerates the pre-sync shape (a bare array of key strings) so a bag
+    // written by an older build, or restored from an old backup, still reads.
+    if (typeof item === 'string') { out.push({ id: item, at: 0 }); continue; }
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Partial<ClearedFailure>;
+    if (typeof rec.id !== 'string' || !rec.id) continue;
+    out.push({ id: rec.id, at: typeof rec.at === 'number' && Number.isFinite(rec.at) ? rec.at : 0 });
   }
-  return keys;
+  return out.sort(compareCleared);
+}
+
+// Newest dismissal first, so both machines drop the same records when a union
+// overflows MAX_CLEARED_FAILURES — the id breaks ties so the order is total.
+function compareCleared(x: ClearedFailure, y: ClearedFailure): number {
+  return y.at - x.at || x.id.localeCompare(y.id);
+}
+
+export const CLEARED_FAILURES_COLLECTION: SettingsCollection<ClearedFailure> = {
+  key: FAILED_NOTICE_CLEARED_KEY,
+  deletedKey: FAILED_NOTICE_CLEARED_DELETED_KEY,
+  max: MAX_CLEARED_FAILURES,
+  readAll: allClearedIn,
+  id: (c) => c.id,
+  compare: compareCleared,
+  revision: (c) => c.at,
+  stamp: (c, now) => ({ ...c, at: now }),
+  // The id IS the content — a dismissal has nothing else to change. So an
+  // existing record is never re-stamped, which is what keeps a rewrite of the
+  // list from making every old dismissal outrank a tombstone elsewhere.
+  content: (c) => c.id,
+};
+
+/** The dismissed-failure keys the store carries. */
+export function clearedFailureKeysIn(store: Store): string[] {
+  return allClearedIn(store.settings).map((c) => c.id);
+}
+
+/** This machine's dismissal state from before any of this synced. */
+export interface LegacyNoticeState {
+  ack: number;
+  cleared: string[];
+}
+
+/**
+ * Read the pre-sync, machine-local dismissal state.
+ *
+ * Folded into the synced values by the readers below rather than replacing
+ * them, and folded by MAX / UNION rather than by precedence: both are real
+ * dismissals the user made, one before this feature synced and one after, so
+ * taking either side alone would resurface notices somebody has already dealt
+ * with. Returns zeroes once clearLegacyNoticeState has run.
+ */
+export async function readLegacyNoticeState(): Promise<LegacyNoticeState> {
+  const [ack, cleared] = await Promise.all([
+    localGet<number>(LEGACY_ACK_KEY),
+    localGet<string[]>(LEGACY_CLEARED_KEY),
+  ]);
+  return {
+    ack: typeof ack === 'number' && Number.isFinite(ack) ? ack : 0,
+    cleared: Array.isArray(cleared) ? cleared.filter((k): k is string => typeof k === 'string') : [],
+  };
+}
+
+/** The watermark and cleared keys a surface should actually apply. */
+export async function readNoticeState(store: Store): Promise<{ ackAt: number; cleared: Set<string> }> {
+  const legacy = await readLegacyNoticeState();
+  return {
+    ackAt: Math.max(noticeAckIn(store), legacy.ack),
+    cleared: new Set([...clearedFailureKeysIn(store), ...legacy.cleared]),
+  };
+}
+
+/**
+ * The settings bag with these dismissals recorded — the only supported way to
+ * save them, because writeCollection is what stamps and tombstones so the
+ * result can survive a merge.
+ *
+ * Takes the full key list rather than a delta, matching how the dashboard holds
+ * it. Records already present keep their original `at` (see `content` above),
+ * so re-saving the list is not an edit to every dismissal in it.
+ */
+export function writeClearedFailures(
+  settings: SettingsBag | undefined,
+  keys: string[],
+  now = Date.now(),
+): SettingsBag {
+  const existing = new Map(allClearedIn(settings).map((c) => [c.id, c]));
+  const next = Array.from(new Set(keys))
+    .map((id) => {
+      const prev = existing.get(id);
+      // `at: 0` is a record read out of the pre-sync shape (a bare key string),
+      // which carries no date. Adopting `now` for those is what lets them age
+      // out later and what gets them a revision that can win a merge — left at
+      // zero they would be both immortal and outranked by everything.
+      return prev && prev.at > 0 ? prev : { id, at: now };
+    })
+    // Age-pruned here rather than at read time, so the list shrinks in the
+    // store instead of only looking smaller on whichever machine read it.
+    .filter((c) => now - c.at <= CLEARED_FAILURE_TTL_MS);
+  return writeCollection(CLEARED_FAILURES_COLLECTION, settings, next, now);
+}
+
+/** The settings bag with the dismiss-everything watermark moved to `ts`. */
+export function writeFailedNoticeAck(settings: SettingsBag | undefined, ts: number): SettingsBag {
+  const current = settings?.[FAILED_NOTICE_ACK_KEY];
+  const prev = typeof current === 'number' && Number.isFinite(current) ? current : 0;
+  // Never moves backwards, so a stale tab can't un-dismiss by writing an older
+  // stamp — the same rule the cross-machine merge applies.
+  return { ...(settings || {}), [FAILED_NOTICE_ACK_KEY]: Math.max(prev, ts) };
+}
+
+/**
+ * Drop this machine's pre-sync copies. Called once the same dismissals are
+ * safely in the store, so the fold in the readers above stops finding them and
+ * the machine-local keys don't linger forever.
+ */
+export async function clearLegacyNoticeState(): Promise<void> {
+  await Promise.all([localRemove(LEGACY_ACK_KEY), localRemove(LEGACY_CLEARED_KEY)]);
 }
 
 // Failures the user hasn't acknowledged yet, newest first. Recipients that

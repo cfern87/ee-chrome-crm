@@ -34,6 +34,8 @@ export interface TagsPanelProps {
   onReorderTags: (orderedIds: string[]) => void;
   onAddGroup: () => void;
   onRenameGroup: (groupId: string, name: string) => void;
+  /** Turn this group into an ordered funnel — see TagGroup.funnel. */
+  onSetGroupFunnel: (groupId: string, funnel: boolean) => void;
   onDeleteGroup: (groupId: string) => void;
 }
 
@@ -42,7 +44,7 @@ export function TagsPanel(props: TagsPanelProps) {
     tags, tagGroups, conversations,
     newTagName, setNewTagName, newTagColor, setNewTagColor, newTagGroup, setNewTagGroup,
     newGroupName, setNewGroupName, newGroupColor, setNewGroupColor,
-    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onSetTagHidden, onReorderTags, onAddGroup, onRenameGroup, onDeleteGroup,
+    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onSetTagHidden, onReorderTags, onAddGroup, onRenameGroup, onSetGroupFunnel, onDeleteGroup,
   } = props;
 
   const usageOf = (tagId: string) => conversations.filter((c) => c.tags.includes(tagId)).length;
@@ -273,17 +275,41 @@ export function TagsPanel(props: TagsPanelProps) {
                 onBlurCapture={(e) => (e.currentTarget.style.border = '1px solid transparent')}
               />
               <span style={{ fontSize: 12, color: color.text.muted }}>{groupTags.length}</span>
+              <label
+                title="Show this group as a progress bar on contacts, with its tags as ordered stages. A contact sits at one stage at a time — picking a stage clears the others in this group."
+                style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: color.text.secondary, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}
+              >
+                <input
+                  type="checkbox"
+                  checked={!!group.funnel}
+                  onChange={(e) => onSetGroupFunnel(group.id, e.target.checked)}
+                  style={{ cursor: 'pointer', margin: 0 }}
+                />
+                Funnel (stages)
+              </label>
               <button
                 onClick={() => onDeleteGroup(group.id)}
                 title="Delete group (its tags become ungrouped)"
-                style={{ marginLeft: 'auto', background: 'none', color: color.danger.base, border: 'none', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                style={{ background: 'none', color: color.danger.base, border: 'none', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
               >
                 Delete group
               </button>
             </div>
+            {group.funnel && (
+              // Spelled out because it is the one consequence of the checkbox
+              // that isn't visible from the checkbox: the group stops behaving
+              // like a bag of tags, and the drag handles below stop being a
+              // display preference and start being the stage sequence.
+              <div style={{ fontSize: 11, color: color.text.muted, margin: '0 0 8px', paddingLeft: 20, lineHeight: 1.5 }}>
+                Shown as a stage bar on each contact, in the order below — drag to re-sequence.
+                Picking a stage <strong>clears the other stages in this group</strong>; picking the current one clears the funnel.
+              </div>
+            )}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {groupTags.length === 0 ? (
-                <div style={{ fontSize: 12, color: color.text.muted, padding: '4px 2px' }}>No tags in this group yet.</div>
+                <div style={{ fontSize: 12, color: color.text.muted, padding: '4px 2px' }}>
+                  No tags in this group yet.{group.funnel ? ' Add one per stage — the bar appears once there is at least one.' : ''}
+                </div>
               ) : groupTags.map((t) => tagRow(t, groupIds))}
             </div>
           </div>

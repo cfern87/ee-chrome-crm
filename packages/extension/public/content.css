@@ -336,6 +336,82 @@
   background: #ccd0d5;
 }
 
+/* ---- Funnels (a tag group read as ordered stages) ---- */
+/*
+   One horizontal bar per funnel group, filled up to the stage this contact has
+   reached. Filled-to-here rather than a single marked stage, because that is
+   what makes it readable at a glance: you see PROGRESS, not a dot in a row of
+   dots. The current stage takes the accent at full strength so "reached stage
+   3" and "is at stage 3" stay distinguishable.
+
+   The accent arrives per-element as --fb-crm-funnel-accent (the tag group's own
+   color), which is why every rule below reads from the variable rather than
+   naming a color. The fallback is the same blue the rest of the panel uses.
+*/
+
+.fb-crm-funnel {
+  display: flex;
+  gap: 2px;
+  border-radius: 6px;
+  overflow: hidden;
+  margin: 0 0 4px;
+}
+
+/* A funnel's title carries the group's color dot inline, so this one section
+   title is a flex row where the others are plain text. */
+.fb-crm-section-title:has(.fb-crm-tag-group-dot) {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* Position readout ("3 of 5") on the right of the group's title row. */
+.fb-crm-funnel__pos {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  color: #8a8d91;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.fb-crm-funnel__step {
+  flex: 1;
+  min-width: 0;
+  /* A floor, so a long funnel stays clickable rather than collapsing into
+     hairlines. The bar scrolls before a stage becomes a target you can miss. */
+  min-height: 22px;
+  border: none;
+  background: #f0f2f5;
+  color: #8a8d91;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+  padding: 5px 4px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+}
+
+/* Stages already passed: the group's accent, lightened. */
+.fb-crm-funnel__step--reached {
+  background: color-mix(in srgb, var(--fb-crm-funnel-accent, #065fd4) 45%, #ffffff);
+  color: #1c1e21;
+}
+
+/* Where the contact actually is. */
+.fb-crm-funnel__step--current {
+  background: var(--fb-crm-funnel-accent, #065fd4);
+  color: #ffffff;
+  font-weight: 700;
+}
+
+.fb-crm-funnel__step:hover { filter: brightness(0.94); }
+.fb-crm-funnel__step:focus-visible { outline: 2px solid #065fd4; outline-offset: -2px; }
+
 /* ---- Custom fields ("Details", above the tag sections) ---- */
 
 .fb-crm-fields {

@@ -18,6 +18,7 @@ import {
 } from './storage';
 import type { Store, Tag, Conversation, CustomFieldDef, TagGroup } from './storage';
 import { bucketTags, showsGroupLabels, type TagBucket } from './tagGrouping';
+import { funnelsFor, stageEditsFor, isNoOpStageEdit, describeStage, type FunnelView } from './funnel';
 import { readPresetActions, stepsFor, describePreset, isDestructive, type PresetAction } from './presets';
 import { PRODUCT_NAME } from './product';
 import { readableFill, chipOutline, ON_DARK } from './ui/contrast';
@@ -1286,6 +1287,60 @@ function tagSectionHtml(opts: {
 }
 
 /**
+ * The funnel bars: one per tag group in funnel mode, each a horizontal row of
+ * ordered stages filled up to where this contact has reached.
+ *
+ * Sits above the tag sections because "where is this person" is the question
+ * the panel is opened to answer, and the chips below are the detail behind it.
+ * The group's tags still appear as ordinary chips down there — the bar is a
+ * second, faster route to the same tags, not a replacement, so removing a
+ * stage by hand keeps working the way it always did.
+ *
+ * Labels are dropped below a certain width per stage: in a panel this narrow a
+ * five-stage funnel gives each stage about forty pixels, which is not enough
+ * for a word and is plenty for a segment you can see the fill of. The title
+ * attribute carries the name in both cases.
+ */
+function funnelBarsHtml(views: FunnelView[]): string {
+  if (!views.length) return '';
+
+  return views.map((view) => {
+    const accent = view.group.color || '#065fd4';
+    const showLabels = view.stages.length <= 4;
+
+    const steps = view.stages.map((stage, i) => {
+      const reached = i <= view.currentIndex;
+      const current = i === view.currentIndex;
+      const cls = ['fb-crm-funnel__step'];
+      if (reached) cls.push('fb-crm-funnel__step--reached');
+      if (current) cls.push('fb-crm-funnel__step--current');
+      const title = current
+        ? `Currently at "${stage.name}" — click to clear ${view.group.name}`
+        : `Move to "${stage.name}"`;
+      return `<button
+        class="${cls.join(' ')}"
+        style="--fb-crm-funnel-accent:${accent}"
+        data-stage-group="${escapeHtml(view.group.id)}"
+        data-stage-index="${i}"
+        aria-pressed="${current}"
+        title="${escapeHtml(title)}"
+      >${showLabels ? escapeHtml(stage.name) : ''}</button>`;
+    }).join('');
+
+    return `
+      <div class="fb-crm-section-title-row">
+        <div class="fb-crm-section-title">
+          <span class="fb-crm-tag-group-dot" style="background:${accent}"></span>${escapeHtml(view.group.name)}
+        </div>
+        <span class="fb-crm-funnel__pos">${
+          view.currentIndex < 0 ? 'Not started' : `${view.currentIndex + 1} of ${view.stages.length}`
+        }</span>
+      </div>
+      <div class="fb-crm-funnel" role="group" aria-label="${escapeHtml(describeStage(view))}">${steps}</div>`;
+  }).join('');
+}
+
+/**
  * The preset-action buttons: one small button per preset, applying the whole
  * bundle of edits in one press (see presets.ts).
  *
@@ -1574,6 +1629,8 @@ async function renderPanelContent() {
       ${isProfilePage() ? '' : '<button class="fb-crm-pick-btn">🎯 Select different conversation</button>'}
 
       ${presetActionsHtml(presets, store, presetArmed)}
+
+      ${funnelBarsHtml(funnelsFor(conv, store.tags, store.tagGroups))}
 
       ${panelFields.length > 0 ? `
         <div class="fb-crm-section-title">Details</div>
@@ -1894,6 +1951,33 @@ function wirePanelActions(threadId: string) {
   panelEl.querySelectorAll<HTMLElement>('[data-add]').forEach(btn => {
     btn.addEventListener('click', async () => {
       await mutate([{ op: 'addTags', conversationId: threadId, tagIds: [btn.dataset.add!] }]);
+      await renderPanel();
+      await injectSidebarTags();
+    });
+  });
+
+  // Funnel stages. The view is rebuilt from a FRESH store read rather than
+  // captured when the panel was rendered: this panel can sit open for minutes
+  // while another tab or another machine edits the same contact, and acting on
+  // the stage list as it looked back then could clear a tag that has since
+  // moved groups. Both ops go in ONE mutate call, remove first, so the contact
+  // is never momentarily at two stages of the same group.
+  panelEl.querySelectorAll<HTMLElement>('[data-stage-group]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const store = await getStore();
+      const conv = store.conversations[threadId];
+      if (!conv) return;
+      const view = funnelsFor(conv, store.tags, store.tagGroups)
+        .find(v => v.group.id === btn.dataset.stageGroup);
+      if (!view) return;
+
+      const edits = stageEditsFor(view, conv, Number(btn.dataset.stageIndex));
+      if (isNoOpStageEdit(edits)) return;
+
+      const mutations: Mutation[] = [];
+      if (edits.remove.length) mutations.push({ op: 'removeTags', conversationId: threadId, tagIds: edits.remove });
+      if (edits.add.length) mutations.push({ op: 'addTags', conversationId: threadId, tagIds: edits.add });
+      await mutate(mutations);
       await renderPanel();
       await injectSidebarTags();
     });

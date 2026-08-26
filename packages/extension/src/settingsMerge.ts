@@ -1,6 +1,6 @@
 // How `store.settings` reconciles across machines.
 //
-// Settings is one untyped bag holding two very different kinds of thing, and
+// Settings is one untyped bag holding three very different kinds of thing, and
 // they cannot merge the same way:
 //
 //   * SCALARS — a toggle, the sending pace, the pinned contact list. There is
@@ -9,6 +9,11 @@
 //     ids and their own edit stamps, which two machines edit INDEPENDENTLY:
 //     adding a preset here and a webhook there are not competing answers to the
 //     same question, they are two changes that should both survive.
+//   * WATERMARKS — a number that only ever moves forward, like the timestamp
+//     recording when notifications were last dismissed. Picking a side is wrong
+//     for these in a way it isn't for a toggle: the side that didn't move is a
+//     legitimate older reading, not a competing opinion, and taking it undoes
+//     the other machine's action. They merge with Math.max instead.
 //
 // Treating the whole bag as scalars is what "preset actions don't sync" was.
 // The Drive merge resolved settings per key — `{...remote, ...local}` — so the
@@ -33,6 +38,7 @@
 
 import { PRESET_COLLECTION } from './presets';
 import { WEBHOOK_COLLECTION } from './webhooks';
+import { CLEARED_FAILURES_COLLECTION, FAILED_NOTICE_ACK_KEY } from './campaigns';
 
 /** The `settings` bag. Untyped by design — it holds every feature's keys. */
 export type SettingsBag = Record<string, unknown>;
@@ -86,7 +92,38 @@ export interface SettingsCollection<T> {
  * there. Inside a function it can only run once everything is loaded.
  */
 function collections(): SettingsCollection<never>[] {
-  return [PRESET_COLLECTION, WEBHOOK_COLLECTION] as unknown as SettingsCollection<never>[];
+  return [PRESET_COLLECTION, WEBHOOK_COLLECTION, CLEARED_FAILURES_COLLECTION] as unknown as SettingsCollection<never>[];
+}
+
+/**
+ * Numeric keys that only ever move forward, merged with Math.max. Resolved at
+ * call time for the same import-cycle reason as `collections` above.
+ *
+ * The notification ack is the motivating case and shows why a scalar rule can't
+ * cover it. Dismiss 79 failed sends on the laptop and its ack jumps to now; the
+ * desktop, which hasn't been opened in a week, still holds last week's. Under
+ * the scalar rules the desktop's copy is a perfectly ordinary "my value" — in
+ * Drive mode `mergeSettings` hands scalars to the local machine outright — so
+ * the desktop would publish the older ack back and all 79 notices would return
+ * on the laptop. Max is the only reading that makes a dismissal stick.
+ */
+function monotonicKeys(): string[] {
+  return [FAILED_NOTICE_ACK_KEY];
+}
+
+/** Apply the watermark rule to whichever of these keys both bags disagree on. */
+function overlayMonotonic(out: SettingsBag, a: SettingsBag | undefined, b: SettingsBag | undefined): SettingsBag {
+  for (const key of monotonicKeys()) {
+    const x = a?.[key];
+    const y = b?.[key];
+    const nx = typeof x === 'number' && Number.isFinite(x) ? x : undefined;
+    const ny = typeof y === 'number' && Number.isFinite(y) ? y : undefined;
+    // A key neither side holds as a number is left exactly as the scalar pass
+    // left it — this rule reinterprets watermarks, it doesn't invent them.
+    if (nx === undefined && ny === undefined) continue;
+    out[key] = Math.max(nx ?? 0, ny ?? 0);
+  }
+  return out;
 }
 
 // A tombstone only has to outlive the gap between a delete here and the next
@@ -219,7 +256,7 @@ function overlayCollections(
   now: number,
 ): SettingsBag {
   for (const spec of collections()) Object.assign(out, mergeCollection(spec, a, b, now));
-  return out;
+  return overlayMonotonic(out, a, b);
 }
 
 /**

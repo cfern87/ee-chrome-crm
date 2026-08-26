@@ -66,6 +66,15 @@ export interface SavedSearch {
   archiveScope?: ArchiveScope;
   /** Pinned presets get a one-click chip above the contact list. */
   pinned?: boolean;
+  // Show this query as a live count tile on the Dashboard.
+  //
+  // A flag on the preset rather than a separate collection of tiles, because a
+  // dashboard tile and a contact-list preset are the same thing asked in two
+  // moods — "how many?" and "show me" — and a query worth counting is almost
+  // always one worth opening. Keeping them one record means one `q:` shard, one
+  // merge rule, and a tile that can hand its query straight to the contact list
+  // when clicked. Absent = false, so no existing preset appears uninvited.
+  onDashboard?: boolean;
   order: number;
   createdAt: number;
   updatedAt: number;

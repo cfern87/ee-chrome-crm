@@ -22,6 +22,13 @@ export const ICON_SVG_ATTRS =
 // All on the same 16x16 box with the same stroke weight, so the rail reads as
 // one set rather than four borrowed glyphs.
 
+/** Dashboard — four tiles, the shape of the counts it holds. */
+export const ICON_DASHBOARD =
+  '<rect x="1.9" y="1.9" width="5" height="5" rx="1" />' +
+  '<rect x="9.1" y="1.9" width="5" height="5" rx="1" />' +
+  '<rect x="1.9" y="9.1" width="5" height="5" rx="1" />' +
+  '<rect x="9.1" y="9.1" width="5" height="5" rx="1" />';
+
 /** Contacts — two people. */
 export const ICON_CONTACTS =
   '<circle cx="6" cy="5.5" r="2.5" />' +

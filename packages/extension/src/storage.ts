@@ -90,6 +90,17 @@ export interface TagGroup {
   name: string;
   color?: string;   // optional accent color for the group header
   order: number;    // display order among groups
+  // Read this group as an ordered FUNNEL rather than a bag: its tags become
+  // progressive stages, drawn as one horizontal bar, and a contact holds
+  // exactly one of them at a time (picking a stage clears the others — see
+  // funnel.ts). Absent = false, so every group that existed before this is
+  // untouched and keeps behaving as a plain group.
+  //
+  // No separate stage-order field: the stage order IS the group's existing tag
+  // order (Tag.order, via tagGrouping.tagDisplayOrder), which the Tags panel
+  // already lets you drag. A second ordering would be two sources of truth for
+  // one visible sequence, and they would disagree the first time either moved.
+  funnel?: boolean;
   createdAt: number;
   updatedAt?: number; // see Tag.updatedAt — same reason, same fallback
 }
@@ -1135,12 +1146,20 @@ async function loadStoreDrive(): Promise<Store> {
     return seed;
   }
 
+  // Re-read the cache before merging. `local` above was captured BEFORE the
+  // Drive round-trip, which is a network call — a write that landed while it
+  // was in flight is in the cache now but not in that snapshot, and merging
+  // without it would compute a result that predates the write and then hand it
+  // to updateLocalCache, which would write the edit straight back out again.
+  // Re-reading costs one local get and closes the window to nothing.
+  const current = (await chromeLocalGet()) || local;
+
   // Merge canonical remote with local edits (last-write-wins per record via the
   // stores' own timestamps, with tombstones carrying deletes). If local
   // contributed anything newer, push it back.
-  const merged = pruneTombstones(mergeStores(remote, local));
+  const merged = pruneTombstones(mergeStores(remote, current));
   if (!sameStore(merged, remote)) queueDriveWrite(merged);
-  await updateLocalCache(merged, local);
+  await updateLocalCache(merged, current);
   return merged;
 }
 
@@ -1339,19 +1358,33 @@ export async function saveStore(input: Store): Promise<SaveResult> {
   // the freshness window rather than re-reading what we just wrote.
   loadedStore = store;
   loadedAt = Date.now();
-  await bumpStoreRev();
 
   if (driveMode) {
     // Mark dirty up front; queueDriveWrite clears it once the upload lands.
     // Drive has no item ceiling and retries on its own, so a save is "ok" once
     // it's durable locally and queued.
     await localFlagSet(DRIVE_DIRTY_KEY, true);
+    // Safe to announce before the upload: in Drive mode the local cache IS what
+    // a reader reconciles against (loadStoreDrive merges Drive INTO it), and it
+    // was written a few lines up. A listener woken now reads the new data.
+    await bumpStoreRev();
     queueDriveWrite(store);
     return { ok: true, pending: 0, itemLimitReached: false, ...planLimit };
   }
 
 
   const res = await syncWriteDelta(store);
+  // Announced only now, and this ordering is load-bearing.
+  //
+  // In legacy mode chrome.storage.sync is CANONICAL: loadStoreUncached returns
+  // it verbatim whenever it has data, ignoring the local cache written above.
+  // Bumping the rev before the delta landed woke every listener to re-read a
+  // sync layer that did not yet contain the edit, so each one painted the
+  // pre-edit store back over what the user had just done — and then painted it
+  // in again when sync's own onChanged fired moments later. That flash of a
+  // tag appearing, vanishing, and returning "after a round trip" was this line
+  // sitting twenty lines higher up.
+  await bumpStoreRev();
   return { ok: res.ok, pending: res.failed, itemLimitReached: res.itemLimitReached, ...planLimit, reason: planLimit.reason ?? res.reason };
 
 }
