@@ -169,19 +169,26 @@ export function formatRelativeTime(ts: number): string {
 
 // --- Read receipts --------------------------------------------------------
 //
-// Whether the last message you sent someone has been opened. Recorded by the
-// content script from Messenger's own receipt (messageStatus.ts) as you
-// browse, so it is an OBSERVATION with an age, never a live query — which is
-// why the chip is dated and why "unknown" is offered as a real answer rather
-// than being dressed up as "not read".
+// Whose turn it is, as far as Messenger has let us observe. Recorded by the
+// content script (messageStatus.ts) as you browse, so it is an OBSERVATION
+// with an age, never a live query — which is why the chip is dated and why
+// "unknown" is offered as a real answer rather than being dressed up as "not
+// read".
+//
+// Three of the four are about YOUR message — read, not read, or no idea. The
+// fourth, 'responded', is about theirs: the thread holds something you haven't
+// opened, which in Messenger only ever means they wrote back. It is the one
+// state that is a to-do rather than a status, so it is the only one coloured
+// like something to act on.
 
-export type ContactReadState = 'read' | 'unread' | 'unknown';
+export type ContactReadState = 'read' | 'unread' | 'responded' | 'unknown';
 
-export function readStateOf(conv: { readState?: 'read' | 'unread' }): ContactReadState {
+export function readStateOf(conv: { readState?: ContactReadState }): ContactReadState {
   return conv.readState ?? 'unknown';
 }
 
 const READ_STATE_CHIP: Record<ContactReadState, { label: string; short: string; fg: string; bg: string }> = {
+  responded: { label: 'Responded', short: '↩', fg: '#0b5cad', bg: '#e3f0fb' },
   read: { label: 'Read', short: '✓✓', fg: '#1a7f4b', bg: '#e6f4ec' },
   unread: { label: 'Not read', short: '✓', fg: '#8a6100', bg: '#fdf1d8' },
   unknown: { label: 'Unknown', short: '·', fg: '#6b6b6b', bg: '#eeeeee' },
@@ -194,16 +201,22 @@ const READ_STATE_CHIP: Record<ContactReadState, { label: string; short: string; 
  * a sweep that finds the same answer again writes nothing (see the
  * observeReadStates mutation), so there is no record of the last look. "Since"
  * rather than "checked" keeps the chip honest about that.
+ *
+ * 'responded' says "unread message", not "they replied to you", because that
+ * is what was actually observed — a first-ever message from a stranger looks
+ * the same from the sidebar. Claiming the narrower thing would be claiming an
+ * inference the DOM doesn't support.
  */
 function readStateTitle(state: ContactReadState, at?: number): string {
   const when = at ? ` (since ${formatRelativeTime(at)})` : '';
+  if (state === 'responded') return `They have an unread message waiting for you${when} — the ball is in your court`;
   if (state === 'read') return `They have opened your last message${when}`;
   if (state === 'unread') return `Your last message hasn't been opened yet${when}`;
   return 'No read receipt has been seen for this contact yet — open their conversation in Messenger and it will be recorded';
 }
 
 export function ReadStateChip({ conv, compact }: {
-  conv: { readState?: 'read' | 'unread'; readStateAt?: number };
+  conv: { readState?: ContactReadState; readStateAt?: number };
   compact?: boolean;
 }) {
   const state = readStateOf(conv);

@@ -39,6 +39,7 @@ import {
   ALT_FRAGMENT_MAX,
   readStateOfLastOutgoing,
   hasReadReceipt,
+  hasUnreadMessage,
 } from './messageStatus';
 import type { ReadState } from './messageStatus';
 import type { ReadStateObservation } from './mutations';
@@ -3076,29 +3077,39 @@ const READ_STATE_TIMEOUT_MS = 4000;
 //     background job with side effects on somebody's inbox is not one.
 //   * The open thread and any chat drawer are read in full, so they can report
 //     'read' or 'unread'.
-//   * A sidebar row can only ever report 'read'. It renders the reader's
-//     avatar but has no status line, so no receipt might mean unread, might
-//     mean it's our turn to reply, might mean the row hasn't finished
-//     rendering — see hasReadReceipt.
+//   * A sidebar row can report 'read' or 'responded', and neither absence
+//     means anything. It renders the reader's avatar but has no status line,
+//     so no receipt might mean unread, might mean it's our turn to reply,
+//     might mean the row hasn't finished rendering — see hasReadReceipt. The
+//     unread marker is one-directional in the same way — see hasUnreadMessage.
 //   * Nothing is reported twice: each thread's last reported answer is kept
 //     here, so a tab sitting on an unchanged screen sends no messages at all.
 const READ_STATE_SWEEP_MS = 20_000;
 const reportedReadState = new Map<string, ReadState>();
 
+// How much a state is worth when two places on screen describe one thread in
+// the same pass. Both steps up are "positive evidence beats its absence":
+// a receipt outranks a missing one, and an unread message — them writing back —
+// outranks anything about our own outgoing message, because it happened after.
+const READ_STATE_RANK: Record<ReadState, number> = { unknown: 0, unread: 1, read: 2, responded: 3 };
+
 function collectReadStateObservations(at: number): ReadStateObservation[] {
   const seen = new Map<string, ReadState>();
   const note = (threadId: string | null | undefined, state: ReadState) => {
     if (!threadId || state === 'unknown') return;
-    // Within one pass 'read' outranks 'unread': the sidebar and the open pane
-    // can both describe the same thread, and a receipt is positive evidence
-    // where its absence is not.
-    if (seen.get(threadId) === 'read') return;
+    const current = seen.get(threadId);
+    if (current && READ_STATE_RANK[current] >= READ_STATE_RANK[state]) return;
     seen.set(threadId, state);
   };
 
+  // The thread the user is looking at. Whatever its sidebar row still says,
+  // having it open means its messages are being read right now, so it is never
+  // reported as 'responded' — see the row loop below.
+  const activeThreadId = isMessagesPage() ? getActiveThreadId() : null;
+
   if (isMessagesPage()) {
     const main = document.querySelector<HTMLElement>('[role="main"]');
-    if (main) note(getActiveThreadId(), readStateOfLastOutgoing(main).state);
+    if (main) note(activeThreadId, readStateOfLastOutgoing(main).state);
   }
 
   for (const composer of findDrawerComposers()) {
@@ -3112,7 +3123,19 @@ function collectReadStateObservations(at: number): ReadStateObservation[] {
 
   for (const row of Array.from(document.querySelectorAll<HTMLElement>('[role="row"]'))) {
     const link = row.querySelector<HTMLAnchorElement>('a[href*="/t/"]');
-    if (link && hasReadReceipt(row)) note(extractThreadId(link.href), 'read');
+    if (!link) continue;
+    const threadId = extractThreadId(link.href);
+    // Messenger clears the unread marker a beat after the thread is opened, and
+    // in that gap the open pane and its own row disagree. The pane is right:
+    // reporting 'responded' for a conversation being read on screen would put a
+    // "they replied, go look" marker on the one thread that plainly doesn't
+    // need it, and it would flip back on the next sweep — a write, a sync and a
+    // Drive upload for a state that lasted two seconds.
+    if (threadId && threadId !== activeThreadId && hasUnreadMessage(row)) {
+      note(threadId, 'responded');
+    } else if (hasReadReceipt(row)) {
+      note(threadId, 'read');
+    }
   }
 
   const out: ReadStateObservation[] = [];

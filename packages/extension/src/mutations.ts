@@ -98,7 +98,12 @@ export type Mutation =
  */
 export interface ReadStateObservation {
   threadId: string;
-  state: 'read' | 'unread' | 'unknown';
+  /**
+   * 'read'/'unread' are about OUR last outgoing message; 'responded' means the
+   * thread holds a message we haven't opened, which is them writing back. See
+   * Conversation.readState for why all three share one field.
+   */
+  state: 'read' | 'unread' | 'responded' | 'unknown';
   /** When it was seen (epoch ms). */
   at: number;
 }

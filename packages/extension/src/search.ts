@@ -144,11 +144,11 @@ export const BUILTIN_FIELDS: FieldDef[] = [
   { key: 'nameManual', label: 'Name edited by hand', kind: 'boolean', category: 'Status' },
   {
     key: 'readState',
-    label: 'Read your last message',
+    label: 'Read / responded',
     kind: 'enum',
     category: 'Status',
-    options: ['read', 'unread', 'unknown'],
-    hint: 'What Messenger last showed for your most recent message to them. "unknown" means no receipt has been seen yet — it is not the same as "not read".',
+    options: ['responded', 'read', 'unread', 'unknown'],
+    hint: '"responded" means they have a message waiting that you haven\'t opened. The rest describe your most recent message to them; "unknown" means no receipt has been seen yet, which is not the same as "not read".',
   },
   {
     key: 'readStateAt',

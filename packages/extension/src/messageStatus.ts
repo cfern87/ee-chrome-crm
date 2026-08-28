@@ -93,7 +93,104 @@ const TEXT_FRAGMENT_MAX = 40;
 // of…") can't sit in the fragment list.
 export const ALT_FRAGMENT_MAX = 120;
 
-export type ReadState = 'read' | 'unread' | 'unknown';
+// ---- Have THEY written back? ----
+//
+// Everything above answers a question about our OUTGOING message. This answers
+// a different one about the thread as a whole: is there something in it we
+// haven't opened? In Messenger that only ever means the other person wrote —
+// our own messages are never unread to us — so an unread thread is a reply
+// sitting there waiting, which is why the CRM records it as 'responded'.
+//
+// Honest about what is observed: this is "the thread is unread", not "they
+// answered the specific message you sent". Three things read the same way from
+// a sidebar row, and only the first is a reply in the strict sense:
+//
+//   * they wrote back, or reacted to something you sent;
+//   * they messaged you for the first time, having never heard from you;
+//   * YOU hit "Mark as unread" on a thread whose last message is your own —
+//     which is real and visible in the wild: a row can show the marker above a
+//     preview that reads "You: Ok".
+//
+// The third is the only one where "responded" overstates things, and it is a
+// deliberate trade. All three mean the same thing to the person using this —
+// this thread wants attention — and the only way to tell them apart is the
+// "You:" prefix on the preview, which is localized text and would rot the
+// first time somebody runs Messenger in another language. A slightly broad
+// marker beats a narrow one that silently stops working.
+//
+// Matched against the same anchored fragments as everything else here, because
+// the failure mode is identical: a loose /\bunread\b/ would match the "Mark as
+// unread" action Messenger offers on rows that HAVE been read, and every read
+// conversation would report a reply.
+export const UNREAD_ROW_PATTERNS: RegExp[] = [
+  // CONFIRMED against the live conversation list. Facebook puts a
+  // screen-reader-only leaf div reading "Unread message:" immediately before
+  // the message preview it introduces — the bold styling is all a sighted user
+  // gets, so this announcement is the only thing in the markup that says so in
+  // words. Also covers a bare "Unread" as the last bullet-separated field of a
+  // row label ("John Doe · 2:14 PM · Unread"). See the fixture in
+  // readState.test.ts.
+  /^unread\b/i,
+  // Fallbacks for layouts not seen here — Messenger runs several. Harmless if
+  // they never fire; each is anchored, so none can match a message body.
+  /^\d+\s+unread\b/i,
+  /^\d+\s+new\s+messages?\b/i,
+  // The row action, offered in this direction only when the row is unread. Its
+  // counterpart "Mark as unread" cannot match: `read\b` has to sit immediately
+  // after "as", and "unread" is a different word.
+  /^mark\s+as\s+read\b/i,
+];
+
+/**
+ * Our own markup, injected INTO Messenger's conversation rows: the tag chips
+ * and the "+" add-tag button (see injectSidebarTags in content.ts).
+ *
+ * Skipped when reading a row, because a chip's text is a TAG NAME — something
+ * the user typed. A tag called "Unread", "Unread leads" or "Unread — follow
+ * up" would otherwise mark every contact carrying it as having written back,
+ * on every row, forever. This is not hypothetical for this codebase: contacts
+ * once got NAMED after our own injected chips, which is why isDamagedName
+ * exists in names.ts. Reading your own output back as if it were the page's is
+ * the same mistake twice.
+ */
+export const CRM_INJECTED_SELECTOR = '[data-crm-chips], [data-crm-add-tag]';
+
+/**
+ * Does this conversation row have an unread message in it?
+ *
+ * For sidebar rows, like hasReadReceipt — and one-directional in the same way.
+ * True means there is something unopened in the thread; false means NOTHING,
+ * because a row not showing an unread marker might be read, might not have
+ * finished rendering, or might be a layout that marks unread some way this
+ * doesn't recognize. Callers must not read false as "they haven't replied".
+ *
+ * (hasReadReceipt needs no such guard: it reads `alt` attributes, and nothing
+ * we inject has one.)
+ */
+export function hasUnreadMessage(scope: HTMLElement): boolean {
+  for (const el of Array.from(scope.querySelectorAll<HTMLElement>('[aria-label], span, div'))) {
+    if (el.closest(CRM_INJECTED_SELECTOR)) continue;
+    const label = el.getAttribute('aria-label');
+    const raw = label || (el.querySelector('span, div') ? '' : el.textContent || '');
+    for (const piece of raw.split(/[\n\r·•|]+/)) {
+      const s = normalizeText(piece);
+      if (!s || s.length > TEXT_FRAGMENT_MAX) continue;
+      if (UNREAD_ROW_PATTERNS.some((re) => re.test(s))) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * What the CRM records about a thread.
+ *
+ * 'read'/'unread' describe OUR last outgoing message; 'responded' describes
+ * theirs. They share one field because they are one question in practice —
+ * "whose turn is it?" — and because a reply makes the receipt on our own
+ * message moot: once somebody has written back, whether they opened the thing
+ * you sent before that is no longer what you want the chip to tell you.
+ */
+export type ReadState = 'read' | 'unread' | 'responded' | 'unknown';
 
 /**
  * Whether the LAST outgoing message in `scope` has been read.

@@ -276,7 +276,19 @@ export interface Conversation {
   // send makes it 'unread' by definition. Never inferred from anything else,
   // because a wrong "they've read it" is the one answer that would make the
   // campaign gate send exactly the follow-up it exists to hold back.
-  readState?: 'read' | 'unread';
+  //
+  // 'responded' is the third answer and the odd one out: it is not about our
+  // message at all, but about THEIRS — there is something in the thread we
+  // haven't opened, which in Messenger can only be them writing back. It shares
+  // this field rather than getting its own because the three are one question
+  // in practice ("whose turn is it?"), and because a reply makes the receipt on
+  // our own message moot — once somebody has answered, whether they opened the
+  // thing you sent before that is no longer what you want to be told.
+  //
+  // It is not sticky: reading the reply lets the next observation of our own
+  // message replace it, which is what keeps the state a description of the
+  // thread right now rather than a flag someone has to remember to clear.
+  readState?: 'read' | 'unread' | 'responded';
   // When that observation was made. Separate from updatedAt because it answers
   // a different question — "how current is this?" rather than "when did this
   // record last change?" — and the dashboard shows it, so a week-old reading
