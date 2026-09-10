@@ -113,7 +113,13 @@ export interface ReadStateObservation {
 // every one of them — several hundred contacts would be several hundred sync
 // item writes in one go, which is how you trip chrome.storage's write quota.
 // The pass is idempotent and runs again, so a cap costs nothing but time.
-const MAX_READ_STATE_WRITES = 25;
+//
+// Exported because the on-demand scan (readScan.ts) has to chunk to it. The
+// scan is NOT idempotent in the same forgiving way — it is a one-shot job the
+// user is watching a progress bar for — so it splits its findings into ops of
+// this size rather than handing over one batch that would be silently cut off
+// at 25.
+export const MAX_READ_STATE_WRITES = 25;
 
 export interface MutationOutcome {
   store: Store;

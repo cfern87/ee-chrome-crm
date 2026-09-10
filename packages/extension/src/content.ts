@@ -43,6 +43,7 @@ import {
 } from './messageStatus';
 import type { ReadState } from './messageStatus';
 import type { ReadStateObservation } from './mutations';
+import { noteState, buildReport, emptyReport, type ScanReport } from './readScan';
 import type { SendFailureKind } from './campaigns';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
@@ -3077,34 +3078,71 @@ const READ_STATE_TIMEOUT_MS = 4000;
 //     background job with side effects on somebody's inbox is not one.
 //   * The open thread and any chat drawer are read in full, so they can report
 //     'read' or 'unread'.
-//   * A sidebar row can report 'read' or 'responded', and neither absence
-//     means anything. It renders the reader's avatar but has no status line,
-//     so no receipt might mean unread, might mean it's our turn to reply,
-//     might mean the row hasn't finished rendering — see hasReadReceipt. The
-//     unread marker is one-directional in the same way — see hasUnreadMessage.
+//   * A sidebar row can report 'responded', and its absence means nothing —
+//     see hasUnreadMessage. It is checked for a receipt too, but in practice
+//     the conversation list does not render one (measured: zero across 80+
+//     rows — see hasReadReceipt), so 'read' effectively only ever comes from
+//     an open pane or a drawer.
 //   * Nothing is reported twice: each thread's last reported answer is kept
 //     here, so a tab sitting on an unchanged screen sends no messages at all.
 const READ_STATE_SWEEP_MS = 20_000;
 const reportedReadState = new Map<string, ReadState>();
 
-// How much a state is worth when two places on screen describe one thread in
-// the same pass. Both steps up are "positive evidence beats its absence":
-// a receipt outranks a missing one, and an unread message — them writing back —
-// outranks anything about our own outgoing message, because it happened after.
-const READ_STATE_RANK: Record<ReadState, number> = { unknown: 0, unread: 1, read: 2, responded: 3 };
+/** What one look at a batch of conversation rows turned up. */
+interface RowHarvest {
+  /** Only threads a row said something about. See noteState — no 'unknown'. */
+  states: Map<string, ReadState>;
+  /**
+   * Every thread whose row was looked at, whether or not it answered. This is
+   * how the scan tells "we saw them and Messenger showed nothing" apart from
+   * "we never got to them" — two very different things to report.
+   */
+  seenThreadIds: Set<string>;
+}
+
+/**
+ * Read every conversation row under `root`.
+ *
+ * The single place the CRM turns a sidebar row into a read state, shared by the
+ * passive sweep and the on-demand scan (scanReadStates). Two copies of this
+ * would be two answers to one DOM question the first time either was touched —
+ * the same reason sidebarTargets.ts exists.
+ *
+ * `activeThreadId` is the conversation currently open, which is never reported
+ * as 'responded': Messenger clears the unread marker a beat AFTER the thread is
+ * opened, and in that gap the open pane and its own row disagree. The pane is
+ * right. Reporting 'responded' there would put a "they replied, go look" marker
+ * on the one thread that plainly doesn't need it, and it would flip back on the
+ * next pass — a write, a sync and a Drive upload for a state that lasted two
+ * seconds.
+ */
+function harvestRows(root: ParentNode, activeThreadId: string | null): RowHarvest {
+  const states = new Map<string, ReadState>();
+  const seenThreadIds = new Set<string>();
+
+  for (const row of Array.from(root.querySelectorAll<HTMLElement>('[role="row"]'))) {
+    const link = row.querySelector<HTMLAnchorElement>('a[href*="/t/"]');
+    if (!link) continue;
+    const threadId = extractThreadId(link.href);
+    if (!threadId) continue;
+    seenThreadIds.add(threadId);
+    if (threadId !== activeThreadId && hasUnreadMessage(row)) {
+      noteState(states, threadId, 'responded');
+    } else if (hasReadReceipt(row)) {
+      noteState(states, threadId, 'read');
+    }
+  }
+
+  return { states, seenThreadIds };
+}
 
 function collectReadStateObservations(at: number): ReadStateObservation[] {
   const seen = new Map<string, ReadState>();
-  const note = (threadId: string | null | undefined, state: ReadState) => {
-    if (!threadId || state === 'unknown') return;
-    const current = seen.get(threadId);
-    if (current && READ_STATE_RANK[current] >= READ_STATE_RANK[state]) return;
-    seen.set(threadId, state);
-  };
+  const note = (threadId: string | null | undefined, state: ReadState) => { noteState(seen, threadId, state); };
 
   // The thread the user is looking at. Whatever its sidebar row still says,
   // having it open means its messages are being read right now, so it is never
-  // reported as 'responded' — see the row loop below.
+  // reported as 'responded' — see harvestRows.
   const activeThreadId = isMessagesPage() ? getActiveThreadId() : null;
 
   if (isMessagesPage()) {
@@ -3121,22 +3159,7 @@ function collectReadStateObservations(at: number): ReadStateObservation[] {
     note(ids[0], readStateOfLastOutgoing(scope).state);
   }
 
-  for (const row of Array.from(document.querySelectorAll<HTMLElement>('[role="row"]'))) {
-    const link = row.querySelector<HTMLAnchorElement>('a[href*="/t/"]');
-    if (!link) continue;
-    const threadId = extractThreadId(link.href);
-    // Messenger clears the unread marker a beat after the thread is opened, and
-    // in that gap the open pane and its own row disagree. The pane is right:
-    // reporting 'responded' for a conversation being read on screen would put a
-    // "they replied, go look" marker on the one thread that plainly doesn't
-    // need it, and it would flip back on the next sweep — a write, a sync and a
-    // Drive upload for a state that lasted two seconds.
-    if (threadId && threadId !== activeThreadId && hasUnreadMessage(row)) {
-      note(threadId, 'responded');
-    } else if (hasReadReceipt(row)) {
-      note(threadId, 'read');
-    }
-  }
+  for (const [threadId, state] of harvestRows(document, activeThreadId).states) note(threadId, state);
 
   const out: ReadStateObservation[] = [];
   for (const [threadId, state] of seen) {
@@ -3180,6 +3203,223 @@ function noteReadState(threadId: string | null | undefined, state: ReadState): v
   reportedReadState.set(threadId, state);
   void mutate([{ op: 'observeReadStates', observations: [{ threadId, state, at: Date.now() }] }])
     .catch(() => { reportedReadState.delete(threadId); });
+}
+
+// ---- Checking a whole selection at once, on demand ----
+//
+// Everything above is a bystander: it reports what the user's own browsing
+// happened to put on screen. This is asked a question — "of these 300 people,
+// who has read my message?" — about contacts who may not have been scrolled
+// past in months.
+//
+// It answers WITHOUT OPENING ANYTHING, and that is the whole design rather
+// than a nicety. Opening a conversation marks it read on the user's own
+// account: it clears their unread badge, tells the other person you've seen
+// their message, and destroys the very 'responded' flag the scan exists to
+// report. So this drives Messenger's conversation LIST, which renders both
+// answers on its rows and costs nothing to look at — the same rows the passive
+// sweep reads, via the same harvestRows.
+//
+// What it CANNOT do follows from the same choice, and the report says so
+// rather than papering over it: the list is ordered by recency, so a contact
+// far enough down may not be reached within the budget, and a row Messenger
+// renders no receipt on has told us nothing. Neither is evidence, and neither
+// is written. See ScanReport for the three buckets.
+
+/** Give up on a scan after this long, however much is left. */
+const READ_SCAN_MAX_MS = 5 * 60_000;
+/** How long to wait for a scroll to bring in more rows before trying again. */
+const READ_SCAN_ROW_WAIT_MS = 1200;
+/** Consecutive scrolls that add nothing before the list is called exhausted. */
+const READ_SCAN_STALL_LIMIT = 3;
+
+/** Set by CRM_CANCEL_READ_SCAN so a running scan can be stopped mid-scroll. */
+let readScanCancelled = false;
+
+/**
+ * Open Facebook's chat dropdown — the conversation list from the top-bar
+ * Messenger icon, over the ordinary feed.
+ *
+ * This is where the scan runs, and the reason is the whole point of the
+ * feature. BOTH of Messenger's own list URLs auto-select a conversation:
+ * loading `messenger.com/` redirects to `/t/<most recent thread>`, and
+ * `facebook.com/messages/` does the same. Either one would mark that thread
+ * read on the user's account on every single scan — clearing their unread
+ * badge, telling the other person they'd looked, and destroying exactly the
+ * 'responded' flag the scan exists to report. Confirmed against the live site,
+ * both hosts.
+ *
+ * The dropdown has no such behaviour: it renders the same conversation rows,
+ * with the same unread markers, over whatever page is already loaded, and
+ * opens nothing. sidebarTargets.ts already treats it as a first-class list
+ * surface for the same reason.
+ *
+ * Returns once rows are on screen, or gives up quietly — a caller that finds no
+ * rows reports an empty scan, which is honest, rather than an error.
+ */
+async function openChatDropdown(): Promise<boolean> {
+  // Brand name rather than a translated word, so this survives a non-English
+  // UI far better than most label matching in here. Several elements can carry
+  // it (the toolbar icon and its inner button), so each is tried in turn.
+  const buttons = Array.from(
+    document.querySelectorAll<HTMLElement>('[role="button"][aria-label]')
+  ).filter((b) => /^messenger$/i.test((b.getAttribute('aria-label') || '').trim()));
+
+  for (const button of buttons) {
+    try { button.click(); } catch { continue; }
+    if (await pollFor(() => hasConversationRows(), 4_000, 250)) return true;
+  }
+  return hasConversationRows();
+}
+
+/**
+ * A link that is really a conversation row, to climb from.
+ *
+ * NOT `a[href*="/t/"]`, which is what this used to be and was wrong: the FIRST
+ * such link in the document is Messenger's "Skip to messages" accessibility
+ * skip-link, which points at a thread but sits in the page header, nowhere near
+ * the list. Climbing from it found no scroll container at all, so the scan
+ * harvested one screen and stopped. Confirmed against the live page — the
+ * skip-link's href even carries `?focus_target=1`.
+ */
+function firstRowLink(root: ParentNode = document): HTMLAnchorElement | null {
+  return root.querySelector<HTMLAnchorElement>('[role="row"] a[href*="/t/"]');
+}
+
+/**
+ * The element that actually scrolls the conversation list.
+ *
+ * Found by climbing from a row rather than by selector: Facebook's class names
+ * are generated and its list is several divs deep in a layout that has been
+ * rearranged more than once. The scroll container is whatever ancestor
+ * overflows, which is a structural fact and survives a redesign that renaming
+ * a class would not.
+ */
+function scrollParentOf(el: Element | null): HTMLElement | null {
+  let node: HTMLElement | null = el?.parentElement ?? null;
+  while (node && node !== document.body) {
+    const overflowY = getComputedStyle(node).overflowY;
+    if ((overflowY === 'auto' || overflowY === 'scroll') && node.scrollHeight > node.clientHeight + 8) return node;
+    node = node.parentElement;
+  }
+  return null;
+}
+
+/**
+ * Walk the conversation list, harvesting read state as it goes.
+ *
+ * `threadIds` is what was asked about (lowercased, already alias-expanded by
+ * the caller — a contact answers to more than one id; see
+ * contacts.threadAliases). The walk stops early once every one of them has
+ * been seen, so a selection of recently-messaged contacts costs a screen or
+ * two rather than the whole history.
+ */
+async function scanReadStates(threadIds: string[], budgetMs: number): Promise<ScanReport> {
+  readScanCancelled = false;
+  const wanted = new Set(threadIds.map((t) => t.toLowerCase()));
+
+  // The list has to be ON SCREEN before anything can be read off it, and on the
+  // feed that means opening the chat dropdown ourselves. See openChatDropdown
+  // for why the scan is run from there rather than from Messenger proper.
+  if (!hasConversationRows()) await openChatDropdown();
+  if (!hasConversationRows()) return emptyReport('list', Array.from(wanted));
+
+  // Give the list a moment to hydrate — a scan that starts on an empty pane
+  // would call the list exhausted before Messenger had drawn a single row.
+  await pollFor(() => firstRowLink(), 15_000, 300);
+
+  const activeThreadId = isMessagesPage() ? getActiveThreadId() : null;
+  const container = scrollParentOf(firstRowLink());
+  const root: ParentNode = container || document;
+  const startScrollTop = container?.scrollTop ?? 0;
+
+  const states = new Map<string, ReadState>();
+  const seenThreadIds = new Set<string>();
+  let exhausted = false;
+
+  const deadline = Date.now() + Math.min(budgetMs || READ_SCAN_MAX_MS, READ_SCAN_MAX_MS);
+  let stalls = 0;
+
+  /**
+   * Read whatever is rendered right now, and report how many CONVERSATIONS
+   * that had not been seen before it turned up.
+   *
+   * Progress is counted in new thread ids rather than in row nodes because
+   * Messenger's list recycles: rows scrolling off the top can be removed as
+   * rows arrive at the bottom, so the node count can sit still through a
+   * perfectly productive scroll. Counting nodes would read that as the end of
+   * the list and stop three scrolls in.
+   *
+   * Ids are lowercased on the way in, to match the wanted-set — Messenger's
+   * hrefs carry vanity handles as well as numeric ids, and 'Jane.Doe' and
+   * 'jane.doe' are the same conversation.
+   */
+  const harvest = (): number => {
+    const pass = harvestRows(root, activeThreadId);
+    let added = 0;
+    for (const id of pass.seenThreadIds) {
+      const key = id.toLowerCase();
+      if (!seenThreadIds.has(key)) { seenThreadIds.add(key); added++; }
+    }
+    for (const [threadId, state] of pass.states) noteState(states, threadId.toLowerCase(), state);
+    return added;
+  };
+
+  // How many of the contacts asked about have been accounted for. The scan can
+  // run for minutes on a long history, so this is reported as it goes — see
+  // reportScanProgress.
+  const resolved = () => {
+    let n = 0;
+    for (const id of wanted) if (seenThreadIds.has(id)) n++;
+    return n;
+  };
+
+  try {
+    harvest();
+    reportScanProgress(resolved(), seenThreadIds.size);
+
+    while (!readScanCancelled && Date.now() < deadline && resolved() < wanted.size) {
+      if (!container) { exhausted = true; break; }
+
+      container.scrollTop += Math.max(200, container.clientHeight * 0.8);
+
+      // Harvesting IS the wait: each poll both collects and asks whether
+      // anything new arrived, so rows that appear mid-wait are picked up rather
+      // than raced past. Requiring several stalls in a row rather than one
+      // keeps a slow network from being mistaken for the end of the list.
+      const grew = !!(await pollFor(() => harvest() > 0, READ_SCAN_ROW_WAIT_MS, 200));
+      reportScanProgress(resolved(), seenThreadIds.size);
+      stalls = grew ? 0 : stalls + 1;
+      if (stalls >= READ_SCAN_STALL_LIMIT) { exhausted = true; break; }
+    }
+  } finally {
+    // Put the list back where the user left it. A scan is meant to be
+    // invisible, and this window may be one they have open.
+    if (container) container.scrollTop = startScrollTop;
+  }
+
+  return buildReport({
+    wanted,
+    states,
+    seenThreadIds,
+    rowsSeen: seenThreadIds.size,
+    exhausted,
+    source: 'list',
+    at: Date.now(),
+  });
+}
+
+/**
+ * Tell the background how far along the scan is, so the dashboard's progress
+ * bar moves during a scroll that can run for minutes.
+ *
+ * Fire-and-forget on purpose: progress is not the result. The result comes
+ * back over the port when the scan finishes, and a dropped progress ping — a
+ * service worker that idled out between messages, say — must not be able to
+ * fail the scan that produced it.
+ */
+function reportScanProgress(scanned: number, rowsSeen: number): void {
+  void sendBg({ type: 'READ_SCAN_PROGRESS', payload: { scanned, rowsSeen } }).catch(() => { /* see above */ });
 }
 
 interface SendResult {
@@ -3815,6 +4055,11 @@ function handleCrmRequest(request: any): Promise<unknown> | null {
       return performDrawerSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard, skipIfUnread, observeAs: String(payload.threadId) });
     case 'CRM_RESOLVE_PROFILE':
       return resolveProfileThreadFor(String(payload.threadId || ''));
+    case 'CRM_SCAN_READ_STATES':
+      return scanReadStates(
+        Array.isArray(payload.threadIds) ? payload.threadIds.map(String) : [],
+        Number(payload.budgetMs) || 0
+      );
     default:
       return null;
   }
@@ -3835,6 +4080,16 @@ if (isExtensionAlive()) {
           // "ready" for a different set of requests than a thread page.
           onProfile: isProfilePage(),
         });
+        return; // synchronous
+      }
+
+      // Stopping a scan has to arrive while the scan itself is still occupying
+      // its port, so it comes in on the one-shot listener and only sets a flag.
+      // The scan notices at its next scroll and returns what it has — a partial
+      // report is a real result, not a failure.
+      if (request.type === 'CRM_CANCEL_READ_SCAN') {
+        readScanCancelled = true;
+        sendResponse({ ok: true });
         return; // synchronous
       }
 

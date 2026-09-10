@@ -24,6 +24,7 @@ import {
 } from '../csv';
 import { mergeConversations, findDuplicateGroups, cleanStoredNames, pickPrimary, DuplicateGroup } from '../contacts';
 import { applyMutations, type Mutation } from '../mutations';
+import type { ReadScanState } from '../readScan';
 import { notePendingEdits, overlayPendingEdits, type PendingEdits } from './pendingEdits';
 import { stageEditsFor, isNoOpStageEdit, type FunnelView } from '../funnel';
 import { isDriveConfigured, getDriveStatus, getDriveAuthState, connectDrive, disconnectDrive, getAuthRedirectUri, readStore as driveReadStore, writeStore as driveWriteStore, DriveStatus, DriveAuthState } from '../drive';
@@ -132,6 +133,120 @@ function viewSignature(query: QueryGroup, sortBy: SortBy, sortDir: 'asc' | 'desc
 // Long enough to swallow a burst of ↑/↓ clicks into one write, short enough
 // that the reorder is durable by the time the user has looked away.
 const PRESET_ORDER_WRITE_MS = 600;
+
+/**
+ * Progress and result for the on-demand reply check.
+ *
+ * Rendered outside the bulk-actions bar, because a scan outlives the selection
+ * that started it: it runs for minutes in a background window, and clearing the
+ * checkboxes — or reloading this tab — must not make it disappear.
+ *
+ * The wording says REPLIES rather than read receipts, and that is a statement
+ * of what the scan can actually observe rather than modesty. Messenger's
+ * conversation list marks unread rows but renders no read receipt on them, so
+ * "have they opened what I sent" is not available without opening the thread —
+ * which this deliberately never does. See the header of readScan.ts.
+ *
+ * The summary keeps three outcomes apart that it would be easy, and wrong, to
+ * collapse together. Only the first is evidence of anything:
+ *
+ *   replied      — the row carried an unread marker.
+ *   no reply     — the row was read and carried no marker.
+ *   not reached  — the scan never got to that conversation. The list is
+ *                  ordered by recency, so these are contacts too far down to
+ *                  reach inside the time budget; running it again gets further.
+ *
+ * Read/unread counts are shown only if something actually reported them, which
+ * on the list surface means never — so they stay out of the way instead of
+ * printing "0 read" and implying nobody had.
+ */
+function ReadScanPanel({ scan, error, onCancel, onDismiss }: {
+  scan: ReadScanState | null;
+  error: string | null;
+  onCancel: () => void;
+  onDismiss: () => void;
+}) {
+  if (error) {
+    return <Banner tone="danger" live style={{ marginBottom: 12 }}>{error}</Banner>;
+  }
+  if (!scan || (!scan.running && !scan.finishedAt)) return null;
+
+  const pct = scan.total > 0 ? Math.min(100, Math.round((scan.scanned / scan.total) * 100)) : 0;
+
+  if (scan.running) {
+    const saving = scan.phase === 'saving';
+    return (
+      <div style={{ background: color.surface.selected, border: '1px solid #b3d9f2', borderRadius: 8, padding: '10px 12px', marginBottom: 12 }} role="status">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: color.accent.base }}>
+            {saving ? 'Saving results…' : `Checking for replies — ${scan.scanned} of ${scan.total}`}
+            <span style={{ fontWeight: 500, color: color.text.secondary }}>
+              {' '}· {scan.rowsSeen} conversation{scan.rowsSeen === 1 ? '' : 's'} looked at
+            </span>
+          </span>
+          {!saving && (
+            <button
+              onClick={onCancel}
+              style={{ background: 'none', color: color.text.secondary, border: 'none', fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}
+            >
+              Stop
+            </button>
+          )}
+        </div>
+        <div style={{ marginTop: 8, height: 8, background: color.border.subtle, borderRadius: 5, overflow: 'hidden', display: 'flex' }}>
+          <div style={{ width: `${saving ? 100 : pct}%`, background: color.accent.base }} />
+        </div>
+        <div style={{ marginTop: 6, fontSize: 11, color: color.text.secondary }}>
+          {saving
+            ? 'Writing the results to your contacts. Paced to stay inside the storage sync limits, so a large check takes a minute or two.'
+            : "Reading Messenger's conversation list in a background window. No conversations are opened, so nothing is marked as read and no unread badges are cleared."}
+        </div>
+      </div>
+    );
+  }
+
+  const t = scan.tally;
+  return (
+    <div style={{ background: color.surface.sunken, border: `1px solid ${color.border.subtle}`, borderRadius: 8, padding: '10px 12px', marginBottom: 12 }} role="status">
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>
+          {scan.error
+            ? <span style={{ color: color.danger.base }}>Reply check stopped: {scan.error}</span>
+            : (
+              <>
+                Checked {scan.scanned} of {scan.total}
+                {t && (
+                  <span style={{ fontWeight: 500, color: color.text.secondary }}>
+                    {' '}· {t.responded} replied
+                    {t.noAnswer > 0 ? ` · ${t.noAnswer} no reply` : ''}
+                    {t.read > 0 ? ` · ${t.read} read` : ''}
+                    {t.unread > 0 ? ` · ${t.unread} unread` : ''}
+                    {t.unreached > 0 ? ` · ${t.unreached} not reached` : ''}
+                  </span>
+                )}
+              </>
+            )}
+        </span>
+        <button
+          onClick={onDismiss}
+          style={{ background: 'none', color: color.text.secondary, border: 'none', fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}
+        >
+          Dismiss
+        </button>
+      </div>
+      {scan.unscannable > 0 && (
+        <div style={{ marginTop: 6, fontSize: 11, color: color.text.secondary }}>
+          {scan.unscannable} selected contact{scan.unscannable === 1 ? ' has' : 's have'} no Messenger thread id, so there was nothing to look up.
+        </div>
+      )}
+      {!scan.error && t && t.unreached > 0 && (
+        <div style={{ marginTop: 6, fontSize: 11, color: color.text.secondary }}>
+          "Not reached" means the scan didn't scroll far enough down Messenger's list to find them — not that they haven't read. Run it again to get further.
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function DashboardApp() {
   const [store, setStore] = useState<Store>(EMPTY_STORE);
@@ -277,6 +392,25 @@ export default function DashboardApp() {
     const interval = setInterval(refreshCampaigns, 3000);
     return () => clearInterval(interval);
   }, [refreshCampaigns]);
+
+  // The on-demand read-state check. Polled rather than pushed for the same
+  // reason the campaign queue is: the scan runs in the service worker, which is
+  // killed and revived at will, so its state lives in storage and every surface
+  // reads it from there. Only polled while one is actually running — a check
+  // finishes and then sits there as a result, which needs no refreshing.
+  const [readScan, setReadScan] = useState<ReadScanState | null>(null);
+  const [readScanError, setReadScanError] = useState<string | null>(null);
+  const refreshReadScan = useCallback(async () => {
+    const res = await sendBg<ReadScanState>({ type: 'GET_READ_SCAN' });
+    if (res) setReadScan(res);
+  }, []);
+
+  useEffect(() => { void refreshReadScan(); }, [refreshReadScan]);
+  useEffect(() => {
+    if (!readScan?.running) return;
+    const interval = setInterval(refreshReadScan, 1500);
+    return () => clearInterval(interval);
+  }, [readScan?.running, refreshReadScan]);
 
   // Which machines have the extension, and which of them is draining the queue.
   const [machines, setMachines] = useState<MachineView | null>(null);
@@ -637,9 +771,25 @@ export default function DashboardApp() {
         return dir * (a.tags.length - b.tags.length);
       case 'name':
         return dir * (a.participantName || '').localeCompare(b.participantName || '');
+      // "Recent activity" means the most recent CONVERSATION, not the most
+      // recent edit to the record.
+      //
+      // This used to sort on `updatedAt`, which is a write stamp: it moves when
+      // anything at all is written to a contact. Every bulk action therefore
+      // reshuffled the default view — assign a tag to 200 people and all 200
+      // jumped to the top, above someone who had actually messaged that
+      // morning. The reply check made it impossible to ignore, since a single
+      // run can rewrite hundreds of contacts at once.
+      //
+      // `updatedAt` can't stop moving — it's the key the cross-machine merge
+      // resolves records by (see mergeStores), and a change that didn't move it
+      // could be reverted by another machine's older copy. So the stamp stays
+      // and the SORT changes to the field that already means what this option
+      // says. Still available as an explicit choice: "Last activity" in
+      // advanced search maps to `updatedAt` (search.ts BUILTIN_FIELDS).
       case 'recent':
       default:
-        return dir * ((a.updatedAt || 0) - (b.updatedAt || 0));
+        return dir * ((a.lastMessageTime || 0) - (b.lastMessageTime || 0));
     }
   });
 
@@ -804,6 +954,33 @@ export default function DashboardApp() {
     const toOpen = selectedConvs.filter((c) => c.chatUrl);
     toOpen.forEach((c) => window.open(c.chatUrl, '_blank'));
     if (toOpen.length > 0) markOpened(toOpen.map((c) => c.id));
+  };
+
+  // Refresh read state for the selection without opening anything. The work
+  // happens in the service worker and a background Messenger window; this only
+  // starts it and then watches chrome.storage — so closing this tab, or the
+  // dashboard being reloaded mid-scan, costs nothing.
+  const handleCheckReadStatus = async () => {
+    setReadScanError(null);
+    const res = await sendBg<{ success: boolean; error?: string }>({
+      type: 'START_READ_SCAN',
+      payload: { conversationIds: Array.from(selectedIds) },
+    });
+    if (!res?.success) { setReadScanError(res?.error || 'Could not start the check.'); return; }
+    await refreshReadScan();
+  };
+
+  const handleCancelReadScan = async () => {
+    await sendBg({ type: 'CANCEL_READ_SCAN' });
+    await refreshReadScan();
+  };
+
+  // Cleared in the worker too, or the last result would reappear every time the
+  // dashboard was opened.
+  const handleDismissReadScan = async () => {
+    setReadScan(null);
+    setReadScanError(null);
+    await sendBg({ type: 'DISMISS_READ_SCAN' });
   };
 
   // The three bulk writes go through mutateStore rather than assembling a whole
@@ -1598,6 +1775,15 @@ export default function DashboardApp() {
                 onChange={setFilterTags}
               />
 
+              {/* Read-status check — outside the bulk bar, because a scan
+                  outlives the selection that started it. */}
+              <ReadScanPanel
+                scan={readScan}
+                error={readScanError}
+                onCancel={handleCancelReadScan}
+                onDismiss={handleDismissReadScan}
+              />
+
               {/* Bulk actions bar */}
               {selectedIds.size > 0 && (
                 <div style={{ background: color.surface.selected, border: '1px solid #b3d9f2', borderRadius: 8, padding: '10px 12px', marginBottom: 12 }}>
@@ -1630,6 +1816,14 @@ export default function DashboardApp() {
                       style={{ background: color.success.base, color: color.surface.raised, border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
                     >
                       💬 Message ({selectedIds.size})
+                    </button>
+                    <button
+                      onClick={handleCheckReadStatus}
+                      disabled={!!readScan?.running}
+                      title="Find which of these contacts have replied and are waiting on you, by reading Messenger's conversation list. Nothing is opened, so nothing gets marked as read. Messenger doesn't show read receipts on that list, so this can't tell you who has opened your message."
+                      style={{ background: color.surface.raised, color: color.accent.base, border: `1px solid ${color.accent.base}`, padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: readScan?.running ? 'not-allowed' : 'pointer', opacity: readScan?.running ? 0.55 : 1 }}
+                    >
+                      🔄 Check for replies ({selectedIds.size})
                     </button>
                     <button
                       onClick={() => { setBulkTagMenu(bulkTagMenu === 'assign' ? null : 'assign'); setBulkDeleteConfirm(false); }}

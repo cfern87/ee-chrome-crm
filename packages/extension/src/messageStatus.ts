@@ -78,8 +78,8 @@ export const ANY_STATUS_PATTERNS: RegExp[] = [
 ];
 
 // The receipt avatar's own alt text, matched on its own where the surrounding
-// markup is not a message thread — a conversation row in the sidebar, say,
-// which has no status line to read but does render the same avatar.
+// markup is not a message thread — a chat drawer, say, which has no status line
+// to read but does render the same avatar.
 export const SEEN_BY_ALT = /^seen by\b/i;
 
 // Statuses are short. The cap is what keeps a message body that happens to
@@ -251,9 +251,24 @@ export function readStateOfLastOutgoing(scope: HTMLElement): { state: ReadState;
 /**
  * Does `scope` contain a read receipt anywhere in it?
  *
- * For markup that is NOT a thread — a conversation row in the Messenger
- * sidebar, which renders the reader's avatar at the end of the row but has no
- * status line and no bubbles to order it against.
+ * For markup that is NOT a full thread pane but still carries the avatar — a
+ * chat drawer on a profile page, say, which has no status line and no bubbles
+ * to order a status against.
+ *
+ * NOT the conversation list. This docstring used to say it was, and the claim
+ * was wrong in a way that shaped a whole feature around it: measured against
+ * the live site on 2026-08-31, over 80 conversation rows on all three list
+ * surfaces (messenger.com, facebook.com/messages, the chat dropdown), the
+ * number of rows carrying a "Seen by" avatar was ZERO. The only one on the page
+ * was inside [role="main"] — the open thread.
+ *
+ * The consequence is worth stating plainly, because it bounds what any bulk
+ * sweep can ever report: the conversation list can tell you somebody has
+ * REPLIED (hasUnreadMessage), and it cannot tell you whether they READ what you
+ * sent. That answer exists only inside an opened conversation, and opening one
+ * marks it read. It is still called on rows anyway — several Messenger layouts
+ * exist and a row that did render one should be believed — but nothing may be
+ * designed on the assumption that it fires.
  *
  * Deliberately one-directional: true means somebody has read the last message,
  * and false means NOTHING, because a row that isn't showing a receipt might be

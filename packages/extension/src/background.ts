@@ -83,6 +83,17 @@ import {
   type SendHoldReason,
 } from './syncHealth';
 import { ensureFreshToken } from './drive';
+import { threadAliases } from './contacts';
+import {
+  chunkObservations,
+  chunkDelayMs,
+  tally,
+  idleScan,
+  READ_SCAN_KEY,
+  type ReadScanState,
+  type ScanReport,
+} from './readScan';
+import { MAX_READ_STATE_WRITES } from './mutations';
 import {
   readWebhooks, subscribersOf, buildPayload, deliver, diffContactEvents,
   writeWebhooks,
@@ -483,14 +494,21 @@ function sendViaPort<T = any>(tabId: number, message: unknown, timeoutMs: number
 // we navigated it to — a Messenger thread for a send, a profile page for the
 // recovery path. Keeps the worker alive (tab messaging resets the idle timer)
 // while the SPA finishes rendering.
-async function waitForContentReady(tabId: number, log: string[], expect: 'messages' | 'profile' = 'messages'): Promise<boolean> {
+async function waitForContentReady(tabId: number, log: string[], expect: 'messages' | 'profile' | 'list' = 'messages'): Promise<boolean> {
   const deadline = Date.now() + 25_000;
   for (;;) {
     const res = await sendToTab<{ pong?: boolean; ready?: boolean; onProfile?: boolean; threadId?: string | null }>(tabId, { type: 'CRM_PING' });
     if (res?.pong) {
       // Older content builds don't report onProfile at all; treat a plain pong
       // on the profile path as good enough rather than stalling for 25s.
-      const ready = expect === 'messages' ? !!res.ready : res.onProfile !== false;
+      //
+      // 'list' asks only that the content script is alive. The read scan runs
+      // on the ordinary feed and opens the chat dropdown itself, so there is no
+      // page-shape test to make here — isMessagesPage() is false on the feed by
+      // design, and requiring it would stall every scan for the full 25s.
+      const ready = expect === 'list' ? true
+        : expect === 'messages' ? !!res.ready
+        : res.onProfile !== false;
       if (ready) {
         // Don't hard-require thread match here (FB sometimes lags updating the
         // path); the content script re-checks before sending. Just log it.
@@ -782,6 +800,228 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
   };
 }
 
+// ---- On-demand read-state scan ----
+//
+// "Of these 300 contacts, who has read my message?" — asked deliberately,
+// rather than waiting for the passive sweep to happen past them.
+//
+// This owns the tab, the writes and the progress; the actual looking is
+// scanReadStates in the content script, which scrolls Messenger's conversation
+// LIST and never opens a thread. See the comment there for why that matters:
+// opening a conversation marks it read on the user's own account and destroys
+// the 'responded' flag the scan exists to report.
+//
+// Deliberately NOT gated on the sender lease (canSendFromThisMachine). That
+// lease exists so two machines can't both be sending as one Facebook account.
+// A scan sends nothing and changes nothing on Facebook's side, so there is
+// nothing to serialize across machines. What it does share is this machine's
+// sender WINDOW, which is why it interlocks with processTick below.
+
+/** How long the content script may spend scrolling before giving up. */
+const READ_SCAN_BUDGET_MS = 5 * 60_000;
+/** Port timeout — the budget plus enough slack to return a partial report. */
+const READ_SCAN_PORT_MS = READ_SCAN_BUDGET_MS + 60_000;
+/** Don't start a scan if a queued send is due sooner than this. */
+const READ_SCAN_SEND_CLEARANCE_MS = 30_000;
+
+// Set for as long as a scan holds the sender window. processTick checks it and
+// defers rather than navigating the tab out from under a scroll in progress.
+let scanning = false;
+
+function getReadScan(): Promise<ReadScanState> {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(READ_SCAN_KEY, (res) => {
+        if (chrome.runtime.lastError) { resolve(idleScan()); return; }
+        resolve((res?.[READ_SCAN_KEY] as ReadScanState) || idleScan());
+      });
+    } catch { resolve(idleScan()); }
+  });
+}
+
+function setReadScan(next: ReadScanState): Promise<void> {
+  return new Promise((resolve) => {
+    try { chrome.storage.local.set({ [READ_SCAN_KEY]: next }, () => { void chrome.runtime.lastError; resolve(); }); }
+    catch { resolve(); }
+  });
+}
+
+async function patchReadScan(patch: Partial<ReadScanState>): Promise<void> {
+  await setReadScan({ ...(await getReadScan()), ...patch });
+}
+
+/**
+ * The thread id to look for on Messenger's rows, for one contact.
+ *
+ * A contact's STORE KEY is whatever id was captured first, and is often not
+ * the id Messenger puts in a row's href — it can be a vanity handle, a profile
+ * id, or a legacy thread id that Facebook has since redirected. Rows carry the
+ * numeric one, so that is what the scan asks about; the applier resolves it
+ * back to whichever contact owns it via ownerIdFor, so the write still lands
+ * on the right record.
+ *
+ * Returns null for a contact with no numeric id anywhere (isUnboundOrphan in
+ * contacts.ts). Those are reported as unscannable up front rather than counted
+ * as "not reached", which would suggest scrolling further would find them.
+ */
+function scanThreadIdFor(conv: Store['conversations'][string]): string | null {
+  const aliases = threadAliases(conv);
+  const numeric = aliases.find((a) => /^\d+$/.test(a));
+  if (numeric) return numeric;
+  return conv.resolvedThreadId ? conv.resolvedThreadId.toLowerCase() : null;
+}
+
+/**
+ * Apply one scan's findings, in ops small enough that none is truncated.
+ *
+ * The pacing between chunks is a storage-quota measure (see chunkDelayMs), so
+ * it is only paid by a chunk that actually WROTE something. A long scroll walks
+ * past hundreds of conversations and most of them will be reporting the state
+ * the CRM already had — mutateStore skips the save entirely for those, and
+ * sleeping twelve seconds after a write that never happened would turn a
+ * confirm-everything scan into a quarter of an hour of nothing.
+ */
+async function applyScanReport(report: ScanReport): Promise<void> {
+  const chunks = chunkObservations(report.observations, MAX_READ_STATE_WRITES);
+  if (!chunks.length) return;
+  const delay = chunkDelayMs(await isDriveEnabled());
+  for (let i = 0; i < chunks.length; i++) {
+    const res = await mutateStore([{ op: 'observeReadStates', observations: chunks[i] }]);
+    if (res.changed && i < chunks.length - 1) await new Promise((r) => setTimeout(r, delay));
+  }
+}
+
+async function startReadScan(conversationIds: string[]): Promise<{ success: boolean; error?: string }> {
+  if (scanning) return { success: false, error: 'A reply check is already running.' };
+
+  // Claimed BEFORE the first await, not after the checks below.
+  //
+  // The scan drives the same window the campaign queue sends from, and every
+  // check here is asynchronous — so a tick firing partway through would pass
+  // the "is a send in flight?" test, start sending, and then have the scan
+  // navigate its half-typed message away. Claiming first makes processTick
+  // defer for as long as this is deciding; anything that decides not to run
+  // has to hand the claim back, which is what `handedOff` and the finally do.
+  scanning = true;
+  let handedOff = false;
+  try {
+    if (!(await isSignedIn())) return { success: false, error: 'Sign in to check for replies.' };
+
+    // The other side of the same race: a send that was already underway when
+    // the claim landed. The scan is the one that yields — it has no deadline
+    // and the queue's pacing does.
+    if (processing) return { success: false, error: 'A message is being sent right now. Try again in a moment.' };
+    const q = await loadQueue();
+    if (q.inFlight) return { success: false, error: 'A message is being sent right now. Try again in a moment.' };
+    if (q.nextSendAt && q.nextSendAt - Date.now() < READ_SCAN_SEND_CLEARANCE_MS && !q.paused) {
+      return { success: false, error: 'A queued message is about to send. Try again in a minute.' };
+    }
+
+    const store = await loadStore();
+    const targets = new Map<string, string>(); // thread id -> conversation key
+    let unscannable = 0;
+    for (const id of conversationIds) {
+      const conv = store.conversations[id];
+      if (!conv) continue;
+      const threadId = scanThreadIdFor(conv);
+      if (!threadId) { unscannable++; continue; }
+      targets.set(threadId, id);
+    }
+
+    if (!targets.size) {
+      return { success: false, error: 'None of the selected contacts have a Messenger thread to check.' };
+    }
+
+    await setReadScan({
+      running: true,
+      phase: 'scanning',
+      startedAt: Date.now(),
+      total: targets.size,
+      scanned: 0,
+      rowsSeen: 0,
+      unscannable,
+    });
+
+    // Deliberately not awaited: the scan runs for minutes and the dashboard
+    // watches chrome.storage, not this response. Awaiting here would hold the
+    // message channel open for the whole scroll. From this point the JOB owns
+    // the claim and releases it when it finishes.
+    handedOff = true;
+    void runReadScan(Array.from(targets.keys())).finally(() => { scanning = false; });
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: String((e as Error)?.message || e) };
+  } finally {
+    // Every path that declined to run — a check that said no, or a throw —
+    // hands the claim back here, so a refused scan can't wedge the send queue.
+    if (!handedOff) scanning = false;
+  }
+}
+
+async function runReadScan(threadIds: string[]): Promise<void> {
+  const log: string[] = [];
+  try {
+    // The ordinary feed, NOT a Messenger URL.
+    //
+    // Both `messenger.com/` and `facebook.com/messages/` redirect to
+    // `/t/<most recent thread>` and open it — which would mark that thread read
+    // on every scan, the exact harm this feature exists to avoid. The content
+    // script opens the top-bar chat dropdown instead, which lists the same
+    // conversations and opens none of them. See openChatDropdown in content.ts.
+    const tabId = await ensureSenderTab('https://www.facebook.com/', log);
+    if (tabId == null) throw new Error('Could not open a Facebook window.');
+    if (!(await waitForContentReady(tabId, log, 'list'))) {
+      throw new Error('Facebook did not finish loading.');
+    }
+
+    const report = await sendViaPort<ScanReport>(
+      tabId,
+      { type: 'CRM_SCAN_READ_STATES', payload: { threadIds, budgetMs: READ_SCAN_BUDGET_MS } },
+      READ_SCAN_PORT_MS
+    );
+    if (!report) throw new Error('The Messenger window stopped responding.');
+
+    await patchReadScan({ phase: 'saving' });
+    await applyScanReport(report);
+
+    const wanted = new Set(threadIds.map((t) => t.toLowerCase()));
+    await patchReadScan({
+      running: false,
+      phase: undefined,
+      finishedAt: Date.now(),
+      scanned: report.judged.length + report.seenNoAnswer.length,
+      rowsSeen: report.rowsSeen,
+      source: report.source,
+      tally: tally(report, wanted),
+      error: undefined,
+    });
+  } catch (e) {
+    console.warn('[CRM] read scan failed', e, log);
+    await patchReadScan({ running: false, finishedAt: Date.now(), error: String((e as Error)?.message || e) });
+  }
+}
+
+/**
+ * Stop a running scan.
+ *
+ * Only raises a flag in the content script. The scan notices at its next
+ * scroll, stops walking, and returns everything it has gathered so far — which
+ * is then written and summarized like any other result. A partial answer is a
+ * real answer, and throwing it away because the user got impatient would mean
+ * re-scrolling the same rows next time.
+ */
+async function cancelReadScan(): Promise<{ success: boolean }> {
+  const tabId = await getStoredSenderTab();
+  if (tabId != null) await sendToTab(tabId, { type: 'CRM_CANCEL_READ_SCAN' });
+  return { success: true };
+}
+
+/** Forget the last result, so it stops appearing every time the dashboard opens. */
+async function dismissReadScan(): Promise<{ success: boolean }> {
+  if (!scanning) await setReadScan(idleScan());
+  return { success: true };
+}
+
 // ---- multi-machine coordination ----
 //
 // The queue and its history are shared across machines (queueSync.ts), but the
@@ -948,6 +1188,11 @@ async function unmarkSending(campaignId: string, threadId: string): Promise<void
 
 async function processTick(): Promise<void> {
   if (processing) return;
+  // A read-state scan is scrolling the sender window right now. Navigating it
+  // to a chat mid-scroll would abandon the scan and, worse, do it by OPENING a
+  // conversation — the one thing the scan is built never to do. The send waits;
+  // a scan is bounded by its own budget, so this can't stall the queue for long.
+  if (scanning) { scheduleTick(READ_SCAN_SEND_CLEARANCE_MS); return; }
   processing = true;
   try {
     // Only the machine holding the sender lease drains the queue. The others
@@ -1836,6 +2081,43 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         // payload — a test that takes a different path than production is a
         // test of the wrong thing — with `test: true` in the data so the
         // receiver can discard it.
+        // ---- read-state scan ----
+        //
+        // Not in QUEUE_MUTATING: a scan touches no campaign and no queue state,
+        // so there is nothing for the other machines to be told about. The
+        // contact writes it produces sync the ordinary way.
+        case 'START_READ_SCAN': {
+          sendResponse(await startReadScan((request.payload?.conversationIds || []) as string[]));
+          break;
+        }
+        case 'GET_READ_SCAN': {
+          sendResponse(await getReadScan());
+          break;
+        }
+        case 'CANCEL_READ_SCAN': {
+          sendResponse(await cancelReadScan());
+          break;
+        }
+        case 'DISMISS_READ_SCAN': {
+          sendResponse(await dismissReadScan());
+          break;
+        }
+        // Sent by the content script as it scrolls, so the progress bar moves
+        // during a scan that can run for minutes. Never fails the scan — see
+        // reportScanProgress in content.ts.
+        case 'READ_SCAN_PROGRESS': {
+          const current = await getReadScan();
+          if (current.running) {
+            await setReadScan({
+              ...current,
+              scanned: Math.min(Number(request.payload?.scanned) || 0, current.total),
+              rowsSeen: Number(request.payload?.rowsSeen) || current.rowsSeen,
+            });
+          }
+          sendResponse({ ok: true });
+          break;
+        }
+
         case 'TEST_WEBHOOK': {
           const hook = readWebhooks(await loadStore()).find((h) => h.id === request.payload?.id);
           if (!hook) { sendResponse({ ok: false, error: 'That webhook no longer exists.' }); break; }
