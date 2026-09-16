@@ -5,6 +5,7 @@
 import { Store, Conversation } from './storage';
 import { profileKey, extractThreadFromProfileUrl } from './csv';
 import { cleanName, looksLikeName, nameKey } from './names';
+import { tasksOf, pruneDoneTasks, type FollowUpTask } from './tasks';
 
 /** Thread id embedded in a Messenger chat URL, if any. */
 function chatUrlThread(url: string | undefined): string | null {
@@ -130,6 +131,14 @@ export function mergeConversations(store: Store, ids: string[], primaryId?: stri
   }
   merged.tags = Array.from(tagSet);
   if (Object.keys(tagStamps).length) merged.tagAddedAt = tagStamps;
+
+  // Follow-up tasks from every duplicate come along. By id, so merging a pair
+  // that already shared a task (one copied from the other) doesn't double it.
+  const taskById = new Map<string, FollowUpTask>();
+  for (const c of [primary, ...others]) {
+    for (const t of tasksOf(c)) if (!taskById.has(t.id)) taskById.set(t.id, t);
+  }
+  if (taskById.size) merged.tasks = pruneDoneTasks(Array.from(taskById.values()));
 
   // The keys we're about to drop are real thread ids Facebook still uses — the
   // Messenger sidebar looks contacts up by them. Losing the numeric one here

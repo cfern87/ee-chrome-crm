@@ -16,6 +16,7 @@ import {
   HIDDEN_TAG_TITLE, bucketTags, showsGroupLabels, formatRelativeTime, ProfileUrlEditor, ReadStateChip,
 } from './shared';
 import { funnelsFor, describeStage, type FunnelView } from '../funnel';
+import { ContactTasks, type TaskHandlers } from './TasksPanel';
 
 export const TAG_FILTER_VISIBLE = 12;
 
@@ -425,9 +426,11 @@ export interface ConvDetailProps {
    * the same tags disagreeing about their own shape is worse than either shape.
    */
   grouped: boolean;
+  /** Add / edit / complete / delete this contact's follow-up tasks. */
+  taskHandlers: TaskHandlers;
 }
 
-export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm2, grouped, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onSetStage, onSetCustomField, onRename, onSetProfileUrl, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
+export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm2, grouped, taskHandlers, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onSetStage, onSetCustomField, onRename, onSetProfileUrl, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
   const availableTags = tags.filter((t) => !conv.tags.includes(t.id));
   const [addingTag, setAddingTag] = useState(false);
   const [editingName, setEditingName] = useState(false);
@@ -555,6 +558,10 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
           </button>
         )}
       </div>
+
+      {/* Follow-ups — right under the actions, because "what do I owe this
+          person next" is the other question you open a contact to answer. */}
+      <ContactTasks conv={conv} handlers={taskHandlers} />
 
       {/* Last message */}
       {conv.lastMessage && (

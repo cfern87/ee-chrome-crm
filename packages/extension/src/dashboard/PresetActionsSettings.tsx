@@ -18,9 +18,10 @@ import {
   writePresetActions, MAX_PRESET_ACTIONS,
 } from '../presets';
 import {
-  Banner, Button, Card, ColorInput, Select, Stack, Text,
+  Banner, Button, Card, ColorInput, Input, Select, Stack, Text,
   Field as FormField, color, radius, space,
 } from '../ui/primitives';
+import type { TaskPriority } from '../tasks';
 import { DraftInput } from './shared';
 
 const STEP_LABELS: Record<PresetStepKind, string> = {
@@ -29,13 +30,29 @@ const STEP_LABELS: Record<PresetStepKind, string> = {
   appendName: 'Append to name',
   prependName: 'Prepend to name',
   setField: 'Set field',
+  addTask: 'Add follow-up task',
+  completeTasks: 'Complete open tasks',
   archive: 'Archive contact',
   unarchive: 'Unarchive contact',
   deleteContact: 'Delete contact',
 };
 
 const STEP_ORDER: PresetStepKind[] = [
-  'addTag', 'removeTag', 'appendName', 'prependName', 'setField', 'archive', 'unarchive', 'deleteContact',
+  'addTag', 'removeTag', 'appendName', 'prependName', 'setField', 'addTask', 'completeTasks',
+  'archive', 'unarchive', 'deleteContact',
+];
+
+/** Due-date choices for a preset's task, as day offsets from the moment it's pressed. */
+const DUE_OFFSETS: { value: string; label: string }[] = [
+  { value: '', label: 'No due date' },
+  { value: '0', label: 'Due today' },
+  { value: '1', label: 'Due tomorrow' },
+  { value: '2', label: 'Due in 2 days' },
+  { value: '3', label: 'Due in 3 days' },
+  { value: '5', label: 'Due in 5 days' },
+  { value: '7', label: 'Due in 1 week' },
+  { value: '14', label: 'Due in 2 weeks' },
+  { value: '30', label: 'Due in 30 days' },
 ];
 
 /** A fresh step of `kind`, with whatever operand it needs defaulted. */
@@ -49,6 +66,8 @@ function blankStep(kind: PresetStepKind, store: Store): PresetStep {
       return { kind, text: '' };
     case 'setField':
       return { kind, fieldId: Object.keys(store.fieldDefs)[0] || '', value: '' };
+    case 'addTask':
+      return { kind, title: 'Follow up', dueInDays: 3 };
     default:
       return { kind };
   }
@@ -214,6 +233,7 @@ export function PresetActionsSettings({ store, updateStore }: {
                         <StepRow
                           key={si}
                           step={step}
+                          store={store}
                           tags={tags}
                           fields={fields}
                           onChange={(next) => setSteps(p, p.steps.map((s, k) => (k === si ? next : s)))}
@@ -276,8 +296,9 @@ export function PresetActionsSettings({ store, updateStore }: {
 }
 
 /** One step of a preset: its kind, and the operand that kind needs. */
-function StepRow({ step, tags, fields, onChange, onRemove, onMove }: {
+function StepRow({ step, store, tags, fields, onChange, onRemove, onMove }: {
   step: PresetStep;
+  store: Store;
   tags: Store['tags'][string][];
   fields: Store['fieldDefs'][string][];
   onChange: (next: PresetStep) => void;
@@ -295,7 +316,10 @@ function StepRow({ step, tags, fields, onChange, onRemove, onMove }: {
       <Select
         value={step.kind}
         aria-label="Action"
-        onChange={(e) => onChange({ kind: e.target.value } as PresetStep)}
+        // Through the same defaults "+ Add an action" uses. A bare `{ kind }`
+        // left an addTask step with no title, which the panel would then
+        // silently skip every time the button was pressed.
+        onChange={(e) => onChange(blankStep(e.target.value as PresetStepKind, store))}
         style={{ width: 150 }}
       >
         {STEP_ORDER.map((k) => (
@@ -347,6 +371,66 @@ function StepRow({ step, tags, fields, onChange, onRemove, onMove }: {
             placeholder="Value (blank clears it)"
             style={{ width: 160 }}
           />
+        </>
+      )}
+
+      {step.kind === 'addTask' && (
+        <>
+          <DraftInput
+            value={step.title}
+            aria-label="Task title"
+            onCommit={(title) => onChange({ ...step, title })}
+            placeholder="Task, e.g. Check in"
+            style={{ width: 170 }}
+          />
+          <Select
+            value={step.dueInDays === undefined ? '' : String(step.dueInDays)}
+            aria-label="Due"
+            onChange={(e) => {
+              const v = e.target.value;
+              const { dueInDays: _d, dueTime: _t, ...rest } = step;
+              onChange(v === '' ? rest : { ...rest, dueInDays: Number(v), ...(step.dueTime ? { dueTime: step.dueTime } : {}) });
+            }}
+            style={{ width: 140 }}
+          >
+            {/* Keep an offset typed in elsewhere (a restored backup) selectable. */}
+            {step.dueInDays !== undefined && !DUE_OFFSETS.some((o) => o.value === String(step.dueInDays)) && (
+              <option value={String(step.dueInDays)}>Due in {step.dueInDays} days</option>
+            )}
+            {DUE_OFFSETS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </Select>
+          {step.dueInDays !== undefined && (
+            // On blur, like the colour input above: a time field fires a change
+            // per typed segment, and each would be a store write and a sync.
+            <Input
+              type="time"
+              aria-label="Due time (optional)"
+              title="Optional. Without a time the task is due any time that day."
+              key={step.dueTime || ''}
+              defaultValue={step.dueTime || ''}
+              onBlur={(e) => {
+                const next = e.target.value;
+                if (next === (step.dueTime || '')) return;
+                const { dueTime: _t, ...rest } = step;
+                onChange(next ? { ...rest, dueTime: next } : rest);
+              }}
+              style={{ width: 110 }}
+            />
+          )}
+          <Select
+            value={step.priority || 'normal'}
+            aria-label="Priority"
+            onChange={(e) => {
+              const { priority: _p, ...rest } = step;
+              const p = e.target.value as TaskPriority;
+              onChange(p === 'normal' ? rest : { ...rest, priority: p });
+            }}
+            style={{ width: 100 }}
+          >
+            <option value="high">High</option>
+            <option value="normal">Normal</option>
+            <option value="low">Low</option>
+          </Select>
         </>
       )}
 

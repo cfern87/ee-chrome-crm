@@ -38,7 +38,9 @@ import {
   color, fontSize, fontWeight, radius, space,
 } from '../ui/primitives';
 import { elevation } from '../ui/tokens';
-import { ICON_DASHBOARD, ICON_CONTACTS, ICON_CAMPAIGNS, ICON_TAGS, ICON_SETTINGS } from '../ui/icons';
+import { ICON_DASHBOARD, ICON_CONTACTS, ICON_TASKS, ICON_CAMPAIGNS, ICON_TAGS, ICON_SETTINGS } from '../ui/icons';
+import { newTask, nextDueAt, countOpenTasks } from '../tasks';
+import { TasksPanel, type TaskHandlers } from './TasksPanel';
 import { Resizer } from '../ui/SplitPane';
 import { useLocalPref } from '../ui/prefs';
 import { tint } from '../ui/contrast';
@@ -84,7 +86,7 @@ import { PRODUCT_NAME, PRODUCT_SLUG } from '../product';
  * absorbed the old Fields tab: both define the shape of a contact rather than
  * being places you work.
  */
-type Route = 'dashboard' | 'contacts' | 'campaigns' | 'tags' | 'settings';
+type Route = 'dashboard' | 'contacts' | 'tasks' | 'campaigns' | 'tags' | 'settings';
 
 /** Sub-views inside Campaigns. */
 type CampaignView = 'compose' | 'active' | 'past';
@@ -121,7 +123,7 @@ const LIST_DEFAULT = 340;
 /** One-line summary of a pace, used in both the composer and Settings. */
 
 type DateFilter = 'all' | 'today' | 'week' | 'month';
-type SortBy = 'recent' | 'lastContacted' | 'lastOpened' | 'dateAdded' | 'lastTagged' | 'tagCount' | 'name';
+type SortBy = 'recent' | 'lastContacted' | 'lastOpened' | 'dateAdded' | 'lastTagged' | 'tagCount' | 'nextTask' | 'name';
 
 // The query, plus the view settings a preset restores alongside it. Comparing
 // this against the applied preset's own signature is what lights up "Update".
@@ -769,6 +771,15 @@ export default function DashboardApp() {
         return dir * ((lastTaggedAt(a) || 0) - (lastTaggedAt(b) || 0));
       case 'tagCount':
         return dir * (a.tags.length - b.tags.length);
+      // Contacts with no dated open task sort after everyone who has one, in
+      // either direction — "soonest follow-up" should never open on a page of
+      // people who have nothing scheduled.
+      case 'nextTask': {
+        const an = nextDueAt(a);
+        const bn = nextDueAt(b);
+        if (an === undefined || bn === undefined) return an === bn ? 0 : an === undefined ? 1 : -1;
+        return dir * (an - bn);
+      }
       case 'name':
         return dir * (a.participantName || '').localeCompare(b.participantName || '');
       // "Recent activity" means the most recent CONVERSATION, not the most
@@ -1509,6 +1520,28 @@ export default function DashboardApp() {
     await updateStore({ ...store, fieldDefs: nextDefs, conversations: nextConvs });
   };
 
+  // Follow-up tasks. Typed mutations, never whole-store writes: ticking two
+  // checkboxes in quick succession is exactly the overlapping-writes case
+  // mutateStore exists for. The task object is built HERE, id included, so the
+  // optimistic preview and the background's result name the same task.
+  const taskHandlers: TaskHandlers = {
+    onAddTask: (conversationId, input) => {
+      const task = newTask(input);
+      if (task) void mutateStore([{ op: 'addTask', conversationId, task }]);
+    },
+    onUpdateTask: (conversationId, taskId, patch) => {
+      void mutateStore([{ op: 'updateTask', conversationId, taskId, patch }]);
+    },
+    onDeleteTask: (conversationId, taskId) => {
+      void mutateStore([{ op: 'deleteTask', conversationId, taskId }]);
+    },
+  };
+
+  const openContactFromTask = (conv: Conversation) => {
+    setSelectedConv(store.conversations[conv.id] ?? conv);
+    go('contacts');
+  };
+
   // Set (or clear, when value is '') a custom field value on a contact.
   const setCustomField = async (conv: Conversation, fieldId: string, value: string) => {
     const nextCf = { ...(conv.customFields || {}) };
@@ -1527,6 +1560,7 @@ export default function DashboardApp() {
   const recentConvs = conversations.filter(
     (c) => Date.now() - c.updatedAt < 7 * 24 * 60 * 60 * 1000
   ).length;
+  const taskCounts = countOpenTasks(store);
 
   if (loading || signedIn === null) {
     return (
@@ -1547,6 +1581,7 @@ export default function DashboardApp() {
   const NAV: NavItem<Route>[] = [
     { id: 'dashboard', label: 'Dashboard', icon: ICON_DASHBOARD, count: dashboardTiles.length },
     { id: 'contacts', label: 'Contacts', icon: ICON_CONTACTS, count: totalConvs },
+    { id: 'tasks', label: 'Follow-ups', icon: ICON_TASKS, count: taskCounts.open || undefined },
     { id: 'campaigns', label: 'Campaigns', icon: ICON_CAMPAIGNS, count: campaigns.length },
     { id: 'tags', label: 'Tags & fields', icon: ICON_TAGS, count: totalTags + fieldDefs.length },
   ];
@@ -1558,6 +1593,7 @@ export default function DashboardApp() {
   const ROUTE_TITLE: Record<Route, string> = {
     dashboard: 'Dashboard',
     contacts: 'Contacts',
+    tasks: 'Follow-ups',
     campaigns: 'Campaigns',
     tags: 'Tags & fields',
     settings: 'Settings',
@@ -1702,6 +1738,7 @@ export default function DashboardApp() {
                       <option value="dateAdded">Date added</option>
                       <option value="lastTagged">Last tagged</option>
                       <option value="tagCount">Number of tags</option>
+                      <option value="nextTask">Next follow-up due</option>
                       <option value="name">Name</option>
                     </Select>
                   )}
@@ -2083,11 +2120,15 @@ export default function DashboardApp() {
             <div style={{ maxWidth: 840, padding: space.xl }}>
               {selectedConv ? (
                 <ConvDetail
-                  conv={selectedConv}
+                  // The live record, not the snapshot taken when it was
+                  // selected: task edits go through mutateStore, which updates
+                  // the store optimistically but not `selectedConv`.
+                  conv={store.conversations[selectedConv.id] ?? selectedConv}
                   store={store}
                   tags={tags}
                   fieldDefs={fieldDefs}
                   grouped={tagsGrouped}
+                  taskHandlers={taskHandlers}
                   deleteConfirm={deleteConfirm}
                   deleteConfirm2={deleteConfirm2}
                   onClose={() => setSelectedConv(null)}
@@ -2177,6 +2218,15 @@ export default function DashboardApp() {
             onCreateTile={createDashboardTile}
             onUpdateTile={updateDashboardTile}
             onRemoveTile={removeDashboardTile}
+          />
+        )}
+
+        {/* Follow-ups — every task on every contact, soonest first. */}
+        {route === 'tasks' && (
+          <TasksPanel
+            conversations={conversations}
+            handlers={taskHandlers}
+            onOpenContact={openContactFromTask}
           />
         )}
 

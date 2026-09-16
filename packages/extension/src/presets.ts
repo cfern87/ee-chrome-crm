@@ -34,6 +34,7 @@ import type { Mutation } from './mutations';
 // module only calls in from function bodies, and that one only reads the
 // collection from inside a function. Same arrangement as storage.ts ↔ drive.ts.
 import { writeCollection, type SettingsBag, type SettingsCollection } from './settingsMerge';
+import { newTask, dueFromOffset, type TaskPriority } from './tasks';
 
 /** One edit inside a preset. */
 export type PresetStep =
@@ -45,6 +46,13 @@ export type PresetStep =
   | { kind: 'appendName'; text: string }
   | { kind: 'prependName'; text: string }
   | { kind: 'setField'; fieldId: string; value: string }
+  // Schedule a follow-up. The due date is RELATIVE — "in 3 days" — and is
+  // resolved when the button is pressed; an absolute date would go stale the
+  // day after the preset was built. No `dueInDays` = no due date. `dueTime` is
+  // "HH:MM"; without one the task is due on the day rather than at a time.
+  | { kind: 'addTask'; title: string; dueInDays?: number; dueTime?: string; priority?: TaskPriority; notes?: string }
+  // Tick off every open follow-up — the natural companion of a "Replied" preset.
+  | { kind: 'completeTasks' }
   | { kind: 'archive' }
   | { kind: 'unarchive' }
   | { kind: 'deleteContact' };
@@ -151,6 +159,22 @@ function normalizeStep(raw: unknown): PresetStep | null {
       return typeof o.fieldId === 'string' && o.fieldId
         ? { kind: 'setField', fieldId: o.fieldId, value: typeof o.value === 'string' ? o.value : '' }
         : null;
+    case 'addTask': {
+      if (typeof o.title !== 'string') return null;
+      const days = typeof o.dueInDays === 'number' && Number.isFinite(o.dueInDays) && o.dueInDays >= 0
+        ? Math.round(o.dueInDays)
+        : undefined;
+      return {
+        kind: 'addTask',
+        title: o.title,
+        ...(days !== undefined ? { dueInDays: days } : {}),
+        ...(days !== undefined && typeof o.dueTime === 'string' && o.dueTime ? { dueTime: o.dueTime } : {}),
+        ...(o.priority === 'high' || o.priority === 'low' ? { priority: o.priority } : {}),
+        ...(typeof o.notes === 'string' && o.notes ? { notes: o.notes } : {}),
+      };
+    }
+    case 'completeTasks':
+      return { kind: 'completeTasks' };
     case 'archive':
     case 'unarchive':
     case 'deleteContact':
@@ -249,7 +273,7 @@ export function newPresetAction(label: string, order: number): PresetAction {
  * whatever position it holds, since anything after it would address a record
  * that is gone.
  */
-export function stepsFor(preset: PresetAction, conv: Conversation, store: Store): Mutation[] {
+export function stepsFor(preset: PresetAction, conv: Conversation, store: Store, now = Date.now()): Mutation[] {
   const out: Mutation[] = [];
   const id = conv.id;
 
@@ -296,6 +320,25 @@ export function stepsFor(preset: PresetAction, conv: Conversation, store: Store)
         out.push({ op: 'setCustomField', conversationId: id, fieldId: step.fieldId, value: step.value });
         break;
 
+      case 'addTask': {
+        const due = step.dueInDays !== undefined ? dueFromOffset(step.dueInDays, step.dueTime, now) : undefined;
+        // Each step gets its own id even when two steps share a timestamp, so
+        // a preset that schedules two follow-ups creates two tasks.
+        const task = newTask(
+          { title: step.title, notes: step.notes, priority: step.priority, dueAt: due?.dueAt, allDay: due?.allDay },
+          now,
+        );
+        if (!task) break; // blank title — nothing to schedule
+        flushTags();
+        out.push({ op: 'addTask', conversationId: id, task });
+        break;
+      }
+
+      case 'completeTasks':
+        flushTags();
+        out.push({ op: 'completeOpenTasks', conversationId: id });
+        break;
+
       case 'archive':
       case 'unarchive':
         flushTags();
@@ -331,10 +374,19 @@ export function describePreset(preset: PresetAction, store: Store): string {
         case 'appendName': return `name + "${s.text}"`;
         case 'prependName': return `"${s.text}" + name`;
         case 'setField': return `${fieldName(s.fieldId)} = ${s.value || '(clear)'}`;
+        case 'addTask': return `task "${s.title || '(untitled)'}"${describeOffset(s.dueInDays, s.dueTime)}`;
+        case 'completeTasks': return 'complete open tasks';
         case 'archive': return 'archive';
         case 'unarchive': return 'unarchive';
         case 'deleteContact': return 'DELETE contact';
       }
     })
     .join(' · ');
+}
+
+/** " due in 3 days at 14:00", " due today", or "" for an undated task. */
+export function describeOffset(days: number | undefined, time: string | undefined): string {
+  if (days === undefined) return '';
+  const when = days === 0 ? 'today' : days === 1 ? 'tomorrow' : `in ${days} days`;
+  return ` due ${when}${time ? ` at ${time}` : ''}`;
 }

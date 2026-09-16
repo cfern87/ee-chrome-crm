@@ -20,6 +20,9 @@ import type { Store, Tag, Conversation, CustomFieldDef, TagGroup } from './stora
 import { bucketTags, showsGroupLabels, type TagBucket } from './tagGrouping';
 import { funnelsFor, stageEditsFor, isNoOpStageEdit, describeStage, type FunnelView } from './funnel';
 import { readPresetActions, stepsFor, describePreset, isDestructive, type PresetAction } from './presets';
+import {
+  openTasksOf, sortTasks, isOverdue, formatDue, priorityOf, newTask, dueFromOffset, TASK_TITLE_MAX,
+} from './tasks';
 import { PRODUCT_NAME } from './product';
 import { readableFill, chipOutline, ON_DARK } from './ui/contrast';
 import { eyeOffSvgMarkup } from './ui/icons';
@@ -1185,6 +1188,15 @@ let deleteArmed = false;
 // presets.ts). Holds the id of the preset awaiting confirmation, or null.
 let presetArmed: string | null = null;
 
+// In-progress "add follow-up" row, module-scoped for the same reason as
+// newTagDraft. `due` is a day offset as a string ('' = no due date); tomorrow
+// is the default because "follow up" almost never means "later today".
+const taskDraft: { title: string; due: string } = { title: '', due: '1' };
+let taskTitleFocused = false;
+
+/** How many open follow-ups the panel lists before pointing at the dashboard. */
+const PANEL_TASKS_VISIBLE = 5;
+
 // ---- Panel preferences (per-browser, via chrome.storage.local) -----------
 //
 // Whether each of the panel's two tag sections is split by tag group. Two
@@ -1377,6 +1389,69 @@ function presetActionsHtml(presets: PresetAction[], store: Store, armedId: strin
     <div class="fb-crm-presets">${buttons}</div>`;
 }
 
+/**
+ * Follow-ups for this contact: open tasks with a tick box, and a one-line
+ * "add" row. Deliberately the quick version — title and a due-date shortcut.
+ * Notes, times, priority and editing live in the dashboard; the panel is where
+ * you are mid-conversation and just need to not forget.
+ *
+ * The title input's value is set on the live element by wirePanelTasks, not
+ * baked in here — see fieldRowHtml for why.
+ */
+function tasksSectionHtml(conv: Conversation): string {
+  const now = Date.now();
+  const open = sortTasks(openTasksOf(conv));
+  const shown = open.slice(0, PANEL_TASKS_VISIBLE);
+  const overdue = open.filter((t) => isOverdue(t, now)).length;
+
+  const rows = shown.map((t) => {
+    const late = isOverdue(t, now);
+    const pri = priorityOf(t);
+    return `
+      <div class="fb-crm-task${late ? ' fb-crm-task--overdue' : ''}">
+        <input type="checkbox" class="fb-crm-task-check" data-task-done="${escapeAttr(t.id)}" aria-label="Mark done: ${escapeAttr(t.title)}" />
+        <div class="fb-crm-task-body">
+          <div class="fb-crm-task-title">${pri === 'high' ? '<span class="fb-crm-task-pri">!</span>' : ''}${escapeHtml(t.title)}</div>
+          <div class="fb-crm-task-due">${escapeHtml(formatDue(t, now))}</div>
+        </div>
+      </div>`;
+  }).join('');
+
+  const more = open.length > shown.length
+    ? `<div class="fb-crm-muted fb-crm-task-more">+${open.length - shown.length} more in the dashboard</div>`
+    : '';
+
+  const dueOptions = PANEL_DUE_CHOICES
+    .map((c) => `<option value="${c.value}"${c.value === taskDraft.due ? ' selected' : ''}>${c.label}</option>`)
+    .join('');
+
+  return `
+    <div class="fb-crm-section-title-row">
+      <div class="fb-crm-section-title">Follow-ups</div>
+      ${open.length ? `<span class="fb-crm-task-count${overdue ? ' fb-crm-task-count--overdue' : ''}">${open.length} open${overdue ? ` · ${overdue} overdue` : ''}</span>` : ''}
+    </div>
+    ${rows ? `<div class="fb-crm-tasks">${rows}</div>${more}` : ''}
+    <div class="fb-crm-task-new">
+      <input type="text" id="fb-crm-task-title" maxlength="${TASK_TITLE_MAX}" placeholder="Add a follow-up…" aria-label="New follow-up" />
+      <select id="fb-crm-task-due" aria-label="Due">${dueOptions}</select>
+      <button id="fb-crm-task-add">Add</button>
+    </div>`;
+}
+
+/** escapeHtml only escapes text; task titles also land inside quoted attributes. */
+function escapeAttr(s: string): string {
+  return escapeHtml(s).replace(/"/g, '&quot;');
+}
+
+const PANEL_DUE_CHOICES: { value: string; label: string }[] = [
+  { value: '0', label: 'Today' },
+  { value: '1', label: 'Tomorrow' },
+  { value: '3', label: '3 days' },
+  { value: '7', label: '1 week' },
+  { value: '14', label: '2 weeks' },
+  { value: '', label: 'No date' },
+];
+
 /** A preset button's own colour, using the same readable-fill rules as tag chips. */
 function chipFillStyle(hex: string): string {
   const { fill, fg } = readableFill(hex);
@@ -1493,6 +1568,8 @@ async function renderPanelContent() {
     focusedFieldId = null;
     editingName = null;
     editingNameFocused = false;
+    taskDraft.title = '';
+    taskTitleFocused = false;
   }
   currentPanelThreadId = threadId;
   lastRenderedThread = threadId;
@@ -1632,6 +1709,8 @@ async function renderPanelContent() {
 
       ${presetActionsHtml(presets, store, presetArmed)}
 
+      ${tasksSectionHtml(conv)}
+
       ${funnelBarsHtml(funnelsFor(conv, store.tags, store.tagGroups))}
 
       ${panelFields.length > 0 ? `
@@ -1692,6 +1771,7 @@ async function renderPanelContent() {
   // aliases, and every action below addresses the contact by key.
   wirePanelActions(conv.id);
   wirePanelFields(conv.id, conv, panelFields);
+  wirePanelTasks(conv.id);
 
   // If the user was typing a tag name when a re-render happened, restore focus
   // and place the caret at the end so their typing isn't interrupted.
@@ -1864,6 +1944,52 @@ function wirePanelFields(threadId: string, conv: Conversation, defs: CustomField
       const v = el.value;
       try { el.setSelectionRange(v.length, v.length); } catch { /* ignore */ }
     }
+  }
+}
+
+// Follow-up tick boxes and the add row. The task is built here, id and all, so
+// the mutation is idempotent if the background retries it.
+function wirePanelTasks(threadId: string) {
+  if (!panelEl) return;
+
+  panelEl.querySelectorAll<HTMLInputElement>('[data-task-done]').forEach(box => {
+    box.addEventListener('change', async () => {
+      box.disabled = true;
+      await mutate([{ op: 'updateTask', conversationId: threadId, taskId: box.dataset.taskDone!, patch: { done: box.checked } }]);
+      await renderPanel();
+    });
+  });
+
+  const titleEl = panelEl.querySelector<HTMLInputElement>('#fb-crm-task-title');
+  const dueEl = panelEl.querySelector<HTMLSelectElement>('#fb-crm-task-due');
+  const addEl = panelEl.querySelector<HTMLButtonElement>('#fb-crm-task-add');
+  if (!titleEl || !dueEl || !addEl) return;
+
+  titleEl.value = taskDraft.title;
+  titleEl.addEventListener('input', () => { taskDraft.title = titleEl.value; });
+  titleEl.addEventListener('focus', () => { taskTitleFocused = true; });
+  titleEl.addEventListener('blur', () => { taskTitleFocused = false; });
+  titleEl.addEventListener('keydown', e => { if (e.key === 'Enter') addEl.click(); });
+  dueEl.addEventListener('change', () => { taskDraft.due = dueEl.value; });
+
+  addEl.addEventListener('click', async () => {
+    const title = titleEl.value.trim();
+    if (!title) { titleEl.focus(); return; }
+    const now = Date.now();
+    const due = dueEl.value === '' ? undefined : dueFromOffset(Number(dueEl.value), undefined, now);
+    const task = newTask({ title, dueAt: due?.dueAt, allDay: due?.allDay }, now);
+    if (!task) return;
+    // Clear the title but keep the chosen due offset — adding several
+    // follow-ups for the same day is the common run.
+    taskDraft.title = '';
+    addEl.disabled = true;
+    await mutate([{ op: 'addTask', conversationId: threadId, task }]);
+    await renderPanel();
+  });
+
+  if (taskTitleFocused) {
+    titleEl.focus();
+    try { titleEl.setSelectionRange(titleEl.value.length, titleEl.value.length); } catch { /* ignore */ }
   }
 }
 

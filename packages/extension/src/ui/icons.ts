@@ -35,6 +35,11 @@ export const ICON_CONTACTS =
   '<path d="M1.5 13.5c0-2.2 2-3.8 4.5-3.8s4.5 1.6 4.5 3.8" stroke-linecap="round" />' +
   '<path d="M11 3.4a2.4 2.4 0 0 1 0 4.6M12.2 9.9c1.4.5 2.3 1.6 2.3 3.1" stroke-linecap="round" />';
 
+/** Follow-ups — a ticked box. */
+export const ICON_TASKS =
+  '<rect x="2" y="2" width="12" height="12" rx="2" />' +
+  '<path d="M5 8.2 7.1 10.3 11 6" stroke-linecap="round" stroke-linejoin="round" />';
+
 /** Campaigns — a paper plane. */
 export const ICON_CAMPAIGNS =
   '<path d="M14.5 1.8 1.6 6.6c-.5.2-.5.9 0 1.1l4.7 1.8 1.8 4.7c.2.5.9.5 1.1 0l4.8-12.9c.2-.5-.3-.9-.8-.7Z" stroke-linejoin="round" />' +

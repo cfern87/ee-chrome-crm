@@ -25,6 +25,7 @@ import { readStore as driveReadStore, writeStore as driveWriteStore, mergeStores
 import { mergeSettingsWithBase, reconcileCollections, type SettingsBag } from './settingsMerge';
 import { getEntitlement, isSignedIn, FREE_CONTACT_LIMIT } from './license';
 import type { SavedSearch } from './search';
+import type { FollowUpTask } from './tasks';
 
 
 export const STORAGE_KEY = 'facebook_crm_store';
@@ -294,6 +295,11 @@ export interface Conversation {
   // record last change?" — and the dashboard shows it, so a week-old reading
   // can be read as the guess it is.
   readStateAt?: number;
+  // Follow-up tasks for this contact — see tasks.ts for why they live on the
+  // record rather than in a collection of their own. Absent = none. Always
+  // edited through the task mutations, which stamp `updatedAt` so the edit
+  // wins the cross-machine merge.
+  tasks?: FollowUpTask[];
 }
 
 export interface Store {
@@ -605,6 +611,21 @@ function shardConv(conv: Conversation): Conversation {
   }
   // Final guard: if still oversized (e.g. an enormous name/url), drop lastMessage.
   if (JSON.stringify(c).length > MAX_ITEM_BYTES) c.lastMessage = '';
+  // Tasks are the other unbounded text on a contact. Shed what's cheapest to
+  // lose first: finished tasks' notes, then finished tasks (oldest first), then
+  // open tasks' notes. Open tasks themselves are never dropped here — Drive
+  // mode has no item ceiling, and this legacy layer is the fallback.
+  if (c.tasks && JSON.stringify(c).length > MAX_ITEM_BYTES) {
+    c.tasks = c.tasks.map((t) => (t.done ? { ...t, notes: undefined } : t));
+    while (JSON.stringify(c).length > MAX_ITEM_BYTES) {
+      const doneIdx = c.tasks.findIndex((t) => t.done);
+      if (doneIdx < 0) break;
+      c.tasks.splice(doneIdx, 1);
+    }
+    if (JSON.stringify(c).length > MAX_ITEM_BYTES) {
+      c.tasks = c.tasks.map((t) => ({ ...t, notes: undefined }));
+    }
+  }
   return c;
 }
 

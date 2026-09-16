@@ -31,6 +31,10 @@ import {
 import { buildThreadIndex } from './contacts';
 import { looksLikeName, isDamagedName } from './names';
 import { profileKey } from './csv';
+import {
+  tasksOf, normalizeTask, patchTask, pruneDoneTasks,
+  type FollowUpTask, type TaskPatch,
+} from './tasks';
 
 export type Mutation =
   // Create-or-update the contact for a Messenger sidebar thread. `allowCreate`
@@ -84,6 +88,15 @@ export type Mutation =
   // it can see in one pass, and one mutation is one store lock rather than
   // twenty.
   | { op: 'observeReadStates'; observations: ReadStateObservation[] }
+  // Follow-up tasks (tasks.ts). The task is built by the SENDER — id and
+  // stamps included — so the optimistic preview and the background's result
+  // agree on the id, and the panel can address the task it just created.
+  | { op: 'addTask'; conversationId: string; task: FollowUpTask }
+  | { op: 'updateTask'; conversationId: string; taskId: string; patch: TaskPatch }
+  | { op: 'deleteTask'; conversationId: string; taskId: string }
+  // Tick off every open task on the contact — what a "they replied" preset
+  // means by "done with the follow-ups".
+  | { op: 'completeOpenTasks'; conversationId: string }
   // Upgrade every contact whose stored profile URL matches this page with the
   // canonical thread id read off it.
   | { op: 'resolveProfileThread'; profileKey: string; threadId: string; chatUrl: string };
@@ -533,9 +546,70 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
       return next ? { store: next, changed: true } : { store, changed: false };
     }
 
+    // ---- Follow-up tasks ----
+    //
+    // Every task op rewrites the contact's whole task list and bumps the
+    // contact's `updatedAt` — that stamp is what carries the edit through the
+    // cross-machine merge (see the note on observeReadStates). A no-op writes
+    // nothing, so a double-clicked checkbox doesn't cost a sync.
+
+    case 'addTask': {
+      const conv = store.conversations[m.conversationId];
+      if (!conv) return { store, changed: false };
+      const task = normalizeTask(m.task);
+      if (!task || !task.title.trim()) return { store, changed: false, conversationId: m.conversationId };
+      const current = tasksOf(conv);
+      // Idempotent on id: a retried send must not add the task twice.
+      if (current.some((t) => t.id === task.id)) return { store, changed: false, conversationId: m.conversationId };
+      return withTasks(store, conv, [...current, task], now);
+    }
+
+    case 'updateTask': {
+      const conv = store.conversations[m.conversationId];
+      if (!conv) return { store, changed: false };
+      const current = tasksOf(conv);
+      let hit = false;
+      const next = current.map((t) => {
+        if (t.id !== m.taskId) return t;
+        const patched = patchTask(t, m.patch, now);
+        if (patched !== t) hit = true;
+        return patched;
+      });
+      if (!hit) return { store, changed: false, conversationId: m.conversationId };
+      return withTasks(store, conv, next, now);
+    }
+
+    case 'deleteTask': {
+      const conv = store.conversations[m.conversationId];
+      if (!conv) return { store, changed: false };
+      const current = tasksOf(conv);
+      const next = current.filter((t) => t.id !== m.taskId);
+      if (next.length === current.length) return { store, changed: false, conversationId: m.conversationId };
+      return withTasks(store, conv, next, now);
+    }
+
+    case 'completeOpenTasks': {
+      const conv = store.conversations[m.conversationId];
+      if (!conv) return { store, changed: false };
+      const current = tasksOf(conv);
+      if (!current.some((t) => !t.done)) return { store, changed: false, conversationId: m.conversationId };
+      return withTasks(store, conv, current.map((t) => (t.done ? t : patchTask(t, { done: true }, now))), now);
+    }
+
     default:
       return { store, changed: false };
   }
+}
+
+/** Store `tasks` on `conv` (pruning old finished ones) and stamp the contact. */
+function withTasks(store: Store, conv: Conversation, tasks: FollowUpTask[], now: number): MutationOutcome {
+  const pruned = pruneDoneTasks(tasks);
+  const updated: Conversation = { ...conv, updatedAt: now };
+  if (pruned.length) updated.tasks = pruned;
+  else delete updated.tasks;
+  const next = copy(store);
+  next.conversations[conv.id] = updated;
+  return { store: next, changed: true, conversationId: conv.id };
 }
 
 /**

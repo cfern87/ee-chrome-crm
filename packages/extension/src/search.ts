@@ -15,6 +15,9 @@
 
 import type { Conversation, Tag, TagGroup, CustomFieldDef } from './storage';
 import { lastTaggedAt, firstTaggedAt } from './storage';
+import {
+  openTasksOf, doneTasksOf, overdueCount, nextDueAt, lastCompletedAt, lastTaskCreatedAt, priorityOf,
+} from './tasks';
 
 // ---------------------------------------------------------------------------
 // Query model
@@ -161,6 +164,21 @@ export const BUILTIN_FIELDS: FieldDef[] = [
     // being a source of store churn. There is no record of the last look.
     hint: 'When their read state last CHANGED — e.g. when they opened your message. Not when it was last checked.',
   },
+
+  // Follow-up tasks (tasks.ts). A contact can hold several, so these are
+  // per-CONTACT readings of its task list, not per-task rows: counts, the
+  // soonest due date, and "any open task whose title…". Two task conditions
+  // in one query may therefore be satisfied by two different tasks.
+  { key: 'openTaskCount', label: 'Open tasks', kind: 'number', category: 'Tasks', hint: 'How many follow-ups are still to do. "> 0" finds everyone with something pending.' },
+  { key: 'overdueTaskCount', label: 'Overdue tasks', kind: 'number', category: 'Tasks', hint: 'Open tasks whose due date has passed. An all-day task is overdue once its whole day is over.' },
+  { key: 'doneTaskCount', label: 'Completed tasks', kind: 'number', category: 'Tasks' },
+  { key: 'nextTaskDue', label: 'Next task due', kind: 'date', category: 'Tasks', hint: 'The soonest due date among open tasks. "is never / unknown" = no dated open task.' },
+  { key: 'taskTitle', label: 'Open task title', kind: 'text', category: 'Tasks', hint: 'Matches if ANY open task matches. "doesn\'t contain" / "is not" mean NO open task does.' },
+  { key: 'taskNotes', label: 'Open task notes', kind: 'text', category: 'Tasks', hint: 'Matches if ANY open task\'s notes match.' },
+  { key: 'taskPriority', label: 'Open task priority', kind: 'enum', category: 'Tasks', options: ['high', 'normal', 'low'], hint: '"is any of" = some open task has that priority; "is none of" = no open task does; "is empty" = no open tasks.' },
+  { key: 'doneTaskTitle', label: 'Completed task title', kind: 'text', category: 'Tasks', hint: 'Matches if ANY completed task matches.' },
+  { key: 'lastTaskCompletedAt', label: 'Last task completed', kind: 'date', category: 'Tasks' },
+  { key: 'lastTaskCreatedAt', label: 'Last task added', kind: 'date', category: 'Tasks' },
 ];
 
 const CUSTOM_PREFIX = 'custom:';
@@ -441,6 +459,33 @@ function dateOf(conv: Conversation, key: string): number | undefined {
     case 'lastTagAt': return lastTaggedAt(conv);
     case 'firstTagAt': return firstTaggedAt(conv);
     case 'readStateAt': return conv.readStateAt || undefined;
+    case 'nextTaskDue': return nextDueAt(conv);
+    case 'lastTaskCompletedAt': return lastCompletedAt(conv);
+    case 'lastTaskCreatedAt': return lastTaskCreatedAt(conv);
+    default: return undefined;
+  }
+}
+
+/** Built-in numeric fields. Undefined only for a key that isn't one. */
+function numberOf(conv: Conversation, key: string, now: number): number | undefined {
+  switch (key) {
+    case 'tagCount': return conv.tags.length;
+    case 'openTaskCount': return openTasksOf(conv).length;
+    case 'overdueTaskCount': return overdueCount(conv, now);
+    case 'doneTaskCount': return doneTasksOf(conv).length;
+    default: return undefined;
+  }
+}
+
+/**
+ * Text fields with one value PER TASK. Returns undefined for a single-valued
+ * field, so the caller falls through to textOf.
+ */
+function textListOf(conv: Conversation, key: string): string[] | undefined {
+  switch (key) {
+    case 'taskTitle': return openTasksOf(conv).map((t) => t.title);
+    case 'taskNotes': return openTasksOf(conv).map((t) => t.notes || '');
+    case 'doneTaskTitle': return doneTasksOf(conv).map((t) => t.title);
     default: return undefined;
   }
 }
@@ -476,6 +521,37 @@ function matchesText(raw: string, cond: Condition): boolean {
     case 'isNot': return hay !== needle;
     case 'startsWith': return hay.startsWith(needle);
     case 'endsWith': return hay.endsWith(needle);
+    default: return true;
+  }
+}
+
+/**
+ * A text condition over several values — one per task. Reads the way the
+ * sentence does: "task title contains X" holds when SOME task's title does,
+ * while the negative operators ("doesn't contain", "is not") hold only when
+ * NO task matches, and "is empty" when no task has any text at all. Treating
+ * the negatives as "some task doesn't contain X" would make them true for
+ * almost everyone with two tasks, which is never what's meant.
+ */
+function matchesTextList(values: string[], cond: Condition): boolean {
+  switch (cond.op) {
+    case 'notContains':
+    case 'isNot':
+    case 'isEmpty':
+      return values.every((v) => matchesText(v, cond));
+    default:
+      return values.some((v) => matchesText(v, cond));
+  }
+}
+
+/** The same any / none reading for a multi-valued choice field. */
+function matchesEnumList(values: string[], cond: Condition): boolean {
+  const want = cond.values || [];
+  switch (cond.op) {
+    case 'isEmpty': return values.length === 0;
+    case 'isNotEmpty': return values.length > 0;
+    case 'isAnyOf': return values.some((v) => want.includes(v));
+    case 'isNoneOf': return !values.some((v) => want.includes(v));
     default: return true;
   }
 }
@@ -629,11 +705,14 @@ function evaluateCondition(conv: Conversation, cond: Condition, fields: FieldDef
   const isCustom = cond.field.startsWith(CUSTOM_PREFIX);
 
   switch (field.kind) {
-    case 'text':
-      return matchesText(isCustom ? customValue(conv, cond.field) : textOf(conv, cond.field), cond);
+    case 'text': {
+      if (isCustom) return matchesText(customValue(conv, cond.field), cond);
+      const list = textListOf(conv, cond.field);
+      return list ? matchesTextList(list, cond) : matchesText(textOf(conv, cond.field), cond);
+    }
 
     case 'number': {
-      if (cond.field === 'tagCount') return matchesNumber(conv.tags.length, cond);
+      if (!isCustom) return matchesNumber(numberOf(conv, cond.field, ctx.now), cond);
       const raw = customValue(conv, cond.field);
       const parsed = raw === '' ? undefined : Number(raw);
       return matchesNumber(parsed !== undefined && Number.isFinite(parsed) ? parsed : undefined, cond);
@@ -654,6 +733,7 @@ function evaluateCondition(conv: Conversation, cond: Condition, fields: FieldDef
     }
 
     case 'enum': {
+      if (cond.field === 'taskPriority') return matchesEnumList(openTasksOf(conv).map(priorityOf), cond);
       // Contacts captured before `source` existed came from Messenger.
       // An absent readState is 'unknown' — a real answer here, and the one
       // every contact starts with, so it has to be selectable.
