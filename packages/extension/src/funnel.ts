@@ -114,6 +114,25 @@ export function isNoOpStageEdit(edits: StageEdits): boolean {
 }
 
 /**
+ * The short position readout beside a funnel's title: the stage NAME first,
+ * then where it sits — "Qualified · 2 of 5". A bare "2 of 5" made the reader
+ * count segments to find out which stage that was.
+ */
+export function stagePosition(view: FunnelView): string {
+  if (view.currentIndex < 0) return 'Not started';
+  return `${view.stages[view.currentIndex].name} · ${view.currentIndex + 1} of ${view.stages.length}`;
+}
+
+/** Tooltip for one stage segment. Numbered, so a stage is identifiable even where its label is cut short. */
+export function stageTitle(view: FunnelView, index: number): string {
+  const stage = view.stages[index];
+  const label = `stage ${index + 1} of ${view.stages.length}: ${stage.name}`;
+  return index === view.currentIndex
+    ? `Currently at ${label} — click to clear ${view.group.name}`
+    : `Move to ${label}`;
+}
+
+/**
  * One-line description of a contact's position, for a tooltip or a title
  * attribute. Spelled out rather than left to "3/5" alone, because the number
  * alone doesn't say which stage that is.

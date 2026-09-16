@@ -450,8 +450,11 @@
    naming a color. The fallback is the same blue the rest of the panel uses.
 */
 
+/* Wraps: in a panel this narrow a long funnel runs onto a second row, so every
+   stage keeps its name instead of being squeezed down to an unlabeled sliver. */
 .fb-crm-funnel {
   display: flex;
+  flex-wrap: wrap;
   gap: 2px;
   border-radius: 6px;
   overflow: hidden;
@@ -466,9 +469,13 @@
   gap: 5px;
 }
 
-/* Position readout ("3 of 5") on the right of the group's title row. */
+/* Position readout ("Qualified · 3 of 5") on the right of the group's title
+   row. May shrink with an ellipsis; the stage is also named in the bar below. */
 .fb-crm-funnel__pos {
-  flex-shrink: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 10px;
   font-weight: 600;
   color: #8a8d91;
@@ -477,10 +484,10 @@
 }
 
 .fb-crm-funnel__step {
-  flex: 1;
-  min-width: 0;
-  /* A floor, so a long funnel stays clickable rather than collapsing into
-     hairlines. The bar scrolls before a stage becomes a target you can miss. */
+  /* Natural width, growing to fill its row. A stage wider than the whole panel
+     is the only one that gets an ellipsis — its title still names it. */
+  flex: 1 1 auto;
+  max-width: 100%;
   min-height: 22px;
   border: none;
   background: #f0f2f5;

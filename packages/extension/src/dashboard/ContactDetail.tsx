@@ -15,7 +15,7 @@ import { useLocalPref } from '../ui/prefs';
 import {
   HIDDEN_TAG_TITLE, bucketTags, showsGroupLabels, formatRelativeTime, ProfileUrlEditor, ReadStateChip,
 } from './shared';
-import { funnelsFor, describeStage, type FunnelView } from '../funnel';
+import { funnelsFor, describeStage, stagePosition, stageTitle, type FunnelView } from '../funnel';
 import { ContactTasks, type TaskHandlers } from './TasksPanel';
 
 export const TAG_FILTER_VISIBLE = 12;
@@ -46,15 +46,17 @@ function FunnelBar({ view, onSetStage }: { view: FunnelView; onSetStage: (index:
         <span style={{ fontSize: 11, fontWeight: 700, color: color.text.muted, textTransform: 'uppercase', letterSpacing: 0.4 }}>
           {view.group.name}
         </span>
-        <span style={{ fontSize: 11, color: color.text.muted }}>
-          {currentIndex < 0 ? 'Not started' : `${currentIndex + 1} of ${stages.length}`}
+        <span style={{ fontSize: 11, color: currentIndex < 0 ? color.text.muted : color.text.secondary, fontWeight: currentIndex < 0 ? 400 : 600 }}>
+          {stagePosition(view)}
         </span>
       </div>
 
+      {/* Wraps rather than truncating, so a long funnel in a narrow pane still
+          names every stage. */}
       <div
         role="group"
         aria-label={describeStage(view)}
-        style={{ display: 'flex', gap: 2, borderRadius: radius.sm, overflow: 'hidden' }}
+        style={{ display: 'flex', flexWrap: 'wrap', gap: 2, borderRadius: radius.sm, overflow: 'hidden' }}
       >
         {stages.map((stage, i) => {
           const reached = i <= currentIndex;
@@ -66,17 +68,12 @@ function FunnelBar({ view, onSetStage }: { view: FunnelView; onSetStage: (index:
             <button
               key={stage.id}
               onClick={() => onSetStage(i)}
-              title={
-                current
-                  ? `Currently at "${stage.name}" — click to clear ${view.group.name}`
-                  : `Move to "${stage.name}"`
-              }
+              title={stageTitle(view, i)}
               aria-pressed={current}
               style={{
-                flex: 1,
-                minWidth: 0,
+                flex: '1 1 auto',
+                maxWidth: '100%',
                 border: 'none',
-                borderRight: i < stages.length - 1 ? `1px solid ${color.surface.raised}` : 'none',
                 background: fill,
                 color: reached ? onColor(fill) : color.text.muted,
                 fontSize: 11,

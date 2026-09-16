@@ -7,7 +7,7 @@
 // that is what most of these pin down.
 
 import { describe, it, expect } from 'vitest';
-import { funnelsFor, stageEditsFor, isNoOpStageEdit, describeStage } from './funnel';
+import { funnelsFor, stageEditsFor, isNoOpStageEdit, describeStage, stagePosition, stageTitle } from './funnel';
 import type { Conversation, Tag, TagGroup } from './storage';
 
 function tag(id: string, groupId?: string, order?: number): Tag {
@@ -129,5 +129,18 @@ describe('describeStage', () => {
 
   it('says so when the contact has not entered', () => {
     expect(describeStage(funnel(conv([])))).toBe('stage: not started');
+  });
+});
+
+describe('stagePosition and stageTitle', () => {
+  it('puts the current stage name in the readout, not just a count', () => {
+    expect(stagePosition(funnel(conv(['qualified'])))).toBe('qualified · 3 of 4');
+    expect(stagePosition(funnel(conv([])))).toBe('Not started');
+  });
+
+  it('names the stage a segment moves to, and the one the contact is at', () => {
+    const view = funnel(conv(['qualified']));
+    expect(stageTitle(view, 0)).toMatch(/^Move to stage 1 of 4: \S+/);
+    expect(stageTitle(view, 2)).toBe('Currently at stage 3 of 4: qualified — click to clear stage');
   });
 });

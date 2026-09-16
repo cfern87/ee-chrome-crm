@@ -18,7 +18,7 @@ import {
 } from './storage';
 import type { Store, Tag, Conversation, CustomFieldDef, TagGroup } from './storage';
 import { bucketTags, showsGroupLabels, type TagBucket } from './tagGrouping';
-import { funnelsFor, stageEditsFor, isNoOpStageEdit, describeStage, type FunnelView } from './funnel';
+import { funnelsFor, stageEditsFor, isNoOpStageEdit, describeStage, stagePosition, stageTitle, type FunnelView } from './funnel';
 import { readPresetActions, stepsFor, describePreset, isDestructive, type PresetAction } from './presets';
 import {
   openTasksOf, sortTasks, isOverdue, formatDue, priorityOf, newTask, dueFromOffset, TASK_TITLE_MAX,
@@ -1311,17 +1311,16 @@ function tagSectionHtml(opts: {
  * second, faster route to the same tags, not a replacement, so removing a
  * stage by hand keeps working the way it always did.
  *
- * Labels are dropped below a certain width per stage: in a panel this narrow a
- * five-stage funnel gives each stage about forty pixels, which is not enough
- * for a word and is plenty for a segment you can see the fill of. The title
- * attribute carries the name in both cases.
+ * Every stage is labelled. This panel is narrow, so a long funnel WRAPS onto a
+ * second row rather than shrinking each stage to a nameless sliver — labels
+ * used to be dropped past four stages, which left a row of coloured blocks and
+ * no way to tell which phase was which short of hovering each one.
  */
 function funnelBarsHtml(views: FunnelView[]): string {
   if (!views.length) return '';
 
   return views.map((view) => {
     const accent = view.group.color || '#065fd4';
-    const showLabels = view.stages.length <= 4;
 
     const steps = view.stages.map((stage, i) => {
       const reached = i <= view.currentIndex;
@@ -1329,9 +1328,7 @@ function funnelBarsHtml(views: FunnelView[]): string {
       const cls = ['fb-crm-funnel__step'];
       if (reached) cls.push('fb-crm-funnel__step--reached');
       if (current) cls.push('fb-crm-funnel__step--current');
-      const title = current
-        ? `Currently at "${stage.name}" — click to clear ${view.group.name}`
-        : `Move to "${stage.name}"`;
+      const title = stageTitle(view, i);
       return `<button
         class="${cls.join(' ')}"
         style="--fb-crm-funnel-accent:${accent}"
@@ -1339,7 +1336,7 @@ function funnelBarsHtml(views: FunnelView[]): string {
         data-stage-index="${i}"
         aria-pressed="${current}"
         title="${escapeHtml(title)}"
-      >${showLabels ? escapeHtml(stage.name) : ''}</button>`;
+      >${escapeHtml(stage.name)}</button>`;
     }).join('');
 
     return `
@@ -1347,9 +1344,7 @@ function funnelBarsHtml(views: FunnelView[]): string {
         <div class="fb-crm-section-title">
           <span class="fb-crm-tag-group-dot" style="background:${accent}"></span>${escapeHtml(view.group.name)}
         </div>
-        <span class="fb-crm-funnel__pos">${
-          view.currentIndex < 0 ? 'Not started' : `${view.currentIndex + 1} of ${view.stages.length}`
-        }</span>
+        <span class="fb-crm-funnel__pos">${escapeHtml(stagePosition(view))}</span>
       </div>
       <div class="fb-crm-funnel" role="group" aria-label="${escapeHtml(describeStage(view))}">${steps}</div>`;
   }).join('');
