@@ -38,7 +38,9 @@ import {
   color, fontSize, fontWeight, radius, space,
 } from '../ui/primitives';
 import { elevation } from '../ui/tokens';
-import { ICON_DASHBOARD, ICON_CONTACTS, ICON_TASKS, ICON_CAMPAIGNS, ICON_TAGS, ICON_SETTINGS } from '../ui/icons';
+import { ICON_DASHBOARD, ICON_CONTACTS, ICON_TASKS, ICON_CAMPAIGNS, ICON_AUTOMATIONS, ICON_TAGS, ICON_SETTINGS } from '../ui/icons';
+import { AutomationsPanel } from './AutomationsPanel';
+import { readAutomations } from '../automations';
 import { newTask, nextDueAt, countOpenTasks } from '../tasks';
 import { TasksPanel, type TaskHandlers } from './TasksPanel';
 import { Resizer } from '../ui/SplitPane';
@@ -86,7 +88,7 @@ import { PRODUCT_NAME, PRODUCT_SLUG } from '../product';
  * absorbed the old Fields tab: both define the shape of a contact rather than
  * being places you work.
  */
-type Route = 'dashboard' | 'contacts' | 'tasks' | 'campaigns' | 'tags' | 'settings';
+type Route = 'dashboard' | 'contacts' | 'tasks' | 'campaigns' | 'automations' | 'tags' | 'settings';
 
 /** Sub-views inside Campaigns. */
 type CampaignView = 'compose' | 'active' | 'past';
@@ -1583,6 +1585,7 @@ export default function DashboardApp() {
     { id: 'contacts', label: 'Contacts', icon: ICON_CONTACTS, count: totalConvs },
     { id: 'tasks', label: 'Follow-ups', icon: ICON_TASKS, count: taskCounts.open || undefined },
     { id: 'campaigns', label: 'Campaigns', icon: ICON_CAMPAIGNS, count: campaigns.length },
+    { id: 'automations', label: 'Automations', icon: ICON_AUTOMATIONS, count: readAutomations(store).length || undefined },
     { id: 'tags', label: 'Tags & fields', icon: ICON_TAGS, count: totalTags + fieldDefs.length },
   ];
 
@@ -1595,6 +1598,7 @@ export default function DashboardApp() {
     contacts: 'Contacts',
     tasks: 'Follow-ups',
     campaigns: 'Campaigns',
+    automations: 'Automations',
     tags: 'Tags & fields',
     settings: 'Settings',
   };
@@ -2227,6 +2231,15 @@ export default function DashboardApp() {
             conversations={conversations}
             handlers={taskHandlers}
             onOpenContact={openContactFromTask}
+          />
+        )}
+
+        {/* Automations — saved jobs that tag contacts from what Messenger shows. */}
+        {route === 'automations' && (
+          <AutomationsPanel
+            store={store}
+            updateStore={updateStore}
+            onOpenTags={() => { setSchemaView('tags'); go('tags'); }}
           />
         )}
 

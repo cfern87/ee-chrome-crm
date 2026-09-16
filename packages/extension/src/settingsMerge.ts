@@ -39,6 +39,7 @@
 import { PRESET_COLLECTION } from './presets';
 import { WEBHOOK_COLLECTION } from './webhooks';
 import { CLEARED_FAILURES_COLLECTION, FAILED_NOTICE_ACK_KEY } from './campaigns';
+import { AUTOMATION_COLLECTION } from './automations';
 
 /** The `settings` bag. Untyped by design — it holds every feature's keys. */
 export type SettingsBag = Record<string, unknown>;
@@ -92,7 +93,7 @@ export interface SettingsCollection<T> {
  * there. Inside a function it can only run once everything is loaded.
  */
 function collections(): SettingsCollection<never>[] {
-  return [PRESET_COLLECTION, WEBHOOK_COLLECTION, CLEARED_FAILURES_COLLECTION] as unknown as SettingsCollection<never>[];
+  return [PRESET_COLLECTION, WEBHOOK_COLLECTION, CLEARED_FAILURES_COLLECTION, AUTOMATION_COLLECTION] as unknown as SettingsCollection<never>[];
 }
 
 /**

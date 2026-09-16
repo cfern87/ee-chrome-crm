@@ -47,6 +47,7 @@ import {
 import type { ReadState } from './messageStatus';
 import type { ReadStateObservation } from './mutations';
 import { noteState, buildReport, emptyReport, type ScanReport } from './readScan';
+import type { UnreadScanReport, UnreadThread } from './automations';
 import type { SendFailureKind } from './campaigns';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
@@ -3440,15 +3441,38 @@ function scrollParentOf(el: Element | null): HTMLElement | null {
  * been seen, so a selection of recently-messaged contacts costs a screen or
  * two rather than the whole history.
  */
-async function scanReadStates(threadIds: string[], budgetMs: number): Promise<ScanReport> {
+/**
+ * Scroll Messenger's conversation list from the top, handing every pass of
+ * rendered rows to `harvest`, until `done` says enough, the budget runs out,
+ * the scan is cancelled, or the list stops growing.
+ *
+ * Shared by the reply check and the unread-tagging automation. Both need the
+ * same careful walk — dropdown, hydration wait, recycled rows, stall detection,
+ * scroll restored afterwards — and differ only in what they read off a row and
+ * when they have seen enough.
+ *
+ * `harvest` returns how many CONVERSATIONS it had not seen before. Progress is
+ * counted in new thread ids rather than in row nodes because Messenger's list
+ * recycles: rows scrolling off the top can be removed as rows arrive at the
+ * bottom, so the node count can sit still through a perfectly productive
+ * scroll. Counting nodes would read that as the end of the list and stop three
+ * scrolls in.
+ *
+ * Returns null when no list could be put on screen at all.
+ */
+async function walkConversationList(opts: {
+  budgetMs: number;
+  harvest: (root: ParentNode, activeThreadId: string | null) => number;
+  done: () => boolean;
+  onProgress: () => void;
+}): Promise<{ exhausted: boolean } | null> {
   readScanCancelled = false;
-  const wanted = new Set(threadIds.map((t) => t.toLowerCase()));
 
   // The list has to be ON SCREEN before anything can be read off it, and on the
   // feed that means opening the chat dropdown ourselves. See openChatDropdown
   // for why the scan is run from there rather than from Messenger proper.
   if (!hasConversationRows()) await openChatDropdown();
-  if (!hasConversationRows()) return emptyReport('list', Array.from(wanted));
+  if (!hasConversationRows()) return null;
 
   // Give the list a moment to hydrate — a scan that starts on an empty pane
   // would call the list exhausted before Messenger had drawn a single row.
@@ -3459,28 +3483,49 @@ async function scanReadStates(threadIds: string[], budgetMs: number): Promise<Sc
   const root: ParentNode = container || document;
   const startScrollTop = container?.scrollTop ?? 0;
 
-  const states = new Map<string, ReadState>();
-  const seenThreadIds = new Set<string>();
   let exhausted = false;
-
-  const deadline = Date.now() + Math.min(budgetMs || READ_SCAN_MAX_MS, READ_SCAN_MAX_MS);
+  const deadline = Date.now() + Math.min(opts.budgetMs || READ_SCAN_MAX_MS, READ_SCAN_MAX_MS);
   let stalls = 0;
 
+  try {
+    opts.harvest(root, activeThreadId);
+    opts.onProgress();
+
+    while (!readScanCancelled && Date.now() < deadline && !opts.done()) {
+      if (!container) { exhausted = true; break; }
+
+      container.scrollTop += Math.max(200, container.clientHeight * 0.8);
+
+      // Harvesting IS the wait: each poll both collects and asks whether
+      // anything new arrived, so rows that appear mid-wait are picked up rather
+      // than raced past. Requiring several stalls in a row rather than one
+      // keeps a slow network from being mistaken for the end of the list.
+      const grew = !!(await pollFor(() => opts.harvest(root, activeThreadId) > 0, READ_SCAN_ROW_WAIT_MS, 200));
+      opts.onProgress();
+      stalls = grew ? 0 : stalls + 1;
+      if (stalls >= READ_SCAN_STALL_LIMIT) { exhausted = true; break; }
+    }
+  } finally {
+    // Put the list back where the user left it. A scan is meant to be
+    // invisible, and this window may be one they have open.
+    if (container) container.scrollTop = startScrollTop;
+  }
+
+  return { exhausted };
+}
+
+async function scanReadStates(threadIds: string[], budgetMs: number): Promise<ScanReport> {
+  const wanted = new Set(threadIds.map((t) => t.toLowerCase()));
+
+  const states = new Map<string, ReadState>();
+  const seenThreadIds = new Set<string>();
+
   /**
-   * Read whatever is rendered right now, and report how many CONVERSATIONS
-   * that had not been seen before it turned up.
-   *
-   * Progress is counted in new thread ids rather than in row nodes because
-   * Messenger's list recycles: rows scrolling off the top can be removed as
-   * rows arrive at the bottom, so the node count can sit still through a
-   * perfectly productive scroll. Counting nodes would read that as the end of
-   * the list and stop three scrolls in.
-   *
-   * Ids are lowercased on the way in, to match the wanted-set — Messenger's
-   * hrefs carry vanity handles as well as numeric ids, and 'Jane.Doe' and
-   * 'jane.doe' are the same conversation.
+   * Read whatever is rendered right now. Ids are lowercased on the way in, to
+   * match the wanted-set — Messenger's hrefs carry vanity handles as well as
+   * numeric ids, and 'Jane.Doe' and 'jane.doe' are the same conversation.
    */
-  const harvest = (): number => {
+  const harvest = (root: ParentNode, activeThreadId: string | null): number => {
     const pass = harvestRows(root, activeThreadId);
     let added = 0;
     for (const id of pass.seenThreadIds) {
@@ -3500,29 +3545,14 @@ async function scanReadStates(threadIds: string[], budgetMs: number): Promise<Sc
     return n;
   };
 
-  try {
-    harvest();
-    reportScanProgress(resolved(), seenThreadIds.size);
-
-    while (!readScanCancelled && Date.now() < deadline && resolved() < wanted.size) {
-      if (!container) { exhausted = true; break; }
-
-      container.scrollTop += Math.max(200, container.clientHeight * 0.8);
-
-      // Harvesting IS the wait: each poll both collects and asks whether
-      // anything new arrived, so rows that appear mid-wait are picked up rather
-      // than raced past. Requiring several stalls in a row rather than one
-      // keeps a slow network from being mistaken for the end of the list.
-      const grew = !!(await pollFor(() => harvest() > 0, READ_SCAN_ROW_WAIT_MS, 200));
-      reportScanProgress(resolved(), seenThreadIds.size);
-      stalls = grew ? 0 : stalls + 1;
-      if (stalls >= READ_SCAN_STALL_LIMIT) { exhausted = true; break; }
-    }
-  } finally {
-    // Put the list back where the user left it. A scan is meant to be
-    // invisible, and this window may be one they have open.
-    if (container) container.scrollTop = startScrollTop;
-  }
+  const walk = await walkConversationList({
+    budgetMs,
+    harvest,
+    done: () => resolved() >= wanted.size,
+    onProgress: () => reportScanProgress(resolved(), seenThreadIds.size),
+  });
+  if (!walk) return emptyReport('list', Array.from(wanted));
+  const { exhausted } = walk;
 
   return buildReport({
     wanted,
@@ -3546,6 +3576,66 @@ async function scanReadStates(threadIds: string[], budgetMs: number): Promise<Sc
  */
 function reportScanProgress(scanned: number, rowsSeen: number): void {
   void sendBg({ type: 'READ_SCAN_PROGRESS', payload: { scanned, rowsSeen } }).catch(() => { /* see above */ });
+}
+
+// ---- Automations: every unread conversation, not a chosen few ----
+//
+// The reply check asks about a selection and stops once it has found them.
+// The "tag unread conversations" automation (automations.ts) asks the open
+// question — which threads have something unread in them? — so it walks the
+// list to a fixed depth instead, collecting each unread row's thread id and
+// the name it shows (for creating a contact, if the automation is set to).
+//
+// The unread test is harvestRows' own: hasUnreadMessage on the row, and never
+// the conversation currently open. Same rule, same reason — see harvestRows.
+
+/** Most conversations one automation run will look through. */
+const UNREAD_SCAN_MAX_ROWS = 500;
+
+async function scanUnreadThreads(depth: number, budgetMs: number): Promise<UnreadScanReport> {
+  const limit = Math.max(1, Math.min(depth || 100, UNREAD_SCAN_MAX_ROWS));
+  const seen = new Set<string>();
+  const unread = new Map<string, UnreadThread>();
+
+  const harvest = (root: ParentNode, activeThreadId: string | null): number => {
+    let added = 0;
+    for (const row of Array.from(root.querySelectorAll<HTMLElement>('[role="row"]'))) {
+      const link = row.querySelector<HTMLAnchorElement>('a[href*="/t/"]');
+      if (!link) continue;
+      const threadId = extractThreadId(link.href);
+      if (!threadId) continue;
+      const key = threadId.toLowerCase();
+      if (!seen.has(key)) {
+        // Past the depth asked for: rows beyond it are neither counted nor read,
+        // so "look through the most recent 100" means exactly that.
+        if (seen.size >= limit) continue;
+        seen.add(key);
+        added++;
+      }
+      if (threadId === activeThreadId || unread.has(key)) continue;
+      if (hasUnreadMessage(row)) {
+        unread.set(key, { threadId, name: getNameFromLink(link) || undefined, chatUrl: buildChatUrl(threadId, link) });
+      }
+    }
+    return added;
+  };
+
+  const walk = await walkConversationList({
+    budgetMs,
+    harvest,
+    done: () => seen.size >= limit,
+    onProgress: () => {
+      void sendBg({ type: 'AUTOMATION_PROGRESS', payload: { rowsSeen: seen.size, unreadFound: unread.size } })
+        .catch(() => { /* progress only — see reportScanProgress */ });
+    },
+  });
+
+  return {
+    unread: Array.from(unread.values()),
+    rowsSeen: seen.size,
+    exhausted: walk ? walk.exhausted : true,
+    cancelled: readScanCancelled,
+  };
 }
 
 interface SendResult {
@@ -4186,6 +4276,8 @@ function handleCrmRequest(request: any): Promise<unknown> | null {
         Array.isArray(payload.threadIds) ? payload.threadIds.map(String) : [],
         Number(payload.budgetMs) || 0
       );
+    case 'CRM_SCAN_UNREAD_THREADS':
+      return scanUnreadThreads(Number(payload.depth) || 0, Number(payload.budgetMs) || 0);
     default:
       return null;
   }

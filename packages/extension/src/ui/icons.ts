@@ -45,6 +45,10 @@ export const ICON_CAMPAIGNS =
   '<path d="M14.5 1.8 1.6 6.6c-.5.2-.5.9 0 1.1l4.7 1.8 1.8 4.7c.2.5.9.5 1.1 0l4.8-12.9c.2-.5-.3-.9-.8-.7Z" stroke-linejoin="round" />' +
   '<path d="M6.3 9.5 9.8 6" stroke-linecap="round" />';
 
+/** Automations — a lightning bolt. */
+export const ICON_AUTOMATIONS =
+  '<path d="M9.2 1.6 3.4 9.1h4.1l-.9 5.3 5.9-7.6H8.3l.9-5.2Z" stroke-linejoin="round" />';
+
 /** Tags and fields — a luggage tag. */
 export const ICON_TAGS =
   '<path d="M2 7.3V2.6c0-.4.3-.7.7-.7h4.7c.2 0 .4.1.5.2l6 6c.3.3.3.8 0 1.1l-4.7 4.7c-.3.3-.8.3-1.1 0l-6-6a.7.7 0 0 1-.2-.5Z" stroke-linejoin="round" />' +

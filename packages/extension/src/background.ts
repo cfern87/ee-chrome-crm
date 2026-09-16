@@ -95,6 +95,11 @@ import {
 } from './readScan';
 import { MAX_READ_STATE_WRITES } from './mutations';
 import {
+  readAutomations, planTagUnread, isDue, whyNotRunnable,
+  AUTOMATION_RUNS_KEY,
+  type Automation, type AutomationRun, type AutomationRuns, type UnreadScanReport,
+} from './automations';
+import {
   readWebhooks, subscribersOf, buildPayload, deliver, diffContactEvents,
   writeWebhooks,
   type WebhookEvent, type PendingEvent, type WebhookConfig,
@@ -891,8 +896,27 @@ async function applyScanReport(report: ScanReport): Promise<void> {
   }
 }
 
+/**
+ * Why the sender window can't be lent to a scan right now, or null when it can.
+ * The caller must already hold `scanning` — see the claim in startReadScan.
+ *
+ * The scan is the one that yields: it has no deadline and the queue's pacing
+ * does.
+ */
+async function scanWindowBusy(): Promise<string | null> {
+  if (processing) return 'A message is being sent right now. Try again in a moment.';
+  const q = await loadQueue();
+  if (q.inFlight) return 'A message is being sent right now. Try again in a moment.';
+  if (q.nextSendAt && q.nextSendAt - Date.now() < READ_SCAN_SEND_CLEARANCE_MS && !q.paused) {
+    return 'A queued message is about to send. Try again in a minute.';
+  }
+  return null;
+}
+
 async function startReadScan(conversationIds: string[]): Promise<{ success: boolean; error?: string }> {
-  if (scanning) return { success: false, error: 'A reply check is already running.' };
+  if (scanning) {
+    return { success: false, error: runningAutomationId ? 'An automation is running. Try again when it finishes.' : 'A reply check is already running.' };
+  }
 
   // Claimed BEFORE the first await, not after the checks below.
   //
@@ -908,14 +932,9 @@ async function startReadScan(conversationIds: string[]): Promise<{ success: bool
     if (!(await isSignedIn())) return { success: false, error: 'Sign in to check for replies.' };
 
     // The other side of the same race: a send that was already underway when
-    // the claim landed. The scan is the one that yields — it has no deadline
-    // and the queue's pacing does.
-    if (processing) return { success: false, error: 'A message is being sent right now. Try again in a moment.' };
-    const q = await loadQueue();
-    if (q.inFlight) return { success: false, error: 'A message is being sent right now. Try again in a moment.' };
-    if (q.nextSendAt && q.nextSendAt - Date.now() < READ_SCAN_SEND_CLEARANCE_MS && !q.paused) {
-      return { success: false, error: 'A queued message is about to send. Try again in a minute.' };
-    }
+    // the claim landed.
+    const busy = await scanWindowBusy();
+    if (busy) return { success: false, error: busy };
 
     const store = await loadStore();
     const targets = new Map<string, string>(); // thread id -> conversation key
@@ -1020,6 +1039,200 @@ async function cancelReadScan(): Promise<{ success: boolean }> {
 async function dismissReadScan(): Promise<{ success: boolean }> {
   if (!scanning) await setReadScan(idleScan());
   return { success: true };
+}
+
+// ---- Automations ----
+//
+// Saved jobs from the dashboard's Automations section (automations.ts). The one
+// kind so far walks Messenger's conversation list, finds every unread thread,
+// and tags the contacts they belong to.
+//
+// It borrows the sender window exactly as the reply check does, and shares its
+// claim: `scanning` is held for the whole run, so processTick defers, a reply
+// check can't start on top of it, and neither can a second automation. Only the
+// content-script half differs (scanUnreadThreads rather than scanReadStates).
+//
+// Scheduled runs happen on ONE machine — the one holding the sender lease — so
+// two browsers signed into the same account don't each open a Facebook window
+// every hour to apply the same tags. "Run now" works on any machine.
+
+const AUTOMATION_ALARM = 'crm-automations';
+/** How often the schedule is checked. Automations can't be set more often than every 15 minutes. */
+const AUTOMATION_CHECK_MINUTES = 5;
+
+/** The automation holding `scanning`, when it's an automation rather than a reply check. */
+let runningAutomationId: string | null = null;
+
+function ensureAutomationAlarm(): void {
+  try {
+    chrome.alarms?.get(AUTOMATION_ALARM, (existing) => {
+      void chrome.runtime.lastError;
+      if (existing) return;
+      try {
+        chrome.alarms?.create(AUTOMATION_ALARM, {
+          delayInMinutes: AUTOMATION_CHECK_MINUTES,
+          periodInMinutes: AUTOMATION_CHECK_MINUTES,
+        });
+      } catch (e) { console.warn('[CRM] alarms unavailable (automations):', e); }
+    });
+  } catch (e) { console.warn('[CRM] alarms unavailable (automations):', e); }
+}
+
+function getAutomationRuns(): Promise<AutomationRuns> {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(AUTOMATION_RUNS_KEY, (res) => {
+        if (chrome.runtime.lastError) { resolve({}); return; }
+        const raw = res?.[AUTOMATION_RUNS_KEY];
+        resolve(raw && typeof raw === 'object' ? (raw as AutomationRuns) : {});
+      });
+    } catch { resolve({}); }
+  });
+}
+
+// Run records are one map in chrome.storage.local, and progress pings from the
+// content script arrive while the job is also patching it — serialized, or a
+// late progress write could put `running: true` back over a finished run.
+let automationRunsLock: Promise<unknown> = Promise.resolve();
+
+function patchAutomationRun(id: string, patch: Partial<AutomationRun> | AutomationRun, replace = false): Promise<void> {
+  const run = automationRunsLock.then(async () => {
+    const runs = await getAutomationRuns();
+    const base = runs[id];
+    if (!replace && !base) return;
+    const next = replace ? (patch as AutomationRun) : { ...base, ...patch };
+    await new Promise<void>((resolve) => {
+      try { chrome.storage.local.set({ [AUTOMATION_RUNS_KEY]: { ...runs, [id]: next } }, () => { void chrome.runtime.lastError; resolve(); }); }
+      catch { resolve(); }
+    });
+  });
+  automationRunsLock = run.catch(() => { /* keep the chain alive */ });
+  return run;
+}
+
+async function startAutomation(id: string, trigger: AutomationRun['trigger']): Promise<{ success: boolean; error?: string }> {
+  if (scanning) {
+    return { success: false, error: runningAutomationId ? 'Another automation is already running.' : 'A reply check is running. Try again when it finishes.' };
+  }
+
+  // Claimed before the first await, for the reason spelled out in startReadScan.
+  scanning = true;
+  let handedOff = false;
+  try {
+    if (!(await isSignedIn())) return { success: false, error: 'Sign in to run automations.' };
+    const busy = await scanWindowBusy();
+    if (busy) return { success: false, error: busy };
+
+    const store = await loadStore();
+    const automation = readAutomations(store).find((a) => a.id === id);
+    if (!automation) return { success: false, error: 'That automation no longer exists.' };
+    const why = whyNotRunnable(automation, store);
+    if (why) return { success: false, error: why };
+
+    await patchAutomationRun(id, {
+      automationId: id,
+      running: true,
+      phase: 'scanning',
+      trigger,
+      startedAt: Date.now(),
+      rowsSeen: 0,
+    }, true);
+
+    handedOff = true;
+    runningAutomationId = id;
+    void runAutomationJob(automation).finally(() => { scanning = false; runningAutomationId = null; });
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: String((e as Error)?.message || e) };
+  } finally {
+    if (!handedOff) scanning = false;
+  }
+}
+
+async function runAutomationJob(automation: Automation): Promise<void> {
+  const log: string[] = [];
+  const id = automation.id;
+  try {
+    // The feed, not a Messenger URL — see runReadScan for why.
+    const tabId = await ensureSenderTab('https://www.facebook.com/', log);
+    if (tabId == null) throw new Error('Could not open a Facebook window.');
+    if (!(await waitForContentReady(tabId, log, 'list'))) {
+      throw new Error('Facebook did not finish loading.');
+    }
+
+    const report = await sendViaPort<UnreadScanReport>(
+      tabId,
+      { type: 'CRM_SCAN_UNREAD_THREADS', payload: { depth: automation.depth, budgetMs: READ_SCAN_BUDGET_MS } },
+      READ_SCAN_PORT_MS
+    );
+    if (!report || !Array.isArray(report.unread)) throw new Error('The Messenger window stopped responding.');
+
+    await patchAutomationRun(id, { phase: 'saving', rowsSeen: report.rowsSeen, unreadFound: report.unread.length });
+
+    // Planned against a store loaded NOW, not when the run started: the scroll
+    // can take minutes, and in that time the automation may have been edited or
+    // deleted, or contacts tagged by hand.
+    const store = await loadStore();
+    const current = readAutomations(store).find((a) => a.id === id);
+    if (!current) throw new Error('The automation was deleted while it was running.');
+    const plan = planTagUnread(current, report.unread, store);
+
+    const chunks: Mutation[][] = [];
+    for (let i = 0; i < plan.groups.length; i += MAX_READ_STATE_WRITES) {
+      chunks.push(plan.groups.slice(i, i + MAX_READ_STATE_WRITES).flat());
+    }
+    // Paced like the reply check's writes, and for the same storage-quota
+    // reason — see chunkDelayMs.
+    const delay = chunkDelayMs(await isDriveEnabled());
+    for (let i = 0; i < chunks.length; i++) {
+      const res = await mutateStore(chunks[i]);
+      if (res.changed && i < chunks.length - 1) await new Promise((r) => setTimeout(r, delay));
+    }
+
+    await patchAutomationRun(id, {
+      running: false,
+      phase: undefined,
+      finishedAt: Date.now(),
+      rowsSeen: report.rowsSeen,
+      unreadFound: report.unread.length,
+      tagged: plan.tagged,
+      alreadyTagged: plan.alreadyTagged,
+      created: plan.created,
+      notInCrm: plan.notInCrm,
+      exhausted: report.exhausted,
+      cancelled: report.cancelled,
+      error: undefined,
+    });
+  } catch (e) {
+    console.warn('[CRM] automation failed', e, log);
+    await patchAutomationRun(id, { running: false, phase: undefined, finishedAt: Date.now(), error: String((e as Error)?.message || e) });
+  }
+}
+
+/** Stop the running automation. Like cancelReadScan: the scan returns what it has, and that is still applied. */
+async function cancelAutomation(): Promise<{ success: boolean }> {
+  if (!runningAutomationId) return { success: true };
+  const tabId = await getStoredSenderTab();
+  if (tabId != null) await sendToTab(tabId, { type: 'CRM_CANCEL_READ_SCAN' });
+  return { success: true };
+}
+
+/** The schedule. Starts at most one due automation per check; the rest wait for the next. */
+async function runDueAutomations(): Promise<void> {
+  if (scanning) return;
+  try {
+    if (!(await isSignedIn())) return;
+    if (!(await canSendFromThisMachine())) return;
+    const store = await loadStore();
+    const runs = await getAutomationRuns();
+    const now = Date.now();
+    const due = readAutomations(store).find((a) => isDue(a, runs[a.id]?.startedAt, now) && !whyNotRunnable(a, store));
+    if (!due) return;
+    const res = await startAutomation(due.id, 'schedule');
+    if (!res.success) console.info('[CRM] scheduled automation deferred:', res.error);
+  } catch (e) {
+    console.warn('[CRM] automation schedule check failed', e);
+  }
 }
 
 // ---- multi-machine coordination ----
@@ -1746,6 +1959,7 @@ try {
     else if (alarm.name === WATCHDOG_ALARM) watchdog();
     else if (alarm.name === DRIVE_SYNC_ALARM) void syncDriveNow();
     else if (alarm.name === ENTITLEMENT_ALARM) void refreshEntitlement().catch(() => { /* offline — cache stands */ });
+    else if (alarm.name === AUTOMATION_ALARM) void runDueAutomations();
 
   });
 } catch (e) {
@@ -1759,6 +1973,7 @@ void seedQueueFromLegacyCampaign();
 ensureWatchdog();
 ensureDriveSync();
 ensureEntitlementCheck();
+ensureAutomationAlarm();
 
 
 // On startup, push up any local edits that didn't reach Drive last session.
@@ -2100,6 +2315,37 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         }
         case 'DISMISS_READ_SCAN': {
           sendResponse(await dismissReadScan());
+          break;
+        }
+
+        // ---- automations ----
+        //
+        // Not in QUEUE_MUTATING, for the same reason as the reply check.
+        case 'RUN_AUTOMATION': {
+          sendResponse(await startAutomation(String(request.payload?.automationId || ''), 'manual'));
+          break;
+        }
+        case 'CANCEL_AUTOMATION': {
+          sendResponse(await cancelAutomation());
+          break;
+        }
+        case 'GET_AUTOMATION_RUNS': {
+          sendResponse({ runs: await getAutomationRuns(), runningId: runningAutomationId });
+          break;
+        }
+        case 'AUTOMATION_PROGRESS': {
+          // Only while one is actually scanning — a ping that arrives after the
+          // job moved on to saving (or finished) must not rewind it.
+          if (runningAutomationId) {
+            const runs = await getAutomationRuns();
+            if (runs[runningAutomationId]?.phase === 'scanning') {
+              await patchAutomationRun(runningAutomationId, {
+                rowsSeen: Number(request.payload?.rowsSeen) || 0,
+                unreadFound: Number(request.payload?.unreadFound) || 0,
+              });
+            }
+          }
+          sendResponse({ ok: true });
           break;
         }
         // Sent by the content script as it scrolls, so the progress bar moves
