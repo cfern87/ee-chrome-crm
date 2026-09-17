@@ -16,9 +16,47 @@
 
 const ROW_SELECTOR = 'a[href*="/t/"]';
 
-/** Is Messenger showing a conversation list anywhere on this page right now? */
+/**
+ * A row in an actual conversation LIST, which is a stricter thing than a link
+ * to a thread. Messenger builds list rows as `[role="row"]`; the other places a
+ * /t/ link turns up do not.
+ *
+ * @see hasConversationListRows for why the difference cost us a whole feature.
+ */
+const LIST_ROW_SELECTOR = '[role="row"] a[href*="/t/"]';
+
+/**
+ * Is there a link to a conversation anywhere on this page?
+ *
+ * What the CHIP INJECTOR asks, and deliberately loose: every /t/ link is
+ * somewhere a chip belongs, including the feed's right-hand Contacts rail,
+ * which is not a conversation list but is a perfectly good place to show
+ * someone's tags.
+ *
+ * Do NOT use this to decide whether a list is on screen to be scanned — see
+ * hasConversationListRows.
+ */
 export function hasConversationRows(root: ParentNode = document): boolean {
   return !!root.querySelector(ROW_SELECTOR);
+}
+
+/**
+ * Is Messenger showing a conversation LIST — rows that can be walked — right
+ * now?
+ *
+ * The distinction is not academic. The reply check and the unread-tagging
+ * automation both run on facebook.com and both began by asking "is the list
+ * already up?" with hasConversationRows. On the ordinary feed the answer was
+ * YES — measured against the live site on 2026-09-17, the feed carries 36
+ * `a[href*="/t/"]` links in the Contacts rail and zero conversation rows — so
+ * neither scan ever opened the chat dropdown. Each then looked for rows it
+ * could walk, found none, waited out its hydration timeout and reported "0
+ * conversations checked, 0 unread", which is exactly what the user saw.
+ *
+ * So this asks for a row, not a link.
+ */
+export function hasConversationListRows(root: ParentNode = document): boolean {
+  return !!root.querySelector(LIST_ROW_SELECTOR);
 }
 
 /**

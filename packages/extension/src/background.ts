@@ -1166,6 +1166,9 @@ async function runAutomationJob(automation: Automation): Promise<void> {
       READ_SCAN_PORT_MS
     );
     if (!report || !Array.isArray(report.unread)) throw new Error('The Messenger window stopped responding.');
+    // "Couldn't look" is not "nothing to find" — say so rather than recording a
+    // confident zero.
+    if (report.unreachable) throw new Error('Could not open Messenger’s conversation list in the background window.');
 
     await patchAutomationRun(id, { phase: 'saving', rowsSeen: report.rowsSeen, unreadFound: report.unread.length });
 

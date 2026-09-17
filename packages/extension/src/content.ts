@@ -34,7 +34,7 @@ import { buildThreadIndex, isUnboundOrphan, planOrphanBinds, threadAliases } fro
 import type { ThreadRow } from './contacts';
 import { extractNameFromLink, extractActiveThreadName, extractProfilePageName, looksLikePersonName, isDamagedName } from './names';
 import { normalizeText } from './text';
-import { hasConversationRows, mutationsAddedRows } from './sidebarTargets';
+import { hasConversationRows, hasConversationListRows, mutationsAddedRows } from './sidebarTargets';
 import {
   DELIVERY_FAILED_PATTERNS,
   DELIVERY_SENT_PATTERNS,
@@ -3389,9 +3389,45 @@ async function openChatDropdown(): Promise<boolean> {
 
   for (const button of buttons) {
     try { button.click(); } catch { continue; }
-    if (await pollFor(() => hasConversationRows(), 4_000, 250)) return true;
+    if (await pollFor(() => hasConversationListRows(), 4_000, 250)) return true;
   }
-  return hasConversationRows();
+  return hasConversationListRows();
+}
+
+/**
+ * Messenger's own list filters — the "All / Unread / Groups / Communities" tabs
+ * at the top of both the chat dropdown and the Messenger page.
+ *
+ * The Unread tab is the single most valuable thing on either surface for this
+ * CRM, and we were ignoring it. Measured live on 2026-09-17: the dropdown's All
+ * list renders about 16 conversations and does NOT paginate — it ends in "See
+ * all in Messenger" — so no amount of scrolling reaches further, and a scan for
+ * unread threads could never see past the most recent handful. Selecting Unread
+ * asks Facebook to do the filtering and listed 29-30 conversations instead, all
+ * of them unread.
+ *
+ * Matched on the label's START rather than its whole text: the tab's accessible
+ * name carries a state suffix on some layouts ("AllHas new content").
+ */
+type ChatFilter = 'all' | 'unread';
+
+async function selectChatFilter(filter: ChatFilter): Promise<boolean> {
+  const want = filter === 'unread' ? /^unread\b/i : /^all\b/i;
+  const tabs = Array.from(document.querySelectorAll<HTMLElement>('[role="tab"]'))
+    .filter((t) => want.test(normalizeText(t.getAttribute('aria-label') || t.textContent || '')));
+  if (!tabs.length) return false;
+
+  for (const tab of tabs) {
+    if (tab.getAttribute('aria-selected') === 'true') return true;
+    try { tab.click(); } catch { continue; }
+    // The list is rebuilt, so wait for rows to come back rather than reading
+    // the tab's own aria-selected, which Facebook updates on its own schedule.
+    if (await pollFor(() => hasConversationListRows(), 4_000, 250)) {
+      await sleep(600); // let the first screenful settle before harvesting
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -3460,14 +3496,24 @@ async function walkConversationList(opts: {
   harvest: (root: ParentNode, activeThreadId: string | null) => number;
   done: () => boolean;
   onProgress: () => void;
+  /** Which of Messenger's own list filters to walk. Omitted = whatever is showing. */
+  filter?: ChatFilter;
 }): Promise<{ exhausted: boolean } | null> {
-  readScanCancelled = false;
+  if (readScanCancelled) return { exhausted: false };
 
   // The list has to be ON SCREEN before anything can be read off it, and on the
   // feed that means opening the chat dropdown ourselves. See openChatDropdown
   // for why the scan is run from there rather than from Messenger proper.
-  if (!hasConversationRows()) await openChatDropdown();
-  if (!hasConversationRows()) return null;
+  //
+  // Asked with the STRICT predicate. The loose one is true on any page carrying
+  // a /t/ link — the feed's Contacts rail alone supplies dozens — which is how
+  // both scans used to conclude the list was already up, never open the
+  // dropdown, and report nothing at all. See hasConversationListRows.
+  if (!hasConversationListRows()) await openChatDropdown();
+  if (!hasConversationListRows()) return null;
+
+  if (opts.filter) await selectChatFilter(opts.filter);
+  if (!hasConversationListRows()) return null;
 
   // Give the list a moment to hydrate — a scan that starts on an empty pane
   // would call the list exhausted before Messenger had drawn a single row.
@@ -3509,7 +3555,40 @@ async function walkConversationList(opts: {
   return { exhausted };
 }
 
+/**
+ * Walk the Unread list and then the All list, harvesting both.
+ *
+ * Both scans want both, for different halves of their answer. Unread is where
+ * the evidence is — it is Facebook's own filter, it reaches conversations the
+ * All list never renders (which stops at ~16 and does not paginate), and every
+ * row on it is by definition a thread with something waiting. All is what says
+ * a thread was LOOKED at and had nothing to say, which is how "no reply" stays
+ * distinguishable from "never got to them".
+ *
+ * The budget is split between the passes so a slow Unread list can't spend the
+ * whole allowance and leave nothing for the second.
+ */
+async function walkBothFilters(opts: {
+  budgetMs: number;
+  harvest: (root: ParentNode, activeThreadId: string | null) => number;
+  done: () => boolean;
+  onProgress: () => void;
+}): Promise<{ exhausted: boolean; reached: boolean }> {
+  const budget = Math.min(opts.budgetMs || READ_SCAN_MAX_MS, READ_SCAN_MAX_MS);
+  const unread = await walkConversationList({ ...opts, filter: 'unread', budgetMs: Math.round(budget / 2) });
+  if (readScanCancelled || opts.done()) {
+    return { exhausted: !!unread?.exhausted, reached: !!unread };
+  }
+  const all = await walkConversationList({ ...opts, filter: 'all', budgetMs: Math.round(budget / 2) });
+  return {
+    // Exhausted only when the pass that can actually run out did.
+    exhausted: !!all?.exhausted,
+    reached: !!unread || !!all,
+  };
+}
+
 async function scanReadStates(threadIds: string[], budgetMs: number): Promise<ScanReport> {
+  readScanCancelled = false;
   const wanted = new Set(threadIds.map((t) => t.toLowerCase()));
 
   const states = new Map<string, ReadState>();
@@ -3540,13 +3619,13 @@ async function scanReadStates(threadIds: string[], budgetMs: number): Promise<Sc
     return n;
   };
 
-  const walk = await walkConversationList({
+  const walk = await walkBothFilters({
     budgetMs,
     harvest,
     done: () => resolved() >= wanted.size,
     onProgress: () => reportScanProgress(resolved(), seenThreadIds.size),
   });
-  if (!walk) return emptyReport('list', Array.from(wanted));
+  if (!walk.reached) return emptyReport('list', Array.from(wanted));
   const { exhausted } = walk;
 
   return buildReport({
@@ -3578,8 +3657,13 @@ function reportScanProgress(scanned: number, rowsSeen: number): void {
 // The reply check asks about a selection and stops once it has found them.
 // The "tag unread conversations" automation (automations.ts) asks the open
 // question — which threads have something unread in them? — so it walks the
-// list to a fixed depth instead, collecting each unread row's thread id and
-// the name it shows (for creating a contact, if the automation is set to).
+// list collecting each unread row's thread id and the name it shows (for
+// creating a contact, if the automation is set to).
+//
+// It walks Messenger's UNREAD filter first (see selectChatFilter), which is
+// both the complete answer and a far shorter walk than scrolling everything and
+// testing each row — and then the All list up to the depth asked for, which
+// catches anything the filter's own view hasn't caught up with yet.
 //
 // The unread test is harvestRows' own: hasUnreadMessage on the row, and never
 // the conversation currently open. Same rule, same reason — see harvestRows.
@@ -3588,9 +3672,14 @@ function reportScanProgress(scanned: number, rowsSeen: number): void {
 const UNREAD_SCAN_MAX_ROWS = 500;
 
 async function scanUnreadThreads(depth: number, budgetMs: number): Promise<UnreadScanReport> {
+  readScanCancelled = false;
   const limit = Math.max(1, Math.min(depth || 100, UNREAD_SCAN_MAX_ROWS));
   const seen = new Set<string>();
   const unread = new Map<string, UnreadThread>();
+  // The depth cap applies to the All pass only. On the Unread pass every row IS
+  // an answer, and cutting that short at a number the user picked to mean "how
+  // far back to look" would silently drop unread threads it had already found.
+  let capped = true;
 
   const harvest = (root: ParentNode, activeThreadId: string | null): number => {
     let added = 0;
@@ -3603,7 +3692,7 @@ async function scanUnreadThreads(depth: number, budgetMs: number): Promise<Unrea
       if (!seen.has(key)) {
         // Past the depth asked for: rows beyond it are neither counted nor read,
         // so "look through the most recent 100" means exactly that.
-        if (seen.size >= limit) continue;
+        if (capped && seen.size >= limit) continue;
         seen.add(key);
         added++;
       }
@@ -3615,21 +3704,41 @@ async function scanUnreadThreads(depth: number, budgetMs: number): Promise<Unrea
     return added;
   };
 
-  const walk = await walkConversationList({
-    budgetMs,
+  const onProgress = () => {
+    void sendBg({ type: 'AUTOMATION_PROGRESS', payload: { rowsSeen: seen.size, unreadFound: unread.size } })
+      .catch(() => { /* progress only — see reportScanProgress */ });
+  };
+
+  const budget = Math.min(budgetMs || READ_SCAN_MAX_MS, READ_SCAN_MAX_MS);
+
+  capped = false;
+  const unreadPass = await walkConversationList({
+    budgetMs: Math.round(budget / 2),
     harvest,
-    done: () => seen.size >= limit,
-    onProgress: () => {
-      void sendBg({ type: 'AUTOMATION_PROGRESS', payload: { rowsSeen: seen.size, unreadFound: unread.size } })
-        .catch(() => { /* progress only — see reportScanProgress */ });
-    },
+    filter: 'unread',
+    done: () => false, // walk the whole filtered list; it only holds answers
+    onProgress,
   });
+
+  capped = true;
+  const allPass = readScanCancelled
+    ? null
+    : await walkConversationList({
+        budgetMs: Math.round(budget / 2),
+        harvest,
+        filter: 'all',
+        done: () => seen.size >= limit,
+        onProgress,
+      });
 
   return {
     unread: Array.from(unread.values()),
     rowsSeen: seen.size,
-    exhausted: walk ? walk.exhausted : true,
+    exhausted: allPass ? allPass.exhausted : true,
     cancelled: readScanCancelled,
+    // Neither pass could even find a list to read — an empty result here means
+    // "we couldn't look", not "you have no unread messages".
+    unreachable: !unreadPass && !allPass,
   };
 }
 

@@ -8,7 +8,7 @@
 // that was broken, rows arriving later.
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { hasConversationRows, mutationsAddedRows } from './sidebarTargets';
+import { hasConversationRows, hasConversationListRows, mutationsAddedRows } from './sidebarTargets';
 
 afterEach(() => { document.body.innerHTML = ''; });
 
@@ -38,6 +38,29 @@ describe('hasConversationRows', () => {
 
   it('is false on an empty page', () => {
     expect(hasConversationRows()).toBe(false);
+  });
+});
+
+// The regression that made both scans report "0 conversations checked". The
+// feed's right-hand Contacts rail links to /t/ without being a conversation
+// list, so the loose predicate said the list was already up and the scans never
+// opened the chat dropdown. Measured live: 36 such links, 0 rows.
+describe('hasConversationListRows', () => {
+  const railLink = '<div><a href="/messages/t/99001/"><span>Dana Ellis</span></a></div>';
+
+  it('is false on a feed whose only thread links are the Contacts rail', () => {
+    document.body.innerHTML = `<div id="feed"><article>A post</article></div><div>${railLink.repeat(3)}</div>`;
+    expect(hasConversationRows()).toBe(true);      // loose: chips belong here
+    expect(hasConversationListRows()).toBe(false); // strict: nothing to walk
+  });
+
+  it('is true once the chat dropdown renders real rows', () => {
+    document.body.innerHTML = `<div id="feed">${railLink}</div><div role="dialog">${row('12345')}</div>`;
+    expect(hasConversationListRows()).toBe(true);
+  });
+
+  it('is false on an empty page', () => {
+    expect(hasConversationListRows()).toBe(false);
   });
 });
 

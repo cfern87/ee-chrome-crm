@@ -231,6 +231,13 @@ export interface UnreadScanReport {
   /** The list ran out before the depth was reached. */
   exhausted: boolean;
   cancelled: boolean;
+  /**
+   * No conversation list could be put on screen at all, so nothing was looked
+   * at. Reported separately because an empty `unread` would otherwise read as
+   * "you have no unread messages" — which is exactly how a scan that silently
+   * never opened Messenger's list went unnoticed.
+   */
+  unreachable?: boolean;
 }
 
 export interface TagUnreadPlan {
