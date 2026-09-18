@@ -367,6 +367,22 @@ function ConditionRow({ cond, fields, ctx, tagGrouping, onChange, onRemove }: Co
 
       case 'one':
       default:
+        // A funnel condition compares against one of the funnel's own stages,
+        // numbered so the order being compared is visible in the picker.
+        if (kind === 'funnelStage') {
+          return (
+            <select
+              value={cond.value ?? ''}
+              onChange={(e) => onChange({ ...cond, value: e.target.value })}
+              style={{ ...selectStyle, minWidth: 130 }}
+            >
+              <option value="" disabled>choose a stage…</option>
+              {(field?.stages || []).map((st, i) => (
+                <option key={st.id} value={st.id}>{i + 1}. {st.name}</option>
+              ))}
+            </select>
+          );
+        }
         return (
           <input
             type={valueInputType}
@@ -813,7 +829,7 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
     () => ({ now: Date.now(), tags, tagGroups, fieldDefs }),
     [tags, tagGroups, fieldDefs]
   );
-  const fields = useMemo(() => buildFields(fieldDefs), [fieldDefs]);
+  const fields = useMemo(() => buildFields(fieldDefs, tags, tagGroups), [fieldDefs, tags, tagGroups]);
   const empty = isQueryEmpty(query);
   // One toggle for every tag picker in this builder — see SEARCH_TAGS_GROUPED_KEY.
   const [tagsGrouped, toggleTagsGrouped] = useSearchTagGrouping();

@@ -36,7 +36,7 @@ export interface FunnelView {
  * is "reached 4". The next stage change cleans the rest up as a side effect —
  * see stageEditsFor, which clears every stage it isn't setting.
  */
-function furthestStage(conv: Conversation, stages: Tag[]): number {
+export function furthestStage(conv: Conversation, stages: { id: string }[]): number {
   let found = -1;
   for (let i = 0; i < stages.length; i++) {
     if (conv.tags.includes(stages[i].id)) found = i;
@@ -44,32 +44,43 @@ function furthestStage(conv: Conversation, stages: Tag[]): number {
   return found;
 }
 
+/** A funnel group and its stages in order — the contact-independent half of a FunnelView. */
+export interface FunnelStages {
+  group: TagGroup;
+  stages: Tag[];
+}
+
 /**
- * Every funnel group in the store, in group order, with this contact's position
- * in each.
+ * Every funnel group in the store, in group order, with its stages in order.
  *
  * A funnel group with no tags yet is dropped: an empty bar is a row of chrome
  * that can't be clicked and says nothing. Ticking the checkbox before adding
  * the stages is the obvious order to do it in, so this is a normal state to
  * pass through rather than a misconfiguration worth flagging.
  */
-export function funnelsFor(
-  conv: Conversation,
-  tags: Record<string, Tag>,
-  tagGroups: Record<string, TagGroup>
-): FunnelView[] {
+export function funnelStages(tags: Record<string, Tag>, tagGroups: Record<string, TagGroup>): FunnelStages[] {
   const groups = Object.values(tagGroups)
     .filter((g) => g.funnel)
     .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
   if (!groups.length) return [];
 
-  const out: FunnelView[] = [];
+  const out: FunnelStages[] = [];
   for (const group of groups) {
     const stages = Object.values(tags).filter((t) => t.groupId === group.id).sort(tagDisplayOrder);
-    if (!stages.length) continue;
-    out.push({ group, stages, currentIndex: furthestStage(conv, stages) });
+    if (stages.length) out.push({ group, stages });
   }
   return out;
+}
+
+/** Every funnel group in the store, in group order, with this contact's position in each. */
+export function funnelsFor(
+  conv: Conversation,
+  tags: Record<string, Tag>,
+  tagGroups: Record<string, TagGroup>
+): FunnelView[] {
+  return funnelStages(tags, tagGroups).map(({ group, stages }) => ({
+    group, stages, currentIndex: furthestStage(conv, stages),
+  }));
 }
 
 /** The tag ids to add and to remove to move a contact to a given stage. */

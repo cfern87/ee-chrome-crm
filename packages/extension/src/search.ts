@@ -15,6 +15,7 @@
 
 import type { Conversation, Tag, TagGroup, CustomFieldDef } from './storage';
 import { lastTaggedAt, firstTaggedAt } from './storage';
+import { funnelStages, furthestStage } from './funnel';
 import {
   openTasksOf, doneTasksOf, overdueCount, nextDueAt, lastCompletedAt, lastTaskCreatedAt, priorityOf,
 } from './tasks';
@@ -105,7 +106,8 @@ export type FieldKind =
   | 'tagGroups'
   | 'tagDate'
   | 'boolean'
-  | 'enum';
+  | 'enum'
+  | 'funnelStage';
 
 export interface FieldDef {
   key: string;
@@ -116,6 +118,12 @@ export interface FieldDef {
   hint?: string;
   /** Choices for `enum` fields. */
   options?: string[];
+  /**
+   * For `funnelStage` fields: the funnel's stages (tag ids and names) in
+   * funnel order. Read at evaluation time, so "at or before Qualified" follows
+   * the stages if they are later dragged into a different order.
+   */
+  stages?: { id: string; name: string }[];
 }
 
 /** Fields that exist regardless of how the user has configured their CRM. */
@@ -190,8 +198,28 @@ const CUSTOM_KIND: Record<CustomFieldDef['type'], FieldKind> = {
   select: 'enum',
 };
 
-/** Every searchable field, including the user's custom field definitions. */
-export function buildFields(fieldDefs: Record<string, CustomFieldDef>): FieldDef[] {
+const FUNNEL_PREFIX = 'funnel:';
+
+/**
+ * Every searchable field, including the user's custom field definitions and one
+ * position field per funnel group (see funnel.ts). Funnel fields are keyed by
+ * GROUP id, so a preset survives its stages being renamed or reordered; turning
+ * funnel mode off (or deleting the group) makes the field "no longer exist",
+ * and the condition is ignored rather than silently matching nobody.
+ */
+export function buildFields(
+  fieldDefs: Record<string, CustomFieldDef>,
+  tags: Record<string, Tag> = {},
+  tagGroups: Record<string, TagGroup> = {}
+): FieldDef[] {
+  const funnels = funnelStages(tags, tagGroups).map<FieldDef>(({ group, stages }) => ({
+    key: FUNNEL_PREFIX + group.id,
+    label: `${group.name} (stage)`,
+    kind: 'funnelStage',
+    category: 'Funnels',
+    hint: 'Compares by position in the funnel. Contacts who haven\'t entered it match none of the before/after options — add "hasn\'t started" with OR to include them.',
+    stages: stages.map((t) => ({ id: t.id, name: t.name })),
+  }));
   const custom = Object.values(fieldDefs)
     .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt)
     .map<FieldDef>((d) => ({
@@ -201,7 +229,7 @@ export function buildFields(fieldDefs: Record<string, CustomFieldDef>): FieldDef
       category: 'Custom fields',
       options: d.type === 'select' ? d.options || [] : undefined,
     }));
-  return [...BUILTIN_FIELDS, ...custom];
+  return [...BUILTIN_FIELDS, ...funnels, ...custom];
 }
 
 export function findField(fields: FieldDef[], key: string): FieldDef | undefined {
@@ -272,6 +300,21 @@ const TAG_GROUP_OPS: OperatorDef[] = [
   { op: 'inNone', label: 'has no tag in', arity: 'multi' },
 ];
 
+// Ordered comparisons against one chosen stage. "Before" and "after" only ever
+// match contacts who are IN the funnel: someone who hasn't started isn't at
+// stage 0.5, and folding them into "at or before Qualified" would make the most
+// common question — "who is stuck early?" — return everyone never touched.
+const FUNNEL_OPS: OperatorDef[] = [
+  { op: 'atOrBefore', label: 'is at or before', arity: 'one' },
+  { op: 'atOrAfter', label: 'is at or after', arity: 'one' },
+  { op: 'at', label: 'is at', arity: 'one' },
+  { op: 'notAt', label: 'is not at', arity: 'one' },
+  { op: 'before', label: 'is before', arity: 'one' },
+  { op: 'after', label: 'is after', arity: 'one' },
+  { op: 'isNotEmpty', label: 'has started', arity: 'none' },
+  { op: 'isEmpty', label: "hasn't started", arity: 'none' },
+];
+
 const BOOLEAN_OPS: OperatorDef[] = [
   { op: 'isTrue', label: 'is yes', arity: 'none' },
   { op: 'isFalse', label: 'is no', arity: 'none' },
@@ -293,6 +336,7 @@ const OPS_BY_KIND: Record<FieldKind, OperatorDef[]> = {
   tagDate: DATE_OPS,
   boolean: BOOLEAN_OPS,
   enum: ENUM_OPS,
+  funnelStage: FUNNEL_OPS,
 };
 
 export function operatorsFor(kind: FieldKind): OperatorDef[] {
@@ -419,6 +463,11 @@ export function conditionIssue(cond: Condition, fields: FieldDef[]): string | nu
     }
     case 'one':
     default: {
+      if (field.kind === 'funnelStage') {
+        if (!cond.value) return 'Choose a stage.';
+        if (!field.stages?.some((s) => s.id === cond.value)) return 'That stage is no longer in this funnel.';
+        return null;
+      }
       if (cond.value === undefined || cond.value === '') return 'Enter a value.';
       if (field.kind === 'number' && !Number.isFinite(Number(cond.value))) return 'Enter a number.';
       if (cond.op === 'regex') {
@@ -682,6 +731,29 @@ function matchesTagDate(conv: Conversation, cond: Condition, now: number): boole
   return scope.some((id) => stamps[id] !== undefined && matchesDate(stamps[id], cond, now));
 }
 
+/**
+ * Position in a funnel against one chosen stage. The contact's position is the
+ * FURTHEST stage they hold, the same reading the funnel bar uses (funnel.ts).
+ */
+function matchesFunnelStage(conv: Conversation, cond: Condition, field: FieldDef): boolean {
+  const stages = field.stages || [];
+  const at = furthestStage(conv, stages);
+  if (cond.op === 'isEmpty') return at < 0;
+  if (cond.op === 'isNotEmpty') return at >= 0;
+  const target = stages.findIndex((s) => s.id === cond.value);
+  if (target < 0) return true; // unreachable: conditionIssue flags it first
+  if (cond.op === 'notAt') return at !== target;
+  if (at < 0) return false;
+  switch (cond.op) {
+    case 'at': return at === target;
+    case 'atOrBefore': return at <= target;
+    case 'atOrAfter': return at >= target;
+    case 'before': return at < target;
+    case 'after': return at > target;
+    default: return true;
+  }
+}
+
 function matchesEnum(raw: string, cond: Condition): boolean {
   const want = cond.values || [];
   switch (cond.op) {
@@ -726,6 +798,7 @@ function evaluateCondition(conv: Conversation, cond: Condition, fields: FieldDef
     case 'tags': return matchesTags(conv.tags, cond);
     case 'tagGroups': return matchesTagGroups(conv, cond, ctx);
     case 'tagDate': return matchesTagDate(conv, cond, ctx.now);
+    case 'funnelStage': return matchesFunnelStage(conv, cond, field);
 
     case 'boolean': {
       const v = cond.field === 'archived' ? !!conv.archived : !!conv.nameManual;
@@ -766,13 +839,13 @@ function evaluateNode(conv: Conversation, node: QueryNode, fields: FieldDef[], c
 /** Does this contact satisfy the query? An empty query matches everything. */
 export function matchesQuery(conv: Conversation, query: QueryGroup | null | undefined, ctx: QueryContext): boolean {
   if (!query) return true;
-  return evaluateNode(conv, query, buildFields(ctx.fieldDefs), ctx);
+  return evaluateNode(conv, query, buildFields(ctx.fieldDefs, ctx.tags, ctx.tagGroups), ctx);
 }
 
 /** Filter a list in one pass, building the field registry only once. */
 export function filterByQuery(convs: Conversation[], query: QueryGroup | null | undefined, ctx: QueryContext): Conversation[] {
   if (isQueryEmpty(query)) return convs;
-  const fields = buildFields(ctx.fieldDefs);
+  const fields = buildFields(ctx.fieldDefs, ctx.tags, ctx.tagGroups);
   return convs.filter((c) => evaluateNode(c, query!, fields, ctx));
 }
 
@@ -813,6 +886,9 @@ function describeCondition(cond: Condition, fields: FieldDef[], ctx: QueryContex
     }
     case 'one':
     default:
+      if (field.kind === 'funnelStage') {
+        return `${phrase} ${quote(field.stages?.find((s) => s.id === cond.value)?.name ?? tagName(cond.value || ''))}`;
+      }
       return `${phrase} ${quote(cond.value)}`;
   }
 }
@@ -835,7 +911,7 @@ function describeNode(node: QueryNode, fields: FieldDef[], ctx: QueryContext, de
 /** One-line plain-English rendering of a query, for preset lists and tooltips. */
 export function describeQuery(query: QueryGroup | null | undefined, ctx: QueryContext): string {
   if (isQueryEmpty(query)) return 'All contacts';
-  return describeNode(query!, buildFields(ctx.fieldDefs), ctx, 0) || 'All contacts';
+  return describeNode(query!, buildFields(ctx.fieldDefs, ctx.tags, ctx.tagGroups), ctx, 0) || 'All contacts';
 }
 
 // ---------------------------------------------------------------------------
