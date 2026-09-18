@@ -21,7 +21,7 @@ import { bucketTags, showsGroupLabels, type TagBucket } from './tagGrouping';
 import { funnelsFor, stageEditsFor, isNoOpStageEdit, describeStage, stagePosition, stageTitle, type FunnelView } from './funnel';
 import { readPresetActions, stepsFor, describePreset, isDestructive, type PresetAction } from './presets';
 import {
-  openTasksOf, sortTasks, isOverdue, formatDue, priorityOf, newTask, dueFromOffset, TASK_TITLE_MAX,
+  openTasksOf, sortTasks, isOverdue, formatDue, priorityOf, newTask, dueFromOffset, inputsToDue, TASK_TITLE_MAX,
 } from './tasks';
 import { PRODUCT_NAME } from './product';
 import { readableFill, chipOutline, ON_DARK } from './ui/contrast';
@@ -1190,9 +1190,13 @@ let deleteArmed = false;
 let presetArmed: string | null = null;
 
 // In-progress "add follow-up" row, module-scoped for the same reason as
-// newTagDraft. `due` is a day offset as a string ('' = no due date); tomorrow
-// is the default because "follow up" almost never means "later today".
-const taskDraft: { title: string; due: string } = { title: '', due: '1' };
+// newTagDraft. `due` is a day offset as a string ('' = no due date, 'custom' =
+// use `date`), and `date` is the YYYY-MM-DD a custom pick left behind.
+//
+// Three days is the default because "follow up" almost never means "later
+// today", and no longer tomorrow: same-day-plus-one collides with the rest of
+// the workflow, so it isn't offered here at all.
+const taskDraft: { title: string; due: string; date: string } = { title: '', due: '3', date: '' };
 let taskTitleFocused = false;
 
 /** How many open follow-ups the panel lists before pointing at the dashboard. */
@@ -1421,6 +1425,13 @@ function tasksSectionHtml(conv: Conversation): string {
     .map((c) => `<option value="${c.value}"${c.value === taskDraft.due ? ' selected' : ''}>${c.label}</option>`)
     .join('');
 
+  // The date field only exists while "Pick a date…" is chosen. It sits on its
+  // own line: the add row is already three controls wide in a 320px panel.
+  const datePicker = taskDraft.due === PANEL_DUE_CUSTOM
+    ? `<input type="date" id="fb-crm-task-date" class="fb-crm-task-date" aria-label="Due date"
+         min="${dateInputValue(Date.now())}" value="${escapeAttr(taskDraft.date)}" />`
+    : '';
+
   return `
     <div class="fb-crm-section-title-row">
       <div class="fb-crm-section-title">Follow-ups</div>
@@ -1431,7 +1442,8 @@ function tasksSectionHtml(conv: Conversation): string {
       <input type="text" id="fb-crm-task-title" maxlength="${TASK_TITLE_MAX}" placeholder="Add a follow-up…" aria-label="New follow-up" />
       <select id="fb-crm-task-due" aria-label="Due">${dueOptions}</select>
       <button id="fb-crm-task-add">Add</button>
-    </div>`;
+    </div>
+    ${datePicker}`;
 }
 
 /** escapeHtml only escapes text; task titles also land inside quoted attributes. */
@@ -1439,12 +1451,26 @@ function escapeAttr(s: string): string {
   return escapeHtml(s).replace(/"/g, '&quot;');
 }
 
+/** A timestamp as the YYYY-MM-DD a date input wants, in local time. */
+function dateInputValue(ts: number): string {
+  const d = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// Day offsets, plus the two that aren't offsets: no date at all, and a date the
+// user picks. The offsets are the common runs; the picker is what stops the
+// list having to grow a month, a quarter and a year option for the follow-up
+// that genuinely is that far out.
+const PANEL_DUE_CUSTOM = 'custom';
+
 const PANEL_DUE_CHOICES: { value: string; label: string }[] = [
   { value: '0', label: 'Today' },
-  { value: '1', label: 'Tomorrow' },
   { value: '3', label: '3 days' },
   { value: '7', label: '1 week' },
   { value: '14', label: '2 weeks' },
+  { value: '30', label: '1 month' },
+  { value: PANEL_DUE_CUSTOM, label: 'Pick a date…' },
   { value: '', label: 'No date' },
 ];
 
@@ -1959,6 +1985,7 @@ function wirePanelTasks(threadId: string) {
   const titleEl = panelEl.querySelector<HTMLInputElement>('#fb-crm-task-title');
   const dueEl = panelEl.querySelector<HTMLSelectElement>('#fb-crm-task-due');
   const addEl = panelEl.querySelector<HTMLButtonElement>('#fb-crm-task-add');
+  const dateEl = panelEl.querySelector<HTMLInputElement>('#fb-crm-task-date');
   if (!titleEl || !dueEl || !addEl) return;
 
   titleEl.value = taskDraft.title;
@@ -1966,13 +1993,25 @@ function wirePanelTasks(threadId: string) {
   titleEl.addEventListener('focus', () => { taskTitleFocused = true; });
   titleEl.addEventListener('blur', () => { taskTitleFocused = false; });
   titleEl.addEventListener('keydown', e => { if (e.key === 'Enter') addEl.click(); });
-  dueEl.addEventListener('change', () => { taskDraft.due = dueEl.value; });
+  dueEl.addEventListener('change', async () => {
+    taskDraft.due = dueEl.value;
+    // Choosing (or leaving) "Pick a date…" adds or removes the date field, so
+    // the section has to be redrawn. Every other choice needs no repaint.
+    if (taskDraft.due === PANEL_DUE_CUSTOM || dateEl) await renderPanel();
+  });
+  dateEl?.addEventListener('change', () => { taskDraft.date = dateEl.value; });
 
   addEl.addEventListener('click', async () => {
     const title = titleEl.value.trim();
     if (!title) { titleEl.focus(); return; }
     const now = Date.now();
-    const due = dueEl.value === '' ? undefined : dueFromOffset(Number(dueEl.value), undefined, now);
+    const custom = dueEl.value === PANEL_DUE_CUSTOM;
+    if (custom && !(dateEl?.value || taskDraft.date)) { dateEl?.focus(); return; }
+    const due = custom
+      ? (({ dueAt, allDay }) => (dueAt === null ? undefined : { dueAt, allDay }))(inputsToDue(dateEl?.value || taskDraft.date, ''))
+      : dueEl.value === ''
+        ? undefined
+        : dueFromOffset(Number(dueEl.value), undefined, now);
     const task = newTask({ title, dueAt: due?.dueAt, allDay: due?.allDay }, now);
     if (!task) return;
     // Clear the title but keep the chosen due offset — adding several

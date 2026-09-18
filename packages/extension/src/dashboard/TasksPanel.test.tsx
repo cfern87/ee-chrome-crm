@@ -129,7 +129,7 @@ describe('ContactTasks', () => {
 
     click(buttonNamed(el, '+ Add follow-up'));
     setValue(el.querySelector<HTMLInputElement>('input[placeholder^="What needs doing"]')!, 'Send pricing');
-    click(buttonNamed(el, 'Tomorrow'));
+    click(buttonNamed(el, '3 days'));
     click(buttonNamed(el, 'Add follow-up'));
 
     expect(h.onAddTask).toHaveBeenCalledTimes(1);
@@ -137,9 +137,32 @@ describe('ContactTasks', () => {
     expect(id).toBe('c1');
     expect(input.title).toBe('Send pricing');
     expect(input.allDay).toBe(true);
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    expect(new Date(input.dueAt).getDate()).toBe(tomorrow.getDate());
+    const expected = new Date();
+    expected.setDate(expected.getDate() + 3);
+    expect(new Date(input.dueAt).getDate()).toBe(expected.getDate());
+  });
+
+  // The date field, not a shortcut: anything further out than the quick picks
+  // is typed in, and that is the whole point of it being there.
+  it('adds a follow-up with a hand-picked date months away', () => {
+    const h = handlers();
+    const el = mount(<ContactTasks conv={contact('c1', 'Ana', [])} handlers={h} />);
+
+    click(buttonNamed(el, '+ Add follow-up'));
+    setValue(el.querySelector<HTMLInputElement>('input[placeholder^="What needs doing"]')!, 'Renewal call');
+    setValue(el.querySelector<HTMLInputElement>('input[type="date"]')!, '2027-03-19');
+    click(buttonNamed(el, 'Add follow-up'));
+
+    const [, input] = h.onAddTask.mock.calls[0];
+    const due = new Date(input.dueAt);
+    expect([due.getFullYear(), due.getMonth() + 1, due.getDate()]).toEqual([2027, 3, 19]);
+    expect(input.allDay).toBe(true);
+  });
+
+  it('offers no Tomorrow shortcut', () => {
+    const el = mount(<ContactTasks conv={contact('c1', 'Ana', [])} handlers={handlers()} />);
+    click(buttonNamed(el, '+ Add follow-up'));
+    expect(Array.from(el.querySelectorAll('button')).map((b) => b.textContent)).not.toContain('Tomorrow');
   });
 
   it('will not add a task with a blank title', () => {

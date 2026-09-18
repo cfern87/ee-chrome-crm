@@ -42,18 +42,36 @@ const STEP_ORDER: PresetStepKind[] = [
   'archive', 'unarchive', 'deleteContact',
 ];
 
-/** Due-date choices for a preset's task, as day offsets from the moment it's pressed. */
+/**
+ * Due-date choices for a preset's task, as day offsets from the moment it's
+ * pressed. A preset cannot hold a CALENDAR date — one built in March would keep
+ * scheduling follow-ups for March (see dueFromOffset) — so "further out" here
+ * means a bigger offset, typed into the box the Custom option reveals, rather
+ * than a date picker.
+ *
+ * No "tomorrow": same-day-plus-one gets in the way of the rest of the workflow,
+ * so it isn't offered on any surface.
+ */
 const DUE_OFFSETS: { value: string; label: string }[] = [
   { value: '', label: 'No due date' },
   { value: '0', label: 'Due today' },
-  { value: '1', label: 'Due tomorrow' },
   { value: '2', label: 'Due in 2 days' },
   { value: '3', label: 'Due in 3 days' },
   { value: '5', label: 'Due in 5 days' },
   { value: '7', label: 'Due in 1 week' },
   { value: '14', label: 'Due in 2 weeks' },
   { value: '30', label: 'Due in 30 days' },
+  { value: 'custom', label: 'Custom…' },
 ];
+
+/** The offset a fresh "Custom…" starts at — past the longest fixed choice, so the box appears. */
+const CUSTOM_DUE_DAYS = 45;
+const MAX_DUE_DAYS = 3650;
+
+/** Is this offset one the fixed list covers, or does it need the custom box? */
+function isCustomOffset(days: number | undefined): boolean {
+  return days !== undefined && !DUE_OFFSETS.some((o) => o.value === String(days));
+}
 
 /** A fresh step of `kind`, with whatever operand it needs defaulted. */
 function blankStep(kind: PresetStepKind, store: Store): PresetStep {
@@ -384,21 +402,39 @@ function StepRow({ step, store, tags, fields, onChange, onRemove, onMove }: {
             style={{ width: 170 }}
           />
           <Select
-            value={step.dueInDays === undefined ? '' : String(step.dueInDays)}
+            value={isCustomOffset(step.dueInDays) ? 'custom' : step.dueInDays === undefined ? '' : String(step.dueInDays)}
             aria-label="Due"
             onChange={(e) => {
               const v = e.target.value;
               const { dueInDays: _d, dueTime: _t, ...rest } = step;
-              onChange(v === '' ? rest : { ...rest, dueInDays: Number(v), ...(step.dueTime ? { dueTime: step.dueTime } : {}) });
+              if (v === '') { onChange(rest); return; }
+              const days = v === 'custom' ? CUSTOM_DUE_DAYS : Number(v);
+              onChange({ ...rest, dueInDays: days, ...(step.dueTime ? { dueTime: step.dueTime } : {}) });
             }}
             style={{ width: 140 }}
           >
-            {/* Keep an offset typed in elsewhere (a restored backup) selectable. */}
-            {step.dueInDays !== undefined && !DUE_OFFSETS.some((o) => o.value === String(step.dueInDays)) && (
-              <option value={String(step.dueInDays)}>Due in {step.dueInDays} days</option>
-            )}
             {DUE_OFFSETS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
           </Select>
+          {isCustomOffset(step.dueInDays) && (
+            // On blur, like the time and colour inputs: a number input fires a
+            // change per keystroke, and each would be a store write and a sync.
+            <Input
+              type="number"
+              min={0}
+              max={MAX_DUE_DAYS}
+              aria-label="Days from when the preset is pressed"
+              title="Days from when the preset is pressed"
+              key={step.dueInDays}
+              defaultValue={step.dueInDays}
+              onBlur={(e) => {
+                const n = Math.round(Number((e.target as HTMLInputElement).value));
+                if (!Number.isFinite(n) || n < 0 || n === step.dueInDays) return;
+                onChange({ ...step, dueInDays: Math.min(n, MAX_DUE_DAYS) });
+              }}
+              style={{ width: 80 }}
+            />
+          )}
+          {isCustomOffset(step.dueInDays) && <Text size="micro" tone="muted">days</Text>}
           {step.dueInDays !== undefined && (
             // On blur, like the colour input above: a time field fires a change
             // per typed segment, and each would be a store write and a sync.

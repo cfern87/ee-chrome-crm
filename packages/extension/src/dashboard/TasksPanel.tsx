@@ -42,13 +42,20 @@ function useNow(periodMs = 60_000): number {
 // Form
 // ---------------------------------------------------------------------------
 
-/** Quick picks for the due date, as day offsets from today. */
+/**
+ * Quick picks for the due date, as day offsets from today. Shortcuts only —
+ * the date field beside them takes any date at all, which is what anything
+ * further out than these uses.
+ *
+ * No "Tomorrow": same-day-plus-one gets in the way of the rest of the
+ * workflow, so it is not offered on any surface.
+ */
 const DUE_SHORTCUTS: { label: string; days: number }[] = [
   { label: 'Today', days: 0 },
-  { label: 'Tomorrow', days: 1 },
   { label: '3 days', days: 3 },
   { label: '1 week', days: 7 },
   { label: '2 weeks', days: 14 },
+  { label: '1 month', days: 30 },
 ];
 
 function dateInputFor(daysFromToday: number): string {

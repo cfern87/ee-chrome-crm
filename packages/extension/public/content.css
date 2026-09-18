@@ -385,6 +385,22 @@
 }
 .fb-crm-task-new button:disabled { opacity: 0.6; cursor: default; }
 
+/* The date field for "Pick a date…", on its own line below the add row: the row
+   is already a text input, a select and a button wide in a 320px panel. */
+.fb-crm-task-date {
+  width: 100%;
+  margin-top: 5px;
+  padding: 5px 8px;
+  border: 1px solid #ccd0d5;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: inherit;
+  background: #fff;
+  color: #1c1e21;
+  outline: none;
+}
+.fb-crm-task-date:focus { border-color: #065fd4; }
+
 /* ---- Tag sections ("Tags on this conversation", "Add existing tag") ---- */
 
 .fb-crm-section-title-row {
