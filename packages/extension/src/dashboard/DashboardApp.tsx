@@ -772,7 +772,8 @@ export default function DashboardApp() {
       case 'lastTagged':
         return dir * ((lastTaggedAt(a) || 0) - (lastTaggedAt(b) || 0));
       case 'tagCount':
-        return dir * (a.tags.length - b.tags.length);
+        // Only tags that still exist — the same count "Number of tags" searches on.
+        return dir * (a.tags.filter((id) => store.tags[id]).length - b.tags.filter((id) => store.tags[id]).length);
       // Contacts with no dated open task sort after everyone who has one, in
       // either direction — "soonest follow-up" should never open on a page of
       // people who have nothing scheduled.
@@ -913,6 +914,19 @@ export default function DashboardApp() {
   // narrower filter can leave you stranded on a page that no longer exists.
   const pageResetKey = JSON.stringify([search, filterTags, filterTagMode, archiveScope, dateFilter, query, sortBy, sortDir, pageSize]);
   useEffect(() => { setPage(0); }, [pageResetKey]);
+  // A different search is a different view, so it starts with nothing
+  // selected. Bulk actions act on every selected id, including ones the new
+  // search no longer shows — carrying a selection across searches meant a
+  // bulk tag/remove/delete could land on contacts that weren't on screen.
+  // Sort and page size only reorder the same set, so they keep the selection.
+  const selectionResetKey = JSON.stringify([search, filterTags, filterTagMode, archiveScope, dateFilter, query]);
+  const firstSelectionKey = useRef(true);
+  useEffect(() => {
+    if (firstSelectionKey.current) { firstSelectionKey.current = false; return; }
+    setSelectedIds(new Set());
+    setBulkTagMenu(null);
+    setBulkDeleteConfirm(false);
+  }, [selectionResetKey]);
   // Clamp when the list shrinks underneath us (e.g. after a bulk delete).
   useEffect(() => { if (page !== currentPage) setPage(currentPage); }, [page, currentPage]);
 

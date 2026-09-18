@@ -515,10 +515,22 @@ function dateOf(conv: Conversation, key: string): number | undefined {
   }
 }
 
+/**
+ * The tags a contact visibly has: ids that still resolve to a tag definition.
+ * A contact can hold ids whose definition is gone (deleted, or lost in a
+ * sync/merge), and every surface that shows tags already drops those — so
+ * counting them here made a contact that shows no tags fail "Number of tags
+ * = 0" and "Tags is empty".
+ */
+function liveTagsOf(conv: Conversation, ctx: QueryContext): string[] {
+  return conv.tags.filter((id) => !!ctx.tags[id]);
+}
+
 /** Built-in numeric fields. Undefined only for a key that isn't one. */
-function numberOf(conv: Conversation, key: string, now: number): number | undefined {
+function numberOf(conv: Conversation, key: string, ctx: QueryContext): number | undefined {
+  const now = ctx.now;
   switch (key) {
-    case 'tagCount': return conv.tags.length;
+    case 'tagCount': return liveTagsOf(conv, ctx).length;
     case 'openTaskCount': return openTasksOf(conv).length;
     case 'overdueTaskCount': return overdueCount(conv, now);
     case 'doneTaskCount': return doneTasksOf(conv).length;
@@ -784,7 +796,7 @@ function evaluateCondition(conv: Conversation, cond: Condition, fields: FieldDef
     }
 
     case 'number': {
-      if (!isCustom) return matchesNumber(numberOf(conv, cond.field, ctx.now), cond);
+      if (!isCustom) return matchesNumber(numberOf(conv, cond.field, ctx), cond);
       const raw = customValue(conv, cond.field);
       const parsed = raw === '' ? undefined : Number(raw);
       return matchesNumber(parsed !== undefined && Number.isFinite(parsed) ? parsed : undefined, cond);
@@ -795,7 +807,7 @@ function evaluateCondition(conv: Conversation, cond: Condition, fields: FieldDef
       return matchesDate(ts, cond, ctx.now);
     }
 
-    case 'tags': return matchesTags(conv.tags, cond);
+    case 'tags': return matchesTags(liveTagsOf(conv, ctx), cond);
     case 'tagGroups': return matchesTagGroups(conv, cond, ctx);
     case 'tagDate': return matchesTagDate(conv, cond, ctx.now);
     case 'funnelStage': return matchesFunnelStage(conv, cond, field);
