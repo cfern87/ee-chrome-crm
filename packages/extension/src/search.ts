@@ -155,11 +155,11 @@ export const BUILTIN_FIELDS: FieldDef[] = [
   { key: 'nameManual', label: 'Name edited by hand', kind: 'boolean', category: 'Status' },
   {
     key: 'readState',
-    label: 'Read / responded',
+    label: 'Read / needs response',
     kind: 'enum',
     category: 'Status',
     options: ['responded', 'read', 'unread', 'unknown'],
-    hint: '"responded" means they have a message waiting that you haven\'t opened. The rest describe your most recent message to them; "unknown" means no receipt has been seen yet, which is not the same as "not read".',
+    hint: '"Needs response" means their message is the latest in the conversation — you owe them a reply, whether or not you have opened it. "Read" and "not read" describe YOUR latest message when it is the last one: whether they have opened it. "Unknown" means nothing has been observed yet, which is not the same as "not read".',
   },
   {
     key: 'readStateAt',
@@ -274,6 +274,12 @@ const NUMBER_OPS: OperatorDef[] = [
 ];
 
 const DATE_OPS: OperatorDef[] = [
+  // Named days, first because they're the common ask. Each resolves against
+  // the day the search RUNS, so a saved preset "tagged today" keeps meaning
+  // today. ("is on" + Today does the same, but hidden one level down.)
+  { op: 'isToday', label: 'is today', arity: 'none' },
+  { op: 'isYesterday', label: 'is yesterday', arity: 'none' },
+  { op: 'isTomorrow', label: 'is tomorrow', arity: 'none' },
   { op: 'inLast', label: 'is in the last', arity: 'duration' },
   { op: 'notInLast', label: 'is not in the last', arity: 'duration' },
   { op: 'inNext', label: 'is in the next', arity: 'duration' },
@@ -349,6 +355,9 @@ export function operatorDef(kind: FieldKind, op: string): OperatorDef | undefine
 
 /** The operator a freshly-picked field starts on. */
 export function defaultOperator(kind: FieldKind): string {
+  // Date fields list the named days first for visibility, but a new condition
+  // still starts as "in the last 30 days" (newCondition presets that operand).
+  if (kind === 'date' || kind === 'tagDate') return 'inLast';
   return OPS_BY_KIND[kind][0].op;
 }
 
@@ -689,7 +698,17 @@ function matchesDate(ts: number | undefined, cond: Condition, now: number): bool
 
   const n = Number(cond.value);
   const unit = cond.unit || 'days';
+  // Local-midnight bounds of the day `offset` days from today. Through shift()
+  // (calendar days), so a DST change can't make a day 23 or 25 hours long.
+  const inDay = (offset: number) => {
+    const today = operandDay(TODAY_TOKEN, now)!;
+    const start = shift(today, offset, 'days');
+    return ts >= start && ts < shift(start, 1, 'days');
+  };
   switch (cond.op) {
+    case 'isToday': return inDay(0);
+    case 'isYesterday': return inDay(-1);
+    case 'isTomorrow': return inDay(1);
     case 'inLast': return ts <= now && ts >= shift(now, -n, unit);
     case 'notInLast': return !(ts <= now && ts >= shift(now, -n, unit));
     case 'inNext': return ts >= now && ts <= shift(now, n, unit);

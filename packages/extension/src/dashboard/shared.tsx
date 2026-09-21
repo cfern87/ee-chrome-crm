@@ -175,11 +175,11 @@ export function formatRelativeTime(ts: number): string {
 // "unknown" is offered as a real answer rather than being dressed up as "not
 // read".
 //
-// Three of the four are about YOUR message — read, not read, or no idea. The
-// fourth, 'responded', is about theirs: the thread holds something you haven't
-// opened, which in Messenger only ever means they wrote back. It is the one
-// state that is a to-do rather than a status, so it is the only one coloured
-// like something to act on.
+// Three of the four are about YOUR message — read, not read, or no idea — and
+// only apply while yours is the latest message. The fourth, 'responded' (shown
+// as "Needs response"), is about theirs: their message is the latest, opened
+// or not. It is the one state that is a to-do rather than a status, so it is
+// the only one coloured like something to act on.
 
 export type ContactReadState = 'read' | 'unread' | 'responded' | 'unknown';
 
@@ -188,7 +188,7 @@ export function readStateOf(conv: { readState?: ContactReadState }): ContactRead
 }
 
 const READ_STATE_CHIP: Record<ContactReadState, { label: string; short: string; fg: string; bg: string }> = {
-  responded: { label: 'Responded', short: '↩', fg: '#0b5cad', bg: '#e3f0fb' },
+  responded: { label: 'Needs response', short: '↩', fg: '#0b5cad', bg: '#e3f0fb' },
   read: { label: 'Read', short: '✓✓', fg: '#1a7f4b', bg: '#e6f4ec' },
   unread: { label: 'Not read', short: '✓', fg: '#8a6100', bg: '#fdf1d8' },
   unknown: { label: 'Unknown', short: '·', fg: '#6b6b6b', bg: '#eeeeee' },
@@ -209,8 +209,8 @@ const READ_STATE_CHIP: Record<ContactReadState, { label: string; short: string; 
  */
 function readStateTitle(state: ContactReadState, at?: number): string {
   const when = at ? ` (since ${formatRelativeTime(at)})` : '';
-  if (state === 'responded') return `They have an unread message waiting for you${when} — the ball is in your court`;
-  if (state === 'read') return `They have opened your last message${when}`;
+  if (state === 'responded') return `Needs response: their message is the latest in the conversation${when} — the ball is in your court`;
+  if (state === 'read') return `They have opened your last message and haven't replied${when} — the ball is in their court`;
   if (state === 'unread') return `Your last message hasn't been opened yet${when}`;
   return 'No read receipt has been seen for this contact yet — open their conversation in Messenger and it will be recorded';
 }

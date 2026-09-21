@@ -4,7 +4,8 @@
 // group and "Budget" as a field are the same errand.
 
 import React, { useState } from 'react';
-import type { Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType } from '../storage';
+import type { Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, TagGroupMode } from '../storage';
+import { tagGroupMode } from '../storage';
 import { Button, Card, Chip, Input, Select, Stack, Text, color, fontSize, fontWeight, radius, space } from '../ui/primitives';
 import { HIDDEN_TAG_TITLE } from './shared';
 import { tagDisplayOrder } from '../tagGrouping';
@@ -34,8 +35,9 @@ export interface TagsPanelProps {
   onReorderTags: (orderedIds: string[]) => void;
   onAddGroup: () => void;
   onRenameGroup: (groupId: string, name: string) => void;
-  /** Turn this group into an ordered funnel — see TagGroup.funnel. */
-  onSetGroupFunnel: (groupId: string, funnel: boolean) => void;
+  onRecolorGroup: (groupId: string, color: string) => void;
+  /** Plain tags, an ordered funnel, or a single choice — see TagGroup.funnel / TagGroup.singleChoice. */
+  onSetGroupMode: (groupId: string, mode: TagGroupMode) => void;
   /** "One tag from this group only" for a funnel group — see TagGroup.funnelExclusive. */
   onSetGroupFunnelExclusive: (groupId: string, exclusive: boolean) => void;
   onDeleteGroup: (groupId: string) => void;
@@ -46,7 +48,7 @@ export function TagsPanel(props: TagsPanelProps) {
     tags, tagGroups, conversations,
     newTagName, setNewTagName, newTagColor, setNewTagColor, newTagGroup, setNewTagGroup,
     newGroupName, setNewGroupName, newGroupColor, setNewGroupColor,
-    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onSetTagHidden, onReorderTags, onAddGroup, onRenameGroup, onSetGroupFunnel, onSetGroupFunnelExclusive, onDeleteGroup,
+    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onSetTagHidden, onReorderTags, onAddGroup, onRenameGroup, onRecolorGroup, onSetGroupMode, onSetGroupFunnelExclusive, onDeleteGroup,
   } = props;
 
   const usageOf = (tagId: string) => conversations.filter((c) => c.tags.includes(tagId)).length;
@@ -267,7 +269,14 @@ export function TagsPanel(props: TagsPanelProps) {
         return (
           <div key={group.id} style={{ marginBottom: 18 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-              <div style={{ width: 12, height: 12, borderRadius: 3, background: group.color || color.text.muted, flexShrink: 0 }} />
+              <input
+                type="color"
+                value={group.color || '#65676b'}
+                title="Change group color"
+                aria-label={`Color of ${group.name}`}
+                onChange={(e) => onRecolorGroup(group.id, e.target.value)}
+                style={{ width: 22, height: 22, border: 'none', borderRadius: 5, background: 'none', flexShrink: 0, cursor: 'pointer', padding: 0 }}
+              />
               <input
                 defaultValue={group.name}
                 onBlur={(e) => onRenameGroup(group.id, e.target.value)}
@@ -277,17 +286,22 @@ export function TagsPanel(props: TagsPanelProps) {
                 onBlurCapture={(e) => (e.currentTarget.style.border = '1px solid transparent')}
               />
               <span style={{ fontSize: 12, color: color.text.muted }}>{groupTags.length}</span>
+              {/* One behaviour at a time, so a select rather than checkboxes —
+                  a group can't sensibly be a funnel AND a single choice. */}
               <label
-                title="Show this group as a progress bar on contacts, with its tags as ordered stages. Picking a stage adds that tag; tick 'One tag from this group only' to have it clear the others."
-                style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: color.text.secondary, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}
+                title="Tags: contacts can have any of these tags. Funnel: shown as a progress bar of ordered stages. Single choice: works like a dropdown — a contact has at most one tag from this group, and picking one removes the others."
+                style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: color.text.secondary, fontWeight: 600, whiteSpace: 'nowrap' }}
               >
-                <input
-                  type="checkbox"
-                  checked={!!group.funnel}
-                  onChange={(e) => onSetGroupFunnel(group.id, e.target.checked)}
-                  style={{ cursor: 'pointer', margin: 0 }}
-                />
-                Funnel (stages)
+                Behaves as
+                <select
+                  value={tagGroupMode(group)}
+                  onChange={(e) => onSetGroupMode(group.id, e.target.value as TagGroupMode)}
+                  style={{ fontSize: 12, padding: '2px 4px', borderRadius: 5, border: `1px solid ${color.border.control}`, background: color.surface.raised, color: color.text.primary, cursor: 'pointer' }}
+                >
+                  <option value="tags">Tags (any number)</option>
+                  <option value="funnel">Funnel (stages)</option>
+                  <option value="single">Single choice</option>
+                </select>
               </label>
               <button
                 onClick={() => onDeleteGroup(group.id)}
@@ -297,6 +311,12 @@ export function TagsPanel(props: TagsPanelProps) {
                 Delete group
               </button>
             </div>
+            {tagGroupMode(group) === 'single' && (
+              <div style={{ fontSize: 11, color: color.text.muted, margin: '0 0 8px', paddingLeft: 20, lineHeight: 1.5 }}>
+                Shown as a dropdown on each contact. A contact has <strong>at most one</strong> of these
+                tags — picking one, anywhere, removes the others in this group.
+              </div>
+            )}
             {group.funnel && (
               // Spelled out because it is the one consequence of the checkbox
               // that isn't visible from the checkbox: the group stops behaving

@@ -26,7 +26,7 @@
 import { appendHistory } from './history';
 import type { Store, Conversation, Tag, NameDiag } from './storage';
 import {
-  addTagsTo, removeTagsFrom, tombstone,
+  addTagsTo, removeTagsFrom, tombstone, singleChoiceRemovals,
   readPinnedContacts, PINNED_CONTACTS_KEY, MAX_PINNED_CONTACTS,
 } from './storage';
 import { buildThreadIndex } from './contacts';
@@ -81,6 +81,8 @@ export type Mutation =
   // the popup's snapshot of the store is up to 5s stale (it polls) — writing
   // that back wholesale is exactly the clobber mutations.ts exists to stop.
   | { op: 'setPinned'; conversationId: string; pinned: boolean }
+  // Hide or show one funnel bar in this contact's panel (Conversation.hiddenFunnels).
+  | { op: 'setFunnelHidden'; conversationId: string; groupId: string; hidden: boolean }
   | { op: 'deleteContact'; conversationId: string }
   | { op: 'markContacted'; conversationId: string }
   | { op: 'setResolvedThread'; conversationId: string; threadId: string; chatUrl?: string }
@@ -394,7 +396,7 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
     case 'addTags': {
       const conv = store.conversations[m.conversationId];
       if (!conv) return { store, changed: false };
-      const updated = addTagsTo(conv, m.tagIds, now);
+      const updated = addTagsWithChoice(conv, m.tagIds, store, now);
       if (updated === conv) return { store, changed: false, conversationId: m.conversationId };
       const next = copy(store);
       next.conversations[m.conversationId] = updated;
@@ -418,7 +420,7 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
       next.tags[m.tag.id] = { ...m.tag, updatedAt: now };
       if (m.attachTo) {
         const conv = next.conversations[m.attachTo];
-        if (conv) next.conversations[m.attachTo] = addTagsTo(conv, [m.tag.id], now);
+        if (conv) next.conversations[m.attachTo] = addTagsWithChoice(conv, [m.tag.id], next, now);
       }
       return { store: next, changed: true, conversationId: m.attachTo };
     }
@@ -488,6 +490,20 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
       if (!!conv.archived === m.archived) return { store, changed: false, conversationId: m.conversationId };
       const next = copy(store);
       next.conversations[m.conversationId] = { ...conv, archived: m.archived, updatedAt: now };
+      return { store: next, changed: true, conversationId: m.conversationId };
+    }
+
+    case 'setFunnelHidden': {
+      const conv = store.conversations[m.conversationId];
+      if (!conv) return { store, changed: false };
+      const current = conv.hiddenFunnels || [];
+      if (current.includes(m.groupId) === m.hidden) return { store, changed: false, conversationId: m.conversationId };
+      const hidden = m.hidden ? [...current, m.groupId] : current.filter((id) => id !== m.groupId);
+      const nextConv = { ...conv, updatedAt: now };
+      if (hidden.length) nextConv.hiddenFunnels = hidden;
+      else delete nextConv.hiddenFunnels;
+      const next = copy(store);
+      next.conversations[m.conversationId] = nextConv;
       return { store: next, changed: true, conversationId: m.conversationId };
     }
 
@@ -623,6 +639,17 @@ function withTasks(store: Store, conv: Conversation, tasks: FollowUpTask[], now:
  * entirely — which matters because the sidebar's routine passes emit upsert
  * mutations on every repaint and almost all of them are no-ops.
  */
+/**
+ * Add tags, honouring single-choice groups (TagGroup.singleChoice): adding one
+ * of their tags takes the group's other tags off in the same edit. Done here,
+ * in the one place every tagging path passes through, so the panel's dropdown,
+ * a chip, a bulk action, a preset and an automation all agree.
+ */
+function addTagsWithChoice(conv: Conversation, tagIds: string[], store: Store, now: number): Conversation {
+  const { add, remove } = singleChoiceRemovals(conv, tagIds, store.tags, store.tagGroups);
+  return addTagsTo(remove.length ? removeTagsFrom(conv, remove, now) : conv, add, now);
+}
+
 export function applyMutations(store: Store, mutations: Mutation[], now = Date.now()): MutationOutcome {
   let current = store;
   let changed = false;

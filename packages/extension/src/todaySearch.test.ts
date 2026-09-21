@@ -98,3 +98,32 @@ describe('copySavedSearch', () => {
     expect(copySavedSearch(searches, 'nope')).toBeNull();
   });
 });
+
+describe('named-day operators', () => {
+  const now = at(2026, 9, 19, 9);
+
+  it('is today / yesterday / tomorrow pick the matching calendar day', () => {
+    expect(run({ field: 'createdAt', op: 'isToday' }, now)).toEqual(['today']);
+    expect(run({ field: 'createdAt', op: 'isYesterday' }, now)).toEqual(['yesterday']);
+    expect(run({ field: 'createdAt', op: 'isTomorrow' }, now)).toEqual(['tomorrow']);
+  });
+
+  it('works on "Date a specific tag was added" — the reported gap', () => {
+    const tagged: Conversation = {
+      ...conv('t', 1), tags: ['lead', 'vip'],
+      tagAddedAt: { lead: at(2026, 9, 19, 8), vip: at(2026, 9, 12) },
+    };
+    const q = newGroup('and');
+    q.children.push({ type: 'condition', id: 'c', field: 'tagDate', op: 'isToday', tagIds: ['lead'] } as Condition);
+    const ctx: QueryContext = { now, tags: {}, tagGroups: {}, fieldDefs: {} };
+    expect(filterByQuery([tagged], q, ctx)).toHaveLength(1);
+    q.children[0] = { ...(q.children[0] as Condition), tagIds: ['vip'] };
+    expect(filterByQuery([tagged], q, ctx)).toHaveLength(0);
+  });
+
+  it('keeps "in the last 30 days" as the default for a new date condition', async () => {
+    const { defaultOperator } = await import('./search');
+    expect(defaultOperator('date')).toBe('inLast');
+    expect(defaultOperator('tagDate')).toBe('inLast');
+  });
+});

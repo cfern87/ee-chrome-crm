@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, removeTagsFrom, lastTaggedAt, getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, isStoreChangeKey, isCrmSyncKey, touchDef } from '../storage';
+import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, removeTagsFrom, lastTaggedAt, getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, isStoreChangeKey, isCrmSyncKey, touchDef, tagGroupMode, TagGroupMode } from '../storage';
 import { BUILD_INFO } from '../buildInfo';
 import { getEntitlement, PLATFORM_URL, FREE_CONTACT_LIMIT, isSignedIn, SESSION_KEY, EXTENSION_AUTH_PATH, type Entitlement } from '../license';
 
@@ -221,7 +221,7 @@ function ReadScanPanel({ scan, error, onCancel, onDismiss }: {
                 Checked {scan.scanned} of {scan.total}
                 {t && (
                   <span style={{ fontWeight: 500, color: color.text.secondary }}>
-                    {' '}· {t.responded} replied
+                    {' '}· {t.responded} need a response
                     {t.noAnswer > 0 ? ` · ${t.noAnswer} no reply` : ''}
                     {t.read > 0 ? ` · ${t.read} read` : ''}
                     {t.unread > 0 ? ` · ${t.unread} unread` : ''}
@@ -595,6 +595,27 @@ export default function DashboardApp() {
     return () => clearInterval(interval);
   }, [refresh]);
 
+  // Writes still on their way to the background. The screen already shows the
+  // result (both write paths below are optimistic), so without this nothing
+  // says a big bulk edit is still being saved — and closing the tab then is
+  // how it gets lost. Drives the "Saving…" pill and the leave-page prompt.
+  const [savesInFlight, setSavesInFlight] = useState(0);
+  const savesInFlightRef = useRef(0);
+  const beginSave = () => { savesInFlightRef.current++; setSavesInFlight(savesInFlightRef.current); };
+  const endSave = () => {
+    savesInFlightRef.current = Math.max(0, savesInFlightRef.current - 1);
+    setSavesInFlight(savesInFlightRef.current);
+  };
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (savesInFlightRef.current === 0) return;
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, []);
+
   // Writes go through the background worker, which serializes every store write
   // in the extension behind one lock. Writing straight from here would race the
   // content scripts: both sides load, both save the whole store, and the later
@@ -610,19 +631,24 @@ export default function DashboardApp() {
     notePendingEdits(storeRef.current, next, pendingEditsRef.current, Date.now());
     storeRef.current = next;
     setStore(next); // optimistic — the write is confirmed below
-    const res = await new Promise<{ success?: boolean; result?: SaveResult } | null>((resolve) => {
-      try {
-        chrome.runtime.sendMessage({ type: 'SET_STORE', payload: next }, (r) => {
-          if (chrome.runtime.lastError) { resolve(null); return; }
-          resolve(r ?? null);
-        });
-      } catch { resolve(null); }
-    });
-    // Background unreachable (worker restarting). The dashboard is an extension
-    // page with its own Drive access, so it can still write directly — unlike a
-    // content script, it holds a snapshot it loaded itself moments ago.
-    if (!res?.success) return saveStore(next);
-    return res.result ?? { ok: true, pending: 0, itemLimitReached: false };
+    beginSave();
+    try {
+      const res = await new Promise<{ success?: boolean; result?: SaveResult } | null>((resolve) => {
+        try {
+          chrome.runtime.sendMessage({ type: 'SET_STORE', payload: next }, (r) => {
+            if (chrome.runtime.lastError) { resolve(null); return; }
+            resolve(r ?? null);
+          });
+        } catch { resolve(null); }
+      });
+      // Background unreachable (worker restarting). The dashboard is an extension
+      // page with its own Drive access, so it can still write directly — unlike a
+      // content script, it holds a snapshot it loaded itself moments ago.
+      if (!res?.success) return await saveStore(next);
+      return res.result ?? { ok: true, pending: 0, itemLimitReached: false };
+    } finally {
+      endSave();
+    }
   };
 
   /**
@@ -658,10 +684,11 @@ export default function DashboardApp() {
     storeRef.current = predicted;
     setStore(predicted);
 
+    beginSave();
     const res = await sendBg<{ success?: boolean; store?: Store }>({
       type: 'MUTATE_STORE',
       payload: { mutations },
-    }, 30_000);
+    }, 30_000).finally(endSave);
 
     // Worker asleep or too slow. The optimistic state stands and the pending
     // overlay keeps it on screen; the next refresh reconciles it. Deliberately
@@ -921,11 +948,14 @@ export default function DashboardApp() {
   // Sort and page size only reorder the same set, so they keep the selection.
   const selectionResetKey = JSON.stringify([search, filterTags, filterTagMode, archiveScope, dateFilter, query]);
   const firstSelectionKey = useRef(true);
-  useEffect(() => {
-    if (firstSelectionKey.current) { firstSelectionKey.current = false; return; }
+  const clearBulkSelection = () => {
     setSelectedIds(new Set());
     setBulkTagMenu(null);
     setBulkDeleteConfirm(false);
+  };
+  useEffect(() => {
+    if (firstSelectionKey.current) { firstSelectionKey.current = false; return; }
+    clearBulkSelection();
   }, [selectionResetKey]);
   // Clamp when the list shrinks underneath us (e.g. after a bulk delete).
   useEffect(() => { if (page !== currentPage) setPage(currentPage); }, [page, currentPage]);
@@ -1180,6 +1210,21 @@ export default function DashboardApp() {
     if (selectedConv?.id === conv.id) setSelectedConv(next.conversations[conv.id] ?? null);
   };
 
+  // A single-choice group's dropdown. Picking a tag is a plain addTags — the
+  // mutation clears the group's other tags — and the blank option clears the
+  // group. Unlike addTagToConv, re-picking a tag the contact already holds
+  // still writes when they hold others from the group too, so the pick tidies
+  // up a contact tagged before the group became single choice.
+  const setChoiceOnConv = async (conv: Conversation, groupId: string, tagId: string) => {
+    const held = conv.tags.filter((t) => storeRef.current.tags[t]?.groupId === groupId);
+    let mutation: Mutation | null = null;
+    if (tagId && (!held.includes(tagId) || held.length > 1)) mutation = { op: 'addTags', conversationId: conv.id, tagIds: [tagId] };
+    if (!tagId && held.length) mutation = { op: 'removeTags', conversationId: conv.id, tagIds: held };
+    if (!mutation) return;
+    const next = await mutateStore([mutation]);
+    if (selectedConv?.id === conv.id) setSelectedConv(next.conversations[conv.id] ?? null);
+  };
+
   // Move a contact along a funnel. The remove goes FIRST and both ops travel in
   // one batch, so the contact is never momentarily at two stages of the same
   // group — a state the dashboard's funnel counts would double-count and the
@@ -1212,12 +1257,17 @@ export default function DashboardApp() {
     setActivePresetId(preset.id);
     setPresetBaseline(viewSignature(q, nextSort, nextDir, nextScope));
     setShowBuilder(true);
+    // Switching presets always starts with nothing selected — even when the
+    // new preset has the same filter and only sorts differently, which the
+    // selectionResetKey effect deliberately lets through.
+    clearBulkSelection();
   };
 
   const clearPreset = () => {
     setQuery(emptyQuery());
     setActivePresetId(null);
     setPresetBaseline(null);
+    clearBulkSelection();
   };
 
   const withViewSettings = (base: SavedSearch): SavedSearch => ({
@@ -1293,7 +1343,6 @@ export default function DashboardApp() {
   // so the list, the sort and the scope all match what the tile counted.
   const openTileInContacts = (preset: SavedSearch) => {
     applyPreset(preset);
-    setSelectedIds(new Set());
     setPage(0);
     go('contacts');
   };
@@ -1469,14 +1518,31 @@ export default function DashboardApp() {
     await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: touchDef({ ...g, name: name.trim() }) } });
   };
 
+  // The group's accent: its header dot, and the colour of its funnel bar and
+  // dropdown label on contacts. The tags inside keep their own colours.
+  const recolorTagGroup = async (groupId: string, color: string) => {
+    const g = store.tagGroups[groupId];
+    if (!g || color === g.color) return;
+    await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: touchDef({ ...g, color }) } });
+  };
+
   // Turn funnel mode on or off for a group. Purely a change of reading — no
   // tag is added, removed or reordered, so a group switched on and straight
   // back off is exactly where it started, and a contact holding two of its
   // tags keeps holding both until someone picks a stage (see funnel.ts).
-  const setTagGroupFunnel = async (groupId: string, funnel: boolean) => {
+  //
+  // Same for single choice, with one difference: once it's on, the NEXT tag
+  // added to a contact from this group clears the group's others (mutations.ts).
+  // Contacts already holding several keep them until then.
+  const setTagGroupMode = async (groupId: string, mode: TagGroupMode) => {
     const g = store.tagGroups[groupId];
-    if (!g || !!g.funnel === funnel) return;
-    await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: touchDef({ ...g, funnel }) } });
+    if (!g || tagGroupMode(g) === mode) return;
+    const nextGroup: TagGroup = { ...g };
+    delete nextGroup.funnel;
+    delete nextGroup.singleChoice;
+    if (mode === 'funnel') nextGroup.funnel = true;
+    if (mode === 'single') nextGroup.singleChoice = true;
+    await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: touchDef(nextGroup) } });
   };
 
   // "One tag from this group only". Like the funnel switch, a change of reading
@@ -1686,6 +1752,7 @@ export default function DashboardApp() {
         />
       }
     >
+      <SavingPill active={savesInFlight > 0} />
       {/* Contacts owns the full viewport and scrolls its two columns
           independently. Every other route is a document, so it keeps the
           centred, page-scrolling wrapper. */}
@@ -1862,7 +1929,15 @@ export default function DashboardApp() {
 
               {/* Bulk actions bar */}
               {selectedIds.size > 0 && (
-                <div style={{ background: color.surface.selected, border: '1px solid #b3d9f2', borderRadius: 8, padding: '10px 12px', marginBottom: 12 }}>
+                // Paused while a save is in flight, so a second press of a bulk
+                // action can't fire against a selection the first is still writing.
+                <div
+                  aria-busy={savesInFlight > 0}
+                  style={{
+                    background: color.surface.selected, border: '1px solid #b3d9f2', borderRadius: 8, padding: '10px 12px', marginBottom: 12,
+                    ...(savesInFlight > 0 ? { pointerEvents: 'none', opacity: 0.6, cursor: 'progress' } : {}),
+                  }}
+                >
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
                     <span style={{ fontSize: 13, fontWeight: 600, color: color.accent.base }}>
                       {selectedIds.size} selected
@@ -2176,6 +2251,7 @@ export default function DashboardApp() {
                   onOpen={() => markOpened([selectedConv.id])}
                   onRemoveTag={(tagId) => removeTagFromConv(selectedConv, tagId)}
                   onAddTag={(tagId) => addTagToConv(selectedConv, tagId)}
+                  onSetChoice={(groupId, tagId) => setChoiceOnConv(selectedConv, groupId, tagId)}
                   onSetStage={(view, index) => setConvStage(selectedConv, view, index)}
                   onSetCustomField={(fieldId, value) => setCustomField(selectedConv, fieldId, value)}
                   onRename={(name) => renameConversation(selectedConv, name)}
@@ -2319,7 +2395,8 @@ export default function DashboardApp() {
                 onReorderTags={reorderTags}
                 onAddGroup={addTagGroup}
                 onRenameGroup={renameTagGroup}
-                onSetGroupFunnel={setTagGroupFunnel}
+                onRecolorGroup={recolorTagGroup}
+                onSetGroupMode={setTagGroupMode}
                 onSetGroupFunnelExclusive={setTagGroupFunnelExclusive}
                 onDeleteGroup={deleteTagGroup}
               />
@@ -2586,3 +2663,40 @@ function CopyButton({ text }: { text: string }) {
 
 
 
+/**
+ * "Saving…" in the bottom corner while a write is on its way to the background.
+ * Appears only after 150ms, so a save that lands at once doesn't flash. Fixed
+ * rather than in the header because the slow writes — bulk tagging, deleting,
+ * merging — are started from all over the page.
+ */
+function SavingPill({ active }: { active: boolean }) {
+  if (!active) return null;
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      style={{
+        position: 'fixed', right: 20, bottom: 20, zIndex: 1000,
+        display: 'flex', alignItems: 'center', gap: 8,
+        padding: '8px 14px', borderRadius: 999,
+        background: color.text.primary, color: color.surface.raised,
+        fontSize: 13, fontWeight: 600, boxShadow: '0 4px 14px rgba(0,0,0,0.2)',
+        opacity: 0, animation: 'crm-saving-show 0s linear 150ms forwards',
+      }}
+    >
+      <style>{`
+        @keyframes crm-saving-show { to { opacity: 1; } }
+        @keyframes crm-saving-spin { to { transform: rotate(360deg); } }
+      `}</style>
+      <span
+        aria-hidden="true"
+        style={{
+          width: 12, height: 12, borderRadius: '50%',
+          border: '2px solid currentColor', borderTopColor: 'transparent',
+          animation: 'crm-saving-spin 0.8s linear infinite',
+        }}
+      />
+      Saving… don’t close this tab
+    </div>
+  );
+}

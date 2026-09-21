@@ -141,6 +141,10 @@ export function mergeConversations(store: Store, ids: string[], primaryId?: stri
   }
   if (taskById.size) merged.tasks = pruneDoneTasks(Array.from(taskById.values()));
 
+  // A funnel hidden on any duplicate stays hidden on the merged contact.
+  const hiddenFunnels = new Set(present.flatMap((c) => c.hiddenFunnels || []));
+  if (hiddenFunnels.size) merged.hiddenFunnels = Array.from(hiddenFunnels);
+
   // The keys we're about to drop are real thread ids Facebook still uses — the
   // Messenger sidebar looks contacts up by them. Losing the numeric one here
   // would make the merged contact's tags disappear from the message list all

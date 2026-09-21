@@ -35,9 +35,22 @@ import type { Mutation } from './mutations';
 // collection from inside a function. Same arrangement as storage.ts ↔ drive.ts.
 import { writeCollection, type SettingsBag, type SettingsCollection } from './settingsMerge';
 import { newTask, dueFromOffset, type TaskPriority } from './tasks';
+import { matchesQuery, normalizeQuery, isQueryEmpty, describeQuery, type QueryGroup, type QueryContext } from './search';
+import { isExclusiveFunnel } from './funnel';
 
-/** One edit inside a preset. */
-export type PresetStep =
+/**
+ * One edit inside a preset, optionally gated by a condition.
+ *
+ * `when` is an advanced-search query (search.ts) — the same builder, the same
+ * matcher — so "only if they're tagged Lead and haven't been contacted in a
+ * week" means exactly what it would mean in the contact list. It is checked
+ * against the contact as it was when the button was PRESSED, not after the
+ * steps above it ran: every step's gate reads the same snapshot, so reordering
+ * steps never changes which of them fire. Absent = always runs.
+ */
+export type PresetStep = PresetStepBody & { when?: QueryGroup };
+
+type PresetStepBody =
   | { kind: 'addTag'; tagId: string }
   | { kind: 'removeTag'; tagId: string }
   // Text bolted onto the contact's name. The classic use is a marker the CRM
@@ -53,11 +66,17 @@ export type PresetStep =
   | { kind: 'addTask'; title: string; dueInDays?: number; dueTime?: string; priority?: TaskPriority; notes?: string }
   // Tick off every open follow-up — the natural companion of a "Replied" preset.
   | { kind: 'completeTasks' }
+  // Move the contact to one stage of a funnel group. Follows the group's own
+  // rule, like clicking that stage in the panel's bar — except it only ever
+  // SETS: pressing it on a contact already at that stage leaves them there
+  // rather than toggling them back out. `groupId` is kept beside the tag so a
+  // stage that has since moved to another group is skipped, not misapplied.
+  | { kind: 'setFunnelStage'; groupId: string; tagId: string }
   | { kind: 'archive' }
   | { kind: 'unarchive' }
   | { kind: 'deleteContact' };
 
-export type PresetStepKind = PresetStep['kind'];
+export type PresetStepKind = PresetStepBody['kind'];
 
 export interface PresetAction {
   id: string;
@@ -146,6 +165,16 @@ function normalizePreset(raw: unknown): PresetAction | null {
 }
 
 function normalizeStep(raw: unknown): PresetStep | null {
+  const body = normalizeStepBody(raw);
+  if (!body) return null;
+  const when = (raw as Record<string, unknown>).when;
+  if (!when || typeof when !== 'object') return body;
+  const q = normalizeQuery(when);
+  // An empty condition matches everyone, so it is the same as none.
+  return isQueryEmpty(q) ? body : { ...body, when: q };
+}
+
+function normalizeStepBody(raw: unknown): PresetStepBody | null {
   if (!raw || typeof raw !== 'object') return null;
   const o = raw as Record<string, unknown>;
   switch (o.kind) {
@@ -175,6 +204,10 @@ function normalizeStep(raw: unknown): PresetStep | null {
     }
     case 'completeTasks':
       return { kind: 'completeTasks' };
+    case 'setFunnelStage':
+      return typeof o.groupId === 'string' && o.groupId && typeof o.tagId === 'string' && o.tagId
+        ? { kind: 'setFunnelStage', groupId: o.groupId, tagId: o.tagId }
+        : null;
     case 'archive':
     case 'unarchive':
     case 'deleteContact':
@@ -283,24 +316,57 @@ export function stepsFor(preset: PresetAction, conv: Conversation, store: Store,
   let nameChanged = false;
   let deletes = false;
 
+  // The tags the contact holds as the steps run, so a funnel step sees a stage
+  // an earlier step in this same preset added.
+  const held = new Set(conv.tags);
+
   const flushTags = () => {
     if (pendingAdds.length) { out.push({ op: 'addTags', conversationId: id, tagIds: pendingAdds }); pendingAdds = []; }
     if (pendingRemoves.length) { out.push({ op: 'removeTags', conversationId: id, tagIds: pendingRemoves }); pendingRemoves = []; }
   };
 
+  // Conditions all read the contact as it was when pressed — see PresetStep.
+  const ctx: QueryContext = { now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs };
+
   for (const step of preset.steps) {
+    if (step.when && !matchesQuery(conv, step.when, ctx)) continue;
     switch (step.kind) {
       case 'addTag':
         if (!store.tags[step.tagId]) break;
         if (pendingRemoves.length) flushTags();
         pendingAdds.push(step.tagId);
+        held.add(step.tagId);
         break;
 
       case 'removeTag':
         if (!store.tags[step.tagId]) break;
         if (pendingAdds.length) flushTags();
         pendingRemoves.push(step.tagId);
+        held.delete(step.tagId);
         break;
+
+      case 'setFunnelStage': {
+        const group = store.tagGroups[step.groupId];
+        const target = store.tags[step.tagId];
+        if (!group || !target || target.groupId !== group.id) break;
+        // Exclusive funnels hold one stage, so the others come off. Additive
+        // ones keep every stage reached, so setting one only adds it.
+        const remove = isExclusiveFunnel(group)
+          ? Object.values(store.tags)
+            .filter((t) => t.groupId === group.id && t.id !== target.id && held.has(t.id))
+            .map((t) => t.id)
+          : [];
+        flushTags();
+        if (remove.length) {
+          out.push({ op: 'removeTags', conversationId: id, tagIds: remove });
+          remove.forEach((t) => held.delete(t));
+        }
+        if (!held.has(target.id)) {
+          out.push({ op: 'addTags', conversationId: id, tagIds: [target.id] });
+          held.add(target.id);
+        }
+        break;
+      }
 
       case 'appendName':
         if (!step.text) break;
@@ -366,22 +432,29 @@ export function describePreset(preset: PresetAction, store: Store): string {
   if (preset.steps.length === 0) return 'Does nothing yet — add some actions.';
   const tagName = (id: string) => store.tags[id]?.name || 'deleted tag';
   const fieldName = (id: string) => store.fieldDefs[id]?.name || 'deleted field';
+  const ctx: QueryContext = { now: Date.now(), tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs };
   return preset.steps
     .map((s) => {
-      switch (s.kind) {
-        case 'addTag': return `+${tagName(s.tagId)}`;
-        case 'removeTag': return `−${tagName(s.tagId)}`;
-        case 'appendName': return `name + "${s.text}"`;
-        case 'prependName': return `"${s.text}" + name`;
-        case 'setField': return `${fieldName(s.fieldId)} = ${s.value || '(clear)'}`;
-        case 'addTask': return `task "${s.title || '(untitled)'}"${describeOffset(s.dueInDays, s.dueTime)}`;
-        case 'completeTasks': return 'complete open tasks';
-        case 'archive': return 'archive';
-        case 'unarchive': return 'unarchive';
-        case 'deleteContact': return 'DELETE contact';
-      }
+      const text = describeStepBody(s);
+      return s.when ? `${text} (if ${describeQuery(s.when, ctx)})` : text;
     })
     .join(' · ');
+
+  function describeStepBody(s: PresetStep): string {
+    switch (s.kind) {
+      case 'addTag': return `+${tagName(s.tagId)}`;
+      case 'removeTag': return `−${tagName(s.tagId)}`;
+      case 'appendName': return `name + "${s.text}"`;
+      case 'prependName': return `"${s.text}" + name`;
+      case 'setField': return `${fieldName(s.fieldId)} = ${s.value || '(clear)'}`;
+      case 'addTask': return `task "${s.title || '(untitled)'}"${describeOffset(s.dueInDays, s.dueTime)}`;
+      case 'completeTasks': return 'complete open tasks';
+      case 'setFunnelStage': return `${store.tagGroups[s.groupId]?.name || 'deleted funnel'} → ${tagName(s.tagId)}`;
+      case 'archive': return 'archive';
+      case 'unarchive': return 'unarchive';
+      case 'deleteContact': return 'DELETE contact';
+    }
+  }
 }
 
 /** " due in 3 days at 14:00", " due today", or "" for an undated task. */

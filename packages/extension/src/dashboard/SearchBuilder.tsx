@@ -49,8 +49,18 @@ const SOURCE_LABELS: Record<string, string> = {
   profile: 'Added from Facebook profile',
 };
 
+// Stored values stay as they are (saved searches and synced contacts hold
+// them); only what the picker shows is spelled out.
+const READ_STATE_LABELS: Record<string, string> = {
+  responded: 'needs response',
+  read: 'read (they opened yours)',
+  unread: 'not read yet',
+  unknown: 'unknown',
+};
+
 function enumOptionLabel(fieldKey: string | undefined, value: string): string {
   if (fieldKey === 'source') return SOURCE_LABELS[value] || value;
+  if (fieldKey === 'readState') return READ_STATE_LABELS[value] || value;
   return value;
 }
 
@@ -622,6 +632,36 @@ function GroupEditor({ group, fields, ctx, tagGrouping, depth, onChange, onRemov
         ))}
       </div>
     </div>
+  );
+}
+
+/**
+ * The advanced-search condition builder on its own — no preset bar, no match
+ * count — for anything else that needs "which contacts" answered the same way
+ * the contact list answers it (a quick action's "only if" condition).
+ */
+export function QueryEditor({ query, onChange, tags, tagGroups, fieldDefs }: {
+  query: QueryGroup;
+  onChange: (next: QueryGroup) => void;
+  tags: QueryContext['tags'];
+  tagGroups: QueryContext['tagGroups'];
+  fieldDefs: QueryContext['fieldDefs'];
+}) {
+  const ctx: QueryContext = useMemo(
+    () => ({ now: Date.now(), tags, tagGroups, fieldDefs }),
+    [tags, tagGroups, fieldDefs]
+  );
+  const fields = useMemo(() => buildFields(fieldDefs, tags, tagGroups), [fieldDefs, tags, tagGroups]);
+  const [tagsGrouped, toggleTagsGrouped] = useSearchTagGrouping();
+  return (
+    <GroupEditor
+      group={query}
+      fields={fields}
+      ctx={ctx}
+      tagGrouping={{ grouped: tagsGrouped, onToggle: toggleTagsGrouped }}
+      depth={0}
+      onChange={onChange}
+    />
   );
 }
 

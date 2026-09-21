@@ -15,9 +15,10 @@ import {
   isCrmSyncKey,
   isStoreChangeKey,
   loadStore as _loadStore,
+  tagGroupMode,
 } from './storage';
 import type { Store, Tag, Conversation, CustomFieldDef, TagGroup } from './storage';
-import { bucketTags, showsGroupLabels, type TagBucket } from './tagGrouping';
+import { bucketTags, showsGroupLabels, tagDisplayOrder, type TagBucket } from './tagGrouping';
 import { funnelsFor, stageEditsFor, isNoOpStageEdit, describeStage, stagePosition, stageTitle, type FunnelView } from './funnel';
 import { readPresetActions, stepsFor, describePreset, isDestructive, type PresetAction } from './presets';
 import {
@@ -41,6 +42,7 @@ import {
   DELIVERY_PENDING_PATTERNS,
   ALT_FRAGMENT_MAX,
   readStateOfLastOutgoing,
+  threadTurnState,
   hasReadReceipt,
   hasUnreadMessage,
 } from './messageStatus';
@@ -294,6 +296,55 @@ interface MutateResponse {
   store?: Store;
   result?: { planLimitReached?: boolean; signedOut?: boolean };
 }
+
+// ---- Panel busy state ----
+//
+// A save goes to the background worker and back, and with a big store or a
+// slow machine that can take seconds. Without a sign that it's still working,
+// people click again (a second tag, a second task) or close the panel or tab
+// before it lands. So every panel action that writes runs through
+// panelAction: while one is in flight the panel carries `fb-crm-busy` (header
+// reads "Saving…" and a bar runs along the top — see content.css), clicks on
+// it are blocked, and leaving the page asks first.
+//
+// Actions QUEUE rather than being dropped while busy: a field that commits on
+// blur can fire during another save, and throwing that edit away would be
+// worse than making it wait its turn. Double clicks are stopped by the blocked
+// pointer events, not by dropping work.
+
+let panelBusyDepth = 0;
+let panelQueue: Promise<void> = Promise.resolve();
+
+function setPanelBusy(delta: number): void {
+  panelBusyDepth = Math.max(0, panelBusyDepth + delta);
+  const busy = panelBusyDepth > 0;
+  panelEl?.classList.toggle('fb-crm-busy', busy);
+  panelEl?.setAttribute('aria-busy', String(busy));
+}
+
+/** Run one panel action that writes, showing the busy state until it finishes. */
+function panelAction(fn: () => Promise<void>): Promise<void> {
+  const run = async () => {
+    setPanelBusy(1);
+    try {
+      await fn();
+    } catch (err) {
+      console.warn('[CRM] panel action failed', err);
+    } finally {
+      setPanelBusy(-1);
+    }
+  };
+  const done = panelQueue.then(run);
+  panelQueue = done;
+  return done;
+}
+
+// Closing or navigating away mid-save: the browser's own "Leave site?" prompt.
+window.addEventListener('beforeunload', (e) => {
+  if (panelBusyDepth === 0) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
 
 async function mutate(mutations: Mutation[]): Promise<Store> {
   if (!mutations.length) return getStore();
@@ -1189,6 +1240,13 @@ let deleteArmed = false;
 // presets.ts). Holds the id of the preset awaiting confirmation, or null.
 let presetArmed: string | null = null;
 
+// Completed funnels (contact at the last stage) collapse to a one-line
+// "Completed" row; these are the group ids opened back up to show the bar.
+// View state only, so it lives here and resets with the conversation.
+const expandedFunnels = new Set<string>();
+// Whether funnels hidden for this contact are listed (so they can be unhidden).
+let showHiddenFunnels = false;
+
 // In-progress "add follow-up" row, module-scoped for the same reason as
 // newTagDraft. `due` is a day offset as a string ('' = no due date, 'custom' =
 // use `date`), and `date` is the YYYY-MM-DD a custom pick left behind.
@@ -1319,12 +1377,55 @@ function tagSectionHtml(opts: {
  * second row rather than shrinking each stage to a nameless sliver — labels
  * used to be dropped past four stages, which left a row of coloured blocks and
  * no way to tell which phase was which short of hovering each one.
+ *
+ * Two things keep this from eating the panel. A funnel the contact has
+ * COMPLETED (at its last stage) collapses to its title and a "✓ Completed"
+ * toggle — the bar has nothing left to say and the tags are still in the chips
+ * below. And a funnel that doesn't apply to this contact can be hidden for
+ * them (Conversation.hiddenFunnels); hidden ones are counted in a one-line
+ * toggle at the bottom so they can be brought back.
  */
-function funnelBarsHtml(views: FunnelView[]): string {
-  if (!views.length) return '';
+function funnelBarsHtml(allViews: FunnelView[], hiddenIds: string[]): string {
+  if (!allViews.length) return '';
+  const hidden = new Set(hiddenIds);
+  const hiddenCount = allViews.filter((v) => hidden.has(v.group.id)).length;
+  const views = showHiddenFunnels ? allViews : allViews.filter((v) => !hidden.has(v.group.id));
 
-  return views.map((view) => {
+  const bars = views.map((view) => {
     const accent = view.group.color || '#065fd4';
+    const groupId = escapeHtml(view.group.id);
+    const groupName = escapeHtml(view.group.name);
+    const title = `
+        <div class="fb-crm-section-title">
+          <span class="fb-crm-tag-group-dot" style="background:${accent}"></span>${groupName}
+        </div>`;
+
+    // Hidden for this contact, listed only so it can be brought back.
+    if (hidden.has(view.group.id)) {
+      return `
+      <div class="fb-crm-section-title-row fb-crm-funnel__row--hidden">
+        ${title}
+        <span class="fb-crm-funnel__meta">
+          <button class="fb-crm-funnel__link" data-funnel-unhide="${groupId}" title="Show ${groupName} for this contact again">Unhide</button>
+        </span>
+      </div>`;
+    }
+
+    const hideBtn = `<button class="fb-crm-funnel__hide" data-funnel-hide="${groupId}" title="Hide ${groupName} for this contact (its tags are kept)" aria-label="Hide ${groupName} for this contact">✕</button>`;
+    const completed = view.currentIndex === view.stages.length - 1;
+    const expanded = expandedFunnels.has(view.group.id);
+
+    const status = completed
+      ? `<button class="fb-crm-funnel__done" data-funnel-expand="${groupId}" aria-expanded="${expanded}"
+           title="${escapeHtml(describeStage(view))} — ${expanded ? 'hide' : 'show'} the pipeline">✓ Completed ${expanded ? '▴' : '▾'}</button>`
+      : `<span class="fb-crm-funnel__pos">${escapeHtml(stagePosition(view))}</span>`;
+
+    const header = `
+      <div class="fb-crm-section-title-row">
+        ${title}
+        <span class="fb-crm-funnel__meta">${status}${hideBtn}</span>
+      </div>`;
+    if (completed && !expanded) return header;
 
     const steps = view.stages.map((stage, i) => {
       const reached = i <= view.currentIndex;
@@ -1343,15 +1444,46 @@ function funnelBarsHtml(views: FunnelView[]): string {
       >${escapeHtml(stage.name)}</button>`;
     }).join('');
 
-    return `
-      <div class="fb-crm-section-title-row">
-        <div class="fb-crm-section-title">
-          <span class="fb-crm-tag-group-dot" style="background:${accent}"></span>${escapeHtml(view.group.name)}
-        </div>
-        <span class="fb-crm-funnel__pos">${escapeHtml(stagePosition(view))}</span>
-      </div>
+    return `${header}
       <div class="fb-crm-funnel" role="group" aria-label="${escapeHtml(describeStage(view))}">${steps}</div>`;
   }).join('');
+
+  const hiddenToggle = hiddenCount
+    ? `<button class="fb-crm-funnel__link fb-crm-funnel__hidden-toggle" data-funnels-show-hidden="1">
+        ${showHiddenFunnels ? 'Stop showing hidden funnels' : `${hiddenCount} funnel${hiddenCount === 1 ? '' : 's'} hidden for this contact · Show`}
+      </button>`
+    : '';
+  return bars + hiddenToggle;
+}
+
+/**
+ * Single-choice groups (TagGroup.singleChoice) as one labelled dropdown each:
+ * the group name, then a select of its tags plus a blank "—" to clear it.
+ *
+ * A contact tagged before the group was switched to single choice can still
+ * hold several of its tags; the dropdown shows the most recently added one, and
+ * the next pick clears the rest (the mutation layer does that).
+ */
+function choiceGroupsHtml(conv: Conversation, store: Store): string {
+  const groups = Object.values(store.tagGroups)
+    .filter((g) => tagGroupMode(g) === 'single')
+    .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
+  const rows = groups.map((g) => {
+    const options = Object.values(store.tags).filter((t) => t.groupId === g.id).sort(tagDisplayOrder);
+    if (!options.length) return '';
+    const held = options.filter((t) => conv.tags.includes(t.id));
+    const current = held.sort((a, b) => (conv.tagAddedAt?.[b.id] ?? 0) - (conv.tagAddedAt?.[a.id] ?? 0))[0];
+    const accent = g.color || '#065fd4';
+    return `
+      <label class="fb-crm-choice">
+        <span class="fb-crm-choice__label"><span class="fb-crm-tag-group-dot" style="background:${accent}"></span>${escapeHtml(g.name)}</span>
+        <select class="fb-crm-choice__select" data-choice-group="${escapeHtml(g.id)}" aria-label="${escapeHtml(g.name)}">
+          <option value="">—</option>
+          ${options.map((t) => `<option value="${escapeHtml(t.id)}"${t.id === current?.id ? ' selected' : ''}>${escapeHtml(t.name)}</option>`).join('')}
+        </select>
+      </label>`;
+  }).join('');
+  return rows ? `<div class="fb-crm-choices">${rows}</div>` : '';
 }
 
 /**
@@ -1590,6 +1722,8 @@ async function renderPanelContent() {
     focusedFieldId = null;
     editingName = null;
     editingNameFocused = false;
+    expandedFunnels.clear();
+    showHiddenFunnels = false;
     taskDraft.title = '';
     taskTitleFocused = false;
   }
@@ -1611,7 +1745,7 @@ async function renderPanelContent() {
           <button class="fb-crm-pick-btn" id="fb-crm-add-profile">➕ Add to CRM</button>
         </div>`;
       wireClose();
-      panelEl.querySelector('#fb-crm-add-profile')?.addEventListener('click', async () => {
+      panelEl.querySelector('#fb-crm-add-profile')?.addEventListener('click', () => void panelAction(async () => {
         // Save the name the panel is SHOWING. It came from getProfilePageName,
         // so establishProfileName below returns that same remembered read
         // rather than a second, later look at a page that has since filled up
@@ -1636,7 +1770,7 @@ async function renderPanelContent() {
         if (conv) currentPanelThreadId = conv.id;
         await renderPanel();
         await injectSidebarTags();
-      });
+      }));
       return;
     }
 
@@ -1676,12 +1810,12 @@ async function renderPanelContent() {
         <button class="fb-crm-pick-btn" id="fb-crm-save-contact">➕ ${wasRemoved ? 'Add back to CRM' : 'Save this contact'}</button>
       </div>`;
     wireClose();
-    panelEl.querySelector('#fb-crm-save-contact')?.addEventListener('click', async () => {
+    panelEl.querySelector('#fb-crm-save-contact')?.addEventListener('click', () => void panelAction(async () => {
       removedThreads.delete(threadId);
       await ensureConversation(threadId);
-      renderPanel();
+      await renderPanel();
       await injectSidebarTags();
-    });
+    }));
     return;
   }
 
@@ -1704,7 +1838,10 @@ async function renderPanelContent() {
   }
   const store = await getStore();
   const convTags = conv.tags.map(tid => store.tags[tid]).filter(Boolean) as Tag[];
-  const availableTags = Object.values(store.tags).filter(t => !conv.tags.includes(t.id));
+  // Single-choice groups have their own dropdown above, so their tags aren't
+  // offered again as chips here.
+  const availableTags = Object.values(store.tags).filter(t =>
+    !conv.tags.includes(t.id) && tagGroupMode(t.groupId ? store.tagGroups[t.groupId] : undefined) !== 'single');
   // Custom fields the user opted into showing here (dashboard → Fields → "In
   // panel"). Same order as the dashboard's detail view.
   const panelFields = Object.values(store.fieldDefs)
@@ -1725,15 +1862,16 @@ async function renderPanelContent() {
       <button class="fb-crm-close">✕</button>
     </div>
     <div class="fb-crm-body">
-      ${nameRowHtml(conv.participantName)}
+      ${nameRowHtml(conv.participantName, !isProfilePage())}
       <div class="fb-crm-meta">📨 Last contacted: <strong>${formatRelative(conv.lastContactedAt)}</strong></div>
-      ${isProfilePage() ? '' : '<button class="fb-crm-pick-btn">🎯 Select different conversation</button>'}
 
       ${presetActionsHtml(presets, store, presetArmed)}
 
       ${tasksSectionHtml(conv)}
 
-      ${funnelBarsHtml(funnelsFor(conv, store.tags, store.tagGroups))}
+      ${funnelBarsHtml(funnelsFor(conv, store.tags, store.tagGroups), conv.hiddenFunnels || [])}
+
+      ${choiceGroupsHtml(conv, store)}
 
       ${panelFields.length > 0 ? `
         <div class="fb-crm-section-title">Details</div>
@@ -1787,7 +1925,7 @@ async function renderPanelContent() {
     </div>`;
 
   wireClose();
-  panelEl.querySelector('.fb-crm-pick-btn')?.addEventListener('click', enterPickMode);
+  panelEl.querySelector('.fb-crm-pick-icon')?.addEventListener('click', enterPickMode);
   // Bind to the record's own store key, not the id in the URL. ensureConversation
   // may have adopted this thread onto an existing contact keyed under one of its
   // aliases, and every action below addresses the contact by key.
@@ -1886,12 +2024,15 @@ function chipTitle(t: Tag): string {
 // below, the input's value is set on the live element by wirePanelActions
 // rather than baked into a value="…" attribute, because escapeHtml escapes
 // text, not attribute quotes.
-function nameRowHtml(participantName: string): string {
+// `showPick` adds the round 🎯 button beside the rename one — "select a
+// different conversation", which used to be a full-width button of its own.
+function nameRowHtml(participantName: string, showPick = false): string {
   if (editingName === null) {
     return `
       <div class="fb-crm-name-row">
         <div class="fb-crm-name">${escapeHtml(participantName)}</div>
         <button class="fb-crm-name-edit" title="Edit name">✎</button>
+        ${showPick ? '<button class="fb-crm-name-edit fb-crm-pick-icon" title="Select a different conversation" aria-label="Select a different conversation">🎯</button>' : ''}
       </div>`;
   }
   return `
@@ -1938,13 +2079,15 @@ function wirePanelFields(threadId: string, conv: Conversation, defs: CustomField
     const stored = conv.customFields?.[def.id] ?? '';
     el.value = fieldDrafts.get(def.id) ?? stored;
 
-    const commit = async () => {
+    const commit = () => {
       const value = el.value.trim();
       fieldDrafts.delete(def.id);
       if (focusedFieldId === def.id) focusedFieldId = null;
       if (value === stored) return;
-      await mutate([{ op: 'setCustomField', conversationId: threadId, fieldId: def.id, value }]);
-      await renderPanel();
+      void panelAction(async () => {
+        await mutate([{ op: 'setCustomField', conversationId: threadId, fieldId: def.id, value }]);
+        await renderPanel();
+      });
     };
 
     if (def.type === 'select' || def.type === 'date') {
@@ -1975,10 +2118,12 @@ function wirePanelTasks(threadId: string) {
   if (!panelEl) return;
 
   panelEl.querySelectorAll<HTMLInputElement>('[data-task-done]').forEach(box => {
-    box.addEventListener('change', async () => {
+    box.addEventListener('change', () => {
       box.disabled = true;
-      await mutate([{ op: 'updateTask', conversationId: threadId, taskId: box.dataset.taskDone!, patch: { done: box.checked } }]);
-      await renderPanel();
+      void panelAction(async () => {
+        await mutate([{ op: 'updateTask', conversationId: threadId, taskId: box.dataset.taskDone!, patch: { done: box.checked } }]);
+        await renderPanel();
+      });
     });
   });
 
@@ -2018,8 +2163,10 @@ function wirePanelTasks(threadId: string) {
     // follow-ups for the same day is the common run.
     taskDraft.title = '';
     addEl.disabled = true;
-    await mutate([{ op: 'addTask', conversationId: threadId, task }]);
-    await renderPanel();
+    await panelAction(async () => {
+      await mutate([{ op: 'addTask', conversationId: threadId, task }]);
+      await renderPanel();
+    });
   });
 
   if (taskTitleFocused) {
@@ -2053,7 +2200,7 @@ function wirePanelActions(threadId: string) {
   // Preset actions. `stepsFor` turns the preset into the same mutations the
   // manual controls emit, so a preset can never do something the panel itself
   // couldn't — and the background applies them under its usual lock.
-  const applyPreset = async (presetId: string) => {
+  const applyPreset = (presetId: string) => panelAction(async () => {
     const store = await getStore();
     const preset = readPresetActions(store).find((p) => p.id === presetId);
     const conv = store.conversations[threadId];
@@ -2078,7 +2225,7 @@ function wirePanelActions(threadId: string) {
     }
     await renderPanel();
     await injectSidebarTags();
-  };
+  });
 
   panelEl.querySelectorAll<HTMLElement>('[data-preset]').forEach(btn => {
     btn.addEventListener('click', async () => {
@@ -2103,19 +2250,48 @@ function wirePanelActions(threadId: string) {
     await renderPanel();
   });
 
+  // Every plain tag edit in the panel: write, redraw, refresh the sidebar chips.
+  const tagEdit = (mutations: Mutation[]) => panelAction(async () => {
+    if (!mutations.length) return;
+    await mutate(mutations);
+    await renderPanel();
+    await injectSidebarTags();
+  });
+
   panelEl.querySelectorAll<HTMLElement>('[data-remove]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      await mutate([{ op: 'removeTags', conversationId: threadId, tagIds: [btn.dataset.remove!] }]);
-      await renderPanel();
-      await injectSidebarTags();
+    btn.addEventListener('click', () => {
+      void tagEdit([{ op: 'removeTags', conversationId: threadId, tagIds: [btn.dataset.remove!] }]);
     });
   });
 
   panelEl.querySelectorAll<HTMLElement>('[data-add]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      await mutate([{ op: 'addTags', conversationId: threadId, tagIds: [btn.dataset.add!] }]);
-      await renderPanel();
-      await injectSidebarTags();
+    btn.addEventListener('click', () => {
+      void tagEdit([{ op: 'addTags', conversationId: threadId, tagIds: [btn.dataset.add!] }]);
+    });
+  });
+
+  // Single-choice groups (TagGroup.singleChoice): the dropdown. Picking a tag
+  // is an ordinary addTags — the mutation layer clears the group's other tags
+  // — and picking the blank option clears the group.
+  panelEl.querySelectorAll<HTMLSelectElement>('[data-choice-group]').forEach(sel => {
+    sel.addEventListener('change', () => {
+      const groupId = sel.dataset.choiceGroup!;
+      const tagId = sel.value;
+      void panelAction(async () => {
+        const store = await getStore();
+        const conv = store.conversations[threadId];
+        if (!conv) return;
+        const held = conv.tags.filter((t) => store.tags[t]?.groupId === groupId);
+        if (tagId) {
+          if (!held.includes(tagId) || held.length > 1) {
+            await mutate([{ op: 'addTags', conversationId: threadId, tagIds: [tagId] }]);
+          }
+        } else if (held.length) {
+          await mutate([{ op: 'removeTags', conversationId: threadId, tagIds: held }]);
+        }
+        await renderPanel();
+        await injectSidebarTags();
+      });
     });
   });
 
@@ -2126,7 +2302,7 @@ function wirePanelActions(threadId: string) {
   // moved groups. Both ops go in ONE mutate call, remove first, so the contact
   // is never momentarily at two stages of the same group.
   panelEl.querySelectorAll<HTMLElement>('[data-stage-group]').forEach(btn => {
-    btn.addEventListener('click', async () => {
+    btn.addEventListener('click', () => void panelAction(async () => {
       const store = await getStore();
       const conv = store.conversations[threadId];
       if (!conv) return;
@@ -2143,7 +2319,34 @@ function wirePanelActions(threadId: string) {
       await mutate(mutations);
       await renderPanel();
       await injectSidebarTags();
+    }));
+  });
+
+  // Completed funnels: open or close the bar. View state only — no write.
+  panelEl.querySelectorAll<HTMLElement>('[data-funnel-expand]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.funnelExpand!;
+      if (expandedFunnels.has(id)) expandedFunnels.delete(id);
+      else expandedFunnels.add(id);
+      await renderPanel();
     });
+  });
+
+  // Hide / unhide a funnel for this contact. Stored on the contact, so it
+  // holds on every machine and every time the panel opens for them.
+  const setFunnelHidden = (groupId: string, hidden: boolean) => panelAction(async () => {
+    await mutate([{ op: 'setFunnelHidden', conversationId: threadId, groupId, hidden }]);
+    await renderPanel();
+  });
+  panelEl.querySelectorAll<HTMLElement>('[data-funnel-hide]').forEach(btn => {
+    btn.addEventListener('click', () => { void setFunnelHidden(btn.dataset.funnelHide!, true); });
+  });
+  panelEl.querySelectorAll<HTMLElement>('[data-funnel-unhide]').forEach(btn => {
+    btn.addEventListener('click', () => { void setFunnelHidden(btn.dataset.funnelUnhide!, false); });
+  });
+  panelEl.querySelector<HTMLElement>('[data-funnels-show-hidden]')?.addEventListener('click', async () => {
+    showHiddenFunnels = !showHiddenFunnels;
+    await renderPanel();
   });
 
   panelEl.querySelector('#fb-crm-create')?.addEventListener('click', async () => {
@@ -2158,9 +2361,7 @@ function wirePanelActions(threadId: string) {
     newTagDraft.name = '';
     newTagDraft.color = randomColor();
     newTagNameFocused = false;
-    await mutate([{ op: 'createTag', tag, attachTo: threadId }]);
-    await renderPanel();
-    await injectSidebarTags();
+    await tagEdit([{ op: 'createTag', tag, attachTo: threadId }]);
   });
 
   // Keep the in-progress draft in sync so a re-render can't lose it.
@@ -2189,7 +2390,7 @@ function wirePanelActions(threadId: string) {
     await renderPanel();
   });
 
-  panelEl.querySelector('#fb-crm-delete-confirm')?.addEventListener('click', async () => {
+  panelEl.querySelector('#fb-crm-delete-confirm')?.addEventListener('click', () => void panelAction(async () => {
     const store = await getStore();
     const conv = store.conversations[threadId];
     const name = conv?.participantName || threadId;
@@ -2212,10 +2413,10 @@ function wirePanelActions(threadId: string) {
     console.info(`[CRM] Removed contact ${threadId} ("${name}") from the CRM`);
     await renderPanel();
     await injectSidebarTags();
-  });
+  }));
 
   // Name edit button — opens the inline editor below.
-  panelEl.querySelector('.fb-crm-name-edit')?.addEventListener('click', async () => {
+  panelEl.querySelector('.fb-crm-name-edit:not(.fb-crm-pick-icon)')?.addEventListener('click', async () => {
     const nameEl = panelEl?.querySelector<HTMLElement>('.fb-crm-name');
     if (!nameEl) return;
     editingName = nameEl.textContent || '';
@@ -2244,9 +2445,11 @@ function wirePanelActions(threadId: string) {
       if (!name) { nameInputEl.focus(); return; }
       editingName = null;
       editingNameFocused = false;
-      await mutate([{ op: 'renameContact', conversationId: threadId, name }]);
-      await renderPanel();
-      await injectSidebarTags();
+      await panelAction(async () => {
+        await mutate([{ op: 'renameContact', conversationId: threadId, name }]);
+        await renderPanel();
+        await injectSidebarTags();
+      });
     };
 
     nameInputEl.addEventListener('input', () => { editingName = nameInputEl.value; });
@@ -3301,14 +3504,16 @@ function collectReadStateObservations(at: number): ReadStateObservation[] {
   const seen = new Map<string, ReadState>();
   const note = (threadId: string | null | undefined, state: ReadState) => { noteState(seen, threadId, state); };
 
-  // The thread the user is looking at. Whatever its sidebar row still says,
-  // having it open means its messages are being read right now, so it is never
-  // reported as 'responded' — see harvestRows.
+  // The thread the user is looking at. Its sidebar row is ignored (see
+  // harvestRows): the open pane itself is the better witness. threadTurnState
+  // asks whose message is last BEFORE looking at receipts — their reply at the
+  // bottom means 'responded' (needs response) even once you've opened it,
+  // rather than the "Seen" on your earlier message reading as 'read'.
   const activeThreadId = isMessagesPage() ? getActiveThreadId() : null;
 
   if (isMessagesPage()) {
     const main = document.querySelector<HTMLElement>('[role="main"]');
-    if (main) note(activeThreadId, readStateOfLastOutgoing(main).state);
+    if (main) note(activeThreadId, threadTurnState(main));
   }
 
   for (const composer of findDrawerComposers()) {
@@ -3317,7 +3522,7 @@ function collectReadStateObservations(at: number): ReadStateObservation[] {
     // Only a drawer that names exactly one thread. An ambiguous one would
     // attribute one conversation's receipt to somebody else.
     if (ids.length !== 1) continue;
-    note(ids[0], readStateOfLastOutgoing(scope).state);
+    note(ids[0], threadTurnState(scope));
   }
 
   for (const [threadId, state] of harvestRows(document, activeThreadId).states) note(threadId, state);

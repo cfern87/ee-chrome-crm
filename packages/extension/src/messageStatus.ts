@@ -184,11 +184,12 @@ export function hasUnreadMessage(scope: HTMLElement): boolean {
 /**
  * What the CRM records about a thread.
  *
- * 'read'/'unread' describe OUR last outgoing message; 'responded' describes
- * theirs. They share one field because they are one question in practice —
- * "whose turn is it?" — and because a reply makes the receipt on our own
- * message moot: once somebody has written back, whether they opened the thing
- * you sent before that is no longer what you want the chip to tell you.
+ * 'read'/'unread' describe OUR last outgoing message, and only while it is the
+ * newest message in the thread; 'responded' (shown as "Needs response") means
+ * THEIR message is the newest — seen as an unread row in the list, or as their
+ * bubble at the bottom of an open thread, opened or not. They share one field
+ * because they are one question — "whose turn is it?" — and a reply makes the
+ * receipt on our own message moot. See threadTurnState.
  */
 export type ReadState = 'read' | 'unread' | 'responded' | 'unknown';
 
@@ -246,6 +247,112 @@ export function readStateOfLastOutgoing(scope: HTMLElement): { state: ReadState;
   const last = statuses[statuses.length - 1];
   if (!last) return { state: 'unknown', label: '' };
   return { state: READ_PATTERNS.some((re) => re.test(last)) ? 'read' : 'unread', label: last };
+}
+
+// ---- Whose message is last? ----
+//
+// readStateOfLastOutgoing answers a question about OUR last message and is
+// blind to anything after it. That made an opened thread lie: they read your
+// message, WROTE BACK, and you opened the reply — the receipt on your message
+// still says "Seen", so the contact was recorded as 'read' ("ball in their
+// court") when the ball was in yours. Asking whose message is at the bottom of
+// the thread first is what fixes that.
+//
+// Answered by LAYOUT, not wording: in every Messenger surface your bubbles sit
+// against the right edge of the conversation and theirs against the left. A
+// text marker ("You sent", the sender's name) would be localized and would rot
+// the first time someone ran Messenger in another language.
+
+export type MessageDirection = 'incoming' | 'outgoing' | 'unknown';
+
+/** A box, as getBoundingClientRect reports it. Injectable so tests can lay out a thread. */
+export interface Box { left: number; right: number; top: number; bottom: number; width: number; height: number }
+export type RectOf = (el: Element) => Box;
+
+// Receipt avatars (14px), the sender's profile picture beside their bubbles
+// (28px, measured live 2026-09-21), reaction badges and inline emoji are small
+// images that sit beside or under a bubble without being one. Anything this
+// size or smaller is not "the last message"; photos and stickers are larger.
+const MIN_MEDIA_PX = 32;
+
+// A candidate has to hug one edge by at least this share of the column width
+// more than the other. Centred items — date separators, "You named the group"
+// notices — sit in between and must not count as either side.
+const SIDE_MARGIN = 0.1;
+
+/**
+ * Which side the newest message in `scope` (an open thread pane, or a chat
+ * drawer) is on.
+ *
+ * The reference column runs from the left edge of `scope` to the right edge
+ * of the composer, and everything above the composer is the thread. Not the
+ * composer alone: measured live, it starts ~180px in (the attachment buttons
+ * sit to its left), which pulled centred items like timestamps toward
+ * "incoming". Its RIGHT edge is still the one to use — the pane can carry a
+ * contact-info column on the right, and the composer shrinks with the
+ * conversation where the pane doesn't. The newest message is
+ * the lowest piece of content above it — message text (`dir="auto"`, which
+ * Messenger puts on every bubble's text) or a picture/sticker — skipping
+ * delivery/receipt labels and small decorations.
+ *
+ * 'unknown' whenever the layout doesn't say clearly: no composer, nothing
+ * above it, or the lowest item centred. The caller must treat that as "no
+ * observation", not as either answer.
+ */
+export function lastMessageDirection(
+  scope: HTMLElement,
+  rectOf: RectOf = (el) => el.getBoundingClientRect(),
+): MessageDirection {
+  const composers = Array.from(scope.querySelectorAll<HTMLElement>('[contenteditable="true"][role="textbox"], [contenteditable="true"]'));
+  const composer = composers[composers.length - 1];
+  if (!composer) return 'unknown';
+  const comp = rectOf(composer);
+  if (!comp.width) return 'unknown';
+  const left = Math.min(rectOf(scope).left, comp.left);
+  const col = { left, right: comp.right, top: comp.top, width: comp.right - left };
+
+  let lowest: { box: Box } | null = null;
+  for (const el of Array.from(scope.querySelectorAll<HTMLElement>('[dir="auto"], img, video'))) {
+    if (el.closest('[contenteditable="true"]')) continue;
+    const box = rectOf(el);
+    if (!box.width || !box.height || box.bottom > col.top) continue;
+
+    if (el.tagName === 'IMG' || el.tagName === 'VIDEO') {
+      if (box.width <= MIN_MEDIA_PX && box.height <= MIN_MEDIA_PX) continue;
+      const alt = normalizeText(el.getAttribute('alt') || '');
+      if (SEEN_BY_ALT.test(alt)) continue;
+    } else {
+      const text = normalizeText(el.textContent || '');
+      if (!text) continue;
+      // "Sent", "Seen", "Delivered"… are the thread's status line, not a message.
+      if (text.length <= TEXT_FRAGMENT_MAX && ANY_STATUS_PATTERNS.some((re) => re.test(text))) continue;
+    }
+    if (!lowest || box.bottom > lowest.box.bottom) lowest = { box };
+  }
+  if (!lowest) return 'unknown';
+
+  const gapLeft = lowest.box.left - col.left;
+  const gapRight = col.right - lowest.box.right;
+  const margin = col.width * SIDE_MARGIN;
+  if (gapLeft - gapRight > margin) return 'outgoing';
+  if (gapRight - gapLeft > margin) return 'incoming';
+  return 'unknown';
+}
+
+/**
+ * What an open thread says about whose turn it is — the one function the
+ * observers use, so a pane and a drawer can't disagree.
+ *
+ * Their message last → 'responded' ("needs response"), whether or not you have
+ * opened it. Yours last → the receipt on it, read or unread. Can't tell whose
+ * is last → 'unknown', which records nothing: falling back to the receipt alone
+ * is exactly the reading that mislabelled replied-to threads as 'read'.
+ */
+export function threadTurnState(scope: HTMLElement, rectOf?: RectOf): ReadState {
+  const dir = lastMessageDirection(scope, rectOf);
+  if (dir === 'incoming') return 'responded';
+  if (dir === 'unknown') return 'unknown';
+  return readStateOfLastOutgoing(scope).state;
 }
 
 /**

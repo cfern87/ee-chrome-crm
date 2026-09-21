@@ -10,7 +10,7 @@
 // needs — so adding a fifth tag to a preset is one click and never a rethink
 // of the layout.
 
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import type { Store, SaveResult } from '../storage';
 import {
   PresetAction, PresetStep, PresetStepKind,
@@ -22,11 +22,15 @@ import {
   Field as FormField, color, radius, space,
 } from '../ui/primitives';
 import type { TaskPriority } from '../tasks';
+import { funnelStages } from '../funnel';
+import { emptyQuery, newCondition, type QueryGroup } from '../search';
 import { DraftInput } from './shared';
+import { QueryEditor } from './SearchBuilder';
 
 const STEP_LABELS: Record<PresetStepKind, string> = {
   addTag: 'Add tag',
   removeTag: 'Remove tag',
+  setFunnelStage: 'Set funnel step',
   appendName: 'Append to name',
   prependName: 'Prepend to name',
   setField: 'Set field',
@@ -38,7 +42,7 @@ const STEP_LABELS: Record<PresetStepKind, string> = {
 };
 
 const STEP_ORDER: PresetStepKind[] = [
-  'addTag', 'removeTag', 'appendName', 'prependName', 'setField', 'addTask', 'completeTasks',
+  'addTag', 'removeTag', 'setFunnelStage', 'appendName', 'prependName', 'setField', 'addTask', 'completeTasks',
   'archive', 'unarchive', 'deleteContact',
 ];
 
@@ -86,8 +90,12 @@ function blankStep(kind: PresetStepKind, store: Store): PresetStep {
       return { kind, fieldId: Object.keys(store.fieldDefs)[0] || '', value: '' };
     case 'addTask':
       return { kind, title: 'Follow up', dueInDays: 3 };
+    case 'setFunnelStage': {
+      const first = funnelStages(store.tags, store.tagGroups)[0];
+      return { kind, groupId: first?.group.id || '', tagId: first?.stages[0]?.id || '' };
+    }
     default:
-      return { kind };
+      return { kind } as PresetStep;
   }
 }
 
@@ -102,6 +110,7 @@ export function PresetActionsSettings({ store, updateStore }: {
 
   const tags = Object.values(store.tags).sort((a, b) => a.name.localeCompare(b.name));
   const fields = Object.values(store.fieldDefs).sort((a, b) => a.order - b.order);
+  const hasFunnels = funnelStages(store.tags, store.tagGroups).length > 0;
 
   // writePresetActions owns the bookkeeping every save needs: `order` is
   // renumbered so it stays dense (the up/down buttons just swap positions in
@@ -281,7 +290,9 @@ export function PresetActionsSettings({ store, updateStore }: {
                       >
                         <option value="">+ Add an action…</option>
                         {STEP_ORDER.map((k) => (
-                          <option key={k} value={k}>{STEP_LABELS[k]}</option>
+                          <option key={k} value={k} disabled={k === 'setFunnelStage' && !hasFunnels}>
+                            {STEP_LABELS[k]}{k === 'setFunnelStage' && !hasFunnels ? ' (no funnels yet)' : ''}
+                          </option>
                         ))}
                       </Select>
                     </Stack>
@@ -323,27 +334,56 @@ function StepRow({ step, store, tags, fields, onChange, onRemove, onMove }: {
   onRemove: () => void;
   onMove: (delta: number) => void;
 }) {
+  const funnels = funnelStages(store.tags, store.tagGroups);
   return (
-    <Stack
-      direction="row"
-      gap="xs"
-      align="center"
-      wrap
-      style={{ background: color.surface.raised, borderRadius: radius.sm, padding: `${space.xs}px ${space.sm}px` }}
-    >
+    <div style={{ background: color.surface.raised, borderRadius: radius.sm, padding: `${space.xs}px ${space.sm}px` }}>
+    <Stack direction="row" gap="xs" align="center" wrap>
       <Select
         value={step.kind}
         aria-label="Action"
         // Through the same defaults "+ Add an action" uses. A bare `{ kind }`
         // left an addTask step with no title, which the panel would then
-        // silently skip every time the button was pressed.
-        onChange={(e) => onChange(blankStep(e.target.value as PresetStepKind, store))}
+        // silently skip every time the button was pressed. The condition is
+        // about WHEN, not what, so it survives a change of kind.
+        onChange={(e) => {
+          const next = blankStep(e.target.value as PresetStepKind, store);
+          onChange(step.when ? { ...next, when: step.when } : next);
+        }}
         style={{ width: 150 }}
       >
         {STEP_ORDER.map((k) => (
-          <option key={k} value={k}>{STEP_LABELS[k]}</option>
+          <option key={k} value={k} disabled={k === 'setFunnelStage' && !funnels.length && step.kind !== k}>
+            {STEP_LABELS[k]}
+          </option>
         ))}
       </Select>
+
+      {step.kind === 'setFunnelStage' && (
+        // Every funnel's stages, grouped by funnel and in stage order. The tag
+        // id alone picks the option (it is unique across groups); the group is
+        // stored beside it — see the step's comment in presets.ts.
+        <Select
+          value={step.tagId}
+          aria-label="Funnel step"
+          onChange={(e) => {
+            const tagId = e.target.value;
+            const f = funnels.find((x) => x.stages.some((s) => s.id === tagId));
+            if (f) onChange({ ...step, groupId: f.group.id, tagId });
+          }}
+          style={{ width: 220 }}
+        >
+          {!funnels.some((f) => f.stages.some((s) => s.id === step.tagId)) && (
+            <option value={step.tagId}>Choose a funnel step…</option>
+          )}
+          {funnels.map((f) => (
+            <optgroup key={f.group.id} label={f.group.name}>
+              {f.stages.map((s, i) => (
+                <option key={s.id} value={s.id}>{i + 1}. {s.name}</option>
+              ))}
+            </optgroup>
+          ))}
+        </Select>
+      )}
 
       {(step.kind === 'addTag' || step.kind === 'removeTag') && (
         <Select
@@ -471,10 +511,91 @@ function StepRow({ step, store, tags, fields, onChange, onRemove, onMove }: {
       )}
 
       <div style={{ marginLeft: 'auto', display: 'flex', gap: space.xxs }}>
+        {!step.when && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => onChange({ ...step, when: { ...emptyQuery(), children: [newCondition()] } })}
+            title="Only run this action when conditions about the contact are true"
+          >
+            If…
+          </Button>
+        )}
         <Button size="sm" variant="ghost" onClick={() => onMove(-1)} title="Move up">↑</Button>
         <Button size="sm" variant="ghost" onClick={() => onMove(1)} title="Move down">↓</Button>
         <Button size="sm" variant="ghost" onClick={onRemove} title="Remove this action">✕</Button>
       </div>
     </Stack>
+    {step.when && (
+      <StepCondition
+        key={step.when.id}
+        when={step.when}
+        store={store}
+        onChange={(when) => onChange({ ...step, when })}
+        onRemove={() => {
+          const { when: _w, ...rest } = step;
+          onChange(rest as PresetStep);
+        }}
+      />
+    )}
+    </div>
+  );
+}
+
+/** How long condition edits settle before they're saved. */
+const CONDITION_SAVE_MS = 600;
+
+/**
+ * A step's "only if" condition, in the advanced-search builder.
+ *
+ * Edits are held in a local draft and saved after a short pause, because the
+ * builder reports every keystroke in a text operand and each save here is a
+ * store write and a sync. The latest onChange is read through a ref so a save
+ * that lands after another edit to the preset doesn't write back a stale copy.
+ */
+function StepCondition({ when, store, onChange, onRemove }: {
+  when: QueryGroup;
+  store: Store;
+  onChange: (next: QueryGroup) => void;
+  onRemove: () => void;
+}) {
+  const [draft, setDraft] = useState(when);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+  const pending = useRef<QueryGroup | null>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flush = () => {
+    if (timer.current) { clearTimeout(timer.current); timer.current = null; }
+    if (pending.current) { onChangeRef.current(pending.current); pending.current = null; }
+  };
+  useEffect(() => flush, []);
+
+  const edit = (next: QueryGroup) => {
+    setDraft(next);
+    pending.current = next;
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(flush, CONDITION_SAVE_MS);
+  };
+
+  return (
+    <div style={{ marginTop: space.xs, paddingLeft: space.sm, borderLeft: `2px solid ${color.border.subtle}` }}>
+      <Stack direction="row" gap="xs" align="center" style={{ marginBottom: space.xs }}>
+        <Text size="micro" weight="semibold" tone="secondary">Only if</Text>
+        <Text size="micro" tone="muted" style={{ flex: 1 }}>
+          checked against the contact as it was when the button was pressed
+        </Text>
+        <Button size="sm" variant="link" onClick={() => { pending.current = null; flush(); onRemove(); }}>
+          Remove condition
+        </Button>
+      </Stack>
+      <QueryEditor
+        query={draft}
+        onChange={edit}
+        tags={store.tags}
+        tagGroups={store.tagGroups}
+        fieldDefs={store.fieldDefs}
+      />
+    </div>
   );
 }

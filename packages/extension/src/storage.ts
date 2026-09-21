@@ -108,8 +108,51 @@ export interface TagGroup {
   // one. Absent = false: picking a stage ADDS that tag and removes nothing,
   // and picking a stage the contact already holds removes just that one.
   funnelExclusive?: boolean;
+  // SINGLE CHOICE: the group works like a dropdown — a contact holds at most
+  // one of its tags, and adding one takes the others off (enforced in the
+  // mutation layer, so it holds for every surface that tags). The panel shows
+  // the group as a select. Mutually exclusive with `funnel`: a group is plain
+  // tags, a funnel, or a single choice — see tagGroupMode.
+  singleChoice?: boolean;
   createdAt: number;
   updatedAt?: number; // see Tag.updatedAt — same reason, same fallback
+}
+
+/** How a tag group behaves. One at a time; see TagGroup.funnel and TagGroup.singleChoice. */
+export type TagGroupMode = 'tags' | 'funnel' | 'single';
+
+export function tagGroupMode(g: Pick<TagGroup, 'funnel' | 'singleChoice'> | undefined): TagGroupMode {
+  if (g?.funnel) return 'funnel';
+  if (g?.singleChoice) return 'single';
+  return 'tags';
+}
+
+/**
+ * The tags to take off `conv` so that adding `tagIds` leaves at most one tag
+ * per single-choice group. Of several added to the same group at once, the
+ * LAST wins — the most recent pick is the one meant.
+ */
+export function singleChoiceRemovals(
+  conv: Conversation,
+  tagIds: string[],
+  tags: Record<string, Tag>,
+  groups: Record<string, TagGroup>,
+): { add: string[]; remove: string[] } {
+  const keep = new Map<string, string>(); // group id → the tag being added to it
+  for (const id of tagIds) {
+    const gid = tags[id]?.groupId;
+    if (gid && tagGroupMode(groups[gid]) === 'single') keep.set(gid, id);
+  }
+  if (!keep.size) return { add: tagIds, remove: [] };
+  const add = tagIds.filter((id) => {
+    const gid = tags[id]?.groupId;
+    return !gid || !keep.has(gid) || keep.get(gid) === id;
+  });
+  const remove = conv.tags.filter((id) => {
+    const gid = tags[id]?.groupId;
+    return !!gid && keep.has(gid) && keep.get(gid) !== id;
+  });
+  return { add, remove };
 }
 
 /**
@@ -306,6 +349,10 @@ export interface Conversation {
   // edited through the task mutations, which stamp `updatedAt` so the edit
   // wins the cross-machine merge.
   tasks?: FollowUpTask[];
+  // Funnel groups (TagGroup ids) not shown in this contact's panel — a funnel
+  // that doesn't apply to them. Display only: the group's tags stay on the
+  // contact and still show as chips. Absent = every funnel shown.
+  hiddenFunnels?: string[];
 }
 
 export interface Store {

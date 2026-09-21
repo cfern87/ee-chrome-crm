@@ -5,6 +5,8 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import type { Store, Conversation, Tag, CustomFieldDef, TagGroup } from '../storage';
+import { tagGroupMode } from '../storage';
+import { tagDisplayOrder } from '../tagGrouping';
 import { normalizeProfileUrl } from '../csv';
 import {
   Button, Card, Chip, Input, SectionTitle, Select, Stack, Text,
@@ -410,6 +412,8 @@ export interface ConvDetailProps {
   onOpen: () => void;
   onRemoveTag: (tagId: string) => void;
   onAddTag: (tagId: string) => void;
+  /** Pick a single-choice group's tag ('' clears the group) — see TagGroup.singleChoice. */
+  onSetChoice: (groupId: string, tagId: string) => void;
   /** Move this contact to a stage of a funnel group — see funnel.ts. */
   onSetStage: (view: FunnelView, index: number) => void;
   onSetCustomField: (fieldId: string, value: string) => void;
@@ -428,8 +432,23 @@ export interface ConvDetailProps {
   taskHandlers: TaskHandlers;
 }
 
-export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm2, grouped, taskHandlers, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onSetStage, onSetCustomField, onRename, onSetProfileUrl, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
-  const availableTags = tags.filter((t) => !conv.tags.includes(t.id));
+export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, deleteConfirm2, grouped, taskHandlers, onClose, onDelete, onArchive, onOpen, onRemoveTag, onAddTag, onSetChoice, onSetStage, onSetCustomField, onRename, onSetProfileUrl, onStartDelete, onConfirmDelete1, onCancelDelete }: ConvDetailProps) {
+  // Single-choice groups get their own dropdown (below the funnels), so their
+  // tags aren't offered again in "add tag". Applied ones still show as chips.
+  const isChoiceTag = (t: Tag) => !!t.groupId && tagGroupMode(store.tagGroups[t.groupId]) === 'single';
+  const availableTags = tags.filter((t) => !conv.tags.includes(t.id) && !isChoiceTag(t));
+  const choiceGroups = Object.values(store.tagGroups)
+    .filter((g) => tagGroupMode(g) === 'single')
+    .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt)
+    .map((group) => {
+      const options = Object.values(store.tags).filter((t) => t.groupId === group.id).sort(tagDisplayOrder);
+      // Several held (tagged before the switch): show the most recently added.
+      const current = options
+        .filter((t) => conv.tags.includes(t.id))
+        .sort((a, b) => (conv.tagAddedAt?.[b.id] ?? 0) - (conv.tagAddedAt?.[a.id] ?? 0))[0];
+      return { group, options, current };
+    })
+    .filter((c) => c.options.length > 0);
   const [addingTag, setAddingTag] = useState(false);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState('');
@@ -578,6 +597,29 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
         <div style={{ marginBottom: 18 }}>
           {funnels.map((view) => (
             <FunnelBar key={view.group.id} view={view} onSetStage={(i) => onSetStage(view, i)} />
+          ))}
+        </div>
+      )}
+
+      {/* Single-choice groups — one dropdown each, like a field. */}
+      {choiceGroups.length > 0 && (
+        <div style={{ marginBottom: 18, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {choiceGroups.map(({ group, options, current }) => (
+            <label key={group.id} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 6, flex: '0 0 40%', minWidth: 0, fontSize: 12, fontWeight: 600, color: color.text.muted, textTransform: 'uppercase', letterSpacing: 0.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: '50%', flexShrink: 0, background: group.color || color.accent.base }} />
+                {group.name}
+              </span>
+              <Select
+                value={current?.id ?? ''}
+                aria-label={group.name}
+                onChange={(e) => onSetChoice(group.id, e.target.value)}
+                style={{ flex: 1, minWidth: 0 }}
+              >
+                <option value="">—</option>
+                {options.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </Select>
+            </label>
           ))}
         </div>
       )}
