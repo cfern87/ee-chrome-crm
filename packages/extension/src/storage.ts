@@ -21,6 +21,7 @@
 //     (changed/removed shards) versus the last synced snapshot, so tagging one
 //     person costs a single write.
 
+import { recordHistory } from './history';
 import { readStore as driveReadStore, writeStore as driveWriteStore, mergeStores } from './drive';
 import { mergeSettingsWithBase, reconcileCollections, type SettingsBag } from './settingsMerge';
 import { getEntitlement, isSignedIn, FREE_CONTACT_LIMIT } from './license';
@@ -92,9 +93,9 @@ export interface TagGroup {
   color?: string;   // optional accent color for the group header
   order: number;    // display order among groups
   // Read this group as an ordered FUNNEL rather than a bag: its tags become
-  // progressive stages, drawn as one horizontal bar, and a contact holds
-  // exactly one of them at a time (picking a stage clears the others — see
-  // funnel.ts). Absent = false, so every group that existed before this is
+  // progressive stages, drawn as one horizontal bar (whether picking a stage
+  // also clears the others is funnelExclusive, below — see funnel.ts).
+  // Absent = false, so every group that existed before this is
   // untouched and keeps behaving as a plain group.
   //
   // No separate stage-order field: the stage order IS the group's existing tag
@@ -102,6 +103,11 @@ export interface TagGroup {
   // already lets you drag. A second ordering would be two sources of truth for
   // one visible sequence, and they would disagree the first time either moved.
   funnel?: boolean;
+  // Funnel groups only: "One tag from this group only". When set, picking a
+  // stage clears every other stage of the group, so a contact holds exactly
+  // one. Absent = false: picking a stage ADDS that tag and removes nothing,
+  // and picking a stage the contact already holds removes just that one.
+  funnelExclusive?: boolean;
   createdAt: number;
   updatedAt?: number; // see Tag.updatedAt — same reason, same fallback
 }
@@ -324,6 +330,12 @@ export interface Store {
   // A tombstone outranks any copy of the record that is older than it, so the
   // delete wins until every replica has seen it. Pruned after TOMBSTONE_TTL_MS.
   deleted: Record<string, number>;
+  // Per-contact activity history (contact id → compact event string). See
+  // history.ts for the encoding and why it lives here rather than on the
+  // contact. Optional so stores written before it existed still type-check;
+  // Drive-mode is where it is carried between machines — the legacy
+  // chrome.storage.sync shards don't hold it (it would eat the item quota).
+  history?: Record<string, string>;
 }
 
 export const EMPTY_STORE: Store = {
@@ -423,6 +435,7 @@ function normalize(s: Partial<Store>): Store {
     notes: s.notes || {},
     settings: s.settings || {},
     deleted: s.deleted || {},
+    history: s.history || {},
   };
 }
 
@@ -1261,8 +1274,10 @@ async function loadStoreUncached(): Promise<Store> {
     // durable only in the cache, and this read would otherwise be what loses
     // them. Their revisions and tombstones make the union safe.
     const cached = await chromeLocalGet();
+    // History isn't in the sync shards either, so it is carried over from the
+    // cache the same way — without this every legacy load would wipe it.
     const store = cached
-      ? { ...fromSync, settings: reconcileCollections(fromSync.settings, cached.settings) }
+      ? { ...fromSync, settings: reconcileCollections(fromSync.settings, cached.settings), history: cached.history || {} }
       : fromSync;
     // Keep local backups fresh for this machine.
     chromeLocalSet(store);
@@ -1368,9 +1383,9 @@ export async function saveStore(input: Store): Promise<SaveResult> {
   // the cache BEFORE the plan limit runs — applyContactLimit also removes
   // conversations, and those are refusals to store, not deletions.
   const previous = (await chromeLocalGet()) || (await idbGet());
-  const withTombstones = pruneDiagnostics(previous
+  const withTombstones = recordHistory(previous, pruneDiagnostics(previous
     ? tombstone(normalize(input), removedConversationIds(previous, input))
-    : pruneTombstones(normalize(input)));
+    : pruneTombstones(normalize(input))));
 
   const { store: limited, blocked } = await applyContactLimit(withTombstones);
 
@@ -1442,6 +1457,8 @@ const SYNC_MAX_ITEMS = 512;      // chrome.storage.sync.MAX_ITEMS
 export async function forcePullFromSync(): Promise<Store | null> {
   const fromSync = await syncGetAll();
   if (!fromSync) return null;
+  // Sync holds no history; keep this machine's rather than wiping it.
+  fromSync.history = (await chromeLocalGet())?.history || {};
   lastSyncSnapshot = clone(fromSync);
   await Promise.all([chromeLocalSet(fromSync), idbSet(fromSync)]);
   invalidateLoadCache();

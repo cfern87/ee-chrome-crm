@@ -17,6 +17,7 @@ import {
 } from './shared';
 import { funnelsFor, describeStage, stagePosition, stageTitle, type FunnelView } from '../funnel';
 import { ContactTasks, type TaskHandlers } from './TasksPanel';
+import { displayHistory, type HistoryEvent } from '../history';
 
 export const TAG_FILTER_VISIBLE = 12;
 
@@ -700,6 +701,8 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
         </div>
       </div>
 
+      <ContactHistory conv={conv} store={store} />
+
       {/* Meta info */}
       <div style={{ fontSize: 12, color: color.text.muted, marginTop: 8 }}>
         <div>ID: {conv.participantId || conv.id}</div>
@@ -709,6 +712,70 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
       </div>
     </div>
   );
+}
+
+const HISTORY_PREVIEW = 8;
+
+/**
+ * The contact's activity log — added, tags added/removed, messages sent —
+ * newest first. Only shown here, in the details pane; see history.ts for how
+ * it is recorded and stored.
+ */
+function ContactHistory({ conv, store }: { conv: Conversation; store: Store }) {
+  const [showAll, setShowAll] = useState(false);
+  useEffect(() => { setShowAll(false); }, [conv.id]);
+  const events = useMemo(() => displayHistory(conv, store.history?.[conv.id]), [conv, store.history]);
+  if (events.length === 0) return null;
+  const shown = showAll ? events : events.slice(0, HISTORY_PREVIEW);
+
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div style={{ fontSize: 12, fontWeight: 600, color: color.text.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>History</div>
+      <ol style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {shown.map((e, i) => (
+          <li key={`${e.at}-${e.op}-${e.arg ?? ''}-${i}`} style={{ display: 'flex', alignItems: 'baseline', gap: 10, fontSize: 13, color: color.text.secondary }}>
+            <span
+              title={new Date(e.at).toLocaleString()}
+              style={{ fontSize: 12, color: color.text.muted, width: 132, flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}
+            >
+              {new Date(e.at).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}
+            </span>
+            <span style={{ minWidth: 0 }}>{describeHistoryEvent(e, store)}</span>
+          </li>
+        ))}
+      </ol>
+      {events.length > HISTORY_PREVIEW && (
+        <button
+          onClick={() => setShowAll(!showAll)}
+          style={{ marginTop: 8, background: 'none', border: 'none', padding: 0, color: color.accent.base, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+        >
+          {showAll ? 'Show less' : `Show all ${events.length}`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function describeHistoryEvent(e: HistoryEvent, store: Store): React.ReactNode {
+  switch (e.op) {
+    case 'c': return 'Added to CRM';
+    case 'm': return 'Message sent';
+    case '+':
+    case '-': {
+      const tag = e.arg ? store.tags[e.arg] : undefined;
+      const verb = e.op === '+' ? 'Tag added' : 'Tag removed';
+      if (!tag) return <>{verb}: <em title={e.arg}>deleted tag</em></>;
+      return (
+        <>
+          {verb}:{' '}
+          <span style={{ display: 'inline-block', padding: '0 7px', borderRadius: 9, background: tag.color, color: onColor(tag.color), fontSize: 12, fontWeight: 600 }}>
+            {tag.name}
+          </span>
+        </>
+      );
+    }
+    default: return null;
+  }
 }
 
 /**

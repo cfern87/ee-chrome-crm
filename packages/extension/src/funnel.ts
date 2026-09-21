@@ -1,4 +1,6 @@
-// Reading a tag group as a funnel: ordered stages, one held at a time.
+// Reading a tag group as a funnel: ordered stages. By default picking a stage
+// just adds that tag; a group marked "one tag from this group only"
+// (TagGroup.funnelExclusive) holds one stage at a time.
 //
 // A tag group already carries everything a funnel needs — which tags belong to
 // it, and what order they go in (Tag.order, drag-reorderable in the Tags
@@ -23,6 +25,8 @@ export interface FunnelView {
   stages: Tag[];
   /** Index into `stages`, or -1 when the contact holds no stage in this group. */
   currentIndex: number;
+  /** Per stage, whether the contact holds that tag. Matters in additive mode, where several can be held. */
+  held?: boolean[];
 }
 
 /**
@@ -80,6 +84,7 @@ export function funnelsFor(
 ): FunnelView[] {
   return funnelStages(tags, tagGroups).map(({ group, stages }) => ({
     group, stages, currentIndex: furthestStage(conv, stages),
+    held: stages.map((s) => conv.tags.includes(s.id)),
   }));
 }
 
@@ -89,13 +94,32 @@ export interface StageEdits {
   remove: string[];
 }
 
+/** Whether picking a stage clears the group's other stages — TagGroup.funnelExclusive. */
+export function isExclusiveFunnel(group: TagGroup): boolean {
+  return !!group.funnelExclusive;
+}
+
 /**
- * What it takes to move a contact to `index` in this funnel.
+ * What picking stage `index` does to this contact.
  *
- * Stages are EXCLUSIVE: the target is added and every other stage of the same
- * group is removed, so a contact occupies exactly one position. That is the
- * whole difference between a funnel and the plain group it is drawn from, and
- * doing it in one edit — rather than "add, then tidy up later" — is what keeps
+ * ADDITIVE (the default): only the picked stage's tag changes. Not held → it
+ * is added and nothing is removed, so a contact keeps every stage they have
+ * reached. Already held → just that tag is removed (the bar then shows the
+ * furthest stage still held). An index outside the stage list does nothing.
+ *
+ * EXCLUSIVE ("One tag from this group only"): see exclusiveEdits.
+ */
+export function stageEditsFor(view: FunnelView, conv: Conversation, index: number): StageEdits {
+  if (isExclusiveFunnel(view.group)) return exclusiveEdits(view, conv, index);
+  const target = view.stages[index];
+  if (!target) return { add: [], remove: [] };
+  return conv.tags.includes(target.id) ? { add: [], remove: [target.id] } : { add: [target.id], remove: [] };
+}
+
+/**
+ * Exclusive mode: the target is added and every other stage of the same
+ * group is removed, so a contact occupies exactly one position. Doing it in
+ * one edit — rather than "add, then tidy up later" — is what keeps
  * a contact from briefly existing at two stages at once, which is a state the
  * counts on the dashboard would happily double-count.
  *
@@ -107,7 +131,7 @@ export interface StageEdits {
  * Only tags the contact actually holds are listed for removal, so a no-op move
  * produces empty arrays and the caller can skip the write entirely.
  */
-export function stageEditsFor(view: FunnelView, conv: Conversation, index: number): StageEdits {
+function exclusiveEdits(view: FunnelView, conv: Conversation, index: number): StageEdits {
   const target = index === view.currentIndex ? null : view.stages[index];
   const held = new Set(conv.tags);
 
@@ -138,6 +162,10 @@ export function stagePosition(view: FunnelView): string {
 export function stageTitle(view: FunnelView, index: number): string {
   const stage = view.stages[index];
   const label = `stage ${index + 1} of ${view.stages.length}: ${stage.name}`;
+  if (!isExclusiveFunnel(view.group)) {
+    const held = view.held ? view.held[index] : index === view.currentIndex;
+    return held ? `Has ${label} — click to remove this tag` : `Add ${label}`;
+  }
   return index === view.currentIndex
     ? `Currently at ${label} — click to clear ${view.group.name}`
     : `Move to ${label}`;

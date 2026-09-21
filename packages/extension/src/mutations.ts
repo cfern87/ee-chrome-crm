@@ -23,6 +23,7 @@
 // Everything here is pure: no chrome, no DOM, no I/O. The background owns the
 // load/save around it.
 
+import { appendHistory } from './history';
 import type { Store, Conversation, Tag, NameDiag } from './storage';
 import {
   addTagsTo, removeTagsFrom, tombstone,
@@ -523,6 +524,10 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
       }
       const next = copy(store);
       next.conversations[m.conversationId] = { ...conv, lastContactedAt: now, updatedAt: now };
+      // Logged here rather than by saveStore's diff: lastContactedAt also moves
+      // on a contact merge or a CSV import, neither of which sent anything.
+      next.history = { ...(store.history || {}) };
+      next.history[m.conversationId] = appendHistory(next.history[m.conversationId], [{ at: now, op: 'm' }]);
       return { store: next, changed: true, conversationId: m.conversationId };
     }
 

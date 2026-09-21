@@ -3458,10 +3458,17 @@ async function selectChatFilter(filter: ChatFilter): Promise<boolean> {
 
   for (const tab of tabs) {
     if (tab.getAttribute('aria-selected') === 'true') return true;
+    // Switching tabs throws the whole list away, scroll container included, and
+    // builds a new one. Measured live 2026-09-19: the old container is detached
+    // within 850ms of the click. Waiting only for "rows exist" was satisfied at
+    // once by the OLD rows, so the walk latched onto a list that was about to
+    // be discarded, scrolled a dead element, stalled, and gave up after one
+    // screenful — about 19 conversations out of 45 unread. So wait for the old
+    // list to actually go, and then for the new one to arrive.
+    const before = firstRowLink();
     try { tab.click(); } catch { continue; }
-    // The list is rebuilt, so wait for rows to come back rather than reading
-    // the tab's own aria-selected, which Facebook updates on its own schedule.
-    if (await pollFor(() => hasConversationListRows(), 4_000, 250)) {
+    if (before) await pollFor(() => !before.isConnected, 4_000, 150);
+    if (await pollFor(() => hasConversationListRows() && firstRowLink(), 4_000, 250)) {
       await sleep(600); // let the first screenful settle before harvesting
       return true;
     }
@@ -3559,9 +3566,17 @@ async function walkConversationList(opts: {
   await pollFor(() => firstRowLink(), 15_000, 300);
 
   const activeThreadId = isMessagesPage() ? getActiveThreadId() : null;
-  const container = scrollParentOf(firstRowLink());
-  const root: ParentNode = container || document;
+  let container = scrollParentOf(firstRowLink());
+  let root: ParentNode = container || document;
   const startScrollTop = container?.scrollTop ?? 0;
+  // Facebook can rebuild the list under us (see selectChatFilter). A detached
+  // container scrolls nothing and its stale rows never grow, which reads as the
+  // end of the list — so find the live one again whenever it has gone.
+  const refreshContainer = () => {
+    if (container && container.isConnected) return;
+    const next = scrollParentOf(firstRowLink());
+    if (next) { container = next; root = next; }
+  };
 
   let exhausted = false;
   const deadline = Date.now() + Math.min(opts.budgetMs || READ_SCAN_MAX_MS, READ_SCAN_MAX_MS);
@@ -3572,6 +3587,7 @@ async function walkConversationList(opts: {
     opts.onProgress();
 
     while (!readScanCancelled && Date.now() < deadline && !opts.done()) {
+      refreshContainer();
       if (!container) { exhausted = true; break; }
 
       container.scrollTop += Math.max(200, container.clientHeight * 0.8);
@@ -3582,7 +3598,14 @@ async function walkConversationList(opts: {
       // keeps a slow network from being mistaken for the end of the list.
       const grew = !!(await pollFor(() => opts.harvest(root, activeThreadId) > 0, READ_SCAN_ROW_WAIT_MS, 200));
       opts.onProgress();
-      stalls = grew ? 0 : stalls + 1;
+      // A scroll through rows already harvested adds nothing, and that is not
+      // the end of the list. The Unread tab draws its first ~29 rows at once and
+      // fetches the next page only when scrolled to the very BOTTOM (measured
+      // live 2026-09-19), so counting those mid-list scrolls as stalls gave up
+      // three screens in and never reached the rows past 29. Only a scroll that
+      // finds nothing new while sitting at the bottom counts.
+      const atBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 8;
+      stalls = grew || !atBottom ? 0 : stalls + 1;
       if (stalls >= READ_SCAN_STALL_LIMIT) { exhausted = true; break; }
     }
   } finally {

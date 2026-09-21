@@ -42,11 +42,14 @@ const STAGES = {
 };
 const TAGS: Record<string, Tag> = { ...STAGES, source: tag('source', 'origin') };
 const GROUPS: Record<string, TagGroup> = {
-  stage: group('stage', { funnel: true }),
+  stage: group('stage', { funnel: true, funnelExclusive: true }),
   origin: group('origin'),
 };
 
+// Most tests below pin down the exclusive mode ("One tag from this group
+// only"); the additive default has its own block at the end.
 const funnel = (c: Conversation) => funnelsFor(c, TAGS, GROUPS)[0];
+const additive = (c: Conversation) => funnelsFor(c, TAGS, { ...GROUPS, stage: group('stage', { funnel: true }) })[0];
 
 describe('funnelsFor', () => {
   it('returns only funnel groups, with stages in display order', () => {
@@ -142,5 +145,30 @@ describe('stagePosition and stageTitle', () => {
     const view = funnel(conv(['qualified']));
     expect(stageTitle(view, 0)).toMatch(/^Move to stage 1 of 4: \S+/);
     expect(stageTitle(view, 2)).toBe('Currently at stage 3 of 4: qualified — click to clear stage');
+  });
+});
+
+describe('additive funnels (the default)', () => {
+  it('adds only the picked stage and removes nothing', () => {
+    const c = conv(['contacted']);
+    expect(stageEditsFor(additive(c), c, 3)).toEqual({ add: ['won'], remove: [] });
+    expect(stageEditsFor(additive(c), c, 0)).toEqual({ add: ['New'], remove: [] });
+  });
+
+  it('picking a held stage removes just that one', () => {
+    const c = conv(['contacted', 'won']);
+    expect(stageEditsFor(additive(c), c, 3)).toEqual({ add: [], remove: ['won'] });
+    expect(stageEditsFor(additive(c), c, 1)).toEqual({ add: [], remove: ['contacted'] });
+  });
+
+  it('an index outside the stages does nothing', () => {
+    const c = conv(['won']);
+    expect(isNoOpStageEdit(stageEditsFor(additive(c), c, -1))).toBe(true);
+  });
+
+  it('titles say add / remove rather than move / clear', () => {
+    const view = additive(conv(['contacted', 'won']));
+    expect(stageTitle(view, 0)).toBe('Add stage 1 of 4: New');
+    expect(stageTitle(view, 1)).toBe('Has stage 2 of 4: contacted — click to remove this tag');
   });
 });

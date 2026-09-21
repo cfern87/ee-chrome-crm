@@ -74,6 +74,8 @@ export function DashboardPanel({
   const [editing, setEditing] = useState<Editing>(null);
   const [draftQuery, setDraftQuery] = useState<QueryGroup>(emptyQuery());
   const [draftName, setDraftName] = useState('');
+  /** The tile whose Remove is waiting on a second click, if any. */
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
 
   const tiles = useMemo(
     () => sortSavedSearches(savedSearches).filter((s) => s.onDashboard),
@@ -172,6 +174,7 @@ export function DashboardPanel({
           onRenamePreset={() => {}}
           onTogglePinPreset={() => {}}
           onToggleDashboardPreset={() => {}}
+          onCopyPreset={() => {}}
           onDeletePreset={() => {}}
           onReorderPreset={() => {}}
         />
@@ -290,13 +293,30 @@ export function DashboardPanel({
                   >
                     Edit query
                   </button>
-                  <button
-                    onClick={() => void onRemoveTile(tile.id)}
-                    title="Take this off the Dashboard. The saved query itself is kept — it stays available in the contact list."
-                    style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, fontWeight: 600, color: color.text.muted, cursor: 'pointer', marginLeft: 'auto' }}
-                  >
-                    Remove
-                  </button>
+                  {/* Two-step, same as deleting an automation: the link sits
+                      right next to "Edit query", and one stray click shouldn't
+                      take a tile off the Dashboard. */}
+                  {confirmRemove === tile.id ? (
+                    <span style={{ display: 'flex', gap: space.xs, marginLeft: 'auto' }}>
+                      <Button
+                        size="sm"
+                        variant="danger-solid"
+                        onClick={() => { setConfirmRemove(null); void onRemoveTile(tile.id); }}
+                        title="The saved query itself is kept — it stays available in the contact list."
+                      >
+                        Remove?
+                      </Button>
+                      <Button size="sm" variant="ghost" onClick={() => setConfirmRemove(null)}>No</Button>
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => setConfirmRemove(tile.id)}
+                      title="Take this off the Dashboard. The saved query itself is kept — it stays available in the contact list."
+                      style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, fontWeight: 600, color: color.text.muted, cursor: 'pointer', marginLeft: 'auto' }}
+                    >
+                      Remove
+                    </button>
+                  )}
                 </div>
               </div>
             );

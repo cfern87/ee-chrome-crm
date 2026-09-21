@@ -17,6 +17,7 @@
 // code + PKCE. See the long note above the auth section for why that replaced
 // the implicit flow, and for the fallback that keeps older OAuth clients working.
 
+import { mergeHistoryMaps } from './history';
 import type { Store } from './storage';
 // Value import back into storage.ts, which also imports from here. Safe: this is
 // a hoisted function declaration and mergeStores only runs long after both
@@ -889,6 +890,7 @@ function normalizeStore(s: Partial<Store>): Store {
     notes: s.notes || {},
     settings: s.settings || {},
     deleted: s.deleted || {},
+    history: s.history || {},
   };
 }
 
@@ -919,6 +921,8 @@ export function mergeStores(a: Store, b: Store): Store {
     notes: { ...a.notes, ...b.notes },
     settings: mergeSettings(a.settings, b.settings),
     deleted,
+    // Append-only, so a union: every event either machine recorded survives.
+    history: mergeHistoryMaps(a.history, b.history),
   };
   for (const [id, conv] of Object.entries(b.conversations)) {
     const cur = out.conversations[id];
@@ -929,6 +933,10 @@ export function mergeStores(a: Store, b: Store): Store {
   for (const [id, at] of Object.entries(deleted)) {
     const conv = out.conversations[id];
     if (conv && (conv.updatedAt || 0) <= at) delete out.conversations[id];
+  }
+  // History for contacts that didn't survive goes with them.
+  for (const id of Object.keys(out.history!)) {
+    if (!out.conversations[id]) delete out.history![id];
   }
   // Tags, groups and field definitions merge on defRevision (updatedAt, or
   // createdAt for records written before that stamp existed) — NOT on createdAt

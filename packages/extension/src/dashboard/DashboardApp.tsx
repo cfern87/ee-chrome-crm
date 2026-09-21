@@ -5,7 +5,7 @@ import { getEntitlement, PLATFORM_URL, FREE_CONTACT_LIMIT, isSignedIn, SESSION_K
 
 import {
   QueryGroup, SavedSearch, ArchiveScope, QueryContext,
-  emptyQuery, isQueryEmpty, filterByQuery, normalizeQuery, newSavedSearch, sortSavedSearches, applyPresetOrder, describeQuery,
+  emptyQuery, isQueryEmpty, filterByQuery, normalizeQuery, newSavedSearch, copySavedSearch, sortSavedSearches, applyPresetOrder, describeQuery,
 } from '../search';
 import AdvancedSearch, { PinnedSearchChips } from './SearchBuilder';
 import {
@@ -1298,6 +1298,15 @@ export default function DashboardApp() {
     go('contacts');
   };
 
+  // Copies are made to be changed, so the copy becomes the active preset —
+  // edits made next can be saved straight into it with "Update".
+  const copyPreset = async (id: string) => {
+    const result = copySavedSearch(store.savedSearches, id);
+    if (!result) return;
+    await updateStore({ ...store, savedSearches: result.searches });
+    applyPreset(result.searches[result.id]);
+  };
+
   const deletePreset = async (id: string) => {
     const next = { ...store.savedSearches };
     delete next[id];
@@ -1468,6 +1477,18 @@ export default function DashboardApp() {
     const g = store.tagGroups[groupId];
     if (!g || !!g.funnel === funnel) return;
     await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: touchDef({ ...g, funnel }) } });
+  };
+
+  // "One tag from this group only". Like the funnel switch, a change of reading
+  // only: contacts already holding several stages keep them until a stage is
+  // next picked.
+  const setTagGroupFunnelExclusive = async (groupId: string, exclusive: boolean) => {
+    const g = store.tagGroups[groupId];
+    if (!g || !!g.funnelExclusive === exclusive) return;
+    const nextGroup: TagGroup = { ...g };
+    if (exclusive) nextGroup.funnelExclusive = true;
+    else delete nextGroup.funnelExclusive;
+    await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: touchDef(nextGroup) } });
   };
 
   // Deleting a group leaves its tags intact but ungrouped.
@@ -2214,6 +2235,7 @@ export default function DashboardApp() {
                 onRenamePreset={(id, name) => patchPreset(id, { name })}
                 onTogglePinPreset={(id) => patchPreset(id, { pinned: !store.savedSearches[id]?.pinned })}
                 onToggleDashboardPreset={(id) => patchPreset(id, { onDashboard: !store.savedSearches[id]?.onDashboard })}
+                onCopyPreset={(id) => void copyPreset(id)}
                 onDeletePreset={deletePreset}
                 onReorderPreset={reorderPreset}
               />
@@ -2298,6 +2320,7 @@ export default function DashboardApp() {
                 onAddGroup={addTagGroup}
                 onRenameGroup={renameTagGroup}
                 onSetGroupFunnel={setTagGroupFunnel}
+                onSetGroupFunnelExclusive={setTagGroupFunnelExclusive}
                 onDeleteGroup={deleteTagGroup}
               />
             )}

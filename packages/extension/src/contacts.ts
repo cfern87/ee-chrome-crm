@@ -2,6 +2,7 @@
 // noisy stored names. All pure (no chrome / DOM), so they're easy to test and
 // can run from the dashboard.
 
+import { combineHistoryInto } from './history';
 import { Store, Conversation } from './storage';
 import { profileKey, extractThreadFromProfileUrl } from './csv';
 import { cleanName, looksLikeName, nameKey } from './names';
@@ -178,7 +179,11 @@ export function mergeConversations(store: Store, ids: string[], primaryId?: stri
     }
   }
 
-  return { store: { ...store, conversations, notes }, mergedInto: merged.id, removed: others.length };
+  // The duplicates' history comes along too; saveStore would otherwise prune
+  // it along with the records it belonged to.
+  const history = combineHistoryInto(store.history, merged.id, others.map((o) => o.id));
+
+  return { store: { ...store, conversations, notes, history }, mergedInto: merged.id, removed: others.length };
 }
 
 /**

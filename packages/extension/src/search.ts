@@ -646,6 +646,26 @@ function startOfDay(iso: string | undefined): number | null {
 }
 
 /**
+ * A date operand that means "whatever day it is when the search runs", stored
+ * in place of a YYYY-MM-DD string. A saved preset or dashboard tile that says
+ * "due on today" should still mean today tomorrow, not the day it was saved.
+ */
+export const TODAY_TOKEN = 'today';
+
+export function isTodayToken(v: string | undefined): boolean {
+  return v === TODAY_TOKEN;
+}
+
+/** Midnight local time of a date operand, resolving TODAY_TOKEN against `now`. */
+function operandDay(v: string | undefined, now: number): number | null {
+  if (isTodayToken(v)) {
+    const d = new Date(now);
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  }
+  return startOfDay(v);
+}
+
+/**
  * Shift a timestamp by a whole number of units. Calendar-aware, so "in the last
  * 3 months" means three calendar months back, not 90 days.
  */
@@ -674,20 +694,20 @@ function matchesDate(ts: number | undefined, cond: Condition, now: number): bool
     case 'notInLast': return !(ts <= now && ts >= shift(now, -n, unit));
     case 'inNext': return ts >= now && ts <= shift(now, n, unit);
     case 'on': {
-      const start = startOfDay(cond.value);
+      const start = operandDay(cond.value, now);
       return start !== null && ts >= start && ts < start + DAY_MS;
     }
     case 'before': {
-      const start = startOfDay(cond.value);
+      const start = operandDay(cond.value, now);
       return start !== null && ts < start;
     }
     case 'after': {
-      const start = startOfDay(cond.value);
+      const start = operandDay(cond.value, now);
       return start !== null && ts >= start + DAY_MS;
     }
     case 'between': {
-      const a = startOfDay(cond.value);
-      const b = startOfDay(cond.value2);
+      const a = operandDay(cond.value, now);
+      const b = operandDay(cond.value2, now);
       if (a === null || b === null) return false;
       const lo = Math.min(a, b);
       const hi = Math.max(a, b) + DAY_MS;
@@ -884,6 +904,10 @@ function describeCondition(cond: Condition, fields: FieldDef[], ctx: QueryContex
     ? `${cond.tagIds && cond.tagIds.length ? cond.tagIds.map(tagName).join(' / ') : 'Any tag'} added`
     : field.label;
   const phrase = `${subject} ${opLabel}`;
+  // On a date field "today" is a moving date, not literal text — shown bare so
+  // it reads that way.
+  const isDate = field.kind === 'date' || field.kind === 'tagDate';
+  const operand = (v: string | undefined) => (isDate && isTodayToken(v) ? 'today' : quote(v));
 
   switch (def?.arity) {
     case 'none':
@@ -891,7 +915,7 @@ function describeCondition(cond: Condition, fields: FieldDef[], ctx: QueryContex
     case 'duration':
       return `${phrase} ${cond.value || '?'} ${cond.unit || 'days'}`;
     case 'two':
-      return `${phrase} ${quote(cond.value)} and ${quote(cond.value2)}`;
+      return `${phrase} ${operand(cond.value)} and ${operand(cond.value2)}`;
     case 'multi': {
       const names = (cond.values || []).map(field.kind === 'tags' ? tagName : field.kind === 'tagGroups' ? groupName : (v: string) => v);
       return `${phrase} [${names.join(', ')}]`;
@@ -901,7 +925,7 @@ function describeCondition(cond: Condition, fields: FieldDef[], ctx: QueryContex
       if (field.kind === 'funnelStage') {
         return `${phrase} ${quote(field.stages?.find((s) => s.id === cond.value)?.name ?? tagName(cond.value || ''))}`;
       }
-      return `${phrase} ${quote(cond.value)}`;
+      return `${phrase} ${operand(cond.value)}`;
   }
 }
 
@@ -940,6 +964,44 @@ export function newSavedSearch(name: string, query: QueryGroup, order: number): 
     createdAt: now,
     updatedAt: now,
   };
+}
+
+/**
+ * Duplicate a saved search, placed directly after the original.
+ *
+ * Query, description and view settings come along; `pinned` and `onDashboard`
+ * do not. A copy is almost always made to be changed, and a second identical
+ * chip in the quick bar or a second identical tile on the Dashboard would be
+ * noise until it has been. Named "<name> (copy)", numbered if that is taken.
+ *
+ * Returns the new collection and the copy's id, or null if `id` is unknown.
+ */
+export function copySavedSearch(
+  searches: Record<string, SavedSearch>,
+  id: string,
+  now = Date.now()
+): { searches: Record<string, SavedSearch>; id: string } | null {
+  const source = searches[id];
+  if (!source) return null;
+
+  const taken = new Set(Object.values(searches).map((s) => s.name));
+  let name = `${source.name} (copy)`;
+  for (let n = 2; taken.has(name); n++) name = `${source.name} (copy ${n})`;
+
+  const base = newSavedSearch(name, normalizeQuery(source.query), source.order);
+  const copy: SavedSearch = {
+    ...base,
+    ...(source.description ? { description: source.description } : {}),
+    ...(source.sortBy ? { sortBy: source.sortBy } : {}),
+    ...(source.sortDir ? { sortDir: source.sortDir } : {}),
+    ...(source.archiveScope ? { archiveScope: source.archiveScope } : {}),
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const ordered = sortSavedSearches(searches).map((s) => s.id);
+  ordered.splice(ordered.indexOf(id) + 1, 0, copy.id);
+  return { searches: applyPresetOrder({ ...searches, [copy.id]: copy }, ordered, now), id: copy.id };
 }
 
 export function sortSavedSearches(searches: Record<string, SavedSearch>): SavedSearch[] {

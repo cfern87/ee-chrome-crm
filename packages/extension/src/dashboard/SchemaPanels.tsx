@@ -36,6 +36,8 @@ export interface TagsPanelProps {
   onRenameGroup: (groupId: string, name: string) => void;
   /** Turn this group into an ordered funnel — see TagGroup.funnel. */
   onSetGroupFunnel: (groupId: string, funnel: boolean) => void;
+  /** "One tag from this group only" for a funnel group — see TagGroup.funnelExclusive. */
+  onSetGroupFunnelExclusive: (groupId: string, exclusive: boolean) => void;
   onDeleteGroup: (groupId: string) => void;
 }
 
@@ -44,7 +46,7 @@ export function TagsPanel(props: TagsPanelProps) {
     tags, tagGroups, conversations,
     newTagName, setNewTagName, newTagColor, setNewTagColor, newTagGroup, setNewTagGroup,
     newGroupName, setNewGroupName, newGroupColor, setNewGroupColor,
-    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onSetTagHidden, onReorderTags, onAddGroup, onRenameGroup, onSetGroupFunnel, onDeleteGroup,
+    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onSetTagHidden, onReorderTags, onAddGroup, onRenameGroup, onSetGroupFunnel, onSetGroupFunnelExclusive, onDeleteGroup,
   } = props;
 
   const usageOf = (tagId: string) => conversations.filter((c) => c.tags.includes(tagId)).length;
@@ -276,7 +278,7 @@ export function TagsPanel(props: TagsPanelProps) {
               />
               <span style={{ fontSize: 12, color: color.text.muted }}>{groupTags.length}</span>
               <label
-                title="Show this group as a progress bar on contacts, with its tags as ordered stages. A contact sits at one stage at a time — picking a stage clears the others in this group."
+                title="Show this group as a progress bar on contacts, with its tags as ordered stages. Picking a stage adds that tag; tick 'One tag from this group only' to have it clear the others."
                 style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: color.text.secondary, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}
               >
                 <input
@@ -301,8 +303,19 @@ export function TagsPanel(props: TagsPanelProps) {
               // like a bag of tags, and the drag handles below stop being a
               // display preference and start being the stage sequence.
               <div style={{ fontSize: 11, color: color.text.muted, margin: '0 0 8px', paddingLeft: 20, lineHeight: 1.5 }}>
-                Shown as a stage bar on each contact, in the order below — drag to re-sequence.
-                Picking a stage <strong>clears the other stages in this group</strong>; picking the current one clears the funnel.
+                Shown as a stage bar on each contact, in the order below — drag to re-sequence.{' '}
+                {group.funnelExclusive
+                  ? <>Picking a stage <strong>clears the other stages in this group</strong>; picking the current one clears the funnel.</>
+                  : <>Picking a stage <strong>adds that tag only</strong> — other stages are kept. Picking a stage the contact already has removes just that one.</>}
+                <label style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 6, fontSize: 12, color: color.text.secondary, fontWeight: 600, cursor: 'pointer', width: 'fit-content' }}>
+                  <input
+                    type="checkbox"
+                    checked={!!group.funnelExclusive}
+                    onChange={(e) => onSetGroupFunnelExclusive(group.id, e.target.checked)}
+                    style={{ cursor: 'pointer', margin: 0 }}
+                  />
+                  One tag from this group only
+                </label>
               </div>
             )}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>

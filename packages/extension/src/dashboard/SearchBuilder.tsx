@@ -15,6 +15,7 @@ import {
   FieldDef, QueryContext,
   buildFields, findField, operatorsFor, operatorDef,
   newGroup, newCondition, conditionIssue, describeQuery, isQueryEmpty, sortSavedSearches,
+  TODAY_TOKEN, isTodayToken,
 } from '../search';
 
 /**
@@ -230,6 +231,53 @@ interface ConditionRowProps {
   onRemove: () => void;
 }
 
+/**
+ * One date operand: a date picker with a "Today" preset beside it.
+ *
+ * Picking Today stores TODAY_TOKEN rather than today's date, so the condition
+ * keeps meaning the current day whenever the search, preset or dashboard tile
+ * runs. A native date input can't display a word, so while the token is set the
+ * picker gives way to a chip; clearing the chip brings the picker back.
+ */
+function DateOperand({ value, onChange }: { value: string | undefined; onChange: (v: string) => void }) {
+  if (isTodayToken(value)) {
+    return (
+      <span
+        title="Always the current date when the search runs"
+        style={{ ...control, display: 'inline-flex', alignItems: 'center', gap: 6, width: 130, boxSizing: 'border-box' }}
+      >
+        <span style={{ flex: 1 }}>Today</span>
+        <button
+          type="button"
+          aria-label="Pick a specific date instead"
+          onClick={() => onChange('')}
+          style={{ border: 'none', background: 'none', padding: 0, cursor: 'pointer', color: color.text.muted, fontSize: 12, lineHeight: 1 }}
+        >
+          ✕
+        </button>
+      </span>
+    );
+  }
+  return (
+    <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+      <input
+        type="date"
+        value={value ?? ''}
+        onChange={(e) => onChange(e.target.value)}
+        style={{ ...control, width: 130 }}
+      />
+      <button
+        type="button"
+        title="Always the current date when the search runs"
+        onClick={() => onChange(TODAY_TOKEN)}
+        style={iconBtn}
+      >
+        Today
+      </button>
+    </span>
+  );
+}
+
 function ConditionRow({ cond, fields, ctx, tagGrouping, onChange, onRemove }: ConditionRowProps) {
   const field = findField(fields, cond.field);
   const kind = field?.kind ?? 'text';
@@ -332,20 +380,29 @@ function ConditionRow({ cond, fields, ctx, tagGrouping, onChange, onRemove }: Co
         );
 
       case 'two':
+        if (valueInputType === 'date') {
+          return (
+            <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }}>
+              <DateOperand value={cond.value} onChange={(value) => onChange({ ...cond, value })} />
+              <span style={{ fontSize: 11, color: color.text.muted }}>and</span>
+              <DateOperand value={cond.value2} onChange={(value2) => onChange({ ...cond, value2 })} />
+            </div>
+          );
+        }
         return (
           <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
             <input
               type={valueInputType}
               value={cond.value ?? ''}
               onChange={(e) => onChange({ ...cond, value: e.target.value })}
-              style={{ ...control, width: valueInputType === 'date' ? 130 : 80 }}
+              style={{ ...control, width: 80 }}
             />
             <span style={{ fontSize: 11, color: color.text.muted }}>and</span>
             <input
               type={valueInputType}
               value={cond.value2 ?? ''}
               onChange={(e) => onChange({ ...cond, value2: e.target.value })}
-              style={{ ...control, width: valueInputType === 'date' ? 130 : 80 }}
+              style={{ ...control, width: 80 }}
             />
           </div>
         );
@@ -382,6 +439,9 @@ function ConditionRow({ cond, fields, ctx, tagGrouping, onChange, onRemove }: Co
               ))}
             </select>
           );
+        }
+        if (valueInputType === 'date') {
+          return <DateOperand value={cond.value} onChange={(value) => onChange({ ...cond, value })} />;
         }
         return (
           <input
@@ -579,13 +639,15 @@ interface PresetBarProps {
   onTogglePin: (id: string) => void;
   /** Show or hide this query as a count tile on the Dashboard. */
   onToggleDashboard: (id: string) => void;
+  /** Duplicate this preset as a starting point for a variation. */
+  onCopy: (id: string) => void;
   onDelete: (id: string) => void;
   onReorder: (id: string, delta: number) => void;
 }
 
 function PresetBar({
   savedSearches, activeId, dirty, ctx,
-  onApply, onSaveNew, onUpdateActive, onRename, onTogglePin, onToggleDashboard, onDelete, onReorder,
+  onApply, onSaveNew, onUpdateActive, onRename, onTogglePin, onToggleDashboard, onCopy, onDelete, onReorder,
 }: PresetBarProps) {
   const [naming, setNaming] = useState(false);
   const [draftName, setDraftName] = useState('');
@@ -731,6 +793,13 @@ function PresetBar({
                     {p.onDashboard ? '▦ On dashboard' : '▦ Dashboard'}
                   </button>
                   <button onClick={() => { setRenamingId(p.id); setRenameDraft(p.name); }} style={iconBtn}>Rename</button>
+                  <button
+                    onClick={() => onCopy(p.id)}
+                    title="Make a copy of this search to change without touching the original"
+                    style={iconBtn}
+                  >
+                    Copy
+                  </button>
                   {confirmDelete === p.id ? (
                     <>
                       <button
@@ -808,6 +877,7 @@ export interface AdvancedSearchProps {
   onRenamePreset: (id: string, name: string) => void;
   onTogglePinPreset: (id: string) => void;
   onToggleDashboardPreset: (id: string) => void;
+  onCopyPreset: (id: string) => void;
   onDeletePreset: (id: string) => void;
   onReorderPreset: (id: string, delta: number) => void;
   /**
@@ -849,6 +919,7 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
           onRename={props.onRenamePreset}
           onTogglePin={props.onTogglePinPreset}
           onToggleDashboard={props.onToggleDashboardPreset}
+          onCopy={props.onCopyPreset}
           onDelete={props.onDeletePreset}
           onReorder={props.onReorderPreset}
         />
