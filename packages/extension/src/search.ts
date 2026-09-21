@@ -396,6 +396,55 @@ export function countConditions(node: QueryNode): number {
   return node.children.reduce((n, c) => n + countConditions(c), 0);
 }
 
+function containsNode(node: QueryNode, id: string): boolean {
+  return node.id === id || (node.type === 'group' && node.children.some((c) => containsNode(c, id)));
+}
+
+/**
+ * Move one node (a condition or a whole group) to position `index` among the
+ * children of group `targetGroupId` — the drag-and-drop in the builder. Pure:
+ * returns a new tree, or the same one when the move is impossible (unknown
+ * ids, the root itself, or a group dropped inside its own subtree).
+ *
+ * `index` is where the node should land in the target's children as they are
+ * BEFORE the move; dragging a node down within its own group accounts for the
+ * gap it leaves.
+ */
+export function moveNode(root: QueryGroup, nodeId: string, targetGroupId: string, index: number): QueryGroup {
+  if (nodeId === root.id) return root;
+  const found: { node: QueryNode | null; group: string; index: number } = { node: null, group: '', index: -1 };
+  const find = (g: QueryGroup) => {
+    g.children.forEach((c, i) => {
+      if (c.id === nodeId) { found.node = c; found.group = g.id; found.index = i; }
+      else if (c.type === 'group') find(c);
+    });
+  };
+  find(root);
+  const moving = found.node;
+  if (!moving) return root;
+  if (containsNode(moving, targetGroupId)) return root; // into itself or a descendant
+  if (!containsNode(root, targetGroupId)) return root;
+
+  let at = index;
+  if (found.group === targetGroupId && found.index < index) at -= 1;
+  if (found.group === targetGroupId && at === found.index) return root; // dropped where it was
+
+  const without = (g: QueryGroup): QueryGroup => ({
+    ...g,
+    children: g.children.filter((c) => c.id !== nodeId).map((c) => (c.type === 'group' ? without(c) : c)),
+  });
+  const insert = (g: QueryGroup): QueryGroup => {
+    if (g.id === targetGroupId) {
+      const children = g.children.map((c) => (c.type === 'group' ? insert(c) : c));
+      const clamped = Math.max(0, Math.min(at, children.length));
+      children.splice(clamped, 0, moving);
+      return { ...g, children };
+    }
+    return { ...g, children: g.children.map((c) => (c.type === 'group' ? insert(c) : c)) };
+  };
+  return insert(without(root));
+}
+
 /**
  * Defensive parse of a query loaded from storage (a preset written by a newer
  * version, or hand-edited JSON from a restored backup). Anything unrecognized

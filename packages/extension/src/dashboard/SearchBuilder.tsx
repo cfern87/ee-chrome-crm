@@ -5,7 +5,7 @@
 // node it owns and a callback that hands a replacement back to its parent — so
 // there is no lookup-by-id and no risk of a stale subtree overwriting a sibling.
 
-import React, { useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { color } from '../ui/primitives';
 import { useLocalPref } from '../ui/prefs';
 import { bucketTags, showsGroupLabels } from '../tagGrouping';
@@ -15,8 +15,42 @@ import {
   FieldDef, QueryContext,
   buildFields, findField, operatorsFor, operatorDef,
   newGroup, newCondition, conditionIssue, describeQuery, isQueryEmpty, sortSavedSearches,
-  TODAY_TOKEN, isTodayToken,
+  TODAY_TOKEN, isTodayToken, moveNode,
 } from '../search';
+
+// ---- drag and drop -------------------------------------------------------
+//
+// Conditions and whole groups can be dragged by their ⠿ handle to reorder
+// them or move them into another group. The one exception to the leaves-up
+// editing described above: a move spans two groups, so it is applied to the
+// ROOT query (moveNode in search.ts) by whoever renders the builder, through
+// this context. Only the handle is draggable — a draggable row would swallow
+// text selection in the inputs inside it.
+
+interface QueryDnd {
+  dragId: string | null;
+  setDragId: (id: string | null) => void;
+  /** Drop the dragged node at `index` among `groupId`'s current children. */
+  drop: (groupId: string, index: number) => void;
+}
+
+const QueryDndContext = createContext<QueryDnd | null>(null);
+
+function QueryDndRoot({ query, onChange, children }: {
+  query: QueryGroup;
+  onChange: (next: QueryGroup) => void;
+  children: React.ReactNode;
+}) {
+  const [dragId, setDragId] = useState<string | null>(null);
+  const drop = (groupId: string, index: number) => {
+    if (dragId) {
+      const next = moveNode(query, dragId, groupId, index);
+      if (next !== query) onChange(next);
+    }
+    setDragId(null);
+  };
+  return <QueryDndContext.Provider value={{ dragId, setDragId, drop }}>{children}</QueryDndContext.Provider>;
+}
 
 /**
  * Whether the tag pickers inside a search filter are split by tag group.
@@ -535,6 +569,35 @@ function GroupEditor({ group, fields, ctx, tagGrouping, depth, onChange, onRemov
 
   const accent = depthColor(depth);
 
+  // Where a drop would land in THIS group, drawn as a line. Every group keeps
+  // its own, and the innermost one under the pointer claims the event, so a
+  // nested group's rows win over the row that contains the whole group.
+  const dnd = useContext(QueryDndContext);
+  const [hint, setHint] = useState<number | null>(null);
+  useEffect(() => { if (!dnd?.dragId) setHint(null); }, [dnd?.dragId]);
+  // A group being dragged can't be dropped into itself, so it offers no target.
+  const dragging = !!dnd?.dragId && dnd.dragId !== group.id;
+
+  const overRow = (e: React.DragEvent<HTMLDivElement>, i: number) => {
+    if (!dragging) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'move';
+    const r = e.currentTarget.getBoundingClientRect();
+    setHint(e.clientY < r.top + r.height / 2 ? i : i + 1);
+  };
+  const dropHere = (e: React.DragEvent, index: number) => {
+    if (!dragging) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setHint(null);
+    dnd!.drop(group.id, index);
+  };
+  const leaveGroup = (e: React.DragEvent<HTMLDivElement>) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setHint(null);
+  };
+  const line = <div aria-hidden="true" style={{ height: 3, borderRadius: 2, background: color.accent.base, margin: '-1px 0' }} />;
+
   return (
     <div
       style={{
@@ -597,15 +660,44 @@ function GroupEditor({ group, fields, ctx, tagGrouping, depth, onChange, onRemov
         </div>
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div
+        style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
+        onDragLeave={leaveGroup}
+      >
         {group.children.map((child, i) => (
-          <div key={child.id} style={{ display: 'flex', gap: 6, alignItems: 'stretch' }}>
+          <React.Fragment key={child.id}>
+          {hint === i && line}
+          <div
+            data-qnode={child.id}
+            onDragOver={(e) => overRow(e, i)}
+            onDrop={(e) => dropHere(e, hint ?? i)}
+            style={{ display: 'flex', gap: 6, alignItems: 'stretch', opacity: dnd?.dragId === child.id ? 0.4 : 1 }}
+          >
             {i > 0 && (
               <div style={{ flex: '0 0 34px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700, color: accent }}>
                 {group.combinator.toUpperCase()}
               </div>
             )}
             {i === 0 && group.children.length > 1 && <div style={{ flex: '0 0 34px' }} />}
+            {dnd && (
+              <span
+                draggable
+                role="button"
+                aria-label={child.type === 'group' ? 'Drag to move this group' : 'Drag to move this condition'}
+                title={child.type === 'group' ? 'Drag to move this group' : 'Drag to reorder, or into another group'}
+                onDragStart={(e) => {
+                  e.dataTransfer.effectAllowed = 'move';
+                  e.dataTransfer.setData('text/plain', child.id);
+                  const row = (e.currentTarget as HTMLElement).closest('[data-qnode]');
+                  if (row) e.dataTransfer.setDragImage(row, 12, 12);
+                  dnd.setDragId(child.id);
+                }}
+                onDragEnd={() => dnd.setDragId(null)}
+                style={{ flex: '0 0 14px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'grab', color: color.text.muted, fontSize: 13, userSelect: 'none' }}
+              >
+                ⠿
+              </span>
+            )}
             <div style={{ flex: 1, minWidth: 0 }}>
               {child.type === 'group' ? (
                 <GroupEditor
@@ -629,7 +721,24 @@ function GroupEditor({ group, fields, ctx, tagGrouping, depth, onChange, onRemov
               )}
             </div>
           </div>
+          </React.Fragment>
         ))}
+        {hint === group.children.length && group.children.length > 0 && line}
+        {/* While dragging: a target for the END of this group — the only way
+            into a group with no children yet, and an easy one for any other. */}
+        {dragging && (
+          <div
+            onDragOver={(e) => { if (!dragging) return; e.preventDefault(); e.stopPropagation(); setHint(group.children.length); }}
+            onDrop={(e) => dropHere(e, group.children.length)}
+            style={{
+              border: `1px dashed ${hint === group.children.length ? color.accent.base : color.border.control}`,
+              borderRadius: 5, padding: '4px 8px', fontSize: 11, color: color.text.muted, textAlign: 'center',
+              background: hint === group.children.length ? `${color.accent.base}14` : 'transparent',
+            }}
+          >
+            Drop here to add to this {group.combinator.toUpperCase()} group
+          </div>
+        )}
       </div>
     </div>
   );
@@ -654,14 +763,16 @@ export function QueryEditor({ query, onChange, tags, tagGroups, fieldDefs }: {
   const fields = useMemo(() => buildFields(fieldDefs, tags, tagGroups), [fieldDefs, tags, tagGroups]);
   const [tagsGrouped, toggleTagsGrouped] = useSearchTagGrouping();
   return (
-    <GroupEditor
-      group={query}
-      fields={fields}
-      ctx={ctx}
-      tagGrouping={{ grouped: tagsGrouped, onToggle: toggleTagsGrouped }}
-      depth={0}
-      onChange={onChange}
-    />
+    <QueryDndRoot query={query} onChange={onChange}>
+      <GroupEditor
+        group={query}
+        fields={fields}
+        ctx={ctx}
+        tagGrouping={{ grouped: tagsGrouped, onToggle: toggleTagsGrouped }}
+        depth={0}
+        onChange={onChange}
+      />
+    </QueryDndRoot>
   );
 }
 
@@ -965,14 +1076,16 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
         />
       )}
 
-      <GroupEditor
-        group={query}
-        fields={fields}
-        ctx={ctx}
-        tagGrouping={tagGrouping}
-        depth={0}
-        onChange={onQueryChange}
-      />
+      <QueryDndRoot query={query} onChange={onQueryChange}>
+        <GroupEditor
+          group={query}
+          fields={fields}
+          ctx={ctx}
+          tagGrouping={tagGrouping}
+          depth={0}
+          onChange={onQueryChange}
+        />
+      </QueryDndRoot>
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10, flexWrap: 'wrap' }}>
         <span style={{ fontSize: 12, fontWeight: 700, color: empty ? color.text.muted : color.accent.base }}>
