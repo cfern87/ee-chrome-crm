@@ -46,6 +46,7 @@ import {
   Campaign,
   createCampaign,
   loadCampaigns,
+  pendingRecipientIndex,
   saveCampaigns,
   getCampaign,
   upsertCampaign,
@@ -95,7 +96,7 @@ import {
 } from './readScan';
 import { MAX_READ_STATE_WRITES } from './mutations';
 import {
-  readAutomations, planTagUnread, isDue, whyNotRunnable,
+  readAutomations, resolveUnread, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable,
   AUTOMATION_RUNS_KEY,
   type Automation, type AutomationRun, type AutomationRuns, type UnreadScanReport,
 } from './automations';
@@ -1111,6 +1112,12 @@ function patchAutomationRun(id: string, patch: Partial<AutomationRun> | Automati
 }
 
 async function startAutomation(id: string, trigger: AutomationRun['trigger']): Promise<{ success: boolean; error?: string }> {
+  // A saved-search automation is pure CRM work: no Facebook window, so it
+  // neither needs nor takes the `scanning` claim, and can run alongside a
+  // reply check or the send queue.
+  const peek = readAutomations(await loadStore()).find((a) => a.id === id);
+  if (peek?.kind === 'search') return startSearchAutomation(id, trigger);
+
   if (scanning) {
     return { success: false, error: runningAutomationId ? 'Another automation is already running.' : 'A reply check is running. Try again when it finishes.' };
   }
@@ -1149,6 +1156,145 @@ async function startAutomation(id: string, trigger: AutomationRun['trigger']): P
   }
 }
 
+/** Saved-search automations in flight. They don't hold `scanning`, so they're tracked here. */
+const runningSearchIds = new Set<string>();
+
+async function startSearchAutomation(id: string, trigger: AutomationRun['trigger']): Promise<{ success: boolean; error?: string }> {
+  if (runningSearchIds.has(id)) return { success: false, error: 'This automation is already running.' };
+  runningSearchIds.add(id);
+  let handedOff = false;
+  try {
+    if (!(await isSignedIn())) return { success: false, error: 'Sign in to run automations.' };
+    const store = await loadStore();
+    const automation = readAutomations(store).find((a) => a.id === id);
+    if (!automation) return { success: false, error: 'That automation no longer exists.' };
+    const why = whyNotRunnable(automation, store);
+    if (why) return { success: false, error: why };
+
+    await patchAutomationRun(id, {
+      automationId: id, running: true, phase: 'saving', trigger, startedAt: Date.now(), rowsSeen: 0,
+    }, true);
+    handedOff = true;
+    void runSearchAutomationJob(id).finally(() => { runningSearchIds.delete(id); });
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: String((e as Error)?.message || e) };
+  } finally {
+    if (!handedOff) runningSearchIds.delete(id);
+  }
+}
+
+async function runSearchAutomationJob(id: string): Promise<void> {
+  try {
+    const store = await loadStore();
+    const automation = readAutomations(store).find((a) => a.id === id);
+    if (!automation) throw new Error('The automation was deleted while it was running.');
+    const search = automation.savedSearchId ? store.savedSearches[automation.savedSearchId] : undefined;
+    if (!search) throw new Error('Its saved search no longer exists.');
+
+    const ids = matchSavedSearch(search, store).map((c) => c.id);
+    const result = await applyAutomationActions(automation, ids);
+    await patchAutomationRun(id, {
+      running: false, phase: undefined, finishedAt: Date.now(), matched: ids.length, error: undefined, ...result,
+    });
+  } catch (e) {
+    console.warn('[CRM] automation failed', e);
+    await patchAutomationRun(id, { running: false, phase: undefined, finishedAt: Date.now(), error: String((e as Error)?.message || e) });
+  }
+}
+
+// Who each automation has messaged, per machine — the backstop to the campaign
+// history (Campaign.automationId), which syncs but is trimmed to MAX_CAMPAIGNS.
+const AUTOMATION_MESSAGED_KEY = 'facebook_crm_automation_messaged';
+const MAX_MESSAGED_PER_AUTOMATION = 5000;
+
+function getAutomationMessaged(): Promise<Record<string, string[]>> {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(AUTOMATION_MESSAGED_KEY, (res) => {
+        if (chrome.runtime.lastError) { resolve({}); return; }
+        const raw = res?.[AUTOMATION_MESSAGED_KEY];
+        resolve(raw && typeof raw === 'object' ? (raw as Record<string, string[]>) : {});
+      });
+    } catch { resolve({}); }
+  });
+}
+
+async function noteAutomationMessaged(automationId: string, threadIds: string[]): Promise<void> {
+  const all = await getAutomationMessaged();
+  const next = Array.from(new Set([...(all[automationId] || []), ...threadIds])).slice(-MAX_MESSAGED_PER_AUTOMATION);
+  await new Promise<void>((resolve) => {
+    try { chrome.storage.local.set({ [AUTOMATION_MESSAGED_KEY]: { ...all, [automationId]: next } }, () => { void chrome.runtime.lastError; resolve(); }); }
+    catch { resolve(); }
+  });
+}
+
+/**
+ * The part both sources share: run the automation's steps on these contacts
+ * (paced, chunked writes), then — if it has a message — queue one campaign to
+ * whichever of them should get it. Planned against a store loaded NOW, and
+ * the message against the store AFTER the steps, so a step that deletes or
+ * archives someone is respected.
+ */
+async function applyAutomationActions(automation: Automation, ids: string[]): Promise<Partial<AutomationRun>> {
+  const store = await loadStore();
+  const plan = planActions(automation, ids, store);
+  const chunks: Mutation[][] = [];
+  for (let i = 0; i < plan.groups.length; i += MAX_READ_STATE_WRITES) {
+    chunks.push(plan.groups.slice(i, i + MAX_READ_STATE_WRITES).flat());
+  }
+  // Paced like the reply check's writes, and for the same storage-quota
+  // reason — see chunkDelayMs.
+  const delay = chunkDelayMs(await isDriveEnabled());
+  for (let i = 0; i < chunks.length; i++) {
+    const res = await mutateStore(chunks[i]);
+    if (res.changed && i < chunks.length - 1) await new Promise((r) => setTimeout(r, delay));
+  }
+  const out: Partial<AutomationRun> = { tagged: plan.changed, alreadyTagged: plan.unchanged };
+
+  const message = automation.message;
+  if (message && message.template.trim()) {
+    const after = await loadStore();
+    const campaigns = await loadCampaigns();
+    // Messaged before = this machine's record plus every recipient of this
+    // automation's campaigns on any machine — minus anyone whose send ended in
+    // an error (failed, or skipped as unread), who is fair game next run.
+    const before = new Set<string>((await getAutomationMessaged())[automation.id] || []);
+    const errored = new Set<string>();
+    for (const c of campaigns) {
+      if (c.automationId !== automation.id) continue;
+      for (const r of c.recipients) {
+        if (r.status === 'error') errored.add(r.threadId);
+        else before.add(r.threadId);
+      }
+    }
+    for (const c of campaigns) {
+      if (c.automationId !== automation.id) continue;
+      for (const r of c.recipients) if (r.status !== 'error') errored.delete(r.threadId);
+    }
+    for (const id of errored) before.delete(id);
+    const queued = new Set(pendingRecipientIndex(campaigns).keys());
+    const mp = planMessage(message, ids, after, before, queued);
+    out.messaged = 0;
+    out.messageSkipped = messageSkipped(mp);
+    if (mp.recipients.length) {
+      const res = await startCampaign({
+        template: message.template,
+        recipients: mp.recipients,
+        dryRun: message.dryRun,
+        skipIfUnread: message.skipIfUnread,
+        automationId: automation.id,
+        name: `${automation.name} (automation)`,
+      });
+      if (!res.success) throw new Error(res.error || 'Could not queue the message.');
+      out.messaged = mp.recipients.length;
+      out.campaignId = res.campaignId;
+      await noteAutomationMessaged(automation.id, mp.recipients.map((r) => r.threadId));
+    }
+  }
+  return out;
+}
+
 async function runAutomationJob(automation: Automation): Promise<void> {
   const log: string[] = [];
   const id = automation.id;
@@ -1178,19 +1324,13 @@ async function runAutomationJob(automation: Automation): Promise<void> {
     const store = await loadStore();
     const current = readAutomations(store).find((a) => a.id === id);
     if (!current) throw new Error('The automation was deleted while it was running.');
-    const plan = planTagUnread(current, report.unread, store);
+    const resolved = resolveUnread(current, report.unread, store);
 
-    const chunks: Mutation[][] = [];
-    for (let i = 0; i < plan.groups.length; i += MAX_READ_STATE_WRITES) {
-      chunks.push(plan.groups.slice(i, i + MAX_READ_STATE_WRITES).flat());
+    // New contacts first, so the actions below can act on them too.
+    for (let i = 0; i < resolved.creates.length; i += MAX_READ_STATE_WRITES) {
+      await mutateStore(resolved.creates.slice(i, i + MAX_READ_STATE_WRITES));
     }
-    // Paced like the reply check's writes, and for the same storage-quota
-    // reason — see chunkDelayMs.
-    const delay = chunkDelayMs(await isDriveEnabled());
-    for (let i = 0; i < chunks.length; i++) {
-      const res = await mutateStore(chunks[i]);
-      if (res.changed && i < chunks.length - 1) await new Promise((r) => setTimeout(r, delay));
-    }
+    const result = await applyAutomationActions(current, [...resolved.ownerIds, ...resolved.createdIds]);
 
     await patchAutomationRun(id, {
       running: false,
@@ -1198,13 +1338,12 @@ async function runAutomationJob(automation: Automation): Promise<void> {
       finishedAt: Date.now(),
       rowsSeen: report.rowsSeen,
       unreadFound: report.unread.length,
-      tagged: plan.tagged,
-      alreadyTagged: plan.alreadyTagged,
-      created: plan.created,
-      notInCrm: plan.notInCrm,
+      created: resolved.createdIds.length,
+      notInCrm: resolved.notInCrm,
       exhausted: report.exhausted,
       cancelled: report.cancelled,
       error: undefined,
+      ...result,
     });
   } catch (e) {
     console.warn('[CRM] automation failed', e, log);
@@ -1222,16 +1361,23 @@ async function cancelAutomation(): Promise<{ success: boolean }> {
 
 /** The schedule. Starts at most one due automation per check; the rest wait for the next. */
 async function runDueAutomations(): Promise<void> {
-  if (scanning) return;
   try {
     if (!(await isSignedIn())) return;
     if (!(await canSendFromThisMachine())) return;
     const store = await loadStore();
     const runs = await getAutomationRuns();
     const now = Date.now();
-    const due = readAutomations(store).find((a) => isDue(a, runs[a.id]?.startedAt, now) && !whyNotRunnable(a, store));
-    if (!due) return;
-    const res = await startAutomation(due.id, 'schedule');
+    const due = readAutomations(store).filter((a) => isDue(a, runs[a.id]?.startedAt, now) && !whyNotRunnable(a, store));
+    // Every due saved-search job (no window, cheap), and at most one unread
+    // scan — the rest of those wait for the next check.
+    for (const a of due.filter((x) => x.kind === 'search')) {
+      if (runningSearchIds.has(a.id)) continue;
+      const res = await startAutomation(a.id, 'schedule');
+      if (!res.success) console.info('[CRM] scheduled automation deferred:', res.error);
+    }
+    const scan = due.find((x) => x.kind === 'tagUnread');
+    if (!scan || scanning) return;
+    const res = await startAutomation(scan.id, 'schedule');
     if (!res.success) console.info('[CRM] scheduled automation deferred:', res.error);
   } catch (e) {
     console.warn('[CRM] automation schedule check failed', e);
@@ -2333,7 +2479,11 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           break;
         }
         case 'GET_AUTOMATION_RUNS': {
-          sendResponse({ runs: await getAutomationRuns(), runningId: runningAutomationId });
+          sendResponse({
+            runs: await getAutomationRuns(),
+            runningId: runningAutomationId,
+            runningIds: [...(runningAutomationId ? [runningAutomationId] : []), ...runningSearchIds],
+          });
           break;
         }
         case 'AUTOMATION_PROGRESS': {

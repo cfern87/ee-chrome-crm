@@ -2447,6 +2447,7 @@ export default function DashboardApp() {
             store={store}
             updateStore={updateStore}
             onOpenTags={() => { setSchemaView('tags'); go('tags'); }}
+            onOpenSearch={openTileInContacts}
           />
         )}
 

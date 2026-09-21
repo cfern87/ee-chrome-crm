@@ -263,57 +263,12 @@ export function PresetActionsSettings({ store, updateStore }: {
                     />
                   </Stack>
 
-                  <div>
-                    <Text as="div" size="small" weight="medium" tone="secondary" style={{ marginBottom: space.xs }}>
-                      Actions, applied in this order
-                    </Text>
-                    <Stack gap="xs">
-                      {p.steps.length === 0 && (
-                        <Text size="micro" tone="muted">Nothing yet — this button would do nothing.</Text>
-                      )}
-                      {p.steps.map((step, si) => (
-                        <StepRow
-                          key={si}
-                          step={step}
-                          store={store}
-                          tags={tags}
-                          fields={fields}
-                          onChange={(next) => setSteps(p, p.steps.map((s, k) => (k === si ? next : s)))}
-                          onRemove={() => setSteps(p, p.steps.filter((_, k) => k !== si))}
-                          onMove={(delta) => {
-                            const j = si + delta;
-                            if (j < 0 || j >= p.steps.length) return;
-                            const next = p.steps.slice();
-                            [next[si], next[j]] = [next[j], next[si]];
-                            setSteps(p, next);
-                          }}
-                        />
-                      ))}
-                    </Stack>
-
-                    <Stack direction="row" gap="xs" align="center" wrap style={{ marginTop: space.sm }}>
-                      <Select
-                        value=""
-                        aria-label="Add an action"
-                        onChange={(e) => {
-                          const kind = e.target.value as PresetStepKind;
-                          if (!kind) return;
-                          setSteps(p, [...p.steps, blankStep(kind, store)]);
-                          e.target.value = '';
-                        }}
-                        style={{ width: 190 }}
-                      >
-                        <option value="">+ Add an action…</option>
-                        {STEP_ORDER.map((k) => (
-                          <option key={k} value={k} disabled={(k === 'setFunnelStage' && !hasFunnels) || (k === 'removeFromFunnel' && !hasGroups)}>
-                            {STEP_LABELS[k]}
-                            {k === 'setFunnelStage' && !hasFunnels ? ' (no funnels yet)' : ''}
-                            {k === 'removeFromFunnel' && !hasGroups ? ' (no tag groups yet)' : ''}
-                          </option>
-                        ))}
-                      </Select>
-                    </Stack>
-                  </div>
+                  <StepListEditor
+                    steps={p.steps}
+                    store={store}
+                    onChange={(steps) => setSteps(p, steps)}
+                    emptyText="Nothing yet — this button would do nothing."
+                  />
 
                   {isDestructive(p) && (
                     <Banner tone="warning">
@@ -338,6 +293,75 @@ export function PresetActionsSettings({ store, updateStore }: {
         {status && <Text size="micro" tone="success">{status}</Text>}
       </Stack>
     </Card>
+  );
+}
+
+/**
+ * An ordered list of actions with "+ Add an action…" — the body of a quick
+ * action, and the actions of an automation (AutomationsPanel), which run the
+ * same steps.
+ */
+export function StepListEditor({ steps, store, onChange, emptyText, title = 'Actions, applied in this order' }: {
+  steps: PresetStep[];
+  store: Store;
+  onChange: (next: PresetStep[]) => void;
+  emptyText?: string;
+  title?: string;
+}) {
+  const tags = Object.values(store.tags).sort((a, b) => a.name.localeCompare(b.name));
+  const fields = Object.values(store.fieldDefs).sort((a, b) => a.order - b.order);
+  const hasFunnels = funnelStages(store.tags, store.tagGroups).length > 0;
+  const hasGroups = groupsForRemoval(store).length > 0;
+  return (
+    <div>
+      <Text as="div" size="small" weight="medium" tone="secondary" style={{ marginBottom: space.xs }}>
+        {title}
+      </Text>
+      <Stack gap="xs">
+        {steps.length === 0 && emptyText && <Text size="micro" tone="muted">{emptyText}</Text>}
+        {steps.map((step, si) => (
+          <StepRow
+            key={si}
+            step={step}
+            store={store}
+            tags={tags}
+            fields={fields}
+            onChange={(next) => onChange(steps.map((s, k) => (k === si ? next : s)))}
+            onRemove={() => onChange(steps.filter((_, k) => k !== si))}
+            onMove={(delta) => {
+              const j = si + delta;
+              if (j < 0 || j >= steps.length) return;
+              const next = steps.slice();
+              [next[si], next[j]] = [next[j], next[si]];
+              onChange(next);
+            }}
+          />
+        ))}
+      </Stack>
+
+      <Stack direction="row" gap="xs" align="center" wrap style={{ marginTop: space.sm }}>
+        <Select
+          value=""
+          aria-label="Add an action"
+          onChange={(e) => {
+            const kind = e.target.value as PresetStepKind;
+            if (!kind) return;
+            onChange([...steps, blankStep(kind, store)]);
+            e.target.value = '';
+          }}
+          style={{ width: 190 }}
+        >
+          <option value="">+ Add an action…</option>
+          {STEP_ORDER.map((k) => (
+            <option key={k} value={k} disabled={(k === 'setFunnelStage' && !hasFunnels) || (k === 'removeFromFunnel' && !hasGroups)}>
+              {STEP_LABELS[k]}
+              {k === 'setFunnelStage' && !hasFunnels ? ' (no funnels yet)' : ''}
+              {k === 'removeFromFunnel' && !hasGroups ? ' (no tag groups yet)' : ''}
+            </option>
+          ))}
+        </Select>
+      </Stack>
+    </div>
   );
 }
 

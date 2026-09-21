@@ -167,6 +167,11 @@ function normalizePreset(raw: unknown): PresetAction | null {
   };
 }
 
+/** Defensive read of a stored step list — shared with automations, which run the same steps. */
+export function normalizeSteps(raw: unknown): PresetStep[] {
+  return Array.isArray(raw) ? raw.map(normalizeStep).filter((s): s is PresetStep => s !== null) : [];
+}
+
 function normalizeStep(raw: unknown): PresetStep | null {
   const body = normalizeStepBody(raw);
   if (!body) return null;
@@ -336,15 +341,21 @@ export function stepsFor(preset: PresetAction, conv: Conversation, store: Store,
   for (const step of preset.steps) {
     if (step.when && !matchesQuery(conv, step.when, ctx)) continue;
     switch (step.kind) {
-      case 'addTag':
-        if (!store.tags[step.tagId]) break;
+      case 'addTag': {
+        const tag = store.tags[step.tagId];
+        if (!tag) break;
+        // Already held: nothing to write — unless it's in a single-choice
+        // group, where adding it again is also what clears the group's others.
+        const single = !!tag.groupId && !!store.tagGroups[tag.groupId]?.singleChoice;
+        if (held.has(step.tagId) && !single) break;
         if (pendingRemoves.length) flushTags();
         pendingAdds.push(step.tagId);
         held.add(step.tagId);
         break;
+      }
 
       case 'removeTag':
-        if (!store.tags[step.tagId]) break;
+        if (!store.tags[step.tagId] || !held.has(step.tagId)) break;
         if (pendingAdds.length) flushTags();
         pendingRemoves.push(step.tagId);
         held.delete(step.tagId);

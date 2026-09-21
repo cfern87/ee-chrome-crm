@@ -164,6 +164,11 @@ export interface Campaign {
   //
   // Part of campaignScalars, so archiving on one machine archives everywhere.
   archived?: boolean;
+  // The automation that queued this campaign (automations.ts), if any. Set at
+  // creation and never changed, so it survives any merge as-is. It is how an
+  // automation's "message each contact once" knows, on every machine, who it
+  // has already messaged.
+  automationId?: string;
 }
 
 // ---- Pure helpers ----
@@ -216,6 +221,7 @@ export interface NewCampaignInput {
   name?: string;
   dryRun?: boolean;
   skipIfUnread?: boolean;
+  automationId?: string;
 }
 
 export function createCampaign(input: NewCampaignInput): Campaign {
@@ -227,6 +233,7 @@ export function createCampaign(input: NewCampaignInput): Campaign {
     template: input.template,
     dryRun: !!input.dryRun,
     skipIfUnread: !!input.skipIfUnread,
+    ...(input.automationId ? { automationId: input.automationId } : {}),
     createdAt: now,
     status: 'running',
     recipients: input.recipients.map((r) => ({

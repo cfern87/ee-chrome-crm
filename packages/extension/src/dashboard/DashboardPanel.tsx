@@ -286,7 +286,16 @@ export function DashboardPanel({
                 {tile.description && (
                   <div style={{ fontSize: 11, color: color.text.muted, lineHeight: 1.4 }}>{tile.description}</div>
                 )}
-                <div style={{ display: 'flex', gap: space.sm, marginTop: 6 }}>
+                <div style={{ display: 'flex', gap: space.sm, marginTop: 6, alignItems: 'center' }}>
+                  {/* The count already opens the list, but a number doesn't
+                      look clickable — this says so in words. */}
+                  <button
+                    onClick={() => onOpenInContacts(tile)}
+                    title="Open these contacts in the contact list, with this query applied"
+                    style={{ background: color.accent.base, color: color.surface.raised, border: 'none', borderRadius: 5, padding: '3px 9px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}
+                  >
+                    Show contacts →
+                  </button>
                   <button
                     onClick={() => startEdit(tile)}
                     style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, fontWeight: 600, color: color.accent.base, cursor: 'pointer' }}

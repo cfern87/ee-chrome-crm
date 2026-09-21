@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import {
-  planTagUnread, readAutomations, writeAutomations, normalizeAutomation, isDue, whyNotRunnable,
-  newTagUnreadAutomation, type Automation,
+  resolveUnread, planActions, planMessage, messageSkipped, matchSavedSearch, withLegacyFields,
+  readAutomations, writeAutomations, normalizeAutomation, isDue, whyNotRunnable,
+  newTagUnreadAutomation, type Automation, type AutomationMessage,
 } from './automations';
+import type { SavedSearch } from './search';
 import { applyMutations } from './mutations';
 import { mergeSettings } from './settingsMerge';
 import { EMPTY_STORE, type Conversation, type Store } from './storage';
@@ -27,63 +29,133 @@ function storeWith(convs: Conversation[], extra: Partial<Store> = {}): Store {
 }
 
 function automation(patch: Partial<Automation> = {}): Automation {
-  return { ...newTagUnreadAutomation(0, 1_000), id: 'a1', tagIds: ['unread'], ...patch };
+  return { ...newTagUnreadAutomation(0, 1_000), id: 'a1', steps: [{ kind: 'addTag', tagId: 'unread' }], tagIds: ['unread'], ...patch };
 }
 
-describe('planTagUnread', () => {
-  it('tags contacts whose conversation is unread and skips people not in the CRM', () => {
-    const store = storeWith([conv('111'), conv('222')]);
-    const plan = planTagUnread(automation(), [{ threadId: '111' }, { threadId: '999' }], store);
+/** What running the automation's actions on these contacts leaves in the store. */
+function applyTo(a: Automation, ids: string[], store: Store): Store {
+  return applyMutations(store, planActions(a, ids, store).groups.flat()).store;
+}
 
-    expect(plan.tagged).toBe(1);
-    expect(plan.notInCrm).toBe(1);
-    const next = applyMutations(store, plan.groups.flat()).store;
+describe('unread source', () => {
+  it('acts on contacts whose conversation is unread and skips people not in the CRM', () => {
+    const store = storeWith([conv('111'), conv('222')]);
+    const r = resolveUnread(automation(), [{ threadId: '111' }, { threadId: '999' }], store);
+    expect(r.ownerIds).toEqual(['111']);
+    expect(r.notInCrm).toBe(1);
+    const next = applyTo(automation(), r.ownerIds, store);
     expect(next.conversations['111'].tags).toEqual(['unread']);
     expect(next.conversations['222'].tags).toEqual([]);
-    expect(next.conversations['999']).toBeUndefined();
   });
 
   it('writes nothing for a contact that already has every tag', () => {
     const store = storeWith([conv('111', { tags: ['unread'] })]);
-    const plan = planTagUnread(automation(), [{ threadId: '111' }], store);
+    const plan = planActions(automation(), ['111'], store);
     expect(plan.groups).toEqual([]);
-    expect(plan.alreadyTagged).toBe(1);
-  });
-
-  it('adds only the tags that are missing', () => {
-    const store = storeWith([conv('111', { tags: ['hot'] })]);
-    const plan = planTagUnread(automation({ tagIds: ['unread', 'hot'] }), [{ threadId: '111' }], store);
-    expect(plan.groups).toEqual([[{ op: 'addTags', conversationId: '111', tagIds: ['unread'] }]]);
+    expect(plan.unchanged).toBe(1);
   });
 
   it('matches a contact saved under a different id by its resolved thread id, once', () => {
     const store = storeWith([conv('jane.doe', { resolvedThreadId: '555' })]);
-    const plan = planTagUnread(automation(), [{ threadId: '555' }, { threadId: '555' }], store);
-    expect(plan.matched).toBe(1);
-    expect(applyMutations(store, plan.groups.flat()).store.conversations['jane.doe'].tags).toEqual(['unread']);
+    const r = resolveUnread(automation(), [{ threadId: '555' }, { threadId: '555' }], store);
+    expect(r.ownerIds).toEqual(['jane.doe']);
   });
 
-  it('creates and tags new contacts when asked to', () => {
+  it('creates new contacts when asked to, then acts on them too', () => {
     const store = storeWith([]);
-    const plan = planTagUnread(automation({ createContacts: true }), [{ threadId: '777', name: 'Sam Lee' }], store);
-    expect(plan.created).toBe(1);
-    const next = applyMutations(store, plan.groups.flat()).store;
+    const a = automation({ createContacts: true });
+    const r = resolveUnread(a, [{ threadId: '777', name: 'Sam Lee' }], store);
+    const created = applyMutations(store, r.creates).store;
+    const next = applyTo(a, r.createdIds, created);
     expect(next.conversations['777'].participantName).toBe('Sam Lee');
     expect(next.conversations['777'].tags).toEqual(['unread']);
   });
 
   it('never brings back a contact the user deleted', () => {
     const store = storeWith([], { deleted: { '777': 5 } });
-    const plan = planTagUnread(automation({ createContacts: true }), [{ threadId: '777' }], store);
-    expect(plan.groups).toEqual([]);
-    expect(plan.notInCrm).toBe(1);
+    const r = resolveUnread(automation({ createContacts: true }), [{ threadId: '777' }], store);
+    expect(r.creates).toEqual([]);
+    expect(r.notInCrm).toBe(1);
   });
 
-  it('ignores tags that were deleted, and does nothing when none are left', () => {
-    const store = storeWith([conv('111')]);
-    const plan = planTagUnread(automation({ tagIds: ['gone'] }), [{ threadId: '111' }], store);
-    expect(plan.groups).toEqual([]);
-    expect(whyNotRunnable(automation({ tagIds: ['gone'] }), store)).not.toBeNull();
+  it('needs at least one action', () => {
+    expect(whyNotRunnable(automation({ steps: [] }), storeWith([]))).not.toBeNull();
+  });
+});
+
+describe('saved-search source', () => {
+  const search: SavedSearch = {
+    id: 's1', name: 'Hot', order: 0, createdAt: 1, updatedAt: 1,
+    query: { type: 'group', id: 'g', combinator: 'and', children: [
+      { type: 'condition', id: 'c', field: 'tags', op: 'hasAny', values: ['hot'] },
+    ] },
+  };
+  const store = () => storeWith(
+    [conv('1', { tags: ['hot'] }), conv('2'), conv('3', { tags: ['hot'], archived: true })],
+    { savedSearches: { s1: search } },
+  );
+
+  it('acts on exactly the contacts the search matches, respecting its archive scope', () => {
+    const s = store();
+    expect(matchSavedSearch(search, s).map((c) => c.id)).toEqual(['1']);
+    expect(matchSavedSearch({ ...search, archiveScope: 'all' }, s).map((c) => c.id).sort()).toEqual(['1', '3']);
+  });
+
+  it('runs several steps with per-contact conditions', () => {
+    const a = automation({
+      kind: 'search', savedSearchId: 's1',
+      steps: [
+        { kind: 'addTag', tagId: 'unread' },
+        { kind: 'archive', when: { type: 'group', id: 'w', combinator: 'and', children: [
+          { type: 'condition', id: 'k', field: 'name', op: 'contains', value: 'Person 1' },
+        ] } },
+      ],
+    });
+    const next = applyTo(a, ['1', '2'], store());
+    expect([...next.conversations['1'].tags].sort()).toEqual(['hot', 'unread']);
+    expect(next.conversations['1'].archived).toBe(true);
+    expect(next.conversations['2'].archived).toBe(false);
+  });
+
+  it('refuses to run without its saved search', () => {
+    const a = automation({ kind: 'search', savedSearchId: 'gone' });
+    expect(whyNotRunnable(a, store())).toMatch(/saved search/);
+  });
+});
+
+describe('message action', () => {
+  const msg: AutomationMessage = { template: 'Hi {{firstName}}', skipIfUnread: false, dryRun: false, oncePerContact: true, maxPerRun: 2 };
+  const withLink = (id: string, extra: Partial<Conversation> = {}) => conv(id, { chatUrl: `https://m.me/${id}`, ...extra });
+
+  it('skips people already messaged, already queued, or without a chat link, and caps the run', () => {
+    const store = storeWith([withLink('a'), withLink('b'), withLink('c'), conv('d'), withLink('e'), withLink('f')]);
+    const plan = planMessage(msg, ['a', 'b', 'c', 'd', 'e', 'f'], store, new Set(['a']), new Set(['b']));
+    expect(plan.recipients.map((r) => r.threadId)).toEqual(['c', 'e']);
+    expect(plan).toMatchObject({ alreadyMessaged: 1, alreadyQueued: 1, noChatLink: 1, overCap: 1 });
+    expect(messageSkipped(plan)).toBe(4);
+  });
+
+  it('messages again when "only once" is off', () => {
+    const store = storeWith([withLink('a')]);
+    expect(planMessage({ ...msg, oncePerContact: false }, ['a'], store, new Set(['a']), new Set()).recipients).toHaveLength(1);
+  });
+
+  it('counts as an action on its own, but not with an empty message', () => {
+    const s = storeWith([]);
+    expect(whyNotRunnable(automation({ steps: [], message: msg }), s)).toBeNull();
+    expect(whyNotRunnable(automation({ steps: [], message: { ...msg, template: '  ' } }), s)).not.toBeNull();
+  });
+});
+
+describe('automations saved before actions existed', () => {
+  it('reads their tags as "add tag" actions', () => {
+    const old = normalizeAutomation({ id: 'x', kind: 'tagUnread', tagIds: ['unread', 'hot'], order: 0, createdAt: 1 });
+    expect(old?.steps).toEqual([{ kind: 'addTag', tagId: 'unread' }, { kind: 'addTag', tagId: 'hot' }]);
+  });
+
+  it('keeps the legacy tag list in step for older builds', () => {
+    const a = withLegacyFields(automation({ steps: [{ kind: 'addTag', tagId: 'hot' }, { kind: 'archive' }] }));
+    expect(a.tagIds).toEqual(['hot']);
   });
 });
 
