@@ -45,7 +45,8 @@ import { newTask, nextDueAt, countOpenTasks } from '../tasks';
 import { TasksPanel, type TaskHandlers } from './TasksPanel';
 import { Resizer } from '../ui/SplitPane';
 import { useLocalPref } from '../ui/prefs';
-import { tint } from '../ui/contrast';
+import { tint, onColor } from '../ui/contrast';
+import { readPresetActions, stepsFor, describePreset, isDestructive } from '../presets';
 import {
   MessagingPanel, ActiveCampaignsView, HistoryPanel, NotificationsDrawer, holdOf, OnlineDot, QueuePreview,
   type HistoryFocus, type ComposeSeed, type ComposerDraft,
@@ -336,6 +337,10 @@ export default function DashboardApp() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkTagMenu, setBulkTagMenu] = useState<'assign' | 'remove' | null>(null);
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
+  // A quick action that deletes, waiting for its confirming second click.
+  const [bulkPresetArmed, setBulkPresetArmed] = useState<string | null>(null);
+  // What the last bulk quick action did, shown under the buttons.
+  const [bulkPresetResult, setBulkPresetResult] = useState<string | null>(null);
 
   // Pagination of the contact list. `pageSize === 0` means "show everything".
   const [page, setPage] = useState(0);
@@ -952,6 +957,8 @@ export default function DashboardApp() {
     setSelectedIds(new Set());
     setBulkTagMenu(null);
     setBulkDeleteConfirm(false);
+    setBulkPresetArmed(null);
+    setBulkPresetResult(null);
   };
   useEffect(() => {
     if (firstSelectionKey.current) { firstSelectionKey.current = false; return; }
@@ -984,6 +991,7 @@ export default function DashboardApp() {
 
   // Bulk actions
   const selectedConvs = filtered.filter((c) => selectedIds.has(c.id));
+  const bulkPresets = readPresetActions(store);
 
   // Check/uncheck exactly the contacts on the current page, leaving any
   // selection made on other pages alone.
@@ -1068,6 +1076,38 @@ export default function DashboardApp() {
     if (selectedConv && selectedIds.has(selectedConv.id)) setSelectedConv(null);
     setSelectedIds(new Set());
     setBulkDeleteConfirm(false);
+  };
+
+  // Quick actions (presets.ts) on the whole selection. Each contact gets its
+  // own stepsFor — the same mutations one press in the Messenger panel would
+  // produce for them — so "only if" conditions are checked per contact and a
+  // funnel step follows each contact's own tags. Built from storeRef, the
+  // freshest store, then sent as ONE batch.
+  const handleBulkPreset = async (presetId: string) => {
+    const current = storeRef.current;
+    const preset = readPresetActions(current).find((p) => p.id === presetId);
+    setBulkPresetArmed(null);
+    if (!preset) return;
+    const now = Date.now();
+    const mutations: Mutation[] = [];
+    let changed = 0;
+    let skipped = 0;
+    for (const id of selectedIds) {
+      const conv = current.conversations[id];
+      if (!conv) continue;
+      const m = stepsFor(preset, conv, current, now);
+      if (m.length) { mutations.push(...m); changed++; } else skipped++;
+    }
+    await mutateStore(mutations);
+    console.info(`[CRM][bulk] Applied preset "${preset.label}" to ${changed} contacts (${skipped} unchanged)`);
+    setBulkPresetResult(
+      `“${preset.label}” applied to ${changed} contact${changed === 1 ? '' : 's'}` +
+      (skipped ? ` · ${skipped} left unchanged (conditions not met, or nothing to change)` : ''),
+    );
+    if (isDestructive(preset)) {
+      if (selectedConv && selectedIds.has(selectedConv.id)) setSelectedConv(null);
+      setSelectedIds(new Set());
+    }
   };
 
   const handleBulkMerge = async () => {
@@ -1948,7 +1988,7 @@ export default function DashboardApp() {
                       )}
                     </span>
                     <button
-                      onClick={() => { setSelectedIds(new Set()); setBulkTagMenu(null); setBulkDeleteConfirm(false); }}
+                      onClick={clearBulkSelection}
                       style={{ background: 'none', color: color.text.secondary, border: 'none', fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}
                     >
                       Clear
@@ -1977,13 +2017,13 @@ export default function DashboardApp() {
                       🔄 Check for replies ({selectedIds.size})
                     </button>
                     <button
-                      onClick={() => { setBulkTagMenu(bulkTagMenu === 'assign' ? null : 'assign'); setBulkDeleteConfirm(false); }}
+                      onClick={() => { setBulkTagMenu(bulkTagMenu === 'assign' ? null : 'assign'); setBulkDeleteConfirm(false); setBulkPresetArmed(null); }}
                       style={{ background: bulkTagMenu === 'assign' ? color.accent.base : color.surface.raised, color: bulkTagMenu === 'assign' ? color.surface.raised : color.accent.base, border: `1px solid ${color.accent.base}`, padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
                     >
                       Assign Tag
                     </button>
                     <button
-                      onClick={() => { setBulkTagMenu(bulkTagMenu === 'remove' ? null : 'remove'); setBulkDeleteConfirm(false); }}
+                      onClick={() => { setBulkTagMenu(bulkTagMenu === 'remove' ? null : 'remove'); setBulkDeleteConfirm(false); setBulkPresetArmed(null); }}
                       style={{ background: bulkTagMenu === 'remove' ? color.accent.base : color.surface.raised, color: bulkTagMenu === 'remove' ? color.surface.raised : color.accent.base, border: `1px solid ${color.accent.base}`, padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
                     >
                       Remove Tag
@@ -1998,12 +2038,67 @@ export default function DashboardApp() {
                       </button>
                     )}
                     <button
-                      onClick={() => { setBulkDeleteConfirm(true); setBulkTagMenu(null); }}
+                      onClick={() => { setBulkDeleteConfirm(true); setBulkTagMenu(null); setBulkPresetArmed(null); }}
                       style={{ background: color.danger.subtle, color: color.danger.base, border: `1px solid ${color.danger.base}`, padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
                     >
                       Delete
                     </button>
                   </div>
+
+                  {/* Quick actions — the same presets the Messenger panel shows,
+                      applied to every selected contact. */}
+                  {bulkPresets.length > 0 && (
+                    <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid #cfe2f5' }}>
+                      <div style={{ fontSize: 11, color: color.text.secondary, marginBottom: 6, fontWeight: 600 }}>
+                        Quick actions for all {selectedIds.size} selected:
+                      </div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                        {bulkPresets.map((p) => {
+                          const destructive = isDestructive(p);
+                          const armed = bulkPresetArmed === p.id;
+                          const bg = armed || destructive ? color.danger.base : p.color || color.surface.raised;
+                          return (
+                            <button
+                              key={p.id}
+                              title={p.description || describePreset(p, store)}
+                              onClick={() => {
+                                setBulkTagMenu(null);
+                                setBulkDeleteConfirm(false);
+                                if (destructive && !armed) { setBulkPresetArmed(p.id); return; }
+                                void handleBulkPreset(p.id);
+                              }}
+                              style={{
+                                background: bg,
+                                color: armed || destructive || p.color ? onColor(bg) : color.text.primary,
+                                border: `1px solid ${armed || destructive ? color.danger.base : p.color || color.border.control}`,
+                                padding: '5px 11px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                              }}
+                            >
+                              {armed ? `Yes, “${p.label}” ${selectedIds.size} contacts` : p.label}
+                            </button>
+                          );
+                        })}
+                        {bulkPresetArmed && (
+                          <button
+                            onClick={() => setBulkPresetArmed(null)}
+                            style={{ background: color.surface.raised, color: color.text.secondary, border: `1px solid ${color.border.control}`, padding: '5px 11px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                          >
+                            Cancel
+                          </button>
+                        )}
+                      </div>
+                      {bulkPresetArmed && (
+                        <div style={{ fontSize: 12, color: color.danger.base, fontWeight: 600, marginTop: 6 }}>
+                          This quick action deletes contacts — click it again to confirm. This cannot be undone.
+                        </div>
+                      )}
+                      {bulkPresetResult && !bulkPresetArmed && (
+                        <div role="status" style={{ fontSize: 12, color: color.success.base, marginTop: 6 }}>
+                          ✓ {bulkPresetResult}
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {/* Tag picker for assign/remove */}
                   {bulkTagMenu && (
