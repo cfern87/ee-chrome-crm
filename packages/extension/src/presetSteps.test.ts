@@ -108,6 +108,24 @@ describe('set funnel step', () => {
   });
 });
 
+describe('remove from funnel', () => {
+  it('takes every tag of the group off and leaves the rest', () => {
+    expect(press([{ kind: 'removeFromFunnel', groupId: 'stage' }], ['s1', 's3', 'lead', 'p2'])).toEqual(['lead', 'p2']);
+  });
+
+  it('also removes a stage an earlier step in the same preset added', () => {
+    expect(press([
+      { kind: 'addTag', tagId: 's2' },
+      { kind: 'removeFromFunnel', groupId: 'stage' },
+    ], ['s1'])).toEqual([]);
+  });
+
+  it('does nothing for a contact not in the funnel, or a deleted group', () => {
+    expect(press([{ kind: 'removeFromFunnel', groupId: 'pipe' }], ['lead'])).toEqual(['lead']);
+    expect(press([{ kind: 'removeFromFunnel', groupId: 'gone' }], ['s1'])).toEqual(['s1']);
+  });
+});
+
 describe('setFunnelHidden', () => {
   it('hides and unhides a funnel on one contact', () => {
     const c = conv([]);

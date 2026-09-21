@@ -72,6 +72,9 @@ type PresetStepBody =
   // rather than toggling them back out. `groupId` is kept beside the tag so a
   // stage that has since moved to another group is skipped, not misapplied.
   | { kind: 'setFunnelStage'; groupId: string; tagId: string }
+  // Take the contact out of a funnel (or any tag group) entirely: every tag
+  // of that group they hold comes off.
+  | { kind: 'removeFromFunnel'; groupId: string }
   | { kind: 'archive' }
   | { kind: 'unarchive' }
   | { kind: 'deleteContact' };
@@ -208,6 +211,8 @@ function normalizeStepBody(raw: unknown): PresetStepBody | null {
       return typeof o.groupId === 'string' && o.groupId && typeof o.tagId === 'string' && o.tagId
         ? { kind: 'setFunnelStage', groupId: o.groupId, tagId: o.tagId }
         : null;
+    case 'removeFromFunnel':
+      return typeof o.groupId === 'string' && o.groupId ? { kind: 'removeFromFunnel', groupId: o.groupId } : null;
     case 'archive':
     case 'unarchive':
     case 'deleteContact':
@@ -368,6 +373,19 @@ export function stepsFor(preset: PresetAction, conv: Conversation, store: Store,
         break;
       }
 
+      case 'removeFromFunnel': {
+        if (!store.tagGroups[step.groupId]) break;
+        // `held`, not conv.tags, so a stage an earlier step added goes too.
+        const remove = Object.values(store.tags)
+          .filter((t) => t.groupId === step.groupId && held.has(t.id))
+          .map((t) => t.id);
+        if (!remove.length) break;
+        flushTags();
+        out.push({ op: 'removeTags', conversationId: id, tagIds: remove });
+        remove.forEach((t) => held.delete(t));
+        break;
+      }
+
       case 'appendName':
         if (!step.text) break;
         name = `${name} ${step.text}`.trim();
@@ -450,6 +468,7 @@ export function describePreset(preset: PresetAction, store: Store): string {
       case 'addTask': return `task "${s.title || '(untitled)'}"${describeOffset(s.dueInDays, s.dueTime)}`;
       case 'completeTasks': return 'complete open tasks';
       case 'setFunnelStage': return `${store.tagGroups[s.groupId]?.name || 'deleted funnel'} → ${tagName(s.tagId)}`;
+      case 'removeFromFunnel': return `remove from ${store.tagGroups[s.groupId]?.name || 'deleted funnel'}`;
       case 'archive': return 'archive';
       case 'unarchive': return 'unarchive';
       case 'deleteContact': return 'DELETE contact';

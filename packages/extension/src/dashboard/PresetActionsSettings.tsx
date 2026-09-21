@@ -11,7 +11,7 @@
 // of the layout.
 
 import React, { useEffect, useRef, useState } from 'react';
-import type { Store, SaveResult } from '../storage';
+import type { Store, SaveResult, TagGroup } from '../storage';
 import {
   PresetAction, PresetStep, PresetStepKind,
   readPresetActions, newPresetAction, describePreset, isDestructive,
@@ -30,7 +30,8 @@ import { QueryEditor } from './SearchBuilder';
 const STEP_LABELS: Record<PresetStepKind, string> = {
   addTag: 'Add tag',
   removeTag: 'Remove tag',
-  setFunnelStage: 'Set funnel step',
+  setFunnelStage: 'Add to funnel stage',
+  removeFromFunnel: 'Remove from funnel',
   appendName: 'Append to name',
   prependName: 'Prepend to name',
   setField: 'Set field',
@@ -42,7 +43,7 @@ const STEP_LABELS: Record<PresetStepKind, string> = {
 };
 
 const STEP_ORDER: PresetStepKind[] = [
-  'addTag', 'removeTag', 'setFunnelStage', 'appendName', 'prependName', 'setField', 'addTask', 'completeTasks',
+  'addTag', 'removeTag', 'setFunnelStage', 'removeFromFunnel', 'appendName', 'prependName', 'setField', 'addTask', 'completeTasks',
   'archive', 'unarchive', 'deleteContact',
 ];
 
@@ -77,6 +78,17 @@ function isCustomOffset(days: number | undefined): boolean {
   return days !== undefined && !DUE_OFFSETS.some((o) => o.value === String(days));
 }
 
+/**
+ * Groups "Remove from funnel" can target: funnels first (the usual target), in
+ * funnel order, then every other tag group — clearing a single-choice or plain
+ * group is the same operation and occasionally just as useful.
+ */
+function groupsForRemoval(store: Store) {
+  const byOrder = (a: TagGroup, b: TagGroup) => a.order - b.order || a.createdAt - b.createdAt;
+  const all = Object.values(store.tagGroups);
+  return [...all.filter((g) => g.funnel).sort(byOrder), ...all.filter((g) => !g.funnel).sort(byOrder)];
+}
+
 /** A fresh step of `kind`, with whatever operand it needs defaulted. */
 function blankStep(kind: PresetStepKind, store: Store): PresetStep {
   switch (kind) {
@@ -94,6 +106,8 @@ function blankStep(kind: PresetStepKind, store: Store): PresetStep {
       const first = funnelStages(store.tags, store.tagGroups)[0];
       return { kind, groupId: first?.group.id || '', tagId: first?.stages[0]?.id || '' };
     }
+    case 'removeFromFunnel':
+      return { kind, groupId: groupsForRemoval(store)[0]?.id || '' };
     default:
       return { kind } as PresetStep;
   }
@@ -111,6 +125,7 @@ export function PresetActionsSettings({ store, updateStore }: {
   const tags = Object.values(store.tags).sort((a, b) => a.name.localeCompare(b.name));
   const fields = Object.values(store.fieldDefs).sort((a, b) => a.order - b.order);
   const hasFunnels = funnelStages(store.tags, store.tagGroups).length > 0;
+  const hasGroups = groupsForRemoval(store).length > 0;
 
   // writePresetActions owns the bookkeeping every save needs: `order` is
   // renumbered so it stays dense (the up/down buttons just swap positions in
@@ -290,8 +305,10 @@ export function PresetActionsSettings({ store, updateStore }: {
                       >
                         <option value="">+ Add an action…</option>
                         {STEP_ORDER.map((k) => (
-                          <option key={k} value={k} disabled={k === 'setFunnelStage' && !hasFunnels}>
-                            {STEP_LABELS[k]}{k === 'setFunnelStage' && !hasFunnels ? ' (no funnels yet)' : ''}
+                          <option key={k} value={k} disabled={(k === 'setFunnelStage' && !hasFunnels) || (k === 'removeFromFunnel' && !hasGroups)}>
+                            {STEP_LABELS[k]}
+                            {k === 'setFunnelStage' && !hasFunnels ? ' (no funnels yet)' : ''}
+                            {k === 'removeFromFunnel' && !hasGroups ? ' (no tag groups yet)' : ''}
                           </option>
                         ))}
                       </Select>
@@ -381,6 +398,21 @@ function StepRow({ step, store, tags, fields, onChange, onRemove, onMove }: {
                 <option key={s.id} value={s.id}>{i + 1}. {s.name}</option>
               ))}
             </optgroup>
+          ))}
+        </Select>
+      )}
+
+      {step.kind === 'removeFromFunnel' && (
+        <Select
+          value={step.groupId}
+          aria-label="Funnel to remove from"
+          title="Every tag this contact has from the chosen group is removed"
+          onChange={(e) => onChange({ ...step, groupId: e.target.value })}
+          style={{ width: 220 }}
+        >
+          {!store.tagGroups[step.groupId] && <option value={step.groupId}>Choose a funnel…</option>}
+          {groupsForRemoval(store).map((g) => (
+            <option key={g.id} value={g.id}>{g.name}{g.funnel ? '' : ' (tag group)'}</option>
           ))}
         </Select>
       )}
