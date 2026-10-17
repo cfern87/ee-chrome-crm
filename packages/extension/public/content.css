@@ -627,7 +627,7 @@
 .fb-crm-choice__select:focus { outline: 2px solid #065fd4; outline-offset: -1px; }
 
 /* Right side of a funnel's title row: the position (or "Completed" toggle)
-   and the hide button. */
+   and the hide / remove buttons. */
 .fb-crm-funnel__meta {
   display: flex;
   align-items: center;
@@ -650,21 +650,61 @@
 }
 .fb-crm-funnel__done:hover { background: #d4ebd6; }
 
-/* Quiet until hovered — it is used rarely and shouldn't compete with the bar. */
-.fb-crm-funnel__hide {
+/* Hide (eye-off) and remove (✕) icon buttons. Quiet until hovered — they are
+   used rarely and shouldn't compete with the bar. Remove turns red on hover so
+   the destructive one never looks like the harmless one. */
+.fb-crm-funnel__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: none;
   background: transparent;
   color: #bcc0c4;
+  font-family: inherit;
   font-size: 10px;
   line-height: 1;
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   padding: 0;
   border-radius: 50%;
   cursor: pointer;
   flex-shrink: 0;
 }
-.fb-crm-funnel__hide:hover { background: #f0f2f5; color: #65676b; }
+.fb-crm-funnel__icon:hover { background: #f0f2f5; color: #65676b; }
+.fb-crm-funnel__icon:focus-visible { outline: 2px solid #065fd4; outline-offset: -2px; }
+.fb-crm-funnel__icon-svg { width: 13px; height: 13px; }
+.fb-crm-funnel__icon--remove:hover,
+.fb-crm-funnel__icon--remove[aria-expanded="true"] { background: #fdecea; color: #c62828; }
+
+/* Inline "Remove from <funnel>?" confirmation, in place of the bar. */
+.fb-crm-funnel__confirm {
+  margin: 4px 0 6px;
+  padding: 8px 10px;
+  border: 1px solid #f5c2c0;
+  border-radius: 6px;
+  background: #fdf3f2;
+  font-size: 12px;
+  color: #1c1e21;
+}
+.fb-crm-funnel__confirm-text { line-height: 1.35; overflow-wrap: anywhere; }
+.fb-crm-funnel__confirm-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+.fb-crm-funnel__confirm-btn {
+  border: none;
+  background: #c62828;
+  color: #fff;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.fb-crm-funnel__confirm-btn:hover { background: #a81f1f; }
 
 /* A funnel hidden for this contact, listed only while "Show" is on. */
 .fb-crm-funnel__row--hidden .fb-crm-section-title { opacity: 0.55; }

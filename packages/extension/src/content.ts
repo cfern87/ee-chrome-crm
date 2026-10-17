@@ -1246,6 +1246,10 @@ let presetArmed: string | null = null;
 const expandedFunnels = new Set<string>();
 // Whether funnels hidden for this contact are listed (so they can be unhidden).
 let showHiddenFunnels = false;
+// Removing a contact from a funnel clears that funnel's tags, so it is two
+// clicks like delete: the ✕ arms it (holds the group id) and the confirm row
+// under the title does it. Reset with the conversation and on panel close.
+let funnelRemoveArmed: string | null = null;
 
 // In-progress "add follow-up" row, module-scoped for the same reason as
 // newTagDraft. `due` is a day offset as a string ('' = no due date, 'custom' =
@@ -1411,7 +1415,17 @@ function funnelBarsHtml(allViews: FunnelView[], hiddenIds: string[]): string {
       </div>`;
     }
 
-    const hideBtn = `<button class="fb-crm-funnel__hide" data-funnel-hide="${groupId}" title="Hide ${groupName} for this contact (its tags are kept)" aria-label="Hide ${groupName} for this contact">✕</button>`;
+    // Two quiet icon buttons: an eye-off to HIDE the bar (tags kept, same icon
+    // the tag chips use for "hidden"), and a ✕ to REMOVE the contact from the
+    // funnel (its tags come off). The ✕ used to mean hide, which read as
+    // delete; now it is the delete. Remove only shows when there's a stage to
+    // clear — on an untouched funnel it would do nothing.
+    const heldNames = view.stages.filter((_, i) => view.held[i]).map((s) => s.name);
+    const hideBtn = `<button class="fb-crm-funnel__icon" data-funnel-hide="${groupId}" title="Hide ${groupName} for this contact (its tags are kept)" aria-label="Hide ${groupName} for this contact">${eyeOffSvgMarkup('fb-crm-funnel__icon-svg')}</button>`;
+    const removeBtn = heldNames.length
+      ? `<button class="fb-crm-funnel__icon fb-crm-funnel__icon--remove" data-funnel-remove="${groupId}" aria-expanded="${funnelRemoveArmed === view.group.id}" title="Remove this contact from ${groupName} (clears its tags)" aria-label="Remove this contact from ${groupName}">✕</button>`
+      : '';
+    const armed = funnelRemoveArmed === view.group.id && heldNames.length > 0;
     const completed = view.currentIndex === view.stages.length - 1;
     const expanded = expandedFunnels.has(view.group.id);
 
@@ -1423,8 +1437,19 @@ function funnelBarsHtml(allViews: FunnelView[], hiddenIds: string[]): string {
     const header = `
       <div class="fb-crm-section-title-row">
         ${title}
-        <span class="fb-crm-funnel__meta">${status}${hideBtn}</span>
+        <span class="fb-crm-funnel__meta">${status}${hideBtn}${removeBtn}</span>
       </div>`;
+    if (armed) {
+      const count = heldNames.length;
+      return `${header}
+      <div class="fb-crm-funnel__confirm" role="alertdialog" aria-label="Remove from ${groupName}?">
+        <div class="fb-crm-funnel__confirm-text">Remove from ${groupName}? This clears ${count === 1 ? 'the tag' : `${count} tags`}: <strong>${heldNames.map(escapeHtml).join(', ')}</strong>.</div>
+        <div class="fb-crm-funnel__confirm-actions">
+          <button class="fb-crm-funnel__confirm-btn" data-funnel-remove-confirm="${groupId}">Remove</button>
+          <button class="fb-crm-funnel__link" data-funnel-remove-cancel="1">Cancel</button>
+        </div>
+      </div>`;
+    }
     if (completed && !expanded) return header;
 
     const steps = view.stages.map((stage, i) => {
@@ -1664,6 +1689,7 @@ async function togglePanel() {
   } else {
     deleteArmed = false; // never leave a delete armed behind a closed panel
     presetArmed = null;
+    funnelRemoveArmed = null;
     panelEl.style.display = 'none';
   }
 }
@@ -1718,6 +1744,7 @@ async function renderPanelContent() {
   if (threadId !== lastRenderedThread) {
     deleteArmed = false;
     presetArmed = null;
+    funnelRemoveArmed = null;
     fieldDrafts.clear();
     focusedFieldId = null;
     editingName = null;
@@ -2340,6 +2367,34 @@ function wirePanelActions(threadId: string) {
   });
   panelEl.querySelectorAll<HTMLElement>('[data-funnel-hide]').forEach(btn => {
     btn.addEventListener('click', () => { void setFunnelHidden(btn.dataset.funnelHide!, true); });
+  });
+  // Remove from a funnel: the ✕ toggles the confirm row, the confirm clears
+  // every tag of that group the contact holds. Read from a FRESH store, like
+  // the stage clicks, so a tag added elsewhere since render goes too.
+  panelEl.querySelectorAll<HTMLElement>('[data-funnel-remove]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.funnelRemove!;
+      funnelRemoveArmed = funnelRemoveArmed === id ? null : id;
+      await renderPanel();
+    });
+  });
+  panelEl.querySelector<HTMLElement>('[data-funnel-remove-cancel]')?.addEventListener('click', async () => {
+    funnelRemoveArmed = null;
+    await renderPanel();
+  });
+  panelEl.querySelector<HTMLElement>('[data-funnel-remove-confirm]')?.addEventListener('click', (e) => {
+    const groupId = (e.currentTarget as HTMLElement).dataset.funnelRemoveConfirm!;
+    void panelAction(async () => {
+      funnelRemoveArmed = null;
+      const store = await getStore();
+      const conv = store.conversations[threadId];
+      if (!conv) return;
+      const remove = conv.tags.filter((t) => store.tags[t]?.groupId === groupId);
+      if (remove.length) await mutate([{ op: 'removeTags', conversationId: threadId, tagIds: remove }]);
+      expandedFunnels.delete(groupId);
+      await renderPanel();
+      await injectSidebarTags();
+    });
   });
   panelEl.querySelectorAll<HTMLElement>('[data-funnel-unhide]').forEach(btn => {
     btn.addEventListener('click', () => { void setFunnelHidden(btn.dataset.funnelUnhide!, false); });
