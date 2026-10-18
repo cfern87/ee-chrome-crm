@@ -2656,8 +2656,9 @@ function resolveSendThreadId(composer: Element): string | null {
   return null;
 }
 
-// Stamp lastContactedAt — but only for an already-saved contact.
-async function markContacted(threadId: string): Promise<void> {
+// Stamp lastContactedAt — but only for an already-saved contact. A campaign
+// send passes the text it sent, which goes into the contact's history.
+async function markContacted(threadId: string, sent?: { message: string; dryRun: boolean }): Promise<void> {
   const store = await getStore();
   // Saved contacts only — never auto-create one just because a message went
   // out. Resolve through aliases so a profile-added contact still counts.
@@ -2665,7 +2666,7 @@ async function markContacted(threadId: string): Promise<void> {
   if (!conv) return;
   // The coalescing window for rapid repeat sends lives in the mutation, so it
   // applies whichever tab the send came from.
-  await mutate([{ op: 'markContacted', conversationId: conv.id }]);
+  await mutate([{ op: 'markContacted', conversationId: conv.id, ...(sent ? { message: sent.message, dryRun: sent.dryRun } : {}) }]);
   console.log('[CRM] Recorded lastContacted for', conv.participantName || threadId);
   if (panelEl && panelEl.style.display !== 'none') renderPanel();
 }
@@ -4450,8 +4451,9 @@ async function performAutomatedSend(threadId: string, rawMessage: string, dryRun
     return { ok: false, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus, log };
   }
 
-  // Stamp lastContacted on the saved contact, mirroring manual sends.
-  try { await markContacted(threadId); } catch { /* non-fatal */ }
+  // Stamp lastContacted on the saved contact, mirroring manual sends, and log
+  // the exact text that went out.
+  try { await markContacted(threadId, { message, dryRun }); } catch { /* non-fatal */ }
   // Nothing was actually sent in a dry run, so the thread's read state is still
   // whatever it was — saying 'unread' here would be a lie the next campaign
   // would act on.
@@ -4718,7 +4720,7 @@ async function performDrawerSend(threadId: string, rawMessage: string, dryRun = 
   if (!res.ok) {
     return { ok: false, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus, log };
   }
-  try { await markContacted(threadId); } catch { /* non-fatal */ }
+  try { await markContacted(threadId, { message, dryRun }); } catch { /* non-fatal */ }
   if (!dryRun) noteReadState(threadId, 'unread');
   return { ok: true, deliveryStatus: res.deliveryStatus, log };
 }

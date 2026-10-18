@@ -13,9 +13,12 @@
 //   time — SECONDS since 2020-01-01 UTC in base 36, padded to 6 chars (fixed
 //          width until 2089, which is what lets tokens sort as plain strings)
 //   op   — 'c' contact added, '+' tag added, '-' tag removed, 'm' message sent,
-//          'w' sent to a webhook by a quick action, 'x' that webhook failed
+//          'q' message queued in a campaign, 'w' sent to a webhook by a quick
+//          action, 'x' that webhook failed
 //   arg  — the tag id for '+' / '-', the HTTP status for 'w', a short reason
-//          for 'x' (see webhookFailureArg), empty otherwise
+//          for 'x' (see webhookFailureArg), the message text for 'q' and 'm'
+//          (see messageArg — absent on an 'm' from a manual send), empty
+//          otherwise
 // e.g. "3ukq0ac,3ukq0c+lx3k9a4f2q,3ukqa1m". A tag event is ~22 bytes of JSON,
 // against ~70 for the same thing as an object — this map can get long.
 //
@@ -26,15 +29,41 @@
 
 import type { Conversation, Store } from './storage';
 
-export type HistoryOp = 'c' | '+' | '-' | 'm' | 'w' | 'x';
+export type HistoryOp = 'c' | '+' | '-' | 'm' | 'q' | 'w' | 'x';
 
-const OPS = 'c+-mwx';
+const OPS = 'c+-mqwx';
+
+/**
+ * A message as a history arg. URI-encoded because the token format reserves
+ * the comma, and real messages are full of them. A leading '~' marks a dry run
+ * — typed but never sent — so the log can't pass one off as real outreach.
+ *
+ * The FULL text, not a preview: "what exactly did this person get?" is the
+ * question the log answers. Only campaign messages land here (one per send,
+ * per contact, capped by MAX_HISTORY_EVENTS), and history lives in local
+ * storage and Drive, never in chrome.storage.sync's small items.
+ */
+export function messageArg(text: string, dryRun = false): string {
+  return (dryRun ? '~' : '') + encodeURIComponent(text);
+}
+
+/** Read a message arg back. Null when the event carries no text. */
+export function messageFromArg(arg: string | undefined): { text: string; dryRun: boolean } | null {
+  if (!arg) return null;
+  const dryRun = arg.startsWith('~');
+  const raw = dryRun ? arg.slice(1) : arg;
+  try {
+    return { text: decodeURIComponent(raw), dryRun };
+  } catch {
+    return { text: raw, dryRun };
+  }
+}
 
 export interface HistoryEvent {
   /** Epoch ms (stored at second precision). */
   at: number;
   op: HistoryOp;
-  /** Tag id for '+' / '-'; HTTP status for 'w'; reason for 'x'. */
+  /** Tag id for '+' / '-'; HTTP status for 'w'; reason for 'x'; message (messageArg) for 'q' / 'm'. */
   arg?: string;
 }
 

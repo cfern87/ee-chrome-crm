@@ -2034,6 +2034,18 @@ async function startCampaign(
   const camp = createCampaign(input);
   camp.startedAt = Date.now();
   await upsertCampaign(camp);
+  // The exact message each recipient will get (variations already rolled),
+  // into their history. A log write failing must not undo a queued campaign.
+  try {
+    await mutateStore([{
+      op: 'logQueued',
+      at: camp.startedAt,
+      dryRun: camp.dryRun,
+      entries: camp.recipients.map((r) => ({ conversationId: r.threadId, message: r.renderedMessage })),
+    }]);
+  } catch (e) {
+    console.warn('[CRM] could not log queued messages', e);
+  }
   void dispatchWebhook('campaign.started', {
     campaign: { id: camp.id, name: camp.name, dryRun: camp.dryRun, skipIfUnread: !!camp.skipIfUnread },
     recipientCount: camp.recipients.length,
@@ -2198,6 +2210,15 @@ async function requeueCampaignRecipient(id: string, threadId: string): Promise<{
   }
 
   await upsertCampaign(c);
+  // Queued again, with the same frozen wording — log it like the first time.
+  try {
+    await mutateStore([{
+      op: 'logQueued', at: Date.now(), dryRun: c.dryRun,
+      entries: [{ conversationId: threadId, message: c.recipients[idx].renderedMessage }],
+    }]);
+  } catch (e) {
+    console.warn('[CRM] could not log requeued message', e);
+  }
   if (c.status === 'running') await kickQueue();
   return { success: true };
 }

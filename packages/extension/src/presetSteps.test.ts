@@ -4,7 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { stepsFor, readPresetActions, campaignSendsFor, webhookSendsFor, needsConfirm, PRESET_ACTIONS_KEY, type PresetAction, type PresetStep } from './presets';
 import { applyMutations } from './mutations';
-import { parseHistory, webhookFailureArg } from './history';
+import { parseHistory, webhookFailureArg, messageFromArg } from './history';
 import { EMPTY_STORE, type Conversation, type Store, type Tag, type TagGroup } from './storage';
 import type { QueryGroup } from './search';
 
@@ -211,5 +211,32 @@ describe('send to webhook', () => {
     expect(webhookFailureArg({ status: 404 })).toBe('HTTP 404');
     expect(webhookFailureArg({ error: 'No response within 10s' })).toBe('timed out');
     expect(webhookFailureArg({ error: 'TypeError: Failed to fetch' })).toBe('unreachable');
+  });
+});
+
+describe('message text in contact history', () => {
+  it('logs the full queued and sent message, commas and all', () => {
+    const a = { ...conv([]), id: 'a' };
+    const store = storeWith(a);
+    const text = 'Hi Pat, quick one — are you free Tue, Wed or Thu?\nThanks!';
+    const out = applyMutations(store, [
+      { op: 'logQueued', at: 1_700_000_000_000, entries: [{ conversationId: 'a', message: text }, { conversationId: 'gone', message: 'x' }] },
+      { op: 'markContacted', conversationId: 'a', message: text },
+      { op: 'markContacted', conversationId: 'a', message: 'Second, right after', dryRun: true },
+    ]);
+    const events = parseHistory(out.store.history?.a);
+    expect(events.map((e) => [e.op, messageFromArg(e.arg)])).toEqual([
+      ['q', { text, dryRun: false }],
+      ['m', { text, dryRun: false }],
+      ['m', { text: 'Second, right after', dryRun: true }],
+    ]);
+    expect(out.store.history?.gone).toBeUndefined();
+  });
+
+  it('keeps a manual send as a plain "message sent"', () => {
+    const a = { ...conv([]), id: 'a' };
+    const out = applyMutations(storeWith(a), [{ op: 'markContacted', conversationId: 'a' }]);
+    expect(parseHistory(out.store.history?.a)).toEqual([expect.objectContaining({ op: 'm' })]);
+    expect(parseHistory(out.store.history?.a)[0].arg).toBeUndefined();
   });
 });

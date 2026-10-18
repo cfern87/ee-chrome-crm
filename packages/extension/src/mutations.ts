@@ -23,7 +23,7 @@
 // Everything here is pure: no chrome, no DOM, no I/O. The background owns the
 // load/save around it.
 
-import { appendHistory } from './history';
+import { appendHistory, messageArg } from './history';
 import type { Store, Conversation, Tag, NameDiag } from './storage';
 import {
   addTagsTo, removeTagsFrom, tombstone, singleChoiceRemovals,
@@ -84,7 +84,12 @@ export type Mutation =
   // Hide or show one funnel bar in this contact's panel (Conversation.hiddenFunnels).
   | { op: 'setFunnelHidden'; conversationId: string; groupId: string; hidden: boolean }
   | { op: 'deleteContact'; conversationId: string }
-  | { op: 'markContacted'; conversationId: string }
+  // `message` is the exact text a campaign sent, logged with the history event;
+  // manual sends leave it out.
+  | { op: 'markContacted'; conversationId: string; message?: string; dryRun?: boolean }
+  // A campaign was queued: log each recipient's exact (already rendered)
+  // message in their history, before anything is sent.
+  | { op: 'logQueued'; entries: Array<{ conversationId: string; message: string }>; dryRun?: boolean; at: number }
   // Record a quick action's webhook POST in the contact's history ('w' sent,
   // 'x' failed). `arg` is the HTTP status, or a short failure reason.
   | { op: 'logWebhook'; conversationId: string; ok: boolean; arg?: string; at: number }
@@ -550,8 +555,10 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
     case 'markContacted': {
       const conv = store.conversations[m.conversationId];
       if (!conv) return { store, changed: false };
-      // Coalesce a burst of rapid sends into one write.
-      if (conv.lastContactedAt && now - conv.lastContactedAt < 1500) {
+      // Coalesce a burst of rapid manual sends into one write. A campaign send
+      // carries its text and is never coalesced: its log line is the record of
+      // what that person was sent.
+      if (!m.message && conv.lastContactedAt && now - conv.lastContactedAt < 1500) {
         return { store, changed: false, conversationId: m.conversationId };
       }
       const next = copy(store);
@@ -559,8 +566,23 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
       // Logged here rather than by saveStore's diff: lastContactedAt also moves
       // on a contact merge or a CSV import, neither of which sent anything.
       next.history = { ...(store.history || {}) };
-      next.history[m.conversationId] = appendHistory(next.history[m.conversationId], [{ at: now, op: 'm' }]);
+      next.history[m.conversationId] = appendHistory(next.history[m.conversationId], [
+        { at: now, op: 'm', ...(m.message ? { arg: messageArg(m.message, m.dryRun) } : {}) },
+      ]);
       return { store: next, changed: true, conversationId: m.conversationId };
+    }
+
+    case 'logQueued': {
+      const entries = m.entries.filter((e) => store.conversations[e.conversationId] && e.message);
+      if (!entries.length) return { store, changed: false };
+      const next = copy(store);
+      next.history = { ...(store.history || {}) };
+      for (const e of entries) {
+        next.history[e.conversationId] = appendHistory(next.history[e.conversationId], [
+          { at: m.at, op: 'q', arg: messageArg(e.message, m.dryRun) },
+        ]);
+      }
+      return { store: next, changed: true };
     }
 
     case 'logWebhook': {

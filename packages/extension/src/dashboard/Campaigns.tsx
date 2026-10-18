@@ -157,6 +157,8 @@ export interface ComposeSeed {
  */
 export interface ComposerDraft {
   template: string;
+  /** Campaign title for History. Blank = the message's first line, as before. */
+  name?: string;
   /** Selected contact ids. An array rather than a Set so the draft stays a plain value. */
   selected: string[];
   dryRun: boolean;
@@ -316,6 +318,7 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
       type: 'START_CAMPAIGN',
       payload: {
         template,
+        ...(draft.name?.trim() ? { name: draft.name.trim() } : {}),
         recipients,
         dryRun,
         skipIfUnread,
@@ -372,6 +375,17 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
         )}
 
         <div style={{ background: color.surface.raised, borderRadius: 10, padding: 18, boxShadow: '0 1px 3px rgba(0,0,0,0.08)', marginBottom: 14 }}>
+          <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: color.text.secondary, marginBottom: 4 }} htmlFor="campaign-name">
+            Campaign name <span style={{ fontWeight: 400, color: color.text.muted }}>(optional — shown in Active and Past sends)</span>
+          </label>
+          <input
+            id="campaign-name"
+            value={draft.name || ''}
+            onChange={(e) => patch({ name: e.target.value })}
+            placeholder="Defaults to the first line of the message"
+            maxLength={80}
+            style={{ ...inputStyle, marginBottom: 14 }}
+          />
           <h3 style={{ margin: '0 0 6px', fontSize: 15, fontWeight: 700 }}>Compose template</h3>
           <p style={{ margin: '0 0 12px', fontSize: 12, color: color.text.muted, lineHeight: 1.6 }}>
             Use <code style={codeStyle}>{'{{name}}'}</code> or{' '}
@@ -1169,6 +1183,7 @@ export function ActiveCampaignCard({ campaign, queue, isNext, onChanged }: { cam
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{campaign.name}</div>
+          <MessagePreview campaign={campaign} />
           <div style={{ marginTop: 4, display: 'flex', gap: 6 }}><StatusBadge status={campaign.status} />{campaign.dryRun && <DryRunChip />}{campaign.skipIfUnread && <UnreadGateChip />}</div>
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
@@ -1193,6 +1208,30 @@ export function ActiveCampaignCard({ campaign, queue, isNext, onChanged }: { cam
         <span>⏳ {sum.pending} pending</span>
         <span style={{ marginLeft: 'auto' }}>{timing()}</span>
       </div>
+    </div>
+  );
+}
+
+/**
+ * The campaign's message, under a title that ISN'T the message — a name typed
+ * in the composer, or an automation's "(automation)" title. Without it those
+ * cards said what the send was called but never what it said. Hidden when the
+ * title is just the message's first line, which would repeat itself.
+ */
+function MessagePreview({ campaign }: { campaign: Campaign }) {
+  const firstLine = (campaign.template.split('\n')[0] || '').trim();
+  const name = campaign.name.replace(/…$/, '');
+  if (!campaign.template.trim() || (name && firstLine.startsWith(name))) return null;
+  return (
+    <div
+      title={campaign.template}
+      style={{
+        marginTop: 3, fontSize: 12, color: color.text.secondary, lineHeight: 1.45,
+        display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+        whiteSpace: 'pre-wrap', overflowWrap: 'anywhere',
+      }}
+    >
+      {campaign.template}
     </div>
   );
 }
@@ -1480,6 +1519,7 @@ export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile,
         <span style={{ color: color.text.muted, fontSize: 13 }}>{expanded ? '▾' : '▸'}</span>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{campaign.name}</div>
+          <MessagePreview campaign={campaign} />
           <div style={{ fontSize: 12, color: color.text.muted, marginTop: 2 }}>
             Started {formatDateTime(campaign.startedAt || campaign.createdAt)}
             {campaign.completedAt ? ` · finished ${formatDateTime(campaign.completedAt)}` : ''}

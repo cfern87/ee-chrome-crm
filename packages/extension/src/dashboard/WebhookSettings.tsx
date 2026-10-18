@@ -31,6 +31,14 @@ import { sendBg, formatRelativeTime, DraftInput } from './shared';
  * error to shout about — the user was asked and said no — so the caller
  * reports it as a plain explanation of what will happen (nothing).
  */
+/**
+ * Shown beside every "Send test" button. The test click is the reliable moment
+ * Chrome will show the host-permission prompt (see the module header), and
+ * deliveries from the Messenger panel or a scheduled automation can't ask.
+ */
+export const TEST_PERMISSION_NOTE =
+  'Click “Send test” once for each new URL: that click is when Chrome asks to allow the extension to reach it. Until it’s allowed, sends to this URL fail.';
+
 export async function ensureHostPermission(url: string): Promise<boolean> {
   try {
     const origin = new URL(url).origin + '/*';
@@ -166,6 +174,7 @@ export function WebhookSettings({ store, updateStore }: {
                 <Button size="sm" variant="danger" onClick={() => setConfirmDelete(h.id)}>Remove</Button>
               )}
             </Stack>
+            <Text as="div" size="micro" tone="muted" style={{ marginTop: space.xxs }}>{TEST_PERMISSION_NOTE}</Text>
 
             <Stack direction="row" gap="sm" align="flex-end" wrap style={{ marginTop: space.sm }}>
               <FormField label="Name (optional)" hint="Echoed in the payload, so one endpoint can tell several apart.">

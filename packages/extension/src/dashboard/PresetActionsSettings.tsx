@@ -27,7 +27,7 @@ import { funnelStages } from '../funnel';
 import { emptyQuery, newCondition, type QueryGroup } from '../search';
 import { DraftInput, sendBg } from './shared';
 import { isValidWebhookUrl } from '../webhooks';
-import { ensureHostPermission } from './WebhookSettings';
+import { ensureHostPermission, TEST_PERMISSION_NOTE } from './WebhookSettings';
 import { QueryEditor } from './SearchBuilder';
 
 const STEP_LABELS: Record<PresetStepKind, string> = {
@@ -782,6 +782,7 @@ function WebhookStepFields({ step, onChange }: {
       </Button>
       {invalid && <Text size="micro" tone="danger">{invalid}</Text>}
       {result && <Text size="micro" tone={result.ok ? 'success' : 'danger'}>{result.text}</Text>}
+      <Text as="div" size="micro" tone="muted" style={{ flexBasis: '100%' }}>{TEST_PERMISSION_NOTE}</Text>
     </>
   );
 }

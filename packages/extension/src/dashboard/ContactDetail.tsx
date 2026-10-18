@@ -19,7 +19,7 @@ import {
 } from './shared';
 import { funnelsFor, describeStage, stagePosition, stageTitle, type FunnelView } from '../funnel';
 import { ContactTasks, type TaskHandlers } from './TasksPanel';
-import { displayHistory, type HistoryEvent } from '../history';
+import { displayHistory, messageFromArg, type HistoryEvent } from '../history';
 
 export const TAG_FILTER_VISIBLE = 12;
 
@@ -801,7 +801,23 @@ function ContactHistory({ conv, store }: { conv: Conversation; store: Store }) {
 function describeHistoryEvent(e: HistoryEvent, store: Store): React.ReactNode {
   switch (e.op) {
     case 'c': return 'Added to CRM';
-    case 'm': return 'Message sent';
+    case 'm':
+    case 'q': {
+      const msg = messageFromArg(e.arg);
+      const verb = e.op === 'q' ? 'Message queued' : 'Message sent';
+      if (!msg) return verb;
+      return (
+        <>
+          {verb}{msg.dryRun ? ' (dry run — not actually sent)' : ''}:
+          <div style={{
+            marginTop: 3, padding: '6px 9px', borderRadius: 6, background: color.surface.sunken,
+            color: color.text.primary, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere',
+          }}>
+            {msg.text}
+          </div>
+        </>
+      );
+    }
     case 'w': return `Sent to webhook${e.arg ? ` (HTTP ${e.arg})` : ''}`;
     case 'x': return <span style={{ color: color.danger.base }}>Webhook failed{e.arg ? `: ${e.arg}` : ''}</span>;
     case '+':
