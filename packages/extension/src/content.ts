@@ -20,7 +20,10 @@ import {
 import type { Store, Tag, Conversation, CustomFieldDef, TagGroup } from './storage';
 import { bucketTags, showsGroupLabels, tagDisplayOrder, type TagBucket } from './tagGrouping';
 import { funnelsFor, stageEditsFor, isNoOpStageEdit, describeStage, stagePosition, stageTitle, type FunnelView } from './funnel';
-import { readPresetActions, stepsFor, describePreset, isDestructive, type PresetAction } from './presets';
+import {
+  readPresetActions, stepsFor, describePreset, isDestructive, needsConfirm, campaignSendsFor,
+  type PresetAction, type PresetCampaignSend,
+} from './presets';
 import {
   openTasksOf, sortTasks, isOverdue, formatDue, priorityOf, newTask, dueFromOffset, inputsToDue, TASK_TITLE_MAX,
 } from './tasks';
@@ -1237,9 +1240,14 @@ const removedThreads = new Set<string>();
 // re-render can't disarm it (or leave it armed) mid-decision.
 let deleteArmed = false;
 
-// Same two-step shape for a preset action that deletes the contact (see
-// presets.ts). Holds the id of the preset awaiting confirmation, or null.
+// Same two-step shape for a preset action that deletes the contact or messages
+// them (see presets.ts needsConfirm). Holds the id of the preset awaiting
+// confirmation, or null.
 let presetArmed: string | null = null;
+
+// One line under the quick actions saying what an "Add to campaign" press did —
+// queued, already waiting, or why not. Cleared with presetArmed.
+let presetNotice: { text: string; error: boolean } | null = null;
 
 // Completed funnels (contact at the last stage) collapse to a one-line
 // "Completed" row; these are the group ids opened back up to show the bar.
@@ -1522,8 +1530,10 @@ function choiceGroupsHtml(conv: Conversation, store: Store): string {
  * didn't cover.
  *
  * A preset that deletes gets an armed confirmation, the same two-control shape
- * as the footer's Remove: the first press only arms it. Nothing else does,
- * because everything else a preset can do is reversible from this same panel.
+ * as the footer's Remove: the first press only arms it. So does one that
+ * messages the contact (Add to campaign), since a sent message can't be undone
+ * either. Nothing else does, because everything else a preset can do is
+ * reversible from this same panel.
  */
 function presetActionsHtml(presets: PresetAction[], store: Store, armedId: string | null): string {
   if (presets.length === 0) return '';
@@ -1544,7 +1554,32 @@ function presetActionsHtml(presets: PresetAction[], store: Store, armedId: strin
     <div class="fb-crm-section-title-row">
       <div class="fb-crm-section-title">Quick actions</div>
     </div>
-    <div class="fb-crm-presets">${buttons}</div>`;
+    <div class="fb-crm-presets">${buttons}</div>
+    ${presetNotice ? `<div class="fb-crm-preset-notice${presetNotice.error ? ' fb-crm-preset-notice--error' : ''}" role="status">${escapeHtml(presetNotice.text)}</div>` : ''}`;
+}
+
+/**
+ * Queue one "Add to campaign" step from a panel press. Pressed here it is one
+ * contact, so a one-recipient campaign; the background drops them if they're
+ * already waiting for this same message (a double press).
+ */
+async function queuePresetCampaign(send: PresetCampaignSend): Promise<{ text: string; error: boolean }> {
+  if (!send.recipients.length) return { text: 'Not messaged: no chat link saved for this contact yet.', error: true };
+  const res = await sendBg<{ success: boolean; error?: string }>({
+    type: 'START_CAMPAIGN',
+    payload: {
+      template: send.template,
+      recipients: send.recipients,
+      skipIfUnread: send.skipIfUnread,
+      dryRun: send.dryRun,
+      skipAlreadyQueued: true,
+    },
+  });
+  if (res?.success) {
+    console.info(`[CRM] Queued preset campaign for ${send.recipients[0].threadId}${send.dryRun ? ' (dry run)' : ''}`);
+    return { text: `Added to a campaign${send.dryRun ? ' (dry run)' : ''} — it will send with your usual pacing.`, error: false };
+  }
+  return { text: `Not messaged: ${res?.error || 'the extension background is not responding.'}`, error: true };
 }
 
 /**
@@ -1689,7 +1724,7 @@ async function togglePanel() {
     await renderPanel();
   } else {
     deleteArmed = false; // never leave a delete armed behind a closed panel
-    presetArmed = null;
+    presetArmed = null; presetNotice = null;
     funnelRemoveArmed = null;
     panelEl.style.display = 'none';
   }
@@ -1744,7 +1779,7 @@ async function renderPanelContent() {
   // edits go with it, for the same reason.
   if (threadId !== lastRenderedThread) {
     deleteArmed = false;
-    presetArmed = null;
+    presetArmed = null; presetNotice = null;
     funnelRemoveArmed = null;
     fieldDrafts.clear();
     focusedFieldId = null;
@@ -1982,7 +2017,7 @@ function renderSignInPanel(): void {
   if (!panelEl) return;
   // A locked panel has no contact and no armed delete to carry forward.
   deleteArmed = false;
-  presetArmed = null;
+  presetArmed = null; presetNotice = null;
   fieldDrafts.clear();
   focusedFieldId = null;
   editingName = null;
@@ -2206,7 +2241,7 @@ function wirePanelTasks(threadId: string) {
 function wireClose() {
   panelEl?.querySelector('.fb-crm-close')?.addEventListener('click', () => {
     deleteArmed = false; // never leave a delete armed behind a closed panel
-    presetArmed = null;
+    presetArmed = null; presetNotice = null;
     editingName = null;  // ...nor a half-typed rename
     editingNameFocused = false;
     if (panelEl) panelEl.style.display = 'none';
@@ -2246,7 +2281,11 @@ function wirePanelActions(threadId: string) {
     }
 
     const mutations = stepsFor(preset, conv, store);
-    presetArmed = null;
+    // "Add to campaign" reads the same pre-press snapshot as the edits, and is
+    // queued before them so a preset that also deletes still has a contact.
+    const sends = campaignSendsFor(preset, [conv], store);
+    presetArmed = null; presetNotice = null;
+    for (const send of sends) presetNotice = await queuePresetCampaign(send);
     if (mutations.length) {
       await mutate(mutations);
       console.info(`[CRM] Applied preset "${preset.label}" to ${threadId}: ${describePreset(preset, store)}`);
@@ -2260,8 +2299,9 @@ function wirePanelActions(threadId: string) {
       const id = btn.dataset.preset!;
       const store = await getStore();
       const preset = readPresetActions(store).find((p) => p.id === id);
-      if (preset && isDestructive(preset)) {
+      if (preset && needsConfirm(preset)) {
         presetArmed = id;
+        presetNotice = null;
         await renderPanel();
         return;
       }
@@ -2274,7 +2314,7 @@ function wirePanelActions(threadId: string) {
   });
 
   panelEl.querySelector<HTMLElement>('[data-preset-cancel]')?.addEventListener('click', async () => {
-    presetArmed = null;
+    presetArmed = null; presetNotice = null;
     await renderPanel();
   });
 

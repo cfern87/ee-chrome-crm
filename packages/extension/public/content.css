@@ -333,6 +333,10 @@
 }
 .fb-crm-preset-armed:hover { background: #c92f2f; }
 
+/* What an "Add to campaign" press did. */
+.fb-crm-preset-notice { margin-top: 6px; font-size: 12px; color: #2f855a; }
+.fb-crm-preset-notice--error { color: #c53030; }
+
 /* ---- Follow-ups (tasks) ----
    Open tasks as compact rows with a tick box, then a one-line add row. An
    overdue task gets a red left edge and red due text — the one thing in this

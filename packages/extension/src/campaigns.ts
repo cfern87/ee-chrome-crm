@@ -236,6 +236,23 @@ export interface NewCampaignInput {
   dryRun?: boolean;
   skipIfUnread?: boolean;
   automationId?: string;
+  // Drop anyone already waiting in a live campaign with this SAME template.
+  // Not stored on the campaign — it only shapes who is in it. Quick actions set
+  // it, so pressing "Add to campaign" twice doesn't message someone twice.
+  skipAlreadyQueued?: boolean;
+}
+
+/** The `recipients` not already pending in a live campaign with this exact template. */
+export function withoutAlreadyQueued<R extends { threadId: string }>(all: Campaign[], template: string, recipients: R[]): R[] {
+  const queued = new Set<string>();
+  for (const c of all) {
+    if (c.status !== 'running' && c.status !== 'paused') continue;
+    if (c.template !== template) continue;
+    for (const r of c.recipients) {
+      if (r.status === 'pending' || r.status === 'sending') queued.add(r.threadId);
+    }
+  }
+  return recipients.filter((r) => !queued.has(r.threadId));
 }
 
 export function createCampaign(input: NewCampaignInput): Campaign {

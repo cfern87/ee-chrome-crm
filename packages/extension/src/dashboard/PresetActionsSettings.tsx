@@ -14,17 +14,18 @@ import React, { useEffect, useRef, useState } from 'react';
 import type { Store, SaveResult, TagGroup } from '../storage';
 import {
   PresetAction, PresetStep, PresetStepKind,
-  readPresetActions, newPresetAction, describePreset, isDestructive,
+  readPresetActions, newPresetAction, describePreset, isDestructive, sendsMessages,
   writePresetActions, MAX_PRESET_ACTIONS,
 } from '../presets';
 import {
-  Banner, Button, Card, ColorInput, Input, Select, Stack, Text,
+  Banner, Button, Card, ColorInput, Input, Select, Stack, Text, Textarea, Toggle,
   Field as FormField, color, radius, space,
 } from '../ui/primitives';
 import type { TaskPriority } from '../tasks';
+import type { Campaign } from '../campaigns';
 import { funnelStages } from '../funnel';
 import { emptyQuery, newCondition, type QueryGroup } from '../search';
-import { DraftInput } from './shared';
+import { DraftInput, sendBg } from './shared';
 import { QueryEditor } from './SearchBuilder';
 
 const STEP_LABELS: Record<PresetStepKind, string> = {
@@ -32,6 +33,7 @@ const STEP_LABELS: Record<PresetStepKind, string> = {
   removeTag: 'Remove tag',
   setFunnelStage: 'Add to funnel stage',
   removeFromFunnel: 'Remove from funnel',
+  addToCampaign: 'Add to campaign',
   appendName: 'Append to name',
   prependName: 'Prepend to name',
   setField: 'Set field',
@@ -44,8 +46,11 @@ const STEP_LABELS: Record<PresetStepKind, string> = {
 
 const STEP_ORDER: PresetStepKind[] = [
   'addTag', 'removeTag', 'setFunnelStage', 'removeFromFunnel', 'appendName', 'prependName', 'setField', 'addTask', 'completeTasks',
-  'archive', 'unarchive', 'deleteContact',
+  'addToCampaign', 'archive', 'unarchive', 'deleteContact',
 ];
+
+/** How many past campaigns "Use a recent campaign's message" offers. */
+const RECENT_CAMPAIGNS = 15;
 
 /**
  * Due-date choices for a preset's task, as day offsets from the moment it's
@@ -108,6 +113,8 @@ function blankStep(kind: PresetStepKind, store: Store): PresetStep {
     }
     case 'removeFromFunnel':
       return { kind, groupId: groupsForRemoval(store)[0]?.id || '' };
+    case 'addToCampaign':
+      return { kind, template: '' };
     default:
       return { kind } as PresetStep;
   }
@@ -268,12 +275,19 @@ export function PresetActionsSettings({ store, updateStore }: {
                     store={store}
                     onChange={(steps) => setSteps(p, steps)}
                     emptyText="Nothing yet — this button would do nothing."
+                    allowCampaign
                   />
 
                   {isDestructive(p) && (
                     <Banner tone="warning">
                       This preset deletes the contact. In the panel it takes two clicks — the first
                       only arms the confirmation — but there is no undo once it runs.
+                    </Banner>
+                  )}
+                  {sendsMessages(p) && (
+                    <Banner tone="info">
+                      This preset messages people, so pressing it takes two clicks — the first only
+                      arms it. On a selection in the dashboard, everyone selected goes into one campaign.
                     </Banner>
                   )}
                 </Stack>
@@ -301,13 +315,20 @@ export function PresetActionsSettings({ store, updateStore }: {
  * action, and the actions of an automation (AutomationsPanel), which run the
  * same steps.
  */
-export function StepListEditor({ steps, store, onChange, emptyText, title = 'Actions, applied in this order' }: {
+export function StepListEditor({ steps, store, onChange, emptyText, title = 'Actions, applied in this order', allowCampaign = false }: {
   steps: PresetStep[];
   store: Store;
   onChange: (next: PresetStep[]) => void;
   emptyText?: string;
   title?: string;
+  /**
+   * Offer "Add to campaign". Quick actions only: an automation has its own
+   * "send a message" with per-run caps and once-per-contact, and its runner
+   * doesn't start campaigns from steps.
+   */
+  allowCampaign?: boolean;
 }) {
+  const kinds = allowCampaign ? STEP_ORDER : STEP_ORDER.filter((k) => k !== 'addToCampaign');
   const tags = Object.values(store.tags).sort((a, b) => a.name.localeCompare(b.name));
   const fields = Object.values(store.fieldDefs).sort((a, b) => a.order - b.order);
   const hasFunnels = funnelStages(store.tags, store.tagGroups).length > 0;
@@ -324,6 +345,7 @@ export function StepListEditor({ steps, store, onChange, emptyText, title = 'Act
             key={si}
             step={step}
             store={store}
+            kinds={kinds}
             tags={tags}
             fields={fields}
             onChange={(next) => onChange(steps.map((s, k) => (k === si ? next : s)))}
@@ -352,7 +374,7 @@ export function StepListEditor({ steps, store, onChange, emptyText, title = 'Act
           style={{ width: 190 }}
         >
           <option value="">+ Add an action…</option>
-          {STEP_ORDER.map((k) => (
+          {kinds.map((k) => (
             <option key={k} value={k} disabled={(k === 'setFunnelStage' && !hasFunnels) || (k === 'removeFromFunnel' && !hasGroups)}>
               {STEP_LABELS[k]}
               {k === 'setFunnelStage' && !hasFunnels ? ' (no funnels yet)' : ''}
@@ -366,9 +388,10 @@ export function StepListEditor({ steps, store, onChange, emptyText, title = 'Act
 }
 
 /** One step of a preset: its kind, and the operand that kind needs. */
-function StepRow({ step, store, tags, fields, onChange, onRemove, onMove }: {
+function StepRow({ step, store, kinds, tags, fields, onChange, onRemove, onMove }: {
   step: PresetStep;
   store: Store;
+  kinds: PresetStepKind[];
   tags: Store['tags'][string][];
   fields: Store['fieldDefs'][string][];
   onChange: (next: PresetStep) => void;
@@ -392,7 +415,7 @@ function StepRow({ step, store, tags, fields, onChange, onRemove, onMove }: {
         }}
         style={{ width: 150 }}
       >
-        {STEP_ORDER.map((k) => (
+        {(kinds.includes(step.kind) ? kinds : [...kinds, step.kind]).map((k) => (
           <option key={k} value={k} disabled={k === 'setFunnelStage' && !funnels.length && step.kind !== k}>
             {STEP_LABELS[k]}
           </option>
@@ -582,6 +605,9 @@ function StepRow({ step, store, tags, fields, onChange, onRemove, onMove }: {
         <Button size="sm" variant="ghost" onClick={onRemove} title="Remove this action">✕</Button>
       </div>
     </Stack>
+    {step.kind === 'addToCampaign' && (
+      <CampaignStepEditor step={step} onChange={onChange} />
+    )}
     {step.when && (
       <StepCondition
         key={step.when.id}
@@ -595,6 +621,129 @@ function StepRow({ step, store, tags, fields, onChange, onRemove, onMove }: {
       />
     )}
     </div>
+  );
+}
+
+type CampaignStep = Extract<PresetStep, { kind: 'addToCampaign' }>;
+
+/**
+ * The message an "Add to campaign" step sends: typed here, or copied from a
+ * recent campaign and then edited as needed. A copy, not a link — the preset
+ * keeps sending what's in this box even after that campaign ages out of
+ * history.
+ */
+function CampaignStepEditor({ step, onChange }: {
+  step: CampaignStep;
+  onChange: (next: PresetStep) => void;
+}) {
+  const [recent, setRecent] = useState<Campaign[] | null>(null);
+
+  // Campaigns live in the background's chrome.storage.local, not the store.
+  useEffect(() => {
+    let live = true;
+    void sendBg<{ campaigns: Campaign[] }>({ type: 'GET_CAMPAIGNS' }).then((res) => {
+      if (!live) return;
+      // One entry per distinct message, newest first — re-running a campaign
+      // shouldn't fill the list with the same text.
+      const seen = new Set<string>();
+      const list = (res?.campaigns || [])
+        .filter((c) => c.template.trim())
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .filter((c) => (seen.has(c.template) ? false : (seen.add(c.template), true)))
+        .slice(0, RECENT_CAMPAIGNS);
+      setRecent(list);
+    });
+    return () => { live = false; };
+  }, []);
+
+  const toggle = (key: 'skipIfUnread' | 'dryRun', on: boolean) => {
+    const { [key]: _k, ...rest } = step;
+    onChange(on ? { ...rest, [key]: true } : rest);
+  };
+
+  return (
+    <Stack gap="xs" style={{ marginTop: space.xs, paddingLeft: space.sm, borderLeft: `2px solid ${color.border.subtle}` }}>
+      <Stack direction="row" gap="xs" align="center" wrap>
+        <Select
+          value=""
+          aria-label="Use the message from a recent campaign"
+          disabled={!recent?.length}
+          onChange={(e) => {
+            const c = recent?.find((x) => x.id === e.target.value);
+            if (c) onChange({ ...step, template: c.template });
+            e.target.value = '';
+          }}
+          style={{ width: 300 }}
+        >
+          <option value="">
+            {recent === null ? 'Loading recent campaigns…' : recent.length ? 'Use a recent campaign’s message…' : 'No recent campaigns'}
+          </option>
+          {(recent || []).map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name} · {new Date(c.createdAt).toLocaleDateString()}
+            </option>
+          ))}
+        </Select>
+        <Text size="micro" tone="muted">or type one below</Text>
+      </Stack>
+      <DraftTextarea
+        value={step.template}
+        aria-label="Campaign message"
+        onCommit={(template) => onChange({ ...step, template })}
+        placeholder="Hi {{firstName}}, just checking in…"
+      />
+      <Text size="micro" tone="muted">
+        {'{{firstName}}'} and {'{{name}}'} are filled in; {'{option a|option b}'} picks one at random per person.
+        Pressed on a selection, everyone goes into one campaign, sent with your usual pacing. Anyone already
+        waiting for this same message, or without a saved chat link, is skipped.
+      </Text>
+      <Stack direction="row" gap="md" wrap align="center">
+        <Toggle
+          labelFirst={false}
+          label="Skip anyone who hasn’t read my last message"
+          checked={!!step.skipIfUnread}
+          onChange={(e) => toggle('skipIfUnread', e.target.checked)}
+        />
+        <Toggle
+          labelFirst={false}
+          label="Dry run (type but don’t send)"
+          checked={!!step.dryRun}
+          onChange={(e) => toggle('dryRun', e.target.checked)}
+        />
+      </Stack>
+    </Stack>
+  );
+}
+
+/**
+ * A textarea that saves on blur (and on unmount), like DraftInput: every
+ * keystroke saved would be a store write and a Drive sync.
+ */
+function DraftTextarea({ value, onCommit, ...rest }: {
+  value: string;
+  onCommit: (next: string) => void;
+  placeholder?: string;
+  'aria-label'?: string;
+}) {
+  const [draft, setDraft] = useState(value);
+  const [focused, setFocused] = useState(false);
+  useEffect(() => { if (!focused) setDraft(value); }, [value, focused]);
+  const latest = useRef({ draft, value, onCommit });
+  latest.current = { draft, value, onCommit };
+  useEffect(() => () => {
+    const { draft: d, value: v, onCommit: fn } = latest.current;
+    if (d !== v) fn(d);
+  }, []);
+  return (
+    <Textarea
+      {...rest}
+      rows={4}
+      value={draft}
+      onFocus={() => setFocused(true)}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => { setFocused(false); if (draft !== value) onCommit(draft); }}
+      style={{ maxWidth: 520 }}
+    />
   );
 }
 

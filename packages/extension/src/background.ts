@@ -45,6 +45,7 @@ import {
 import {
   Campaign,
   createCampaign,
+  withoutAlreadyQueued,
   loadCampaigns,
   pendingRecipientIndex,
   saveCampaigns,
@@ -1909,12 +1910,24 @@ async function kickQueue(): Promise<void> {
 // more: a campaign started while others are running simply joins the queue and
 // starts taking turns. The pacing is shared, so this adds messages to send
 // without adding to the rate at which they go out.
-async function startCampaign(input: NewCampaignInput): Promise<{ success: boolean; campaignId?: string; error?: string }> {
+async function startCampaign(
+  input: NewCampaignInput,
+): Promise<{ success: boolean; campaignId?: string; error?: string; queued?: number; alreadyQueued?: number }> {
   if (!input.recipients || input.recipients.length === 0) {
     return { success: false, error: 'No recipients selected.' };
   }
   if (!input.template || !input.template.trim()) {
     return { success: false, error: 'Template message is empty.' };
+  }
+
+  let alreadyQueued = 0;
+  if (input.skipAlreadyQueued) {
+    const fresh = withoutAlreadyQueued(await loadCampaigns(), input.template, input.recipients);
+    alreadyQueued = input.recipients.length - fresh.length;
+    if (fresh.length === 0) {
+      return { success: false, alreadyQueued, error: 'Everyone is already waiting to be sent this message.' };
+    }
+    input = { ...input, recipients: fresh };
   }
 
   const camp = createCampaign(input);
@@ -1925,7 +1938,7 @@ async function startCampaign(input: NewCampaignInput): Promise<{ success: boolea
     recipientCount: camp.recipients.length,
   });
   await kickQueue();
-  return { success: true, campaignId: camp.id };
+  return { success: true, campaignId: camp.id, queued: camp.recipients.length, alreadyQueued };
 }
 
 // Pausing/cancelling ONE campaign leaves the rest of the queue running — the

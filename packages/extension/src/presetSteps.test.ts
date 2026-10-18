@@ -2,7 +2,7 @@
 // "set funnel step" action. The merge side of presets is in presets.test.ts.
 
 import { describe, it, expect } from 'vitest';
-import { stepsFor, readPresetActions, PRESET_ACTIONS_KEY, type PresetAction, type PresetStep } from './presets';
+import { stepsFor, readPresetActions, campaignSendsFor, needsConfirm, PRESET_ACTIONS_KEY, type PresetAction, type PresetStep } from './presets';
 import { applyMutations } from './mutations';
 import { EMPTY_STORE, type Conversation, type Store, type Tag, type TagGroup } from './storage';
 import type { QueryGroup } from './search';
@@ -134,5 +134,42 @@ describe('setFunnelHidden', () => {
 
     const shown = applyMutations(hidden.store, [{ op: 'setFunnelHidden', conversationId: 'c1', groupId: 'pipe', hidden: false }]);
     expect(shown.store.conversations.c1.hiddenFunnels).toBeUndefined();
+  });
+});
+
+describe('add to campaign', () => {
+  const contact = (id: string, tags: string[], chatUrl?: string): Conversation =>
+    ({ ...conv(tags), id, participantName: `P ${id}`, ...(chatUrl ? { chatUrl } : {}) });
+
+  it('puts every matching contact of a bulk press into ONE send', () => {
+    const a = contact('a', ['lead'], 'https://m/a');
+    const b = contact('b', ['vip'], 'https://m/b');
+    const c = contact('c', ['lead']); // no chat link
+    const store = { ...storeWith(a), conversations: { a, b, c } };
+    const sends = campaignSendsFor(preset([{ kind: 'addToCampaign', template: 'Hi {{firstName}}' }]), [a, b, c, a], store);
+    expect(sends).toHaveLength(1);
+    expect(sends[0].recipients.map((r) => r.threadId)).toEqual(['a', 'b']);
+    expect(sends[0].noChatLink).toBe(1);
+  });
+
+  it('respects the step condition per contact', () => {
+    const a = contact('a', ['lead'], 'https://m/a');
+    const b = contact('b', ['vip'], 'https://m/b');
+    const store = { ...storeWith(a), conversations: { a, b } };
+    const sends = campaignSendsFor(preset([{ kind: 'addToCampaign', template: 'Hi', when: hasTag('lead') }]), [a, b], store);
+    expect(sends[0].recipients.map((r) => r.threadId)).toEqual(['a']);
+  });
+
+  it('is not a store edit, and a blank message sends nothing', () => {
+    const a = contact('a', [], 'https://m/a');
+    const store = storeWith(a);
+    expect(stepsFor(preset([{ kind: 'addToCampaign', template: 'Hi' }]), a, store)).toEqual([]);
+    expect(campaignSendsFor(preset([{ kind: 'addToCampaign', template: '  ' }]), [a], store)).toEqual([]);
+    expect(needsConfirm(preset([{ kind: 'addToCampaign', template: 'Hi' }]))).toBe(true);
+  });
+
+  it('survives a round trip through settings', () => {
+    const settings = { [PRESET_ACTIONS_KEY]: [preset([{ kind: 'addToCampaign', template: 'Hi', dryRun: true }])] };
+    expect(readPresetActions({ settings })[0].steps).toEqual([{ kind: 'addToCampaign', template: 'Hi', dryRun: true }]);
   });
 });

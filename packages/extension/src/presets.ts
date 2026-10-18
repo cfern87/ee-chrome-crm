@@ -75,6 +75,14 @@ type PresetStepBody =
   // Take the contact out of a funnel (or any tag group) entirely: every tag
   // of that group they hold comes off.
   | { kind: 'removeFromFunnel'; groupId: string }
+  // Queue a message to the contact as a bulk-messaging campaign (campaigns.ts).
+  // Not a store edit, so stepsFor never emits anything for it: the surface that
+  // pressed the button collects the recipients with campaignSendsFor and starts
+  // the campaign itself. Pressed on a selection, everyone it applies to goes
+  // into ONE campaign — one send queue entry, one card in history — rather than
+  // one campaign per contact. The template is a copy, typed in or taken from a
+  // recent campaign when the preset was built; it never tracks that campaign.
+  | { kind: 'addToCampaign'; template: string; skipIfUnread?: boolean; dryRun?: boolean }
   | { kind: 'archive' }
   | { kind: 'unarchive' }
   | { kind: 'deleteContact' };
@@ -98,6 +106,16 @@ export interface PresetAction {
 /** Presets that delete need a confirmation click; nothing else does. */
 export function isDestructive(p: PresetAction): boolean {
   return p.steps.some((s) => s.kind === 'deleteContact');
+}
+
+/** Presets that message people. These also take a confirmation click — a sent message can't be taken back either. */
+export function sendsMessages(p: PresetAction): boolean {
+  return p.steps.some((s) => s.kind === 'addToCampaign' && !!s.template.trim());
+}
+
+/** Does pressing this preset need the armed second click? */
+export function needsConfirm(p: PresetAction): boolean {
+  return isDestructive(p) || sendsMessages(p);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +236,15 @@ function normalizeStepBody(raw: unknown): PresetStepBody | null {
         : null;
     case 'removeFromFunnel':
       return typeof o.groupId === 'string' && o.groupId ? { kind: 'removeFromFunnel', groupId: o.groupId } : null;
+    case 'addToCampaign':
+      return typeof o.template === 'string'
+        ? {
+          kind: 'addToCampaign',
+          template: o.template,
+          ...(o.skipIfUnread === true ? { skipIfUnread: true } : {}),
+          ...(o.dryRun === true ? { dryRun: true } : {}),
+        }
+        : null;
     case 'archive':
     case 'unarchive':
     case 'deleteContact':
@@ -443,6 +470,10 @@ export function stepsFor(preset: PresetAction, conv: Conversation, store: Store,
       case 'deleteContact':
         deletes = true;
         break;
+
+      case 'addToCampaign':
+        // Not a store edit — see campaignSendsFor.
+        break;
     }
   }
 
@@ -453,6 +484,53 @@ export function stepsFor(preset: PresetAction, conv: Conversation, store: Store,
     out.push({ op: 'renameContact', conversationId: id, name });
   }
   if (deletes) out.push({ op: 'deleteContact', conversationId: id });
+  return out;
+}
+
+/** One campaign a press of a preset should start: an addToCampaign step and who it goes to. */
+export interface PresetCampaignSend {
+  template: string;
+  skipIfUnread: boolean;
+  dryRun: boolean;
+  recipients: Array<{ threadId: string; participantName: string; chatUrl: string }>;
+  /** Matched the step but have no saved chat link, so can't be messaged. */
+  noChatLink: number;
+}
+
+/**
+ * The campaigns one press of `preset` on `convs` should start — one per
+ * addToCampaign step, holding EVERY contact that step applies to, so a bulk
+ * press is one campaign rather than one per contact. Conditions are checked
+ * per contact against the same snapshot stepsFor uses (the contacts as they
+ * were when pressed). Steps with no recipients are left out.
+ */
+export function campaignSendsFor(
+  preset: PresetAction,
+  convs: Conversation[],
+  store: Store,
+  now = Date.now(),
+): PresetCampaignSend[] {
+  const ctx: QueryContext = { now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs };
+  const out: PresetCampaignSend[] = [];
+  for (const step of preset.steps) {
+    if (step.kind !== 'addToCampaign' || !step.template.trim()) continue;
+    const send: PresetCampaignSend = {
+      template: step.template,
+      skipIfUnread: !!step.skipIfUnread,
+      dryRun: !!step.dryRun,
+      recipients: [],
+      noChatLink: 0,
+    };
+    const seen = new Set<string>();
+    for (const conv of convs) {
+      if (seen.has(conv.id)) continue;
+      seen.add(conv.id);
+      if (step.when && !matchesQuery(conv, step.when, ctx)) continue;
+      if (!conv.chatUrl) { send.noChatLink++; continue; }
+      send.recipients.push({ threadId: conv.id, participantName: conv.participantName, chatUrl: conv.chatUrl });
+    }
+    if (send.recipients.length || send.noChatLink) out.push(send);
+  }
   return out;
 }
 
@@ -483,6 +561,11 @@ export function describePreset(preset: PresetAction, store: Store): string {
       case 'archive': return 'archive';
       case 'unarchive': return 'unarchive';
       case 'deleteContact': return 'DELETE contact';
+      case 'addToCampaign': {
+        const first = (s.template.split('\n')[0] || '').trim();
+        if (!first) return 'add to campaign (no message yet)';
+        return `add to campaign "${first.length > 40 ? `${first.slice(0, 40)}…` : first}"${s.dryRun ? ' (dry run)' : ''}`;
+      }
     }
   }
 }

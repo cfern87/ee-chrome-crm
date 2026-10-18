@@ -46,7 +46,7 @@ import { TasksPanel, type TaskHandlers } from './TasksPanel';
 import { Resizer } from '../ui/SplitPane';
 import { useLocalPref } from '../ui/prefs';
 import { tint, onColor } from '../ui/contrast';
-import { readPresetActions, stepsFor, describePreset, isDestructive } from '../presets';
+import { readPresetActions, stepsFor, describePreset, isDestructive, needsConfirm, campaignSendsFor, type PresetAction } from '../presets';
 import {
   MessagingPanel, ActiveCampaignsView, HistoryPanel, NotificationsDrawer, holdOf, OnlineDot, QueuePreview,
   type HistoryFocus, type ComposeSeed, type ComposerDraft,
@@ -1090,24 +1090,68 @@ export default function DashboardApp() {
     if (!preset) return;
     const now = Date.now();
     const mutations: Mutation[] = [];
+    const convs: Conversation[] = [];
     let changed = 0;
     let skipped = 0;
     for (const id of selectedIds) {
       const conv = current.conversations[id];
       if (!conv) continue;
+      convs.push(conv);
       const m = stepsFor(preset, conv, current, now);
       if (m.length) { mutations.push(...m); changed++; } else skipped++;
     }
-    await mutateStore(mutations);
+    // "Add to campaign" steps: ONE campaign per step for the whole selection,
+    // built from the same pre-press snapshot the edits were, so a condition
+    // reads the same contact for both. Started before the edits land so a
+    // preset that also deletes still has everyone to message.
+    const campaignNotes = await startPresetCampaigns(preset, convs, current, now);
+    if (mutations.length) await mutateStore(mutations);
     console.info(`[CRM][bulk] Applied preset "${preset.label}" to ${changed} contacts (${skipped} unchanged)`);
+    const editsOnly = preset.steps.some((s) => s.kind !== 'addToCampaign');
     setBulkPresetResult(
-      `“${preset.label}” applied to ${changed} contact${changed === 1 ? '' : 's'}` +
-      (skipped ? ` · ${skipped} left unchanged (conditions not met, or nothing to change)` : ''),
+      [
+        editsOnly
+          ? `“${preset.label}” applied to ${changed} contact${changed === 1 ? '' : 's'}` +
+            (skipped ? ` · ${skipped} left unchanged (conditions not met, or nothing to change)` : '')
+          : '',
+        ...campaignNotes,
+      ].filter(Boolean).join(' · '),
     );
     if (isDestructive(preset)) {
       if (selectedConv && selectedIds.has(selectedConv.id)) setSelectedConv(null);
       setSelectedIds(new Set());
     }
+  };
+
+  // Queue the campaigns a preset's "Add to campaign" steps call for, returning
+  // one line per step for the result notice.
+  const startPresetCampaigns = async (
+    preset: PresetAction, convs: Conversation[], current: Store, now: number,
+  ): Promise<string[]> => {
+    const notes: string[] = [];
+    for (const send of campaignSendsFor(preset, convs, current, now)) {
+      const noLink = send.noChatLink ? `, ${send.noChatLink} without a chat link skipped` : '';
+      if (!send.recipients.length) { notes.push(`nobody messaged${noLink}`); continue; }
+      const res = await sendBg<{ success: boolean; error?: string; queued?: number; alreadyQueued?: number }>({
+        type: 'START_CAMPAIGN',
+        payload: {
+          template: send.template,
+          recipients: send.recipients,
+          skipIfUnread: send.skipIfUnread,
+          dryRun: send.dryRun,
+          skipAlreadyQueued: true,
+        },
+      });
+      const already = res?.alreadyQueued ? `, ${res.alreadyQueued} already waiting for it` : '';
+      if (res?.success) {
+        const n = res.queued ?? send.recipients.length;
+        notes.push(`${n} contact${n === 1 ? '' : 's'} added to one campaign${send.dryRun ? ' (dry run)' : ''}${already}${noLink}`);
+      } else {
+        notes.push(`campaign not started: ${res?.error || 'the background is not responding'}${noLink}`);
+      }
+    }
+    if (notes.length) void refreshCampaigns();
+    return notes;
   };
 
   const handleBulkMerge = async () => {
@@ -2055,6 +2099,7 @@ export default function DashboardApp() {
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                         {bulkPresets.map((p) => {
                           const destructive = isDestructive(p);
+                          const confirm = needsConfirm(p);
                           const armed = bulkPresetArmed === p.id;
                           const bg = armed || destructive ? color.danger.base : p.color || color.surface.raised;
                           return (
@@ -2064,7 +2109,7 @@ export default function DashboardApp() {
                               onClick={() => {
                                 setBulkTagMenu(null);
                                 setBulkDeleteConfirm(false);
-                                if (destructive && !armed) { setBulkPresetArmed(p.id); return; }
+                                if (confirm && !armed) { setBulkPresetArmed(p.id); setBulkPresetResult(null); return; }
                                 void handleBulkPreset(p.id);
                               }}
                               style={{
@@ -2087,11 +2132,17 @@ export default function DashboardApp() {
                           </button>
                         )}
                       </div>
-                      {bulkPresetArmed && (
-                        <div style={{ fontSize: 12, color: color.danger.base, fontWeight: 600, marginTop: 6 }}>
-                          This quick action deletes contacts — click it again to confirm. This cannot be undone.
-                        </div>
-                      )}
+                      {bulkPresetArmed && (() => {
+                        const armedPreset = bulkPresets.find((p) => p.id === bulkPresetArmed);
+                        const deletes = !!armedPreset && isDestructive(armedPreset);
+                        return (
+                          <div style={{ fontSize: 12, color: color.danger.base, fontWeight: 600, marginTop: 6 }}>
+                            {deletes
+                              ? 'This quick action deletes contacts — click it again to confirm. This cannot be undone.'
+                              : `This quick action messages people: everyone selected goes into one campaign. Click it again to queue it.`}
+                          </div>
+                        );
+                      })()}
                       {bulkPresetResult && !bulkPresetArmed && (
                         <div role="status" style={{ fontSize: 12, color: color.success.base, marginTop: 6 }}>
                           ✓ {bulkPresetResult}
