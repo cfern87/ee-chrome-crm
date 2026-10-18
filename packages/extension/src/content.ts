@@ -56,6 +56,7 @@ import { noteState, buildReport, emptyReport, type ScanReport } from './readScan
 import type { UnreadScanReport, UnreadThread } from './automations';
 import type { SendFailureKind } from './campaigns';
 import { isE2eeThreadUrl, threadChatUrl } from './threadUrl';
+import { isPlaceholderThreadText, profileOwnerIdFromHtml } from './profileOwner';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
 const COLORS = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E2'];
@@ -2839,6 +2840,9 @@ function getProfilePageThreadId(): string | null {
   const meta = document.querySelector<HTMLMetaElement>('meta[property="al:android:url"], meta[property="al:ios:url"]');
   const metaId = meta?.content.match(/fb:\/\/(?:profile|page)\/(\d+)/);
   if (metaId) return metaId[1];
+  // The page's embedded data — the only source left on vanity-URL profiles.
+  const owner = profileOwnerIdFromHtml(document.documentElement.innerHTML);
+  if (owner) return owner;
   // Constrained fallback: a single, unambiguous /messages/t/<id> link.
   const ids = new Set<string>();
   document.querySelectorAll<HTMLAnchorElement>('a[href*="/messages/t/"]').forEach((a) => {
@@ -4483,6 +4487,14 @@ async function performAutomatedSend(threadId: string, rawMessage: string, dryRun
 
   // 3. Type, send, and validate against the conversation pane.
   const scope = (document.querySelector('[role="main"]') as HTMLElement) || document.body;
+
+  // A thread id that maps to nobody: refuse before typing rather than send a
+  // message Facebook is certain to reject. 'unconfirmed' so the caller still
+  // runs profile recovery, which finds the person's real conversation.
+  if (isPlaceholderThreadText(scope.innerText || '')) {
+    stamp(`thread is a "Facebook user" placeholder — this id is not the contact's conversation; nothing typed`);
+    return { ok: false, error: 'Saved chat link opens an empty "Facebook user" conversation', failureKind: 'unconfirmed', log };
+  }
   const res = await typeSendAndConfirm(composer, scope, message, dryRun, stamp, opts, () => findComposer());
   if (!res.ok) {
     return { ok: false, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus, log };
