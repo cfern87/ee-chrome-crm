@@ -280,7 +280,6 @@ export function PresetActionsSettings({ store, updateStore }: {
                     store={store}
                     onChange={(steps) => setSteps(p, steps)}
                     emptyText="Nothing yet — this button would do nothing."
-                    allowCampaign
                   />
 
                   {isDestructive(p) && (
@@ -320,20 +319,20 @@ export function PresetActionsSettings({ store, updateStore }: {
  * action, and the actions of an automation (AutomationsPanel), which run the
  * same steps.
  */
-export function StepListEditor({ steps, store, onChange, emptyText, title = 'Actions, applied in this order', allowCampaign = false }: {
+export function StepListEditor({ steps, store, onChange, emptyText, title = 'Actions, applied in this order', hideKinds = [] }: {
   steps: PresetStep[];
   store: Store;
   onChange: (next: PresetStep[]) => void;
   emptyText?: string;
   title?: string;
   /**
-   * Offer "Add to campaign" and "Send to webhook". Quick actions only: an
-   * automation has its own "send a message" with per-run caps and
-   * once-per-contact, and its runner applies store edits only.
+   * Actions this surface covers some other way. Automations hide "Add to
+   * campaign": their "Also send them a message" is the same thing with the
+   * per-run cap and once-per-contact a scheduled job needs.
    */
-  allowCampaign?: boolean;
+  hideKinds?: PresetStepKind[];
 }) {
-  const kinds = allowCampaign ? STEP_ORDER : STEP_ORDER.filter((k) => k !== 'addToCampaign' && k !== 'sendWebhook');
+  const kinds = STEP_ORDER.filter((k) => !hideKinds.includes(k));
   const tags = Object.values(store.tags).sort((a, b) => a.name.localeCompare(b.name));
   const fields = Object.values(store.fieldDefs).sort((a, b) => a.order - b.order);
   const hasFunnels = funnelStages(store.tags, store.tagGroups).length > 0;
@@ -643,26 +642,6 @@ function CampaignStepEditor({ step, onChange }: {
   step: CampaignStep;
   onChange: (next: PresetStep) => void;
 }) {
-  const [recent, setRecent] = useState<Campaign[] | null>(null);
-
-  // Campaigns live in the background's chrome.storage.local, not the store.
-  useEffect(() => {
-    let live = true;
-    void sendBg<{ campaigns: Campaign[] }>({ type: 'GET_CAMPAIGNS' }).then((res) => {
-      if (!live) return;
-      // One entry per distinct message, newest first — re-running a campaign
-      // shouldn't fill the list with the same text.
-      const seen = new Set<string>();
-      const list = (res?.campaigns || [])
-        .filter((c) => c.template.trim())
-        .sort((a, b) => b.createdAt - a.createdAt)
-        .filter((c) => (seen.has(c.template) ? false : (seen.add(c.template), true)))
-        .slice(0, RECENT_CAMPAIGNS);
-      setRecent(list);
-    });
-    return () => { live = false; };
-  }, []);
-
   const toggle = (key: 'skipIfUnread' | 'dryRun', on: boolean) => {
     const { [key]: _k, ...rest } = step;
     onChange(on ? { ...rest, [key]: true } : rest);
@@ -670,29 +649,7 @@ function CampaignStepEditor({ step, onChange }: {
 
   return (
     <Stack gap="xs" style={{ marginTop: space.xs, paddingLeft: space.sm, borderLeft: `2px solid ${color.border.subtle}` }}>
-      <Stack direction="row" gap="xs" align="center" wrap>
-        <Select
-          value=""
-          aria-label="Use the message from a recent campaign"
-          disabled={!recent?.length}
-          onChange={(e) => {
-            const c = recent?.find((x) => x.id === e.target.value);
-            if (c) onChange({ ...step, template: c.template });
-            e.target.value = '';
-          }}
-          style={{ width: 300 }}
-        >
-          <option value="">
-            {recent === null ? 'Loading recent campaigns…' : recent.length ? 'Use a recent campaign’s message…' : 'No recent campaigns'}
-          </option>
-          {(recent || []).map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name} · {new Date(c.createdAt).toLocaleDateString()}
-            </option>
-          ))}
-        </Select>
-        <Text size="micro" tone="muted">or type one below</Text>
-      </Stack>
+      <RecentCampaignPicker onPick={(template) => onChange({ ...step, template })} />
       <DraftTextarea
         value={step.template}
         aria-label="Campaign message"
@@ -718,6 +675,60 @@ function CampaignStepEditor({ step, onChange }: {
           onChange={(e) => toggle('dryRun', e.target.checked)}
         />
       </Stack>
+    </Stack>
+  );
+}
+
+/**
+ * "Use a recent campaign's message…": a dropdown of recent campaigns' messages
+ * that hands the chosen one to `onPick` — a copy for the caller to keep,
+ * never a link to the campaign. Shared by quick actions' "Add to campaign"
+ * and automations' "Also send them a message".
+ */
+export function RecentCampaignPicker({ onPick }: { onPick: (template: string) => void }) {
+  const [recent, setRecent] = useState<Campaign[] | null>(null);
+
+  // Campaigns live in the background's chrome.storage.local, not the store.
+  useEffect(() => {
+    let live = true;
+    void sendBg<{ campaigns: Campaign[] }>({ type: 'GET_CAMPAIGNS' }).then((res) => {
+      if (!live) return;
+      // One entry per distinct message, newest first — re-running a campaign
+      // shouldn't fill the list with the same text.
+      const seen = new Set<string>();
+      const list = (res?.campaigns || [])
+        .filter((c) => c.template.trim())
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .filter((c) => (seen.has(c.template) ? false : (seen.add(c.template), true)))
+        .slice(0, RECENT_CAMPAIGNS);
+      setRecent(list);
+    });
+    return () => { live = false; };
+  }, []);
+
+  return (
+    <Stack direction="row" gap="xs" align="center" wrap>
+      <Select
+        value=""
+        aria-label="Use the message from a recent campaign"
+        disabled={!recent?.length}
+        onChange={(e) => {
+          const c = recent?.find((x) => x.id === e.target.value);
+          if (c) onPick(c.template);
+          e.target.value = '';
+        }}
+        style={{ width: 300 }}
+      >
+        <option value="">
+          {recent === null ? 'Loading recent campaigns…' : recent.length ? 'Use a recent campaign’s message…' : 'No recent campaigns'}
+        </option>
+        {(recent || []).map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.name} · {new Date(c.createdAt).toLocaleDateString()}
+          </option>
+        ))}
+      </Select>
+      <Text size="micro" tone="muted">or type one below</Text>
     </Stack>
   );
 }

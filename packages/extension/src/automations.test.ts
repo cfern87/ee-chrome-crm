@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   resolveUnread, planActions, planMessage, messageSkipped, matchSavedSearch, withLegacyFields,
   readAutomations, writeAutomations, normalizeAutomation, isDue, whyNotRunnable,
-  newTagUnreadAutomation, type Automation, type AutomationMessage,
+  newTagUnreadAutomation, describeRun, type Automation, type AutomationMessage,
 } from './automations';
 import type { SavedSearch } from './search';
 import { applyMutations } from './mutations';
@@ -192,5 +192,18 @@ describe('isDue', () => {
     const lastRun = 1_700_000_000_000;
     expect(isDue(hour, lastRun, lastRun + 30 * 60_000)).toBe(false);
     expect(isDue(hour, lastRun, lastRun + 60 * 60_000)).toBe(true);
+  });
+});
+
+describe('automation webhook actions', () => {
+  it('keeps a "Send to webhook" step through normalize, and reports it in the run line', () => {
+    const a = normalizeAutomation({ ...newTagUnreadAutomation(0), steps: [{ kind: 'sendWebhook', url: 'https://x.test/h' }] });
+    expect(a?.steps).toEqual([{ kind: 'sendWebhook', url: 'https://x.test/h' }]);
+    const line = describeRun({
+      automationId: 'a', running: false, trigger: 'manual', startedAt: 0, rowsSeen: 0, matched: 3, tagged: 0,
+      webhookSent: 2, webhookFailed: 1,
+    });
+    expect(line).toContain('2 sent to webhook');
+    expect(line).toContain('1 webhook failed');
   });
 });

@@ -510,6 +510,9 @@ export interface AutomationRun {
   campaignId?: string;
   /** Contacts the message skipped: already messaged, already queued, no link, or over the cap. */
   messageSkipped?: number;
+  /** "Send to webhook" actions: contacts POSTed, and POSTs that failed (each logged in that contact's history). */
+  webhookSent?: number;
+  webhookFailed?: number;
   exhausted?: boolean;
   cancelled?: boolean;
   error?: string;
@@ -537,6 +540,8 @@ export function describeRun(run: AutomationRun): string {
   if (run.notInCrm) parts.push(`${run.notInCrm} not in CRM`);
   if (run.messaged !== undefined) parts.push(`${run.messaged} queued to message`);
   if (run.messageSkipped) parts.push(`${run.messageSkipped} not messaged`);
+  if (run.webhookSent !== undefined) parts.push(`${run.webhookSent} sent to webhook`);
+  if (run.webhookFailed) parts.push(`${run.webhookFailed} webhook failed (see contact history)`);
   if (run.matched === undefined) parts.push(`${run.rowsSeen} conversations checked`);
   if (run.cancelled) parts.push('stopped early');
   return parts.join(' · ');

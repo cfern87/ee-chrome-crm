@@ -108,6 +108,7 @@ import {
   type WebhookEvent, type PendingEvent, type WebhookConfig, type WebhookDelivery,
 } from './webhooks';
 import { webhookFailureArg } from './history';
+import { webhookSendsFor, isDestructive } from './presets';
 
 const TICK_ALARM = 'crm-campaign-tick';
 const WATCHDOG_ALARM = 'crm-campaign-watchdog';
@@ -1354,6 +1355,24 @@ async function noteAutomationMessaged(automationId: string, threadIds: string[])
 async function applyAutomationActions(automation: Automation, ids: string[]): Promise<Partial<AutomationRun>> {
   const store = await loadStore();
   const plan = planActions(automation, ids, store);
+
+  // "Send to webhook" steps, read from the same pre-edit snapshot as the
+  // edits. Sent after them, unless the automation deletes — then before, so
+  // the contacts still exist to be sent and logged. sendPresetWebhook never
+  // throws, so a dead endpoint can't stop the run.
+  const asPreset = { id: automation.id, label: automation.name, order: 0, createdAt: 0, steps: automation.steps };
+  const hooks = webhookSendsFor(asPreset, ids.map((id) => store.conversations[id]).filter((c): c is Conversation => !!c), store);
+  const hookTally = { sent: 0, failed: 0 };
+  const sendHooks = async () => {
+    for (const h of hooks) {
+      const r = await sendPresetWebhook(h.url, automation.name, h.conversationIds);
+      hookTally.sent += r.sent;
+      hookTally.failed += r.failed;
+    }
+  };
+  const deletesFirst = isDestructive(asPreset);
+  if (deletesFirst) await sendHooks();
+
   const chunks: Mutation[][] = [];
   for (let i = 0; i < plan.groups.length; i += MAX_READ_STATE_WRITES) {
     chunks.push(plan.groups.slice(i, i + MAX_READ_STATE_WRITES).flat());
@@ -1365,7 +1384,9 @@ async function applyAutomationActions(automation: Automation, ids: string[]): Pr
     const res = await mutateStore(chunks[i]);
     if (res.changed && i < chunks.length - 1) await new Promise((r) => setTimeout(r, delay));
   }
+  if (!deletesFirst) await sendHooks();
   const out: Partial<AutomationRun> = { tagged: plan.changed, alreadyTagged: plan.unchanged };
+  if (hooks.length) { out.webhookSent = hookTally.sent; out.webhookFailed = hookTally.failed; }
 
   const message = automation.message;
   if (message && message.template.trim()) {

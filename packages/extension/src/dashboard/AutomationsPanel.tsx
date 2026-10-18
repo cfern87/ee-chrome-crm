@@ -24,7 +24,7 @@ import {
   Field as FormField, color, radius, space,
 } from '../ui/primitives';
 import { sendBg, formatRelativeTime } from './shared';
-import { StepListEditor } from './PresetActionsSettings';
+import { StepListEditor, RecentCampaignPicker } from './PresetActionsSettings';
 
 interface RunsResponse { runs: AutomationRuns; runningId: string | null; runningIds?: string[] }
 
@@ -440,6 +440,7 @@ function AutomationEditor({ initial, store, isNew, onSave, onCancel, onOpenTags,
               onChange={(steps) => set({ steps })}
               title="Actions, applied in this order — the same ones quick actions use, each with an optional “If…”"
               emptyText="No actions yet."
+              hideKinds={['addToCampaign']}
             />
             <Button size="sm" variant="link" onClick={onOpenTags} style={{ alignSelf: 'flex-start' }}>Manage tags</Button>
 
@@ -451,6 +452,8 @@ function AutomationEditor({ initial, store, isNew, onSave, onCancel, onOpenTags,
             />
             {draft.message && (
               <Stack gap="sm" style={{ paddingLeft: space.md, borderLeft: `2px solid ${color.border.subtle}` }}>
+                {/* Copies the message in; it can still be edited below. */}
+                <RecentCampaignPicker onPick={(template) => setMessage({ template })} />
                 <FormField label="Message" hint="Queued as a campaign each run, sent with your usual pacing. {{firstName}} and {{name}} are filled in; {option a|option b} picks one at random per person.">
                   {(fp) => (
                     <Textarea
