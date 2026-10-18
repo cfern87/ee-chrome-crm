@@ -25,7 +25,8 @@ import {
   type PresetAction, type PresetCampaignSend, type PresetWebhookSend,
 } from './presets';
 import {
-  openTasksOf, sortTasks, isOverdue, formatDue, priorityOf, newTask, dueFromOffset, inputsToDue, TASK_TITLE_MAX,
+  openTasksOf, sortTasks, isOverdue, formatDue, priorityOf, newTask, dueFromOffset, inputsToDue, rescheduleDue,
+  RESCHEDULE_DAYS, TASK_TITLE_MAX,
 } from './tasks';
 import { PRODUCT_NAME } from './product';
 import { readableFill, chipOutline, ON_DARK } from './ui/contrast';
@@ -1621,6 +1622,9 @@ function tasksSectionHtml(conv: Conversation): string {
         <div class="fb-crm-task-body">
           <div class="fb-crm-task-title">${pri === 'high' ? '<span class="fb-crm-task-pri">!</span>' : ''}${escapeHtml(t.title)}</div>
           <div class="fb-crm-task-due">${escapeHtml(formatDue(t, now))}</div>
+          <div class="fb-crm-task-resched" role="group" aria-label="Reschedule">${RESCHEDULE_DAYS
+            .map((n) => `<button type="button" data-task-resched="${escapeAttr(t.id)}" data-days="${n}" title="Due ${n} days from today">+${n}d</button>`)
+            .join('')}</div>
         </div>
       </div>`;
   }).join('');
@@ -2009,7 +2013,7 @@ async function renderPanelContent() {
   // aliases, and every action below addresses the contact by key.
   wirePanelActions(conv.id);
   wirePanelFields(conv.id, conv, panelFields);
-  wirePanelTasks(conv.id);
+  wirePanelTasks(conv);
 
   // If the user was typing a tag name when a re-render happened, restore focus
   // and place the caret at the end so their typing isn't interrupted.
@@ -2192,14 +2196,28 @@ function wirePanelFields(threadId: string, conv: Conversation, defs: CustomField
 
 // Follow-up tick boxes and the add row. The task is built here, id and all, so
 // the mutation is idempotent if the background retries it.
-function wirePanelTasks(threadId: string) {
+function wirePanelTasks(conv: Conversation) {
   if (!panelEl) return;
+  const threadId = conv.id;
 
   panelEl.querySelectorAll<HTMLInputElement>('[data-task-done]').forEach(box => {
     box.addEventListener('change', () => {
       box.disabled = true;
       void panelAction(async () => {
         await mutate([{ op: 'updateTask', conversationId: threadId, taskId: box.dataset.taskDone!, patch: { done: box.checked } }]);
+        await renderPanel();
+      });
+    });
+  });
+
+  panelEl.querySelectorAll<HTMLButtonElement>('[data-task-resched]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const t = openTasksOf(conv).find((x) => x.id === btn.dataset.taskResched);
+      if (!t) return;
+      btn.disabled = true;
+      void panelAction(async () => {
+        const patch = rescheduleDue(t, Number(btn.dataset.days), Date.now());
+        await mutate([{ op: 'updateTask', conversationId: threadId, taskId: t.id, patch }]);
         await renderPanel();
       });
     });
@@ -3506,6 +3524,21 @@ function statusForMessageNode(node: HTMLElement, target: string, scope: HTMLElem
   return 'unknown';
 }
 
+// Facebook's own words next to the newest copy of the message, for the log.
+// 'failed' is a pattern match; this is what the pattern matched against, which
+// is the only clue to WHY ("couldn't send" alone, or a reason after it).
+function deliveryStatusDetail(scope: HTMLElement, target: string): string {
+  const nodes = findMessageNodes(scope, target);
+  let el: HTMLElement | null = nodes[nodes.length - 1] || null;
+  const seen: string[] = [];
+  for (let i = 0; i < 8 && el; i++) {
+    for (const f of statusFragments(el, target)) if (!seen.includes(f)) seen.push(f);
+    if (seen.join(' | ').length > 300 || el === scope) break;
+    el = el.parentElement;
+  }
+  return seen.join(' | ').slice(0, 300);
+}
+
 function deliveryStatuses(scope: HTMLElement, target: string): DeliveryStatus[] {
   return findMessageNodes(scope, target).map((n) => statusForMessageNode(n, target, scope));
 }
@@ -4215,7 +4248,9 @@ async function typeSendAndConfirm(
 
   // Snapshot the thread so we can detect the NEW outgoing bubble afterwards.
   const beforeCount = findMessageNodes(scope, target).length;
-  stamp(`bubblesBefore=${beforeCount} scopeTextLen=${(scope.innerText || '').length}`);
+  // The text itself, not just its length: a short pane is an empty or
+  // placeholder conversation, and what it says is the diagnosis.
+  stamp(`bubblesBefore=${beforeCount} scopeTextLen=${(scope.innerText || '').length} scopeText="${normalizeText(scope.innerText || '').slice(0, 300)}"`);
 
   // Type the message. execCommand('insertText') fires the beforeinput/input
   // events Facebook's editor expects, unlike setting textContent directly.
@@ -4334,6 +4369,8 @@ async function typeSendAndConfirm(
   const status = await pollDeliveryStatus(scope, target, 15_000);
   stamp(`deliveryStatus=${status}`);
   if (status === 'failed') {
+    stamp(`failure text: "${deliveryStatusDetail(scope, target)}"`);
+    stamp(`scopeAfter="${normalizeText(scope.innerText || '').slice(-400)}"`);
     return {
       ok: false,
       error: "Facebook couldn't send the message (the conversation link didn't resolve)",

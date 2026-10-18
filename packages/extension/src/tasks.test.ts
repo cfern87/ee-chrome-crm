@@ -4,7 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   newTask, patchTask, pruneDoneTasks, isOverdue, bucketOf, dueFromOffset, inputsToDue, dueToInputs,
-  nextDueAt, sortTasks, normalizeTask, MAX_DONE_TASKS, type FollowUpTask,
+  nextDueAt, sortTasks, normalizeTask, rescheduleDue, MAX_DONE_TASKS, type FollowUpTask,
 } from './tasks';
 import { applyMutations } from './mutations';
 import { stepsFor, readPresetActions, writePresetActions, type PresetAction } from './presets';
@@ -30,6 +30,22 @@ function contact(id: string, patch: Partial<Conversation> = {}): Conversation {
 function storeOf(...convs: Conversation[]): Store {
   return { ...EMPTY_STORE, conversations: Object.fromEntries(convs.map((c) => [c.id, c])) };
 }
+
+describe('rescheduleDue', () => {
+  it('counts from today, so an overdue task lands in the future', () => {
+    const late = task('a', { dueAt: day(2026, 9, 1), allDay: true });
+    expect(rescheduleDue(late, 3, NOW)).toEqual({ dueAt: day(2026, 9, 19), allDay: true });
+  });
+
+  it('keeps the time of day of a timed task', () => {
+    const timed = task('a', { dueAt: day(2026, 9, 10, 14, 30) });
+    expect(rescheduleDue(timed, 10, NOW)).toEqual({ dueAt: day(2026, 9, 26, 14, 30), allDay: false });
+  });
+
+  it('gives an undated task an all-day due date', () => {
+    expect(rescheduleDue(task('a'), 7, NOW)).toEqual({ dueAt: day(2026, 9, 23), allDay: true });
+  });
+});
 
 describe('task model', () => {
   it('refuses a blank title', () => {

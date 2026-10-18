@@ -11,7 +11,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import type { Conversation } from '../storage';
 import {
   allTasks, sortTasks, compareTasks, bucketOf, formatDue, isOverdue, dueToInputs, inputsToDue, priorityOf, tasksOf,
-  BUCKET_LABELS, TASK_PRIORITIES, TASK_TITLE_MAX, TASK_NOTES_MAX,
+  rescheduleDue, BUCKET_LABELS, RESCHEDULE_DAYS, TASK_PRIORITIES, TASK_TITLE_MAX, TASK_NOTES_MAX,
   type FollowUpTask, type NewTaskInput, type TaskPatch, type TaskPriority, type TaskBucket, type TaskEntry,
 } from '../tasks';
 import {
@@ -304,6 +304,23 @@ export function TaskRow({ task, conv, now, handlers, conversationId, onOpenConta
             <a href={conv.chatUrl} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: color.accent.base }}>
               Open chat ↗
             </a>
+          )}
+          {!task.done && (
+            <span role="group" aria-label="Reschedule" style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+              <Text size="micro" tone="muted">Reschedule</Text>
+              {RESCHEDULE_DAYS.map((n) => (
+                <Button
+                  key={n}
+                  size="sm"
+                  variant="ghost"
+                  title={`Due ${n} days from today`}
+                  onClick={() => handlers.onUpdateTask(conversationId, task.id, rescheduleDue(task, n, Date.now()))}
+                  style={{ padding: '0 6px', minHeight: 0, height: 20, fontSize: 11 }}
+                >
+                  +{n}d
+                </Button>
+              ))}
+            </span>
           )}
         </div>
 

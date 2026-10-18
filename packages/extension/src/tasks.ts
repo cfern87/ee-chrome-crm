@@ -216,6 +216,22 @@ export function dueFromOffset(days: number, time: string | undefined, now: numbe
   return { dueAt: d.getTime(), allDay: false };
 }
 
+/** The one-click reschedule offsets offered on every open task, in days. */
+export const RESCHEDULE_DAYS = [3, 5, 7, 10];
+
+/**
+ * New due date for "+N days": counted from today, not from the old due date —
+ * rescheduling is mostly done to overdue tasks, and "+3" on something two
+ * weeks late should not leave it still overdue. A task due at a time keeps
+ * that time of day; an all-day or undated task becomes all-day.
+ */
+export function rescheduleDue(t: Pick<FollowUpTask, 'dueAt' | 'allDay'>, days: number, now: number): { dueAt: number; allDay: boolean } {
+  if (t.dueAt === undefined || t.allDay) return dueFromOffset(days, undefined, now);
+  const d = new Date(t.dueAt);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return dueFromOffset(days, `${pad(d.getHours())}:${pad(d.getMinutes())}`, now);
+}
+
 /** A due date as the pair of values a date and a time input hold. */
 export function dueToInputs(t: Pick<FollowUpTask, 'dueAt' | 'allDay'>): { date: string; time: string } {
   if (t.dueAt === undefined) return { date: '', time: '' };
