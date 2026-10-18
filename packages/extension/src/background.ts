@@ -95,6 +95,7 @@ import {
   type ScanReport,
 } from './readScan';
 import { MAX_READ_STATE_WRITES } from './mutations';
+import { e2eeVariantOf } from './threadUrl';
 import {
   readAutomations, resolveUnread, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable,
   AUTOMATION_RUNS_KEY,
@@ -633,6 +634,16 @@ async function recordResolvedThread(requestedThreadId: string, resolvedThreadId:
   }
 }
 
+// Save a chat URL a send just proved, so the next send goes straight there.
+async function recordChatUrl(conversationId: string, chatUrl: string, log: string[]): Promise<void> {
+  try {
+    const res = await mutateStore([{ op: 'setChatUrl', conversationId, chatUrl }]);
+    if (res.changed) log.push(`saved working chat URL ${chatUrl}`);
+  } catch (e) {
+    log.push(`could not save chat URL: ${String(e)}`);
+  }
+}
+
 // Outcome of one attempt, minus the log — every step here appends to a single
 // shared log array instead, so the diagnostics stay in chronological order
 // across the first attempt and both recovery paths.
@@ -791,8 +802,31 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
   if (first.ok) return { ok: true, log };
   if (!shouldRecover(first)) return { ok: false, error: first.error, failureKind: first.failureKind, log };
 
-  // Not confirmed sent. Try to repair the conversation link via the profile.
+  // Cheapest repair first: the same id on the encrypted route. An e2ee thread
+  // opened at /messages/t/<id> is an empty shell whose sends all come back
+  // "Couldn't send" — exactly the not-delivered verdict — and saved URLs lost
+  // their "e2ee/" segment for a long time (see threadUrl.ts). The profile
+  // recovery below can't fix that: it rebuilds a classic URL too.
   log.push(`first attempt did not confirm as sent: ${first.error || 'unknown'}`);
+  if (first.failureKind === 'not-delivered') {
+    const e2eeUrl = e2eeVariantOf(chatUrl);
+    if (e2eeUrl) {
+      log.push(`e2ee retry: trying the encrypted route ${e2eeUrl}`);
+      const t = await ensureSenderTab(e2eeUrl, log);
+      if (t != null && (await waitForContentReady(t, log, 'messages'))) {
+        // 'sent-only': the first attempt read an explicit "Couldn't send", so
+        // only an explicit "Sent" copy here may count as already delivered.
+        const retry = await attemptSend(t, r, dryRun, 'sent-only', log, gate);
+        if (retry.ok) {
+          await recordChatUrl(r.threadId, e2eeUrl, log);
+          return { ok: true, log };
+        }
+        log.push(`e2ee retry failed (${retry.error || 'unknown'}) — falling back to profile recovery`);
+      }
+    }
+  }
+
+  // Not confirmed sent. Try to repair the conversation link via the profile.
   const recovery = await recoverViaProfile(r, dryRun, dupGuardFor(first), log, gate);
   if (recovery?.ok) return { ok: true, log };
 

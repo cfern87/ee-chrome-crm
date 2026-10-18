@@ -41,6 +41,20 @@ export const CAMPAIGNS_KEY = 'facebook_crm_campaigns';
 // leave the outcome without the diagnosis that led to it.
 export const MAX_CAMPAIGNS = 50;
 export const MAX_LOG_LINES = 100;
+const LOG_HEAD_LINES = 35;
+
+// Keep both ends of an over-long log. The tail is the final outcome, but the
+// head is the FIRST attempt — the one that explains why recovery ran at all —
+// and a plain tail-slice dropped exactly that on long recovery trails.
+export function capLog(log: string[]): string[] {
+  if (log.length <= MAX_LOG_LINES) return log;
+  const tail = MAX_LOG_LINES - LOG_HEAD_LINES - 1;
+  return [
+    ...log.slice(0, LOG_HEAD_LINES),
+    `… ${log.length - LOG_HEAD_LINES - tail} log lines omitted …`,
+    ...log.slice(-tail),
+  ];
+}
 
 // Default human-like pacing. All durations in milliseconds.
 export const DEFAULTS = {
@@ -392,9 +406,7 @@ export async function saveCampaigns(campaigns: Campaign[]): Promise<void> {
     .map((c) => ({
       ...c,
       recipients: c.recipients.map((r) =>
-        r.log && r.log.length > MAX_LOG_LINES
-          ? { ...r, log: r.log.slice(-MAX_LOG_LINES) }
-          : r
+        r.log && r.log.length > MAX_LOG_LINES ? { ...r, log: capLog(r.log) } : r
       ),
     }));
   await localSet(CAMPAIGNS_KEY, trimmed);
@@ -494,6 +506,69 @@ export function matchingRecipients(c: Campaign, query: string): CampaignRecipien
 /** Everyone in this campaign whose send failed and could be tried again. */
 export function failedRecipients(c: Campaign): CampaignRecipient[] {
   return c.recipients.filter((r) => r.status === 'error');
+}
+
+// The error a recipient row shows is the LAST attempt's — usually the profile
+// recovery's. What sent it into recovery in the first place is only recorded
+// as a log line, and that is the one that says why the normal send failed.
+const FIRST_ATTEMPT_RE = /first attempt did not confirm as sent: (.*)$/;
+
+export function firstAttemptError(r: CampaignRecipient): string | null {
+  for (const line of r.log || []) {
+    const m = FIRST_ATTEMPT_RE.exec(line);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+// Plain-text dump of every failed recipient, full logs included, for pasting
+// into a bug report. Tallies go first so the common pattern is visible before
+// fifty logs of detail.
+export function failureReport(c: Campaign, profileUrlFor: (threadId: string) => string | undefined = () => undefined): string {
+  const failed = failedRecipients(c);
+  const sum = summarize(c);
+  const tally = (keys: string[]) => {
+    const m = new Map<string, number>();
+    for (const k of keys) m.set(k, (m.get(k) || 0) + 1);
+    return [...m.entries()].sort((a, b) => b[1] - a[1]).map(([k, n]) => `  ${n} × ${k}`);
+  };
+
+  const out: string[] = [
+    `Campaign: ${c.name} (${c.id})`,
+    `Status: ${c.status}${c.dryRun ? ' · DRY RUN' : ''}${c.skipIfUnread ? ' · skip-if-unread' : ''}`,
+    `Started: ${new Date(c.startedAt || c.createdAt).toISOString()}${c.completedAt ? ` · finished ${new Date(c.completedAt).toISOString()}` : ''}`,
+    `Totals: ${sum.sent} sent · ${sum.errors} failed · ${sum.pending} pending · ${sum.total} total`,
+    `Report copied: ${new Date().toISOString()}`,
+    '',
+    'Template:',
+    c.template,
+    '',
+    'Final error (what the row shows):',
+    ...tally(failed.map((r) => `[${r.errorKind || 'no kind'}] ${r.error || '(no error text)'}`)),
+    '',
+    'First-attempt error (why it went to recovery):',
+    ...tally(failed.map((r) => firstAttemptError(r) || '(no recovery — first attempt was final)')),
+    '',
+    'Sent:',
+    ...c.recipients.filter((r) => r.status === 'sent').map((r) => `  ${r.participantName} (${r.threadId}) ${r.sentAt ? new Date(r.sentAt).toISOString() : ''}`),
+  ];
+
+  failed.forEach((r, i) => {
+    out.push(
+      '',
+      `===== ${i + 1}/${failed.length}: ${r.participantName} =====`,
+      `threadId: ${r.threadId}`,
+      `chatUrl: ${r.chatUrl || '(none)'}`,
+      `profileUrl: ${profileUrlFor(r.threadId) || '(none)'}`,
+      `errorKind: ${r.errorKind || '(none)'}`,
+      `error: ${r.error || '(none)'}`,
+      `firstAttemptError: ${firstAttemptError(r) || '(none)'}`,
+      `attempts: ${r.attempts}${r.failedAt ? ` · failedAt ${new Date(r.failedAt).toISOString()}` : ''}`,
+      `log (${r.log?.length || 0} lines${(r.log?.length || 0) >= MAX_LOG_LINES ? `, capped at ${MAX_LOG_LINES}` : ''}):`,
+      ...(r.log || ['(no log)']),
+    );
+  });
+  return out.join('\n');
 }
 
 // =====================================================================

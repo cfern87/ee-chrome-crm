@@ -51,6 +51,7 @@ import type { ReadStateObservation } from './mutations';
 import { noteState, buildReport, emptyReport, type ScanReport } from './readScan';
 import type { UnreadScanReport, UnreadThread } from './automations';
 import type { SendFailureKind } from './campaigns';
+import { isE2eeThreadUrl, threadChatUrl } from './threadUrl';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
 const COLORS = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E2'];
@@ -3141,14 +3142,19 @@ async function getResolvedThreadId(threadId: string): Promise<string | null> {
 // and point the contact's chat URL straight at it so the next send skips the
 // interstitial entirely. The store key stays as the originally captured id —
 // re-keying would orphan every campaign recipient that references it.
-async function saveResolvedThreadId(requestedThreadId: string, resolvedThreadId: string): Promise<boolean> {
+//
+// `e2ee` must say which route the id was seen on. Leaving it to the mutation's
+// default writes the classic /messages/t/ route, and an encrypted thread's id
+// on that route is an empty shell that rejects every send (see threadUrl.ts).
+async function saveResolvedThreadId(requestedThreadId: string, resolvedThreadId: string, e2ee: boolean): Promise<boolean> {
   if (!resolvedThreadId || resolvedThreadId === requestedThreadId) return false;
   const store = await getStore();
   const conv = store.conversations[requestedThreadId];
   if (!conv) return false;
-  if (conv.resolvedThreadId === resolvedThreadId) return true; // already recorded
+  const chatUrl = threadChatUrl(resolvedThreadId, e2ee);
+  if (conv.resolvedThreadId === resolvedThreadId && conv.chatUrl === chatUrl) return true; // already recorded
   await mutate([
-    { op: 'setResolvedThread', conversationId: requestedThreadId, threadId: resolvedThreadId },
+    { op: 'setResolvedThread', conversationId: requestedThreadId, threadId: resolvedThreadId, chatUrl },
   ]);
   return true;
 }
@@ -3199,7 +3205,7 @@ async function applyPendingThreadResolve(): Promise<void> {
 
   const active = getActiveThreadId();
   if (active && active !== pending.threadId) {
-    const saved = await saveResolvedThreadId(pending.threadId, active);
+    const saved = await saveResolvedThreadId(pending.threadId, active, isE2eeThreadUrl(window.location.pathname));
     console.log('[CRM] Resolved legacy thread id after Continue:', pending.threadId, '→', active, 'saved:', saved);
   }
   await writePendingResolve(null);
@@ -4342,7 +4348,7 @@ async function performAutomatedSend(threadId: string, rawMessage: string, dryRun
       if (composer) {
         const resolved = getActiveThreadId();
         if (resolved && resolved !== threadId) {
-          const saved = await saveResolvedThreadId(threadId, resolved);
+          const saved = await saveResolvedThreadId(threadId, resolved, isE2eeThreadUrl(window.location.pathname));
           stamp(`thread id resolved ${threadId} → ${resolved} (saved=${saved})`);
         }
         await writePendingResolve(null);
@@ -4477,13 +4483,17 @@ function drawerScope(composer: HTMLElement): HTMLElement {
 // header (Facebook doesn't always link the thread). Unverifiable means we do
 // not send — messaging the wrong person is far worse than a logged failure.
 
-interface DrawerIdentity { threadIds: string[]; text: string }
+// `e2ee`: the drawer's conversation links use the encrypted route, which has
+// to be kept when the id is saved (see saveResolvedThreadId).
+interface DrawerIdentity { threadIds: string[]; text: string; e2ee: boolean }
 
 function drawerIdentity(scope: HTMLElement): DrawerIdentity {
   const ids = new Set<string>();
+  let e2ee = false;
   scope.querySelectorAll<HTMLAnchorElement>('a[href*="/t/"]').forEach((a) => {
     const id = extractThreadId(a.href);
     if (id) ids.add(id.toLowerCase());
+    if (id && isE2eeThreadUrl(a.href)) e2ee = true;
   });
   const labels: string[] = [];
   const own = scope.getAttribute('aria-label');
@@ -4491,7 +4501,7 @@ function drawerIdentity(scope: HTMLElement): DrawerIdentity {
   scope.querySelectorAll('h1, h2, h3, h4, [role="heading"]').forEach((n) => labels.push(n.textContent || ''));
   scope.querySelectorAll<HTMLImageElement>('img[alt]').forEach((n) => labels.push(n.alt || ''));
   scope.querySelectorAll<HTMLAnchorElement>('a[href*="/t/"]').forEach((n) => labels.push(n.textContent || ''));
-  return { threadIds: [...ids], text: normalizeText(labels.join(' ')).toLowerCase() };
+  return { threadIds: [...ids], text: normalizeText(labels.join(' ')).toLowerCase(), e2ee };
 }
 
 // Three verdicts, not two. 'mismatch' is a hard stop — that drawer is somebody
@@ -4624,7 +4634,7 @@ async function performDrawerSend(threadId: string, rawMessage: string, dryRun = 
   // The drawer links the conversation Facebook considers current — that's the
   // id future sends should use.
   if (picked.ident.threadIds.length === 1 && picked.ident.threadIds[0] !== threadId) {
-    const saved = await saveResolvedThreadId(threadId, picked.ident.threadIds[0]);
+    const saved = await saveResolvedThreadId(threadId, picked.ident.threadIds[0], picked.ident.e2ee);
     stamp(`drawer belongs to thread ${picked.ident.threadIds[0]} (saved for ${threadId}=${saved})`);
   }
 
@@ -4670,7 +4680,8 @@ async function resolveProfileThreadFor(requestedThreadId: string): Promise<Profi
   }
   stamp(`profile thread id = ${threadId}`);
   if (requestedThreadId && threadId !== requestedThreadId) {
-    const saved = await saveResolvedThreadId(requestedThreadId, threadId);
+    // A profile's fbid is an account id, which lives on the classic route.
+    const saved = await saveResolvedThreadId(requestedThreadId, threadId, false);
     stamp(`recorded ${requestedThreadId} → ${threadId} (saved=${saved})`);
   }
   return {

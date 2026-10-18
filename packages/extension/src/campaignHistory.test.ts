@@ -3,6 +3,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   campaignMatchesQuery, matchingRecipients, failedRecipients, collectUnseenFailures,
+  failureReport, capLog, MAX_LOG_LINES,
   type Campaign, type CampaignRecipient,
 } from './campaigns';
 
@@ -131,5 +132,51 @@ describe('collectUnseenFailures with archiving', () => {
   // would leave the notice on screen with no way to make it stop.
   it('stays quiet about an archived campaign', () => {
     expect(collectUnseenFailures([{ ...failing, archived: true }], 0)).toHaveLength(0);
+  });
+});
+
+describe('failureReport', () => {
+  const failing = (name: string, first: string | null, error: string) => recipient(name, {
+    status: 'error',
+    error,
+    errorKind: 'unconfirmed',
+    log: [
+      '[t] navigating to https://www.facebook.com/messages/t/1/',
+      ...(first ? [`[t] first attempt did not confirm as sent: ${first}`] : []),
+      '[t] recovery: opening profile https://facebook.com/x',
+    ],
+  });
+
+  it('tallies final and first-attempt errors and includes every log line', () => {
+    const c = campaign({
+      recipients: [
+        recipient('Dana Ellis', { sentAt: 5 }),
+        failing('Flavia Passos', 'Could not confirm message was delivered', 'Drawer X'),
+        failing('Gus Hale', 'Could not confirm message was delivered', 'Drawer X'),
+        failing('Ivy Moss', null, 'Message composer not found'),
+      ],
+    });
+    const text = failureReport(c, (id) => (id === 'gushale' ? 'https://facebook.com/gus' : undefined));
+    expect(text).toContain('Totals: 1 sent · 3 failed');
+    expect(text).toContain('2 × [unconfirmed] Drawer X');
+    expect(text).toContain('2 × Could not confirm message was delivered');
+    expect(text).toContain('1 × (no recovery — first attempt was final)');
+    expect(text).toContain('profileUrl: https://facebook.com/gus');
+    expect(text.match(/recovery: opening profile/g)).toHaveLength(3);
+  });
+});
+
+describe('capLog', () => {
+  it('keeps the head (first attempt) and the tail (outcome) of a long log', () => {
+    const log = Array.from({ length: 250 }, (_, i) => `line ${i}`);
+    const capped = capLog(log);
+    expect(capped).toHaveLength(MAX_LOG_LINES);
+    expect(capped[0]).toBe('line 0');
+    expect(capped[capped.length - 1]).toBe('line 249');
+    expect(capped.some((l) => l.includes('omitted'))).toBe(true);
+  });
+
+  it('leaves a short log alone', () => {
+    expect(capLog(['a', 'b'])).toEqual(['a', 'b']);
   });
 });

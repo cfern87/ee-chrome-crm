@@ -477,13 +477,15 @@ export function ProfileUrlEditor({ value, onSave, compact }: { value?: string; o
   );
 }
 
-export function CopyButton({ text }: { text: string }) {
+// `text` may be a function so an expensive payload (a whole failure report) is
+// only built when the button is actually clicked, not on every render.
+export function CopyButton({ text, label = 'Copy', title = 'Copy template' }: { text: string | (() => string); label?: string; title?: string }) {
   const [copied, setCopied] = useState(false);
 
   const copy = async (e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      await navigator.clipboard.writeText(text);
+      await navigator.clipboard.writeText(typeof text === 'function' ? text() : text);
     } catch {
       return;
     }
@@ -494,7 +496,7 @@ export function CopyButton({ text }: { text: string }) {
   return (
     <button
       onClick={copy}
-      title="Copy template"
+      title={title}
       style={{
         background: copied ? color.success.subtle : color.surface.raised,
         color: copied ? color.success.base : color.text.secondary,
@@ -506,7 +508,7 @@ export function CopyButton({ text }: { text: string }) {
         cursor: 'pointer',
       }}
     >
-      {copied ? 'Copied ✓' : 'Copy'}
+      {copied ? 'Copied ✓' : label}
     </button>
   );
 }

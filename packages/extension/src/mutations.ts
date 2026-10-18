@@ -86,6 +86,10 @@ export type Mutation =
   | { op: 'deleteContact'; conversationId: string }
   | { op: 'markContacted'; conversationId: string }
   | { op: 'setResolvedThread'; conversationId: string; threadId: string; chatUrl?: string }
+  // Point a contact at a chat URL that has just been proven to work, without
+  // touching its thread ids — the e2ee repair, where the id was right all along
+  // and only the route was wrong (see threadUrl.ts).
+  | { op: 'setChatUrl'; conversationId: string; chatUrl: string }
   // Record what Messenger last showed about OUR last message in one or more
   // threads. Batched because the sweep that produces these reports everything
   // it can see in one pass, and one mutation is one store lock rather than
@@ -281,6 +285,15 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
         chatUrl: m.chatUrl ?? `https://www.facebook.com/messages/t/${m.threadId}/`,
         updatedAt: now,
       };
+      return { store: next, changed: true, conversationId: m.conversationId };
+    }
+
+    case 'setChatUrl': {
+      const conv = store.conversations[m.conversationId];
+      if (!conv) return { store, changed: false };
+      if (conv.chatUrl === m.chatUrl) return { store, changed: false, conversationId: m.conversationId };
+      const next = copy(store);
+      next.conversations[m.conversationId] = { ...conv, chatUrl: m.chatUrl, updatedAt: now };
       return { store: next, changed: true, conversationId: m.conversationId };
     }
 

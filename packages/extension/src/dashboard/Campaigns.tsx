@@ -15,7 +15,7 @@ import {
   FailedSend, failureKey,
   QueueState, QueueMode, activeCampaigns, queueDepth,
   pendingRecipientIndex, runnableCampaigns,
-  campaignMatchesQuery, matchingRecipients, failedRecipients,
+  campaignMatchesQuery, matchingRecipients, failedRecipients, failureReport,
 } from '../campaigns';
 import { pickVariation, countVariations, variationIssue, VARIATION_COUNT_CAP } from '../variations';
 import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo } from '../devices';
@@ -1528,6 +1528,13 @@ export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile,
               >
                 Resend to {failed.length} failed →
               </Button>
+            )}
+            {failed.length > 0 && (
+              <CopyButton
+                text={() => failureReport(campaign, (id) => store.conversations[id]?.profileUrl)}
+                label={`Copy ${failed.length} error${failed.length !== 1 ? 's' : ''} + logs`}
+                title="Copy every failed recipient's error and full send log as plain text, for pasting into a bug report"
+              />
             )}
             {!isLive && (
               <Button
