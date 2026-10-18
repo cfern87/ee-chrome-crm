@@ -26,7 +26,7 @@
 // mid-step).
 
 import { loadStore, saveStore, flushDriveIfDirty, syncDriveNow, isDriveEnabled, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, removeTagsFrom } from './storage';
-import type { Store, SaveResult } from './storage';
+import type { Store, SaveResult, Conversation } from './storage';
 import { applyMutations } from './mutations';
 import type { Mutation } from './mutations';
 import {
@@ -104,9 +104,10 @@ import {
 } from './automations';
 import {
   readWebhooks, subscribersOf, buildPayload, deliver, diffContactEvents,
-  writeWebhooks,
-  type WebhookEvent, type PendingEvent, type WebhookConfig,
+  writeWebhooks, isValidWebhookUrl, presetHook, buildPresetPayload, contactSummary, TEST_CONTACT,
+  type WebhookEvent, type PendingEvent, type WebhookConfig, type WebhookDelivery,
 } from './webhooks';
+import { webhookFailureArg } from './history';
 
 const TICK_ALARM = 'crm-campaign-tick';
 const WATCHDOG_ALARM = 'crm-campaign-watchdog';
@@ -256,6 +257,85 @@ async function dispatchWebhook(
   } catch (e) {
     console.warn('[CRM] webhook dispatch failed', e);
   }
+}
+
+// ---- quick action: "Send to webhook" ----
+
+/** POSTs in flight at once for one press — enough to be quick, not enough to look like a flood. */
+const PRESET_WEBHOOK_CONCURRENCY = 4;
+/** Contacts per history write, so a long bulk run that's cut short still has what it did logged. */
+const PRESET_WEBHOOK_LOG_CHUNK = 20;
+
+interface PresetWebhookResult {
+  success: boolean;
+  sent: number;
+  failed: number;
+  /** The commonest failure reason, for the one-line notice. */
+  error?: string;
+}
+
+/**
+ * POST each contact to `url`, one request per contact, and log every outcome in
+ * that contact's history.
+ *
+ * Built to fail gracefully, because a bulk press can be hundreds of contacts
+ * and the endpoint is whatever the user typed: it never throws, one contact's
+ * failure never stops the others, a bad URL is logged against every contact
+ * rather than refused silently, and logging failures are swallowed — the POSTs
+ * have already happened and must not be reported as failed because the
+ * bookkeeping hiccupped.
+ */
+async function sendPresetWebhook(url: string, presetLabel: string, conversationIds: string[]): Promise<PresetWebhookResult> {
+  const result: PresetWebhookResult = { success: true, sent: 0, failed: 0 };
+  const reasons = new Map<string, number>();
+  try {
+    const store = await loadStore();
+    const contacts = conversationIds.map((id) => store.conversations[id]).filter((c): c is Conversation => !!c);
+    const invalid = isValidWebhookUrl(url);
+    const hook = presetHook(url, presetLabel);
+
+    for (let start = 0; start < contacts.length; start += PRESET_WEBHOOK_LOG_CHUNK) {
+      const chunk = contacts.slice(start, start + PRESET_WEBHOOK_LOG_CHUNK);
+      const logs: Mutation[] = [];
+      let next = 0;
+      const worker = async () => {
+        while (next < chunk.length) {
+          const conv = chunk[next++];
+          let delivery: WebhookDelivery;
+          try {
+            delivery = invalid
+              ? { at: Date.now(), ok: false, error: invalid }
+              : await deliver(hook, buildPresetPayload(hook, presetLabel, contactSummary(conv, store)));
+          } catch (e) {
+            delivery = { at: Date.now(), ok: false, error: String(e) };
+          }
+          if (delivery.ok) result.sent++;
+          else {
+            result.failed++;
+            const why = invalid ? 'bad URL' : webhookFailureArg(delivery);
+            reasons.set(why, (reasons.get(why) || 0) + 1);
+          }
+          logs.push({
+            op: 'logWebhook',
+            conversationId: conv.id,
+            ok: delivery.ok,
+            at: delivery.at,
+            arg: delivery.ok ? (delivery.status ? String(delivery.status) : undefined) : (invalid ? 'bad URL' : webhookFailureArg(delivery)),
+          });
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(PRESET_WEBHOOK_CONCURRENCY, chunk.length) }, worker));
+      try { await mutateStore(logs); } catch (e) { console.warn('[CRM] could not log webhook results', e); }
+    }
+  } catch (e) {
+    console.warn('[CRM] preset webhook run failed', e);
+    result.success = false;
+    reasons.set(String(e), 1);
+  }
+  const top = [...reasons.entries()].sort((a, b) => b[1] - a[1])[0];
+  if (top) result.error = top[0];
+  console.info(`[CRM] Preset "${presetLabel}" webhook: ${result.sent} sent, ${result.failed} failed`);
+  return result;
 }
 
 /**
@@ -2574,6 +2654,25 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
             contact: { id: 'test_contact', name: 'Test Contact', tags: ['example'], archived: false },
           }));
           await recordDeliveries([{ id: hook.id, delivery }]);
+          sendResponse({ ok: delivery.ok, status: delivery.status, error: delivery.error });
+          break;
+        }
+
+        case 'SEND_PRESET_WEBHOOK': {
+          const p = request.payload || {};
+          const ids = Array.isArray(p.conversationIds) ? p.conversationIds.filter((x: unknown): x is string => typeof x === 'string') : [];
+          sendResponse(await sendPresetWebhook(String(p.url || ''), String(p.presetLabel || ''), ids));
+          break;
+        }
+
+        // The editor's "Send test": the same POST a press makes, with a
+        // placeholder contact, and nothing logged anywhere.
+        case 'TEST_PRESET_WEBHOOK': {
+          const url = String(request.payload?.url || '');
+          const invalid = isValidWebhookUrl(url);
+          if (invalid) { sendResponse({ ok: false, error: invalid }); break; }
+          const hook = presetHook(url, String(request.payload?.presetLabel || 'Test'));
+          const delivery = await deliver(hook, buildPresetPayload(hook, hook.name || 'Test', TEST_CONTACT, true));
           sendResponse({ ok: delivery.ok, status: delivery.status, error: delivery.error });
           break;
         }

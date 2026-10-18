@@ -85,6 +85,9 @@ export type Mutation =
   | { op: 'setFunnelHidden'; conversationId: string; groupId: string; hidden: boolean }
   | { op: 'deleteContact'; conversationId: string }
   | { op: 'markContacted'; conversationId: string }
+  // Record a quick action's webhook POST in the contact's history ('w' sent,
+  // 'x' failed). `arg` is the HTTP status, or a short failure reason.
+  | { op: 'logWebhook'; conversationId: string; ok: boolean; arg?: string; at: number }
   | { op: 'setResolvedThread'; conversationId: string; threadId: string; chatUrl?: string }
   // Point a contact at a chat URL that has just been proven to work, without
   // touching its thread ids — the e2ee repair, where the id was right all along
@@ -557,6 +560,16 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
       // on a contact merge or a CSV import, neither of which sent anything.
       next.history = { ...(store.history || {}) };
       next.history[m.conversationId] = appendHistory(next.history[m.conversationId], [{ at: now, op: 'm' }]);
+      return { store: next, changed: true, conversationId: m.conversationId };
+    }
+
+    case 'logWebhook': {
+      if (!store.conversations[m.conversationId]) return { store, changed: false };
+      const next = copy(store);
+      next.history = { ...(store.history || {}) };
+      next.history[m.conversationId] = appendHistory(next.history[m.conversationId], [
+        { at: m.at, op: m.ok ? 'w' : 'x', ...(m.arg ? { arg: m.arg } : {}) },
+      ]);
       return { store: next, changed: true, conversationId: m.conversationId };
     }
 

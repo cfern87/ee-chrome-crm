@@ -802,6 +802,8 @@ function describeHistoryEvent(e: HistoryEvent, store: Store): React.ReactNode {
   switch (e.op) {
     case 'c': return 'Added to CRM';
     case 'm': return 'Message sent';
+    case 'w': return `Sent to webhook${e.arg ? ` (HTTP ${e.arg})` : ''}`;
+    case 'x': return <span style={{ color: color.danger.base }}>Webhook failed{e.arg ? `: ${e.arg}` : ''}</span>;
     case '+':
     case '-': {
       const tag = e.arg ? store.tags[e.arg] : undefined;

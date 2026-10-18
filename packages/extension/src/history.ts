@@ -12,8 +12,10 @@
 // ENCODING. Events are comma-separated tokens: `<time><op><arg>`, where
 //   time — SECONDS since 2020-01-01 UTC in base 36, padded to 6 chars (fixed
 //          width until 2089, which is what lets tokens sort as plain strings)
-//   op   — 'c' contact added, '+' tag added, '-' tag removed, 'm' message sent
-//   arg  — the tag id for '+' / '-', empty otherwise
+//   op   — 'c' contact added, '+' tag added, '-' tag removed, 'm' message sent,
+//          'w' sent to a webhook by a quick action, 'x' that webhook failed
+//   arg  — the tag id for '+' / '-', the HTTP status for 'w', a short reason
+//          for 'x' (see webhookFailureArg), empty otherwise
 // e.g. "3ukq0ac,3ukq0c+lx3k9a4f2q,3ukqa1m". A tag event is ~22 bytes of JSON,
 // against ~70 for the same thing as an object — this map can get long.
 //
@@ -24,14 +26,30 @@
 
 import type { Conversation, Store } from './storage';
 
-export type HistoryOp = 'c' | '+' | '-' | 'm';
+export type HistoryOp = 'c' | '+' | '-' | 'm' | 'w' | 'x';
+
+const OPS = 'c+-mwx';
 
 export interface HistoryEvent {
   /** Epoch ms (stored at second precision). */
   at: number;
   op: HistoryOp;
-  /** Tag id for '+' / '-'. */
+  /** Tag id for '+' / '-'; HTTP status for 'w'; reason for 'x'. */
   arg?: string;
+}
+
+/**
+ * A webhook failure reason short enough to live in a history token: the HTTP
+ * status when there was one, else a word for what went wrong. Free text from
+ * fetch ("TypeError: Failed to fetch") would bloat every token it lands in.
+ */
+export function webhookFailureArg(d: { status?: number; error?: string }): string {
+  if (d.status) return `HTTP ${d.status}`;
+  const err = (d.error || '').toLowerCase();
+  if (err.includes('no response within')) return 'timed out';
+  if (err.includes('permission')) return 'no permission';
+  if (err.includes('url')) return 'bad URL';
+  return 'unreachable';
 }
 
 /**
@@ -59,7 +77,7 @@ function decodeToken(tok: string): HistoryEvent | null {
   if (tok.length < TIME_WIDTH + 1) return null;
   const secs = parseInt(tok.slice(0, TIME_WIDTH), 36);
   const op = tok[TIME_WIDTH] as HistoryOp;
-  if (!Number.isFinite(secs) || !'c+-m'.includes(op)) return null;
+  if (!Number.isFinite(secs) || !OPS.includes(op)) return null;
   const arg = tok.slice(TIME_WIDTH + 1);
   const at = (secs + EPOCH_S) * 1000;
   return arg ? { at, op, arg } : { at, op };

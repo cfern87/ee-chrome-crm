@@ -26,6 +26,8 @@ import type { Campaign } from '../campaigns';
 import { funnelStages } from '../funnel';
 import { emptyQuery, newCondition, type QueryGroup } from '../search';
 import { DraftInput, sendBg } from './shared';
+import { isValidWebhookUrl } from '../webhooks';
+import { ensureHostPermission } from './WebhookSettings';
 import { QueryEditor } from './SearchBuilder';
 
 const STEP_LABELS: Record<PresetStepKind, string> = {
@@ -34,6 +36,7 @@ const STEP_LABELS: Record<PresetStepKind, string> = {
   setFunnelStage: 'Add to funnel stage',
   removeFromFunnel: 'Remove from funnel',
   addToCampaign: 'Add to campaign',
+  sendWebhook: 'Send to webhook',
   appendName: 'Append to name',
   prependName: 'Prepend to name',
   setField: 'Set field',
@@ -46,7 +49,7 @@ const STEP_LABELS: Record<PresetStepKind, string> = {
 
 const STEP_ORDER: PresetStepKind[] = [
   'addTag', 'removeTag', 'setFunnelStage', 'removeFromFunnel', 'appendName', 'prependName', 'setField', 'addTask', 'completeTasks',
-  'addToCampaign', 'archive', 'unarchive', 'deleteContact',
+  'addToCampaign', 'sendWebhook', 'archive', 'unarchive', 'deleteContact',
 ];
 
 /** How many past campaigns "Use a recent campaign's message" offers. */
@@ -115,6 +118,8 @@ function blankStep(kind: PresetStepKind, store: Store): PresetStep {
       return { kind, groupId: groupsForRemoval(store)[0]?.id || '' };
     case 'addToCampaign':
       return { kind, template: '' };
+    case 'sendWebhook':
+      return { kind, url: '' };
     default:
       return { kind } as PresetStep;
   }
@@ -322,13 +327,13 @@ export function StepListEditor({ steps, store, onChange, emptyText, title = 'Act
   emptyText?: string;
   title?: string;
   /**
-   * Offer "Add to campaign". Quick actions only: an automation has its own
-   * "send a message" with per-run caps and once-per-contact, and its runner
-   * doesn't start campaigns from steps.
+   * Offer "Add to campaign" and "Send to webhook". Quick actions only: an
+   * automation has its own "send a message" with per-run caps and
+   * once-per-contact, and its runner applies store edits only.
    */
   allowCampaign?: boolean;
 }) {
-  const kinds = allowCampaign ? STEP_ORDER : STEP_ORDER.filter((k) => k !== 'addToCampaign');
+  const kinds = allowCampaign ? STEP_ORDER : STEP_ORDER.filter((k) => k !== 'addToCampaign' && k !== 'sendWebhook');
   const tags = Object.values(store.tags).sort((a, b) => a.name.localeCompare(b.name));
   const fields = Object.values(store.fieldDefs).sort((a, b) => a.order - b.order);
   const hasFunnels = funnelStages(store.tags, store.tagGroups).length > 0;
@@ -589,6 +594,8 @@ function StepRow({ step, store, kinds, tags, fields, onChange, onRemove, onMove 
         </>
       )}
 
+      {step.kind === 'sendWebhook' && <WebhookStepFields step={step} onChange={onChange} />}
+
       <div style={{ marginLeft: 'auto', display: 'flex', gap: space.xxs }}>
         {!step.when && (
           <Button
@@ -712,6 +719,59 @@ function CampaignStepEditor({ step, onChange }: {
         />
       </Stack>
     </Stack>
+  );
+}
+
+type WebhookStep = Extract<PresetStep, { kind: 'sendWebhook' }>;
+
+/**
+ * The POST URL for a "Send to webhook" step, and a test button. Host
+ * permission is asked for here, on the click that saves or tests the URL —
+ * chrome.permissions.request needs a user gesture on an extension page, and
+ * the Messenger panel, where the button is usually pressed, can't ask.
+ */
+function WebhookStepFields({ step, onChange }: {
+  step: WebhookStep;
+  onChange: (next: PresetStep) => void;
+}) {
+  const [testing, setTesting] = useState(false);
+  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const invalid = step.url.trim() ? isValidWebhookUrl(step.url) : null;
+
+  const test = async () => {
+    setTesting(true);
+    setResult(null);
+    const granted = await ensureHostPermission(step.url);
+    const res = await sendBg<{ ok: boolean; status?: number; error?: string }>(
+      { type: 'TEST_PRESET_WEBHOOK', payload: { url: step.url, presetLabel: 'Test' } },
+      20000,
+    );
+    setTesting(false);
+    if (!res) { setResult({ ok: false, text: 'The extension background didn’t respond — try again.' }); return; }
+    setResult(res.ok
+      ? { ok: true, text: `Test payload delivered${res.status ? ` (HTTP ${res.status})` : ''}.` }
+      : { ok: false, text: `Test failed: ${res.error || 'no response'}${granted ? '' : ' — Chrome wasn’t given permission to reach this host'}.` });
+  };
+
+  return (
+    <>
+      <DraftInput
+        value={step.url}
+        aria-label="Webhook POST URL"
+        onCommit={(url) => {
+          setResult(null);
+          onChange({ ...step, url: url.trim() });
+          if (url.trim() && !isValidWebhookUrl(url)) void ensureHostPermission(url);
+        }}
+        placeholder="https://example.com/hook"
+        style={{ width: 260 }}
+      />
+      <Button size="sm" variant="secondary" onClick={test} disabled={!step.url.trim() || !!invalid || testing}>
+        {testing ? 'Sending…' : 'Send test'}
+      </Button>
+      {invalid && <Text size="micro" tone="danger">{invalid}</Text>}
+      {result && <Text size="micro" tone={result.ok ? 'success' : 'danger'}>{result.text}</Text>}
+    </>
   );
 }
 

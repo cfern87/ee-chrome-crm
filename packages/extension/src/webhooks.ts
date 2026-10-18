@@ -46,7 +46,10 @@ export type WebhookEvent =
   | 'campaign.started'
   | 'campaign.completed'
   | 'message.sent'
-  | 'message.failed';
+  | 'message.failed'
+  // Sent by a quick action's "Send to webhook" step, not by a subscription —
+  // so it is deliberately absent from WEBHOOK_EVENTS below.
+  | 'preset.action';
 
 export interface WebhookEventDef {
   event: WebhookEvent;
@@ -294,6 +297,35 @@ export function buildPayload(hook: WebhookConfig, event: WebhookEvent, data: Rec
     data,
   };
 }
+
+/**
+ * A stand-in webhook for a quick action's "Send to webhook" step, so the step
+ * goes through the same deliver() — same headers, same timeout, same
+ * never-throws — as a subscribed webhook. Never stored.
+ */
+export function presetHook(url: string, presetLabel: string): WebhookConfig {
+  return { id: 'preset', url: url.trim(), events: ['preset.action'], enabled: true, name: presetLabel, createdAt: 0 };
+}
+
+/** The `preset.action` payload for one contact (or the test contact). */
+export function buildPresetPayload(
+  hook: WebhookConfig,
+  presetLabel: string,
+  contact: WebhookContact,
+  test = false,
+): WebhookPayload {
+  return buildPayload(hook, 'preset.action', {
+    preset: presetLabel,
+    contact,
+    ...(test ? { test: true, note: 'Test delivery from Not Another Social CRM. No CRM data changed.' } : {}),
+  });
+}
+
+/** What the test button sends in place of a real contact. */
+export const TEST_CONTACT: WebhookContact = {
+  id: 'test_contact', name: 'Test Contact', tags: ['example'], archived: false,
+  chatUrl: 'https://www.facebook.com/messages/t/0/',
+};
 
 // ---------------------------------------------------------------------------
 // Change detection

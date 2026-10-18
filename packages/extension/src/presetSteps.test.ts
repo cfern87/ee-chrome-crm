@@ -2,8 +2,9 @@
 // "set funnel step" action. The merge side of presets is in presets.test.ts.
 
 import { describe, it, expect } from 'vitest';
-import { stepsFor, readPresetActions, campaignSendsFor, needsConfirm, PRESET_ACTIONS_KEY, type PresetAction, type PresetStep } from './presets';
+import { stepsFor, readPresetActions, campaignSendsFor, webhookSendsFor, needsConfirm, PRESET_ACTIONS_KEY, type PresetAction, type PresetStep } from './presets';
 import { applyMutations } from './mutations';
+import { parseHistory, webhookFailureArg } from './history';
 import { EMPTY_STORE, type Conversation, type Store, type Tag, type TagGroup } from './storage';
 import type { QueryGroup } from './search';
 
@@ -171,5 +172,44 @@ describe('add to campaign', () => {
   it('survives a round trip through settings', () => {
     const settings = { [PRESET_ACTIONS_KEY]: [preset([{ kind: 'addToCampaign', template: 'Hi', dryRun: true }])] };
     expect(readPresetActions({ settings })[0].steps).toEqual([{ kind: 'addToCampaign', template: 'Hi', dryRun: true }]);
+  });
+});
+
+describe('send to webhook', () => {
+  const contact = (id: string, tags: string[]): Conversation => ({ ...conv(tags), id });
+
+  it('collects every matching contact of a bulk press under one URL', () => {
+    const a = contact('a', ['lead']);
+    const b = contact('b', ['vip']);
+    const store = { ...storeWith(a), conversations: { a, b } };
+    const p = preset([{ kind: 'sendWebhook', url: ' https://x.test/h ', when: hasTag('lead') }]);
+    expect(webhookSendsFor(p, [a, b], store)).toEqual([{ url: 'https://x.test/h', conversationIds: ['a'] }]);
+  });
+
+  it('is not a store edit, needs no confirmation, and a blank URL sends nothing', () => {
+    const a = contact('a', []);
+    const store = storeWith(a);
+    const p = preset([{ kind: 'sendWebhook', url: 'https://x.test/h' }]);
+    expect(stepsFor(p, a, store)).toEqual([]);
+    expect(needsConfirm(p)).toBe(false);
+    expect(webhookSendsFor(preset([{ kind: 'sendWebhook', url: '' }]), [a], store)).toEqual([]);
+  });
+
+  it('logs sent and failed POSTs in the contact history', () => {
+    const a = contact('a', []);
+    const store = storeWith(a);
+    const out = applyMutations(store, [
+      { op: 'logWebhook', conversationId: 'a', ok: true, arg: '200', at: 1_700_000_000_000 },
+      { op: 'logWebhook', conversationId: 'a', ok: false, arg: 'HTTP 500', at: 1_700_000_005_000 },
+      { op: 'logWebhook', conversationId: 'gone', ok: false, at: 1_700_000_005_000 },
+    ]);
+    expect(parseHistory(out.store.history?.a).map((e) => [e.op, e.arg])).toEqual([['w', '200'], ['x', 'HTTP 500']]);
+    expect(out.store.history?.gone).toBeUndefined();
+  });
+
+  it('turns delivery failures into short reasons', () => {
+    expect(webhookFailureArg({ status: 404 })).toBe('HTTP 404');
+    expect(webhookFailureArg({ error: 'No response within 10s' })).toBe('timed out');
+    expect(webhookFailureArg({ error: 'TypeError: Failed to fetch' })).toBe('unreachable');
   });
 });

@@ -46,7 +46,11 @@ import { TasksPanel, type TaskHandlers } from './TasksPanel';
 import { Resizer } from '../ui/SplitPane';
 import { useLocalPref } from '../ui/prefs';
 import { tint, onColor } from '../ui/contrast';
-import { readPresetActions, stepsFor, describePreset, isDestructive, needsConfirm, campaignSendsFor, type PresetAction } from '../presets';
+import {
+  readPresetActions, stepsFor, describePreset, isDestructive, needsConfirm, campaignSendsFor, webhookSendsFor,
+  type PresetAction, type PresetWebhookSend,
+} from '../presets';
+import { ensureHostPermission } from './WebhookSettings';
 import {
   MessagingPanel, ActiveCampaignsView, HistoryPanel, NotificationsDrawer, holdOf, OnlineDot, QueuePreview,
   type HistoryFocus, type ComposeSeed, type ComposerDraft,
@@ -341,6 +345,8 @@ export default function DashboardApp() {
   const [bulkPresetArmed, setBulkPresetArmed] = useState<string | null>(null);
   // What the last bulk quick action did, shown under the buttons.
   const [bulkPresetResult, setBulkPresetResult] = useState<string | null>(null);
+  // The result includes a failure (a webhook that didn't take), so it reads as a warning.
+  const [bulkPresetWarn, setBulkPresetWarn] = useState(false);
 
   // Pagination of the contact list. `pageSize === 0` means "show everything".
   const [page, setPage] = useState(0);
@@ -1088,6 +1094,10 @@ export default function DashboardApp() {
     const preset = readPresetActions(current).find((p) => p.id === presetId);
     setBulkPresetArmed(null);
     if (!preset) return;
+    // Asked first, while this click still counts as a user gesture — Chrome
+    // only shows the host-permission prompt from one.
+    const hookUrls = [...new Set(preset.steps.flatMap((s) => (s.kind === 'sendWebhook' && s.url.trim() ? [s.url.trim()] : [])))];
+    await Promise.all(hookUrls.map((u) => ensureHostPermission(u)));
     const now = Date.now();
     const mutations: Mutation[] = [];
     const convs: Conversation[] = [];
@@ -1105,9 +1115,19 @@ export default function DashboardApp() {
     // reads the same contact for both. Started before the edits land so a
     // preset that also deletes still has everyone to message.
     const campaignNotes = await startPresetCampaigns(preset, convs, current, now);
+    // Webhooks go after the edits so the edits show at once rather than after
+    // every POST — except when the preset deletes, where the contacts have to
+    // still exist to be sent and to have the outcome logged on them.
+    const hooks = webhookSendsFor(preset, convs, current, now);
+    const deletes = isDestructive(preset);
+    setBulkPresetWarn(false);
+    if (hooks.length) setBulkPresetResult(`Sending to webhook…`);
+    let webhookNotes: string[] = [];
+    if (deletes) webhookNotes = await sendPresetWebhooks(preset, hooks);
     if (mutations.length) await mutateStore(mutations);
+    if (!deletes) webhookNotes = await sendPresetWebhooks(preset, hooks);
     console.info(`[CRM][bulk] Applied preset "${preset.label}" to ${changed} contacts (${skipped} unchanged)`);
-    const editsOnly = preset.steps.some((s) => s.kind !== 'addToCampaign');
+    const editsOnly = preset.steps.some((s) => s.kind !== 'addToCampaign' && s.kind !== 'sendWebhook');
     setBulkPresetResult(
       [
         editsOnly
@@ -1115,6 +1135,7 @@ export default function DashboardApp() {
             (skipped ? ` · ${skipped} left unchanged (conditions not met, or nothing to change)` : '')
           : '',
         ...campaignNotes,
+        ...webhookNotes,
       ].filter(Boolean).join(' · '),
     );
     if (isDestructive(preset)) {
@@ -1151,6 +1172,34 @@ export default function DashboardApp() {
       }
     }
     if (notes.length) void refreshCampaigns();
+    return notes;
+  };
+
+  // POST each "Send to webhook" step's contacts. The background never throws
+  // and logs every outcome on the contact; a failure here only ever becomes a
+  // line in the notice, never an error that stops the rest of the preset.
+  const sendPresetWebhooks = async (preset: PresetAction, sends: PresetWebhookSend[]): Promise<string[]> => {
+    const notes: string[] = [];
+    for (const send of sends) {
+      let host = send.url;
+      try { host = new URL(send.url).host; } catch { /* shown as typed */ }
+      // Generous: one POST per contact, four at a time, each up to 10s.
+      const timeout = 30_000 + send.conversationIds.length * 3_000;
+      const res = await sendBg<{ success: boolean; sent: number; failed: number; error?: string }>({
+        type: 'SEND_PRESET_WEBHOOK',
+        payload: { url: send.url, presetLabel: preset.label, conversationIds: send.conversationIds },
+      }, timeout);
+      if (!res) {
+        setBulkPresetWarn(true);
+        notes.push(`webhook ${host}: no answer from the background yet — results will appear in each contact's history`);
+        continue;
+      }
+      if (res.failed) setBulkPresetWarn(true);
+      notes.push(
+        `webhook ${host}: ${res.sent} sent` +
+        (res.failed ? `, ${res.failed} failed${res.error ? ` (${res.error})` : ''} — logged in each contact's history` : ''),
+      );
+    }
     return notes;
   };
 
@@ -2144,8 +2193,8 @@ export default function DashboardApp() {
                         );
                       })()}
                       {bulkPresetResult && !bulkPresetArmed && (
-                        <div role="status" style={{ fontSize: 12, color: color.success.base, marginTop: 6 }}>
-                          ✓ {bulkPresetResult}
+                        <div role="status" style={{ fontSize: 12, color: bulkPresetWarn ? color.danger.base : color.success.base, marginTop: 6 }}>
+                          {bulkPresetWarn ? '⚠' : '✓'} {bulkPresetResult}
                         </div>
                       )}
                     </div>

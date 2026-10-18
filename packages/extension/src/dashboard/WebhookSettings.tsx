@@ -31,7 +31,7 @@ import { sendBg, formatRelativeTime, DraftInput } from './shared';
  * error to shout about — the user was asked and said no — so the caller
  * reports it as a plain explanation of what will happen (nothing).
  */
-async function ensureHostPermission(url: string): Promise<boolean> {
+export async function ensureHostPermission(url: string): Promise<boolean> {
   try {
     const origin = new URL(url).origin + '/*';
     if (typeof chrome === 'undefined' || !chrome.permissions?.request) return true;

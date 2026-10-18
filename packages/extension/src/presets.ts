@@ -83,6 +83,11 @@ type PresetStepBody =
   // one campaign per contact. The template is a copy, typed in or taken from a
   // recent campaign when the preset was built; it never tracks that campaign.
   | { kind: 'addToCampaign'; template: string; skipIfUnread?: boolean; dryRun?: boolean }
+  // POST the contact to a URL (webhooks.ts buildPresetPayload). Also not a
+  // store edit: the background delivers it — one POST per contact, so a bulk
+  // press of fifty is fifty POSTs — and logs each outcome in that contact's
+  // history. A failed POST never stops the rest of the preset or the batch.
+  | { kind: 'sendWebhook'; url: string }
   | { kind: 'archive' }
   | { kind: 'unarchive' }
   | { kind: 'deleteContact' };
@@ -245,6 +250,8 @@ function normalizeStepBody(raw: unknown): PresetStepBody | null {
           ...(o.dryRun === true ? { dryRun: true } : {}),
         }
         : null;
+    case 'sendWebhook':
+      return typeof o.url === 'string' ? { kind: 'sendWebhook', url: o.url } : null;
     case 'archive':
     case 'unarchive':
     case 'deleteContact':
@@ -472,7 +479,8 @@ export function stepsFor(preset: PresetAction, conv: Conversation, store: Store,
         break;
 
       case 'addToCampaign':
-        // Not a store edit — see campaignSendsFor.
+      case 'sendWebhook':
+        // Not store edits — see campaignSendsFor and webhookSendsFor.
         break;
     }
   }
@@ -534,6 +542,38 @@ export function campaignSendsFor(
   return out;
 }
 
+/** One webhook a press of a preset should POST to, and the contacts to POST. */
+export interface PresetWebhookSend {
+  url: string;
+  conversationIds: string[];
+}
+
+/**
+ * The webhook POSTs one press of `preset` on `convs` calls for — one entry per
+ * sendWebhook step, with every contact whose condition matched, read from the
+ * same pre-press snapshot as stepsFor. Steps with no URL, or nobody matching,
+ * are left out.
+ */
+export function webhookSendsFor(
+  preset: PresetAction,
+  convs: Conversation[],
+  store: Store,
+  now = Date.now(),
+): PresetWebhookSend[] {
+  const ctx: QueryContext = { now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs };
+  const out: PresetWebhookSend[] = [];
+  for (const step of preset.steps) {
+    if (step.kind !== 'sendWebhook' || !step.url.trim()) continue;
+    const ids = new Set<string>();
+    for (const conv of convs) {
+      if (step.when && !matchesQuery(conv, step.when, ctx)) continue;
+      ids.add(conv.id);
+    }
+    if (ids.size) out.push({ url: step.url.trim(), conversationIds: [...ids] });
+  }
+  return out;
+}
+
 /** One-line plain-English rendering of a preset, for the settings list and the button tooltip. */
 export function describePreset(preset: PresetAction, store: Store): string {
   if (preset.steps.length === 0) return 'Does nothing yet — add some actions.';
@@ -565,6 +605,10 @@ export function describePreset(preset: PresetAction, store: Store): string {
         const first = (s.template.split('\n')[0] || '').trim();
         if (!first) return 'add to campaign (no message yet)';
         return `add to campaign "${first.length > 40 ? `${first.slice(0, 40)}…` : first}"${s.dryRun ? ' (dry run)' : ''}`;
+      }
+      case 'sendWebhook': {
+        if (!s.url.trim()) return 'send to webhook (no URL yet)';
+        try { return `send to webhook ${new URL(s.url).host}`; } catch { return 'send to webhook (bad URL)'; }
       }
     }
   }

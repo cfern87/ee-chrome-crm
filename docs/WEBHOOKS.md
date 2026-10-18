@@ -164,6 +164,20 @@ over normal operation.
 > **`dryRun: true`** means the message was typed into the conversation but never
 > actually sent. Don't treat a dry-run `message.sent` as real outreach.
 
+### Quick action event
+
+| Event | `data` |
+| --- | --- |
+| `preset.action` | `preset` (the quick action's label), `contact: { … }`, and `test: true` + `note` on a test |
+
+Not a subscription: this comes from a quick action's **Send to webhook** step,
+which POSTs straight to the URL typed into that step (no token header, and
+nothing to tick in Settings → Webhooks). A press sends one request per contact,
+so a bulk press on 50 contacts is 50 requests, four at a time. Each outcome —
+sent with its HTTP status, or failed with a short reason — is written to that
+contact's history in the dashboard. A failed request is never retried and never
+stops the rest of the quick action or the other contacts.
+
 ---
 
 ## 4. Security — read this

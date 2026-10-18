@@ -21,8 +21,8 @@ import type { Store, Tag, Conversation, CustomFieldDef, TagGroup } from './stora
 import { bucketTags, showsGroupLabels, tagDisplayOrder, type TagBucket } from './tagGrouping';
 import { funnelsFor, stageEditsFor, isNoOpStageEdit, describeStage, stagePosition, stageTitle, type FunnelView } from './funnel';
 import {
-  readPresetActions, stepsFor, describePreset, isDestructive, needsConfirm, campaignSendsFor,
-  type PresetAction, type PresetCampaignSend,
+  readPresetActions, stepsFor, describePreset, isDestructive, needsConfirm, campaignSendsFor, webhookSendsFor,
+  type PresetAction, type PresetCampaignSend, type PresetWebhookSend,
 } from './presets';
 import {
   openTasksOf, sortTasks, isOverdue, formatDue, priorityOf, newTask, dueFromOffset, inputsToDue, TASK_TITLE_MAX,
@@ -1583,6 +1583,21 @@ async function queuePresetCampaign(send: PresetCampaignSend): Promise<{ text: st
 }
 
 /**
+ * POST this contact for a "Send to webhook" step. The background delivers,
+ * logs the outcome in the contact's history, and never throws; this only
+ * turns its answer into the panel's one-line notice.
+ */
+async function sendPanelWebhook(send: PresetWebhookSend, presetLabel: string): Promise<{ text: string; error: boolean }> {
+  const res = await sendBg<{ success: boolean; sent: number; failed: number; error?: string }>({
+    type: 'SEND_PRESET_WEBHOOK',
+    payload: { url: send.url, presetLabel, conversationIds: send.conversationIds },
+  }, 30_000);
+  if (!res) return { text: 'Webhook: no answer yet — the result will show in this contact’s history.', error: true };
+  if (res.failed) return { text: `Webhook failed${res.error ? ` (${res.error})` : ''} — logged in this contact’s history.`, error: true };
+  return { text: 'Sent to webhook.', error: false };
+}
+
+/**
  * Follow-ups for this contact: open tasks with a tick box, and a one-line
  * "add" row. Deliberately the quick version — title and a due-date shortcut.
  * Notes, times, priority and editing live in the dashboard; the panel is where
@@ -2284,12 +2299,27 @@ function wirePanelActions(threadId: string) {
     // "Add to campaign" reads the same pre-press snapshot as the edits, and is
     // queued before them so a preset that also deletes still has a contact.
     const sends = campaignSendsFor(preset, [conv], store);
+    const hooks = webhookSendsFor(preset, [conv], store);
     presetArmed = null; presetNotice = null;
-    for (const send of sends) presetNotice = await queuePresetCampaign(send);
+    const notes: { text: string; error: boolean }[] = [];
+    for (const send of sends) notes.push(await queuePresetCampaign(send));
+    // Webhooks after the edits, so the panel updates without waiting on an
+    // endpoint — unless the preset deletes, when the contact must still exist
+    // to be sent and logged.
+    const deletes = isDestructive(preset);
+    if (deletes) for (const h of hooks) notes.push(await sendPanelWebhook(h, preset.label));
     if (mutations.length) {
       await mutate(mutations);
       console.info(`[CRM] Applied preset "${preset.label}" to ${threadId}: ${describePreset(preset, store)}`);
     }
+    if (!deletes && hooks.length) {
+      presetNotice = { text: 'Sending to webhook…', error: false };
+      await renderPanel();
+      for (const h of hooks) notes.push(await sendPanelWebhook(h, preset.label));
+    }
+    presetNotice = notes.length
+      ? { text: notes.map((n) => n.text).join(' '), error: notes.some((n) => n.error) }
+      : null;
     await renderPanel();
     await injectSidebarTags();
   });
