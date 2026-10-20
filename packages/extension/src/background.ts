@@ -66,6 +66,7 @@ import {
   collectUnseenFailures,
   readNoticeState,
   summarize,
+  postedUnconfirmed,
 } from './campaigns';
 import {
   heartbeat,
@@ -648,7 +649,7 @@ async function ensureSenderTab(chatUrl: string, log: string[]): Promise<number |
   return tabId!;
 }
 
-interface SendResult { ok: boolean; error?: string; failureKind?: SendFailureKind; log: string[] }
+interface SendResult { ok: boolean; error?: string; failureKind?: SendFailureKind; deliveryStatus?: string; log: string[] }
 
 // The chat URL to navigate to for a recipient. A campaign snapshots each
 // recipient's chatUrl at creation time, but a contact's Facebook profile/chat
@@ -729,7 +730,12 @@ async function recordChatUrl(conversationId: string, chatUrl: string, log: strin
 // Outcome of one attempt, minus the log — every step here appends to a single
 // shared log array instead, so the diagnostics stay in chronological order
 // across the first attempt and both recovery paths.
-interface Attempt { ok: boolean; error?: string; failureKind?: SendFailureKind }
+//
+// `deliveryStatus` is only set once the message's bubble appeared in the
+// thread — i.e. Messenger took it. See postedUnconfirmed.
+interface Attempt { ok: boolean; error?: string; failureKind?: SendFailureKind; deliveryStatus?: string }
+
+const POSTED_UNCONFIRMED_NOTE = 'message was posted but Facebook never showed a status — not retried, to avoid sending it twice';
 
 // How a retry decides an already-present copy of the message counts as
 // delivered; see the DupGuard comment in content.ts. Only the retries pass one.
@@ -749,17 +755,31 @@ function dupGuardFor(first: Attempt): DupGuard {
 }
 
 // One send attempt against an already-open chat page.
-async function attemptSend(tabId: number, r: Campaign['recipients'][number], dryRun: boolean, skipIfDelivered: DupGuard | undefined, log: string[], opts: SendGate = {}): Promise<Attempt> {
+async function attemptSend(tabId: number, r: Campaign['recipients'][number], dryRun: boolean, skipIfDelivered: DupGuard | undefined, log: string[], opts: SendGate = {}, reloaded = false): Promise<Attempt> {
   const res = await sendViaPort<SendResult>(tabId, {
     type: 'CRM_SEND_MESSAGE',
     payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered, skipIfUnread: opts.skipIfUnread },
   }, 120_000);
   if (!res) {
     log.push('send port closed without a response');
+    // Usually the Continue interstitial: an account-id URL opens the
+    // pre-encryption archive, and clicking Continue can be a full page load
+    // into the live e2ee chat, which kills the script mid-request. The tab is
+    // then sitting on the right conversation, so finish there — once, and with
+    // a duplicate guard in case the script got as far as sending.
+    if (!reloaded) {
+      const url = (await getTab(tabId))?.url || '';
+      if (/\/messages\/(e2ee\/)?t\//.test(url)) {
+        log.push(`page reloaded into ${url} — sending there`);
+        if (await waitForContentReady(tabId, log, 'messages')) {
+          return attemptSend(tabId, r, dryRun, skipIfDelivered || 'not-failed', log, opts, true);
+        }
+      }
+    }
     return { ok: false, error: 'No response from content script (tab closed or send timed out)' };
   }
   log.push(...(res.log || []));
-  return { ok: res.ok, error: res.error, failureKind: res.failureKind };
+  return { ok: res.ok, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus };
 }
 
 // ---- Recovery: repair the conversation link via the contact's profile ----
@@ -804,6 +824,10 @@ async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: bool
     if (tabId != null && (await waitForContentReady(tabId, log, 'messages'))) {
       const retry = await attemptSend(tabId, r, dryRun, guard, log, opts);
       if (retry.ok) return retry;
+      if (postedUnconfirmed(retry)) {
+        log.push(`recovery: ${POSTED_UNCONFIRMED_NOTE}`);
+        return retry;
+      }
       log.push(`recovery: resolved-thread retry failed (${retry.error || 'unknown'}) — falling back to the profile drawer`);
     }
   } else if (!resolved?.ok) {
@@ -835,7 +859,7 @@ async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: bool
   if (!drawer || (!drawer.ok && drawer.failureKind === 'no-composer')) {
     const tab = await getTab(drawerTabId);
     const url = tab?.url || '';
-    if (/\/messages\/t\//.test(url)) {
+    if (/\/messages\/(e2ee\/)?t\//.test(url)) {
       log.push(`recovery: Message opened a full conversation (${url}) — sending there instead`);
       if (await waitForContentReady(drawerTabId, log, 'messages')) {
         return await attemptSend(drawerTabId, r, dryRun, guard, log, opts);
@@ -847,7 +871,7 @@ async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: bool
     log.push('recovery: no response from the drawer send');
     return null;
   }
-  return { ok: drawer.ok, error: drawer.error, failureKind: drawer.failureKind };
+  return { ok: drawer.ok, error: drawer.error, failureKind: drawer.failureKind, deliveryStatus: drawer.deliveryStatus };
 }
 
 // A first attempt that ended in anything other than a confirmed "sent" gets the
@@ -882,6 +906,10 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
     first = await attemptSend(tabId, r, dryRun, undefined, log, gate);
   }
   if (first.ok) return { ok: true, log };
+  if (postedUnconfirmed(first)) {
+    log.push(POSTED_UNCONFIRMED_NOTE);
+    return { ok: false, error: 'Posted, but Facebook never showed it as sent — check the conversation', failureKind: 'unconfirmed', log };
+  }
   if (!shouldRecover(first)) return { ok: false, error: first.error, failureKind: first.failureKind, log };
 
   // Cheapest repair first: the same id on the encrypted route. An e2ee thread
@@ -903,6 +931,10 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
           await recordChatUrl(r.threadId, e2eeUrl, log);
           return { ok: true, log };
         }
+        if (postedUnconfirmed(retry)) {
+          log.push(POSTED_UNCONFIRMED_NOTE);
+          return { ok: false, error: 'Posted, but Facebook never showed it as sent — check the conversation', failureKind: 'unconfirmed', log };
+        }
         log.push(`e2ee retry failed (${retry.error || 'unknown'}) — falling back to profile recovery`);
       }
     }
@@ -911,6 +943,9 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
   // Not confirmed sent. Try to repair the conversation link via the profile.
   const recovery = await recoverViaProfile(r, dryRun, dupGuardFor(first), log, gate);
   if (recovery?.ok) return { ok: true, log };
+  if (recovery && postedUnconfirmed(recovery)) {
+    return { ok: false, error: 'Posted, but Facebook never showed it as sent — check the conversation', failureKind: 'unconfirmed', log };
+  }
 
   // Recovery couldn't run, or ran and also failed — either way this is a real
   // failure now and is recorded as one, with the whole trail attached.

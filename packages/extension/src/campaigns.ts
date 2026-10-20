@@ -521,6 +521,17 @@ export function matchingRecipients(c: Campaign, query: string): CampaignRecipien
 }
 
 /** Everyone in this campaign whose send failed and could be tried again. */
+// The bubble appeared but no verdict could be read. That is NOT a failure to
+// send: measured live 2026-10-18, these were delivered every time — the status
+// just sat further up the DOM than the reader looked. Retrying through another
+// route then delivers a second copy (Meghan Richey, Kristin Wood Hasselblad),
+// because the drawer's history is still "Loading..." when the duplicate check
+// runs. So once a bubble has posted, nothing sends again for this recipient.
+// `deliveryStatus` is only ever set after the bubble posted.
+export function postedUnconfirmed(a: { ok: boolean; deliveryStatus?: string }): boolean {
+  return !a.ok && (a.deliveryStatus === 'unknown' || a.deliveryStatus === 'pending');
+}
+
 export function failedRecipients(c: Campaign): CampaignRecipient[] {
   return c.recipients.filter((r) => r.status === 'error');
 }

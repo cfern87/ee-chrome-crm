@@ -3,7 +3,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   campaignMatchesQuery, matchingRecipients, failedRecipients, collectUnseenFailures,
-  failureReport, capLog, MAX_LOG_LINES,
+  failureReport, capLog, MAX_LOG_LINES, postedUnconfirmed,
   type Campaign, type CampaignRecipient,
 } from './campaigns';
 
@@ -178,5 +178,18 @@ describe('capLog', () => {
 
   it('leaves a short log alone', () => {
     expect(capLog(['a', 'b'])).toEqual(['a', 'b']);
+  });
+});
+
+describe('postedUnconfirmed', () => {
+  it('stops retries once a bubble posted without a readable verdict', () => {
+    expect(postedUnconfirmed({ ok: false, deliveryStatus: 'unknown' })).toBe(true);
+    expect(postedUnconfirmed({ ok: false, deliveryStatus: 'pending' })).toBe(true);
+  });
+
+  it('still allows recovery when nothing posted or Facebook said it failed', () => {
+    expect(postedUnconfirmed({ ok: false })).toBe(false);
+    expect(postedUnconfirmed({ ok: false, deliveryStatus: 'failed' })).toBe(false);
+    expect(postedUnconfirmed({ ok: true, deliveryStatus: 'sent' })).toBe(false);
   });
 });

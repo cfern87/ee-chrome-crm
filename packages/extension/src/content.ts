@@ -3509,13 +3509,27 @@ function findMessageNodes(scope: HTMLElement, target: string): HTMLElement[] {
   return hits.filter((el) => !hits.some((other) => other !== el && el.contains(other)));
 }
 
+// How far above the text a bubble's status can sit. Was 8, which is too short
+// for an e2ee bubble carrying a link: measured live 2026-10-18, its "Seen by"
+// receipt was 11 levels up. Every such send then read 'unknown', and recovery
+// sent the message again through the drawer — Meghan Richey got it twice.
+const STATUS_WALK_MAX = 16;
+
+// Each message row carries one "Message actions" toolbar, present in the DOM
+// without hovering. An element holding two of them spans two messages, and
+// anything read from it may be the other message's status.
+function spansSeveralMessages(el: HTMLElement): boolean {
+  return el.querySelectorAll('[aria-label="Message actions"]').length > 1;
+}
+
 // Walk out from a bubble looking for its status. The first status found wins
 // and we stop: climbing further would eventually reach a container holding the
-// NEXT message's status and read that instead. The size cap is the same guard
-// for elements that jump straight from the bubble to a big pane.
+// NEXT message's status and read that instead. The size cap and the row check
+// are what keep the longer walk from doing exactly that.
 function statusForMessageNode(node: HTMLElement, target: string, scope: HTMLElement): DeliveryStatus {
   let el: HTMLElement | null = node;
-  for (let i = 0; i < 8 && el; i++) {
+  for (let i = 0; i < STATUS_WALK_MAX && el; i++) {
+    if (spansSeveralMessages(el)) break;
     const fragments = statusFragments(el, target);
     const total = fragments.reduce((n, f) => n + f.length, 0);
     if (total > 300) break; // dragging in neighbouring messages — stop
@@ -3535,7 +3549,7 @@ function deliveryStatusDetail(scope: HTMLElement, target: string): string {
   const nodes = findMessageNodes(scope, target);
   let el: HTMLElement | null = nodes[nodes.length - 1] || null;
   const seen: string[] = [];
-  for (let i = 0; i < 8 && el; i++) {
+  for (let i = 0; i < STATUS_WALK_MAX && el && !spansSeveralMessages(el); i++) {
     for (const f of statusFragments(el, target)) if (!seen.includes(f)) seen.push(f);
     if (seen.join(' | ').length > 300 || el === scope) break;
     el = el.parentElement;
