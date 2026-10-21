@@ -3568,14 +3568,14 @@ function deliveryStatuses(scope: HTMLElement, target: string): DeliveryStatus[] 
 // SEND_PORT_TIMEOUT_MS for the whole send, which has to cover this too.
 const DELIVERY_STATUS_TIMEOUT_MS = 60_000;
 
-async function pollDeliveryStatus(scope: HTMLElement, target: string, timeoutMs: number): Promise<DeliveryStatus> {
+async function pollDeliveryStatus(paneOf: () => HTMLElement, target: string, timeoutMs: number): Promise<DeliveryStatus> {
   const terminal = await pollFor(() => {
-    const all = deliveryStatuses(scope, target);
+    const all = deliveryStatuses(paneOf(), target);
     const last = all[all.length - 1];
     return last === 'sent' || last === 'failed' ? last : null;
   }, timeoutMs, 500);
   if (terminal) return terminal;
-  const all = deliveryStatuses(scope, target);
+  const all = deliveryStatuses(paneOf(), target);
   return all.length ? all[all.length - 1] : 'unknown';
 }
 
@@ -4231,7 +4231,12 @@ async function typeSendAndConfirm(
   opts: SendOptions,
   // Re-locate the composer inside this same conversation. Messenger can replace
   // the element on send, and a retry aimed at the detached node does nothing.
-  refind?: () => HTMLElement | null
+  refind?: () => HTMLElement | null,
+  // Re-locate `scope` if Messenger swaps it out. The first message to someone
+  // creates the conversation, and the pane can re-render around it: the bubble
+  // is seen in the old pane, and then the status lands in a new one that a
+  // detached `scope` never sees — 'unknown' on a message that was delivered.
+  rescope?: () => HTMLElement | null
 ): Promise<{ ok: boolean; error?: string; failureKind?: SendFailureKind; deliveryStatus?: DeliveryStatus }> {
   const target = normalizeText(message);
 
@@ -4267,6 +4272,18 @@ async function typeSendAndConfirm(
       };
     }
   }
+
+  let pane = scope;
+  const livePane = (): HTMLElement => {
+    if (!pane.isConnected && rescope) {
+      const next = rescope();
+      if (next && next !== pane) {
+        stamp('conversation pane was re-rendered — following the new one');
+        pane = next;
+      }
+    }
+    return pane;
+  };
 
   // Snapshot the thread so we can detect the NEW outgoing bubble afterwards.
   const beforeCount = findMessageNodes(scope, target).length;
@@ -4363,7 +4380,7 @@ async function typeSendAndConfirm(
     // detached node that still holds the text, so it never looked cleared.
     // findMessageNodes ignores anything inside a contenteditable, so a bubble
     // count can only go up when a message is actually posted.
-    const bubbleCount = () => findMessageNodes(scope, target).length;
+    const bubbleCount = () => findMessageNodes(livePane(), target).length;
 
     let confirmed = await pollFor(() => bubbleCount() > beforeCount, 10_000, 400);
     if (!confirmed) {
@@ -4379,7 +4396,7 @@ async function typeSendAndConfirm(
       const live = refind?.() || composer;
       stamp(
         `FAILED bubblesAfter=${bubbleCount()} composerLen=${composerText(live).length} ` +
-        `scopeTextLen=${(scope.innerText || '').length} scopeTail="${normalizeText(scope.innerText || '').slice(-160)}"`
+        `scopeTextLen=${(livePane().innerText || '').length} scopeTail="${normalizeText(livePane().innerText || '').slice(-160)}"`
       );
       return { ok: false, error: 'Could not confirm message was delivered', failureKind: 'unconfirmed' };
     }
@@ -4396,11 +4413,11 @@ async function typeSendAndConfirm(
   // delivered link message there read 'unknown'. Hence the long wait, and the
   // elapsed time in the log so the next measurement is free.
   const statusStarted = Date.now();
-  const status = await pollDeliveryStatus(scope, target, DELIVERY_STATUS_TIMEOUT_MS);
+  const status = await pollDeliveryStatus(livePane, target, DELIVERY_STATUS_TIMEOUT_MS);
   stamp(`deliveryStatus=${status} after ${Math.round((Date.now() - statusStarted) / 1000)}s`);
   if (status === 'failed') {
-    stamp(`failure text: "${deliveryStatusDetail(scope, target)}"`);
-    stamp(`scopeAfter="${normalizeText(scope.innerText || '').slice(-400)}"`);
+    stamp(`failure text: "${deliveryStatusDetail(livePane(), target)}"`);
+    stamp(`scopeAfter="${normalizeText(livePane().innerText || '').slice(-400)}"`);
     return {
       ok: false,
       error: "Facebook couldn't send the message (the conversation link didn't resolve)",
@@ -4521,7 +4538,8 @@ async function performAutomatedSend(threadId: string, rawMessage: string, dryRun
     stamp(`thread is a "Facebook user" placeholder — this id is not the contact's conversation; nothing typed`);
     return { ok: false, error: 'Saved chat link opens an empty "Facebook user" conversation', failureKind: 'unconfirmed', log };
   }
-  const res = await typeSendAndConfirm(composer, scope, message, dryRun, stamp, opts, () => findComposer());
+  const res = await typeSendAndConfirm(composer, scope, message, dryRun, stamp, opts, () => findComposer(),
+    () => document.querySelector('[role="main"]') as HTMLElement | null);
   if (!res.ok) {
     return { ok: false, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus, log };
   }
