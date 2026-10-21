@@ -754,12 +754,18 @@ function dupGuardFor(first: Attempt): DupGuard {
   return first.failureKind === 'not-delivered' ? 'sent-only' : 'not-failed';
 }
 
+// How long one content-script send may take, end to end: finding the composer
+// (12s), a Continue interstitial (15s), typing, bubble confirmation (18s) and
+// then up to 60s for Facebook's verdict on a link message (see
+// DELIVERY_STATUS_TIMEOUT_MS in content.ts). 120s no longer covered that.
+const SEND_PORT_TIMEOUT_MS = 180_000;
+
 // One send attempt against an already-open chat page.
 async function attemptSend(tabId: number, r: Campaign['recipients'][number], dryRun: boolean, skipIfDelivered: DupGuard | undefined, log: string[], opts: SendGate = {}, reloaded = false): Promise<Attempt> {
   const res = await sendViaPort<SendResult>(tabId, {
     type: 'CRM_SEND_MESSAGE',
     payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered, skipIfUnread: opts.skipIfUnread },
-  }, 120_000);
+  }, SEND_PORT_TIMEOUT_MS);
   if (!res) {
     log.push('send port closed without a response');
     // Usually the Continue interstitial: an account-id URL opens the
@@ -848,7 +854,7 @@ async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: bool
   const drawer = await sendViaPort<SendResult>(drawerTabId, {
     type: 'CRM_SEND_VIA_DRAWER',
     payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered: guard, skipIfUnread: opts.skipIfUnread },
-  }, 120_000);
+  }, SEND_PORT_TIMEOUT_MS);
   if (drawer) log.push(...(drawer.log || []));
 
   // Some layouts answer the Message button with a navigation to the full

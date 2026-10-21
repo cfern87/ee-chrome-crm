@@ -3564,6 +3564,10 @@ function deliveryStatuses(scope: HTMLElement, target: string): DeliveryStatus[] 
 // Status of the LAST copy of the message in the thread — the one we just sent.
 // Polls until it settles on a terminal value, since Messenger shows "Sending…"
 // first and only then resolves to Sent or Couldn't send.
+// See the measurement where this is used. The background's send port allows
+// SEND_PORT_TIMEOUT_MS for the whole send, which has to cover this too.
+const DELIVERY_STATUS_TIMEOUT_MS = 60_000;
+
 async function pollDeliveryStatus(scope: HTMLElement, target: string, timeoutMs: number): Promise<DeliveryStatus> {
   const terminal = await pollFor(() => {
     const all = deliveryStatuses(scope, target);
@@ -4384,8 +4388,16 @@ async function typeSendAndConfirm(
   }
 
   // Step two: Facebook's own verdict on the bubble we just added.
-  const status = await pollDeliveryStatus(scope, target, 15_000);
-  stamp(`deliveryStatus=${status}`);
+  //
+  // A message with a link carries no status at all until its preview has been
+  // built — measured live 2026-10-21: bubble, then ~3s of nothing, "Sending",
+  // then "Sent", in a classic thread. E2ee threads build the preview in the
+  // browser and took longer than the 15s this used to allow, so every
+  // delivered link message there read 'unknown'. Hence the long wait, and the
+  // elapsed time in the log so the next measurement is free.
+  const statusStarted = Date.now();
+  const status = await pollDeliveryStatus(scope, target, DELIVERY_STATUS_TIMEOUT_MS);
+  stamp(`deliveryStatus=${status} after ${Math.round((Date.now() - statusStarted) / 1000)}s`);
   if (status === 'failed') {
     stamp(`failure text: "${deliveryStatusDetail(scope, target)}"`);
     stamp(`scopeAfter="${normalizeText(scope.innerText || '').slice(-400)}"`);
