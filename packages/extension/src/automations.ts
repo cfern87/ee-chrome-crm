@@ -416,7 +416,7 @@ export function matchSavedSearch(search: SavedSearch, store: Store, now = Date.n
   const pool = Object.values(store.conversations).filter((c) =>
     scope === 'all' ? true : scope === 'archived' ? c.archived : !c.archived);
   return filterByQuery(pool, normalizeQuery(search.query), {
-    now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs,
+    now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs, history: store.history,
   });
 }
 

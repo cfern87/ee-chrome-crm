@@ -794,11 +794,14 @@ interface PresetBarProps {
   onCopy: (id: string) => void;
   onDelete: (id: string) => void;
   onReorder: (id: string, delta: number) => void;
+  /** Names of the Dashboard ratio tiles that would break if this search were deleted. */
+  usedByTiles?: (id: string) => string[];
 }
 
 function PresetBar({
   savedSearches, activeId, dirty, ctx,
   onApply, onSaveNew, onUpdateActive, onRename, onTogglePin, onToggleDashboard, onCopy, onDelete, onReorder,
+  usedByTiles,
 }: PresetBarProps) {
   const [naming, setNaming] = useState(false);
   const [draftName, setDraftName] = useState('');
@@ -960,6 +963,7 @@ function PresetBar({
                         Delete?
                       </button>
                       <button onClick={() => setConfirmDelete(null)} style={iconBtn}>No</button>
+                      <DeleteTileWarning names={usedByTiles?.(p.id) ?? []} />
                     </>
                   ) : (
                     <button onClick={() => setConfirmDelete(p.id)} style={{ ...iconBtn, color: color.danger.base }}>Delete</button>
@@ -971,6 +975,26 @@ function PresetBar({
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Shown next to "Delete?" when Dashboard ratio tiles use the search: the
+ * tile would otherwise only say so after the fact, by showing "—".
+ */
+function DeleteTileWarning({ names }: { names: string[] }) {
+  if (names.length === 0) return null;
+  const quoted = names.map((n) => `“${n || 'Untitled tile'}”`);
+  const list = quoted.length <= 2 ? quoted.join(' and ') : `${quoted.slice(0, 2).join(', ')} and ${quoted.length - 2} more`;
+  return (
+    <span
+      role="alert"
+      data-delete-warning
+      style={{ flexBasis: '100%', fontSize: 11, lineHeight: 1.4, color: color.danger.base, fontWeight: 600 }}
+    >
+      ⚠ Used by the Dashboard ratio tile{names.length !== 1 ? 's' : ''} {list}. {names.length !== 1 ? 'They' : 'It'} will show “—”
+      until you pick another search in {names.length !== 1 ? 'their' : 'its'} formula.
+    </span>
   );
 }
 
@@ -1031,6 +1055,8 @@ export interface AdvancedSearchProps {
   onCopyPreset: (id: string) => void;
   onDeletePreset: (id: string) => void;
   onReorderPreset: (id: string, delta: number) => void;
+  /** Names of the Dashboard ratio tiles that would break if this search were deleted. */
+  usedByTiles?: (id: string) => string[];
   /**
    * Hide the saved-preset bar, leaving just the query editor.
    *
@@ -1073,6 +1099,7 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
           onCopy={props.onCopyPreset}
           onDelete={props.onDeletePreset}
           onReorder={props.onReorderPreset}
+          usedByTiles={props.usedByTiles}
         />
       )}
 

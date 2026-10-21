@@ -62,6 +62,8 @@ import { SettingsPanel } from './SettingsPanel';
 import { TagFilter, ConvDetail, type TagFilterMode } from './ContactDetail';
 import { TagsPanel, FieldsPanel } from './SchemaPanels';
 import { DashboardPanel } from './DashboardPanel';
+import { DASHBOARD_TILE_ORDER_KEY, readTileOrder, writeTileOrder, type TileOrder } from '../dashboardTiles';
+import { readRatioTiles, saveRatioTile, deleteRatioTile, tilesUsingSearch, type RatioTile } from '../ratioTiles';
 import { PRODUCT_NAME, PRODUCT_SLUG } from '../product';
 
 
@@ -271,6 +273,9 @@ export default function DashboardApp() {
   // order they asked for, and the timer that will write it. See reorderPreset.
   const pendingPresetOrderRef = useRef<string[] | null>(null);
   const presetOrderTimerRef = useRef<number | null>(null);
+  // Same, for the Dashboard's tile order: the stamped value not yet written.
+  const pendingTileOrderRef = useRef<TileOrder | null>(null);
+  const tileOrderTimerRef = useRef<number | null>(null);
   // Contacts written here that a read hasn't confirmed yet. See pendingEdits.ts.
   const pendingEditsRef = useRef<PendingEdits>(new Map());
   const [route, setRoute] = useState<Route>('contacts');
@@ -567,9 +572,13 @@ export default function DashboardApp() {
     // that predates it can't put the old order back under the cursor. The
     // ticket above can't cover this: the read may be legitimately newer than
     // the reorder and still not contain it, because it hasn't been written yet.
-    const reordered = pendingPresetOrderRef.current
+    const presetsReordered = pendingPresetOrderRef.current
       ? { ...s, savedSearches: applyPresetOrder(s.savedSearches, pendingPresetOrderRef.current) }
       : s;
+    // Same for an unwritten Dashboard tile reorder.
+    const reordered = pendingTileOrderRef.current
+      ? { ...presetsReordered, settings: { ...presetsReordered.settings, [DASHBOARD_TILE_ORDER_KEY]: pendingTileOrderRef.current } }
+      : presetsReordered;
     // Same argument, applied to contacts: a read that sampled the canonical
     // layer before this tab's write reached it must not paint the edit away.
     const next = overlayPendingEdits(reordered, pendingEditsRef.current, Date.now());
@@ -742,14 +751,26 @@ export default function DashboardApp() {
   // Don't lose a reorder that is still sitting in the debounce when the tab
   // goes away. Neither hook can await the write, but both start it, and the
   // background worker outlives this page.
+  // The tile-order twin of flushPresetOrder.
+  const flushTileOrder = useCallback(() => {
+    if (tileOrderTimerRef.current !== null) {
+      window.clearTimeout(tileOrderTimerRef.current);
+      tileOrderTimerRef.current = null;
+    }
+    if (!pendingTileOrderRef.current) return;
+    pendingTileOrderRef.current = null;
+    void updateStore(storeRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- updateStore closes over refs only
+  }, []);
+
   useEffect(() => {
-    const onHide = () => flushPresetOrder();
+    const onHide = () => { flushPresetOrder(); flushTileOrder(); };
     window.addEventListener('beforeunload', onHide);
     return () => {
       window.removeEventListener('beforeunload', onHide);
-      flushPresetOrder();
+      onHide();
     };
-  }, [flushPresetOrder]);
+  }, [flushPresetOrder, flushTileOrder]);
 
   // --- Conversations ---
   const conversations = Object.values(store.conversations);
@@ -794,6 +815,7 @@ export default function DashboardApp() {
     tags: store.tags,
     tagGroups: store.tagGroups,
     fieldDefs: store.fieldDefs,
+    history: store.history,
   };
   const filtered = filterByQuery(quickFiltered, query, queryCtx);
 
@@ -1472,10 +1494,55 @@ export default function DashboardApp() {
     await patchPreset(id, { onDashboard: false });
   };
 
+  // Rearrange the Dashboard's tiles (an empty list resets to the default
+  // order). Applied at once and written on a debounce, for the same reasons as
+  // reorderPreset: arrow-key moves come in bursts.
+  const reorderTiles = (ids: string[]) => {
+    const current = storeRef.current;
+    const settings = writeTileOrder(current.settings, ids);
+    const next = { ...current, settings };
+    storeSeqRef.current++;
+    pendingTileOrderRef.current = readTileOrder(settings);
+    storeRef.current = next;
+    setStore(next);
+
+    if (tileOrderTimerRef.current !== null) window.clearTimeout(tileOrderTimerRef.current);
+    tileOrderTimerRef.current = window.setTimeout(flushTileOrder, PRESET_ORDER_WRITE_MS);
+  };
+
   // Open a tile's query in the contact list. Same path as applying any preset,
   // so the list, the sort and the scope all match what the tile counted.
   const openTileInContacts = (preset: SavedSearch) => {
     applyPreset(preset);
+    setPage(0);
+    go('contacts');
+  };
+
+  // Ratio tiles live in settings as a synced collection (see ratioTiles.ts).
+  // Read from storeRef so a save straight after another write builds on it.
+  const ratioTiles = useMemo(() => readRatioTiles(store.settings), [store.settings]);
+
+  const saveRatioTileDef = async (tile: RatioTile) => {
+    const current = storeRef.current;
+    await updateStore({ ...current, settings: saveRatioTile(current.settings, tile) });
+  };
+
+  const deleteRatioTileDef = async (id: string) => {
+    const current = storeRef.current;
+    await updateStore({ ...current, settings: deleteRatioTile(current.settings, id) });
+  };
+
+  // A ratio tile's count that covers several searches at once ("in both A and
+  // B") has no preset of its own, so it opens as an unsaved query — the same
+  // state as building that query by hand in the contact list.
+  const openQueryInContacts = (view: { query: QueryGroup; archiveScope: ArchiveScope }) => {
+    const q = normalizeQuery(view.query);
+    setQuery(q);
+    setArchiveScope(view.archiveScope);
+    setActivePresetId(null);
+    setPresetBaseline(null);
+    setShowBuilder(true);
+    clearBulkSelection();
     setPage(0);
     go('contacts');
   };
@@ -2508,6 +2575,7 @@ export default function DashboardApp() {
                 onToggleDashboardPreset={(id) => patchPreset(id, { onDashboard: !store.savedSearches[id]?.onDashboard })}
                 onCopyPreset={(id) => void copyPreset(id)}
                 onDeletePreset={deletePreset}
+                usedByTiles={(id) => tilesUsingSearch(ratioTiles, id).map((t) => t.name)}
                 onReorderPreset={reorderPreset}
               />
             </div>
@@ -2529,6 +2597,12 @@ export default function DashboardApp() {
             onCreateTile={createDashboardTile}
             onUpdateTile={updateDashboardTile}
             onRemoveTile={removeDashboardTile}
+            tileOrder={readTileOrder(store.settings)?.ids ?? null}
+            onReorderTiles={reorderTiles}
+            ratioTiles={ratioTiles}
+            onSaveRatioTile={saveRatioTileDef}
+            onDeleteRatioTile={deleteRatioTileDef}
+            onOpenQueryInContacts={openQueryInContacts}
           />
         )}
 

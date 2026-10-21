@@ -2,6 +2,12 @@
 // Bumps the patch/revision version (x.y.Z -> x.y.(Z+1)) in the extension manifest,
 // which is the file Chrome reads to determine the installed version, and carries
 // that number to every other place the version is recorded.
+//
+// Run by .githooks/pre-commit on every commit to main. The revision (Z) is a
+// running count of commits that a minor release keeps counting; only a major
+// release starts it over. Set BUMP for that one commit:
+//   BUMP=minor git commit ...   x.y.z -> x.(y+1).(z+1)
+//   BUMP=major git commit ...   x.y.z -> (x+1).0.0
 const fs = require('fs');
 const path = require('path');
 
@@ -10,7 +16,15 @@ const manifestPath = path.join(root, 'packages', 'extension', 'public', 'manifes
 
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 const [major, minor, patch] = manifest.version.split('.').map(Number);
-const nextVersion = `${major}.${minor}.${patch + 1}`;
+const bump = (process.env.BUMP || 'patch').toLowerCase();
+if (!['patch', 'minor', 'major'].includes(bump)) {
+  console.error(`BUMP must be patch, minor or major (got "${process.env.BUMP}")`);
+  process.exit(1);
+}
+const nextVersion =
+  bump === 'major' ? `${major + 1}.0.0`
+  : bump === 'minor' ? `${major}.${minor + 1}.${patch + 1}`
+  : `${major}.${minor}.${patch + 1}`;
 
 manifest.version = nextVersion;
 fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');

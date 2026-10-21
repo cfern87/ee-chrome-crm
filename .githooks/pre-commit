@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Auto-bumps the extension's revision (patch) version on every commit to main.
+# BUMP=minor (or major) on the commit bumps that part instead — see
+# scripts/bump-version.js.
 branch="$(git symbolic-ref --short HEAD 2>/dev/null)"
 
 if [ "$branch" = "main" ]; then

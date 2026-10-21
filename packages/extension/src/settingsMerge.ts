@@ -40,6 +40,8 @@ import { PRESET_COLLECTION } from './presets';
 import { WEBHOOK_COLLECTION } from './webhooks';
 import { CLEARED_FAILURES_COLLECTION, FAILED_NOTICE_ACK_KEY } from './campaigns';
 import { AUTOMATION_COLLECTION } from './automations';
+import { DASHBOARD_TILE_ORDER_KEY } from './dashboardTiles';
+import { RATIO_TILE_COLLECTION } from './ratioTiles';
 
 /** The `settings` bag. Untyped by design — it holds every feature's keys. */
 export type SettingsBag = Record<string, unknown>;
@@ -93,7 +95,9 @@ export interface SettingsCollection<T> {
  * there. Inside a function it can only run once everything is loaded.
  */
 function collections(): SettingsCollection<never>[] {
-  return [PRESET_COLLECTION, WEBHOOK_COLLECTION, CLEARED_FAILURES_COLLECTION, AUTOMATION_COLLECTION] as unknown as SettingsCollection<never>[];
+  return [
+    PRESET_COLLECTION, WEBHOOK_COLLECTION, CLEARED_FAILURES_COLLECTION, AUTOMATION_COLLECTION, RATIO_TILE_COLLECTION,
+  ] as unknown as SettingsCollection<never>[];
 }
 
 /**
@@ -110,6 +114,33 @@ function collections(): SettingsCollection<never>[] {
  */
 function monotonicKeys(): string[] {
   return [FAILED_NOTICE_ACK_KEY];
+}
+
+/**
+ * Keys holding a whole value stamped `{ ..., at: number }`, merged by keeping
+ * whichever side's stamp is newer (`b` on a tie). For a value that is one
+ * choice made all at once — the Dashboard's tile order — where neither "local
+ * wins" (Drive mode would never take the other machine's reorder) nor a union
+ * (an order nobody arranged) is right. Resolved at call time, as above.
+ */
+function stampedKeys(): string[] {
+  return [DASHBOARD_TILE_ORDER_KEY];
+}
+
+function stampOf(v: unknown): number | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const at = (v as { at?: unknown }).at;
+  return typeof at === 'number' && Number.isFinite(at) ? at : undefined;
+}
+
+function overlayStamped(out: SettingsBag, a: SettingsBag | undefined, b: SettingsBag | undefined): SettingsBag {
+  for (const key of stampedKeys()) {
+    const sa = stampOf(a?.[key]);
+    const sb = stampOf(b?.[key]);
+    if (sa === undefined && sb === undefined) continue;
+    out[key] = sb !== undefined && (sa === undefined || sb >= sa) ? b![key] : a![key];
+  }
+  return out;
 }
 
 /** Apply the watermark rule to whichever of these keys both bags disagree on. */
@@ -257,7 +288,7 @@ function overlayCollections(
   now: number,
 ): SettingsBag {
   for (const spec of collections()) Object.assign(out, mergeCollection(spec, a, b, now));
-  return overlayMonotonic(out, a, b);
+  return overlayStamped(overlayMonotonic(out, a, b), a, b);
 }
 
 /**

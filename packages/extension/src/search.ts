@@ -16,6 +16,7 @@
 import type { Conversation, Tag, TagGroup, CustomFieldDef } from './storage';
 import { lastTaggedAt, firstTaggedAt } from './storage';
 import { funnelStages, furthestStage } from './funnel';
+import { parseHistory } from './history';
 import {
   openTasksOf, doneTasksOf, overdueCount, nextDueAt, lastCompletedAt, lastTaskCreatedAt, priorityOf,
 } from './tasks';
@@ -92,6 +93,13 @@ export interface QueryContext {
   tags: Record<string, Tag>;
   tagGroups: Record<string, TagGroup>;
   fieldDefs: Record<string, CustomFieldDef>;
+  /**
+   * Store.history (contact id → encoded event log, see history.ts). Only
+   * "Date a specific tag was removed" reads it — removals aren't stamped on
+   * the contact record. Absent = no removals known, so that field matches
+   * nobody (except on "is never / unknown").
+   */
+  history?: Record<string, string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +149,15 @@ export const BUILTIN_FIELDS: FieldDef[] = [
   { key: 'tagGroup', label: 'Tag group', kind: 'tagGroups', category: 'Tags', hint: 'Matches on any tag belonging to the chosen group' },
   { key: 'tagCount', label: 'Number of tags', kind: 'number', category: 'Tags' },
   { key: 'tagDate', label: 'Date a specific tag was added', kind: 'tagDate', category: 'Tags' },
+  // Same kind as tagDate, so it gets the same tag picker, operators and date
+  // inputs; only the evaluation (from the history log) differs.
+  {
+    key: 'tagRemovedDate',
+    label: 'Date a specific tag was removed',
+    kind: 'tagDate',
+    category: 'Tags',
+    hint: 'Uses the most recent removal of each tag. Only removals recorded in the contact\'s history are known — older ones don\'t match. A tag that was removed and later added back still counts as removed on that date; add "Tags has none of" to exclude those.',
+  },
   { key: 'lastTagAt', label: 'Last tagged', kind: 'date', category: 'Tags', hint: 'Most recent tag application. Only recorded for tags added since tag dates were introduced.' },
   { key: 'firstTagAt', label: 'First tagged', kind: 'date', category: 'Tags' },
 
@@ -832,6 +849,45 @@ function matchesTagDate(conv: Conversation, cond: Condition, now: number): boole
 }
 
 /**
+ * Tag id → when it was most recently removed, read from one contact's history.
+ * Memoized on the encoded string: a long list re-filtered on every render
+ * would otherwise re-decode every contact's log each time, and an unchanged
+ * log is the same string.
+ */
+const removalCache = new Map<string, Record<string, number>>();
+const REMOVAL_CACHE_MAX = 5000;
+
+function lastRemovals(encoded: string | undefined): Record<string, number> {
+  if (!encoded) return {};
+  const hit = removalCache.get(encoded);
+  if (hit) return hit;
+  const out: Record<string, number> = {};
+  for (const e of parseHistory(encoded)) {
+    if (e.op === '-' && e.arg && e.at > (out[e.arg] ?? -Infinity)) out[e.arg] = e.at;
+  }
+  if (removalCache.size >= REMOVAL_CACHE_MAX) removalCache.clear();
+  removalCache.set(encoded, out);
+  return out;
+}
+
+/**
+ * "Was <tag> removed in the last 30 days" — the removal counterpart of
+ * matchesTagDate, with the same ANY-of-the-selected-tags reading. Removal
+ * dates come from the history log ('-' events), not the contact record, and
+ * only the latest removal of each tag counts (as tagAddedAt holds only the
+ * latest addition). With no tags selected, the scope is every tag this
+ * contact has ever had removed.
+ */
+function matchesTagRemovedDate(conv: Conversation, cond: Condition, ctx: QueryContext): boolean {
+  const stamps = lastRemovals(ctx.history?.[conv.id]);
+  const scope = cond.tagIds && cond.tagIds.length > 0 ? cond.tagIds : Object.keys(stamps);
+
+  if (cond.op === 'isEmpty') return scope.every((id) => stamps[id] === undefined);
+  if (cond.op === 'isNotEmpty') return scope.some((id) => stamps[id] !== undefined);
+  return scope.some((id) => stamps[id] !== undefined && matchesDate(stamps[id], cond, ctx.now));
+}
+
+/**
  * Position in a funnel against one chosen stage. The contact's position is the
  * FURTHEST stage they hold, the same reading the funnel bar uses (funnel.ts).
  */
@@ -897,7 +953,8 @@ function evaluateCondition(conv: Conversation, cond: Condition, fields: FieldDef
 
     case 'tags': return matchesTags(liveTagsOf(conv, ctx), cond);
     case 'tagGroups': return matchesTagGroups(conv, cond, ctx);
-    case 'tagDate': return matchesTagDate(conv, cond, ctx.now);
+    case 'tagDate':
+      return field.key === 'tagRemovedDate' ? matchesTagRemovedDate(conv, cond, ctx) : matchesTagDate(conv, cond, ctx.now);
     case 'funnelStage': return matchesFunnelStage(conv, cond, field);
 
     case 'boolean': {
@@ -969,7 +1026,7 @@ function describeCondition(cond: Condition, fields: FieldDef[], ctx: QueryContex
   // tagDate reads as "<tag> added is in the last 30 days" rather than repeating
   // the generic field label, because the tag scope is the real subject.
   const subject = field.kind === 'tagDate'
-    ? `${cond.tagIds && cond.tagIds.length ? cond.tagIds.map(tagName).join(' / ') : 'Any tag'} added`
+    ? `${cond.tagIds && cond.tagIds.length ? cond.tagIds.map(tagName).join(' / ') : 'Any tag'} ${field.key === 'tagRemovedDate' ? 'removed' : 'added'}`
     : field.label;
   const phrase = `${subject} ${opLabel}`;
   // On a date field "today" is a moving date, not literal text — shown bare so

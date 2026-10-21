@@ -370,7 +370,7 @@ export function stepsFor(preset: PresetAction, conv: Conversation, store: Store,
   };
 
   // Conditions all read the contact as it was when pressed — see PresetStep.
-  const ctx: QueryContext = { now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs };
+  const ctx: QueryContext = { now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs, history: store.history };
 
   for (const step of preset.steps) {
     if (step.when && !matchesQuery(conv, step.when, ctx)) continue;
@@ -518,7 +518,7 @@ export function campaignSendsFor(
   store: Store,
   now = Date.now(),
 ): PresetCampaignSend[] {
-  const ctx: QueryContext = { now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs };
+  const ctx: QueryContext = { now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs, history: store.history };
   const out: PresetCampaignSend[] = [];
   for (const step of preset.steps) {
     if (step.kind !== 'addToCampaign' || !step.template.trim()) continue;
@@ -560,7 +560,7 @@ export function webhookSendsFor(
   store: Store,
   now = Date.now(),
 ): PresetWebhookSend[] {
-  const ctx: QueryContext = { now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs };
+  const ctx: QueryContext = { now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs, history: store.history };
   const out: PresetWebhookSend[] = [];
   for (const step of preset.steps) {
     if (step.kind !== 'sendWebhook' || !step.url.trim()) continue;
