@@ -20,7 +20,7 @@ import { build } from 'vite';
 import react from '@vitejs/plugin-react';
 import { resolve, dirname } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
-import { readFileSync, writeFileSync, unlinkSync, watch as watchDir } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, watch as watchDir } from 'fs';
 import { execSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -76,6 +76,34 @@ async function emitUiStylesheet() {
     // Cache-busted, or a watch rebuild would re-run the first version forever.
     const mod = await import(pathToFileURL(tmp).href + `?t=${Date.now()}`);
     writeFileSync(r('dist/ui.css'), mod.uiStylesheet({ pageReset: true }), 'utf8');
+  } finally {
+    try { unlinkSync(tmp); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * Render the user-facing guides in docs/ into dist/help/<slug>.html, via
+ * src/helpPages.ts — bundled and run here like the stylesheet above, so
+ * `marked` stays a build-time dependency and never reaches the extension.
+ */
+async function emitHelpPages(version) {
+  const esbuild = await import('esbuild');
+  const tmp = r('dist/.help-pages.mjs');
+  await esbuild.build({
+    entryPoints: [r('src/helpPages.ts')],
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    outfile: tmp,
+    logLevel: 'warning',
+  });
+  try {
+    const mod = await import(pathToFileURL(tmp).href + `?t=${Date.now()}`);
+    mkdirSync(r('dist/help'), { recursive: true });
+    for (const page of mod.HELP_PAGES) {
+      const md = readFileSync(r(`../../docs/${page.source}`), 'utf8');
+      writeFileSync(r(`dist/help/${page.slug}.html`), mod.renderHelpPage(page, md, { version }), 'utf8');
+    }
   } finally {
     try { unlinkSync(tmp); } catch { /* already gone */ }
   }
@@ -147,6 +175,10 @@ async function run() {
   //    distinct hex colours and four greys for "muted text".
   await emitUiStylesheet();
 
+  // 5. help/*.html — the webhook guides from docs/, readable inside the
+  //    extension (Settings links to them) without access to this repository.
+  await emitHelpPages(BUILD_INFO.version);
+
   console.log('\n✓ Extension build complete (dashboard=ESM, content/background=IIFE)');
   console.log(
     `  v${BUILD_INFO.version} · ${BUILD_INFO.commit}${BUILD_INFO.dirty ? '+local changes' : ''}` +
@@ -183,10 +215,10 @@ function watch() {
     timer = setTimeout(rebuild, 150); // coalesce the burst a single save emits
   };
 
-  for (const dir of ['src', 'public']) {
+  for (const dir of ['src', 'public', '../../docs']) {
     watchDir(r(dir), { recursive: true }, onChange);
   }
-  console.log('\n  Watching src/ and public/ — every save rebuilds dist/. Ctrl+C to stop.');
+  console.log('\n  Watching src/, public/ and docs/ — every save rebuilds dist/. Ctrl+C to stop.');
 }
 
 const watching = process.argv.includes('--watch');

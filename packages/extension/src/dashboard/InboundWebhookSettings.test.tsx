@@ -63,6 +63,30 @@ async function render(store: Store, updateStore = vi.fn(async (_s: Store) => ({ 
 
 const INFO = { endpointUrl: 'https://x.supabase.co/functions/v1/crm-inbox', status: null };
 
+describe('help links', () => {
+  it('Incoming webhooks links to its guide inside the extension, on or off', async () => {
+    fakeBackground({ INBOUND_INFO: INFO });
+    await render({ ...EMPTY_STORE });
+    const link = container!.querySelector('a[href="help/incoming-webhooks.html"]') as HTMLAnchorElement;
+    expect(link).toBeTruthy();
+    expect(link.target).toBe('_blank');
+  });
+
+  it('(outgoing) Webhooks links to its guide inside the extension', async () => {
+    const { WebhookSettings } = await import('./WebhookSettings');
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root!.render(<WebhookSettings store={{ ...EMPTY_STORE }} updateStore={vi.fn() as never} />);
+    });
+    const link = container.querySelector('a[href="help/webhooks.html"]') as HTMLAnchorElement;
+    expect(link).toBeTruthy();
+    expect(link.target).toBe('_blank');
+    expect(container.textContent).not.toContain('docs/WEBHOOKS.md');
+  });
+});
+
 describe('InboundWebhookSettings', () => {
   it('is off by default and asks the server for nothing but local info', async () => {
     const sent = fakeBackground({ INBOUND_INFO: INFO });

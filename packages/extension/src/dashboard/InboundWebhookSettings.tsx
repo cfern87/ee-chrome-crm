@@ -1,4 +1,4 @@
-// Settings → Data → Incoming webhooks (EXPERIMENTAL).
+// Settings â†’ Data â†’ Incoming webhooks (EXPERIMENTAL).
 //
 // The switch, the tokens outside systems use, which automations they may run,
 // and enough live status to test the whole loop from here. See ../inbound.ts.
@@ -12,6 +12,7 @@ import { readInboundSettings, writeInboundSettings, type InboundSettings, type I
 import type { InboundCommandSummary, InboundToken } from '../inboundClient';
 import { Banner, Button, Card, Input, Stack, Text, Toggle, Field as FormField, color, radius, space } from '../ui/primitives';
 import { sendBg, formatRelativeTime, CopyButton } from './shared';
+import { helpUrl } from '../helpLinks';
 
 type Fail = { ok: false; error: string };
 
@@ -46,10 +47,10 @@ function describeStatus(s: InboundStatus | null): string {
   if (!s) return 'Not checked yet on this machine.';
   const when = formatRelativeTime(s.at);
   if (s.skipped === 'disabled') return `Off (checked ${when}).`;
-  if (s.skipped === 'signed-out') return `Signed out — not checking (${when}).`;
+  if (s.skipped === 'signed-out') return `Signed out â€” not checking (${when}).`;
   if (s.skipped === 'not-sender') return `Another machine is the sending machine, so it runs incoming webhooks (${when}).`;
   if (!s.ok) return `Last check failed ${when}: ${s.error}`;
-  const last = s.last ? ` Last command: ${s.last.command} → ${s.last.status}${s.last.error ? ` (${s.last.error})` : ''}.` : '';
+  const last = s.last ? ` Last command: ${s.last.command} â†’ ${s.last.status}${s.last.error ? ` (${s.last.error})` : ''}.` : '';
   return `Checked ${when}: ${s.claimed} new.${last}`;
 }
 
@@ -133,8 +134,9 @@ export function InboundWebhookSettings({ store, updateStore }: {
       </Stack>
       <Text as="p" size="small" tone="muted" leading="relaxed" style={{ margin: `${space.xs}px 0 ${space.md}px` }}>
         Let another system (Zapier, your website, a script) run automations by POSTing to a URL. Requests wait
-        on the server until the browser running your sending machine picks them up — checked about once a minute.
-        Only automations you tick below can be run. See <code>docs/INBOUND_WEBHOOKS.md</code>.
+        on the server until the browser running your sending machine picks them up â€” checked about once a minute.
+        Only automations you tick below can be run.{' '}
+        <a href={helpUrl('incoming-webhooks')} target="_blank" rel="noreferrer">Open the incoming webhook guide</a>.
       </Text>
 
       {!settings.enabled ? (
@@ -146,7 +148,7 @@ export function InboundWebhookSettings({ store, updateStore }: {
             <code style={{ fontSize: 12, wordBreak: 'break-all' }}>{endpoint}</code>
             <Stack direction="row" gap="sm" align="center" wrap style={{ marginTop: space.sm }}>
               <Text size="micro" tone="muted" style={{ flex: 1 }}>{describeStatus(status)}</Text>
-              <Button size="sm" variant="secondary" onClick={checkNow} disabled={busy}>{busy ? 'Checking…' : 'Check now'}</Button>
+              <Button size="sm" variant="secondary" onClick={checkNow} disabled={busy}>{busy ? 'Checkingâ€¦' : 'Check now'}</Button>
             </Stack>
           </div>
 
@@ -155,7 +157,7 @@ export function InboundWebhookSettings({ store, updateStore }: {
             {tokens.filter((t) => !t.revoked_at).length === 0 && <Text size="small" tone="muted">No active tokens.</Text>}
             {tokens.map((t) => (
               <Stack key={t.id} direction="row" gap="sm" align="center" style={{ opacity: t.revoked_at ? 0.5 : 1 }}>
-                <code style={{ fontSize: 12 }}>{t.token_prefix}…</code>
+                <code style={{ fontSize: 12 }}>{t.token_prefix}â€¦</code>
                 <Text size="small" style={{ flex: 1 }}>{t.label || ''}</Text>
                 <Text size="micro" tone="muted">
                   {t.revoked_at ? 'revoked' : t.last_used_at ? `used ${formatRelativeTime(Date.parse(t.last_used_at))}` : 'never used'}
@@ -168,10 +170,10 @@ export function InboundWebhookSettings({ store, updateStore }: {
                 data-testid="inbound-setup"
                 style={{ marginTop: space.sm, padding: space.md, borderRadius: radius.sm, border: `1px solid ${color.success.base}`, background: color.success.subtle }}
               >
-                <Text as="div" size="small" weight="semibold">Your new token — copy it now, it won’t be shown again</Text>
+                <Text as="div" size="small" weight="semibold">Your new token â€” copy it now, it wonâ€™t be shown again</Text>
                 <SetupRow label="Token" value={newToken} copyTitle="Copy token" />
                 <Text as="div" size="micro" tone="muted" style={{ marginTop: space.sm }}>
-                  To set up Zapier (“Webhooks by Zapier” → POST), Make, or your own code, paste these:
+                  To set up Zapier (â€œWebhooks by Zapierâ€ â†’ POST), Make, or your own code, paste these:
                 </Text>
                 <SetupRow label="URL" value={setup.url} copyTitle="Copy URL" />
                 <SetupRow label="Header: Authorization" value={setup.header} copyTitle="Copy header value" />
@@ -179,7 +181,7 @@ export function InboundWebhookSettings({ store, updateStore }: {
                 <Stack direction="row" gap="sm" align="center" style={{ marginTop: space.sm }}>
                   <Text size="micro" tone="muted" style={{ flex: 1 }}>Or test it from a terminal right away.</Text>
                   <CopyButton text={setup.curl} label="Copy curl" title="Copy curl command" />
-                  <Button size="sm" variant="secondary" onClick={() => setNewToken(null)}>Done, I’ve saved it</Button>
+                  <Button size="sm" variant="secondary" onClick={() => setNewToken(null)}>Done, Iâ€™ve saved it</Button>
                 </Stack>
               </div>
             )}
@@ -211,7 +213,7 @@ export function InboundWebhookSettings({ store, updateStore }: {
             {recent.length === 0 && <Text size="small" tone="muted">None yet.</Text>}
             {recent.map((c) => (
               <Text key={c.id} as="div" size="micro" tone={c.status === 'failed' ? 'danger' : 'muted'}>
-                {formatRelativeTime(Date.parse(c.created_at))} · {c.command} · {c.status}{c.error ? ` — ${c.error}` : ''}
+                {formatRelativeTime(Date.parse(c.created_at))} Â· {c.command} Â· {c.status}{c.error ? ` â€” ${c.error}` : ''}
               </Text>
             ))}
           </div>

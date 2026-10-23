@@ -1,7 +1,7 @@
 # Not Another Social CRM — Incoming webhooks (experimental)
 
 Let another system run CRM automations by POSTing to a URL. The opposite
-direction to [WEBHOOKS.md](WEBHOOKS.md).
+direction to [outgoing webhooks](WEBHOOKS.md).
 
 ## How it works
 

@@ -1,4 +1,4 @@
-// Settings → Data → Webhooks.
+// Settings â†’ Data â†’ Webhooks.
 //
 // The editor for the outbound POSTs described in ../webhooks.ts. Two things
 // here are worth knowing before reading the code:
@@ -7,7 +7,7 @@
 //     "wherever the user later decides to point a webhook", so `https://*/*`
 //     is an OPTIONAL permission requested at the moment a URL is saved.
 //     chrome.permissions.request must be called from a user gesture on an
-//     extension page, which is exactly what a click on Save is — so it lives
+//     extension page, which is exactly what a click on Save is â€” so it lives
 //     here and not in the background worker.
 //  2. NOTHING IS SUBSCRIBED BY DEFAULT. A new webhook fires nothing until
 //     events are ticked. See newWebhook for why.
@@ -23,12 +23,13 @@ import {
   Field as FormField, color, radius, space,
 } from '../ui/primitives';
 import { sendBg, formatRelativeTime, DraftInput } from './shared';
+import { helpUrl } from '../helpLinks';
 
 /**
  * Ask for permission to reach `url`'s origin.
  *
  * Returns true when the extension may now POST there. A refusal is not an
- * error to shout about — the user was asked and said no — so the caller
+ * error to shout about â€” the user was asked and said no â€” so the caller
  * reports it as a plain explanation of what will happen (nothing).
  */
 /**
@@ -37,7 +38,7 @@ import { sendBg, formatRelativeTime, DraftInput } from './shared';
  * deliveries from the Messenger panel or a scheduled automation can't ask.
  */
 export const TEST_PERMISSION_NOTE =
-  'Click “Send test” once for each new URL: that click is when Chrome asks to allow the extension to reach it. Until it’s allowed, sends to this URL fail.';
+  'Click â€œSend testâ€ once for each new URL: that click is when Chrome asks to allow the extension to reach it. Until itâ€™s allowed, sends to this URL fail.';
 
 export async function ensureHostPermission(url: string): Promise<boolean> {
   try {
@@ -48,7 +49,7 @@ export async function ensureHostPermission(url: string): Promise<boolean> {
     return await chrome.permissions.request({ origins: [origin] });
   } catch {
     // No permissions API (or an origin Chrome won't accept). Let the save go
-    // ahead — the delivery itself will report the real failure.
+    // ahead â€” the delivery itself will report the real failure.
     return true;
   }
 }
@@ -67,7 +68,7 @@ export function WebhookSettings({ store, updateStore }: {
   // writeWebhooks owns the bookkeeping the cross-machine merge depends on:
   // stamping the hooks that actually changed, and leaving a tombstone for one
   // that's removed. Without it a save publishes the whole list and rolls back
-  // whatever another machine changed in the meantime — see ../settingsMerge.ts.
+  // whatever another machine changed in the meantime â€” see ../settingsMerge.ts.
   const persist = async (next: WebhookConfig[]) => {
     await updateStore({ ...store, settings: writeWebhooks(store.settings, next) });
   };
@@ -87,7 +88,7 @@ export function WebhookSettings({ store, updateStore }: {
     await persist([...hooks, newWebhook(url)]);
     setDraftUrl('');
     setStatus(granted
-      ? 'Added. Tick the events you want it to receive — it sends nothing until you do.'
+      ? 'Added. Tick the events you want it to receive â€” it sends nothing until you do.'
       : "Added, but Chrome wasn't given permission to reach that host, so deliveries will fail. Remove and re-add it to be asked again.");
   };
 
@@ -119,10 +120,11 @@ export function WebhookSettings({ store, updateStore }: {
     <Card style={{ marginBottom: space.md }}>
       <Text as="h3" size="strong" weight="semibold" style={{ margin: 0 }}>Webhooks</Text>
       <Text as="p" size="small" tone="muted" leading="relaxed" style={{ margin: `${space.xs}px 0 ${space.lg}px` }}>
-        POST a small JSON payload to a URL of yours whenever something happens in the CRM — a contact
+        POST a small JSON payload to a URL of yours whenever something happens in the CRM â€” a contact
         gets tagged, a campaign finishes, a message fails. Delivery is best-effort: one attempt per
-        event, no retries, so treat it as a notification rather than a ledger. The payload format is
-        documented in <code>docs/WEBHOOKS.md</code>.
+        event, no retries, so treat it as a notification rather than a ledger.{' '}
+        <a href={helpUrl('webhooks')} target="_blank" rel="noreferrer">Open the webhook guide</a> for the
+        payload format â€” it can be downloaded and sent to whoever builds the receiving end.
       </Text>
 
       <Stack gap="sm">
@@ -157,7 +159,7 @@ export function WebhookSettings({ store, updateStore }: {
                 onChange={(e) => update(h.id, { enabled: e.target.checked })}
               />
               <Button size="sm" variant="secondary" onClick={() => test(h)} disabled={testing === h.id}>
-                {testing === h.id ? 'Sending…' : 'Send test'}
+                {testing === h.id ? 'Sendingâ€¦' : 'Send test'}
               </Button>
               {confirmDelete === h.id ? (
                 <>
@@ -203,7 +205,7 @@ export function WebhookSettings({ store, updateStore }: {
 
             <div style={{ marginTop: space.sm }}>
               <Text as="div" size="small" weight="medium" tone="secondary" style={{ marginBottom: space.xs }}>
-                Events {h.events.length === 0 && <Text as="span" size="micro" tone="warning">— none ticked, so this sends nothing</Text>}
+                Events {h.events.length === 0 && <Text as="span" size="micro" tone="warning">â€” none ticked, so this sends nothing</Text>}
               </Text>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: space.xxs }}>
                 {WEBHOOK_EVENTS.map((def) => (
