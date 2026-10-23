@@ -14,3 +14,6 @@ build/
 *.swo
 *~
 .cache/
+
+# Local token for scripts/inbound-smoke.mjs
+.inbound-token
