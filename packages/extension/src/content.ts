@@ -1229,6 +1229,8 @@ let newTagNameFocused = false;
 // panel moves to another contact — a draft must never leak onto someone else.
 const fieldDrafts = new Map<string, string>();
 let focusedFieldId: string | null = null;
+/** Caret of the focused field at the moment a re-render removed it. */
+let fieldCaret: [number, number] | null = null;
 
 // Threads the user has explicitly removed from the CRM on this page. Without
 // it, auto-capture would re-create the contact on the very next panel render —
@@ -2144,23 +2146,47 @@ function fieldRowHtml(def: CustomFieldDef): string {
     return `<div class="fb-crm-field-row">${label}<select ${attrs}>${options}</select></div>`;
   }
 
-  const inputType = def.type === 'number' ? 'number' : def.type === 'date' ? 'date' : 'text';
-  const placeholder = def.type === 'text' ? ' placeholder="Add value…"' : '';
-  return `<div class="fb-crm-field-row">${label}<input type="${inputType}" ${attrs}${placeholder} /></div>`;
+  // Free text is a textarea that grows with its content (see autoGrowField),
+  // so a note longer than a few words can be read in full.
+  if (def.type === 'text') {
+    return `<div class="fb-crm-field-row">${label}<textarea rows="1" ${attrs} placeholder="Add value…"></textarea></div>`;
+  }
+
+  const inputType = def.type === 'number' ? 'number' : 'date';
+  return `<div class="fb-crm-field-row">${label}<input type="${inputType}" ${attrs} /></div>`;
+}
+
+// Fit a text field's height to its content, up to the CSS max-height (past
+// that it scrolls).
+function autoGrowField(el: HTMLTextAreaElement): void {
+  el.style.height = 'auto';
+  el.style.height = `${el.scrollHeight + 2}px`; // + top/bottom border
 }
 
 // Fill in the Details inputs and commit edits. Free text and numbers commit on
 // blur or Enter (so we don't write — and sync — on every keystroke); dropdowns
 // and dates commit as soon as they change, since there's nothing to finish
-// typing.
+// typing. In a text field Shift+Enter adds a new line.
+//
+// A panel re-render replaces these elements, and Chrome fires `blur` on a
+// focused element when it is removed. That blur is not the user leaving the
+// field, so it must not save: re-renders land often (any storage change), and
+// saving on each one meant saving — and trimming away the space just typed —
+// in the middle of typing. The blur handler waits a tick and only commits if
+// the element is still in the page; otherwise the draft survives in
+// fieldDrafts and the rebuilt field picks up where the user was.
 function wirePanelFields(threadId: string, conv: Conversation, defs: CustomFieldDef[]) {
   if (!panelEl) return;
 
   for (const def of defs) {
-    const el = panelEl.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-field="${def.id}"]`);
+    const el = panelEl.querySelector<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(`[data-field="${def.id}"]`);
     if (!el) continue;
     const stored = conv.customFields?.[def.id] ?? '';
     el.value = fieldDrafts.get(def.id) ?? stored;
+    if (el instanceof HTMLTextAreaElement) {
+      autoGrowField(el);
+      el.addEventListener('input', () => autoGrowField(el));
+    }
 
     const commit = () => {
       const value = el.value.trim();
@@ -2177,22 +2203,31 @@ function wirePanelFields(threadId: string, conv: Conversation, defs: CustomField
       el.addEventListener('change', commit);
       continue;
     }
+    const textEl = el as HTMLInputElement | HTMLTextAreaElement;
     el.addEventListener('input', () => { fieldDrafts.set(def.id, el.value); });
     el.addEventListener('focus', () => { focusedFieldId = def.id; });
-    el.addEventListener('blur', commit);
-    el.addEventListener('keydown', e => { if ((e as KeyboardEvent).key === 'Enter') el.blur(); });
+    el.addEventListener('blur', () => {
+      try { fieldCaret = [textEl.selectionStart ?? el.value.length, textEl.selectionEnd ?? el.value.length]; } catch { fieldCaret = null; }
+      setTimeout(() => { if (el.isConnected) commit(); }, 0);
+    });
+    el.addEventListener('keydown', e => {
+      const k = e as KeyboardEvent;
+      if (k.key === 'Enter' && !k.shiftKey) { k.preventDefault(); el.blur(); }
+    });
   }
 
-  // A re-render that lands mid-edit rebuilt the input the user was typing in;
-  // put the caret back where they left it.
+  // A re-render that lands mid-edit rebuilt the field the user was typing in;
+  // put the focus and caret back where they left them.
   if (focusedFieldId) {
-    const el = panelEl.querySelector<HTMLInputElement>(`input[data-field="${focusedFieldId}"]`);
+    const el = panelEl.querySelector<HTMLInputElement | HTMLTextAreaElement>(`input[data-field="${focusedFieldId}"], textarea[data-field="${focusedFieldId}"]`);
     if (el) {
       el.focus();
-      const v = el.value;
-      try { el.setSelectionRange(v.length, v.length); } catch { /* ignore */ }
+      const end = el.value.length;
+      const [start, stop] = fieldCaret ?? [end, end];
+      try { el.setSelectionRange(Math.min(start, end), Math.min(stop, end)); } catch { /* number inputs have no caret */ }
     }
   }
+  fieldCaret = null;
 }
 
 // Follow-up tick boxes and the add row. The task is built here, id and all, so

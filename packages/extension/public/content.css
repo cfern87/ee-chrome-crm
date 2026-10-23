@@ -789,6 +789,18 @@
   outline: none;
 }
 .fb-crm-field-input:focus { border-color: #065fd4; }
+/* Free-text fields grow with their content (autoGrowField), then scroll. */
+textarea.fb-crm-field-input {
+  resize: none;
+  overflow-y: auto;
+  max-height: 160px;
+  line-height: 18px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  box-sizing: border-box;
+}
+.fb-crm-field-row:has(textarea) { align-items: flex-start; }
+.fb-crm-field-row:has(textarea) .fb-crm-field-label { padding-top: 7px; }
 select.fb-crm-field-input { cursor: pointer; }
 
 .fb-crm-muted { color: #8a8d91; font-size: 12px; }

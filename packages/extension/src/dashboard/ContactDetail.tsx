@@ -3,7 +3,7 @@
 // Both are "one contact / one tag list" concerns rather than workspace layout,
 // which is what DashboardApp keeps.
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { Store, Conversation, Tag, CustomFieldDef, TagGroup } from '../storage';
 import { tagGroupMode } from '../storage';
 import { tagDisplayOrder } from '../tagGrouping';
@@ -712,8 +712,8 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
           <div style={{ fontSize: 12, fontWeight: 600, color: color.text.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Details</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             {fieldDefs.map((def) => (
-              <div key={def.id} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <label style={{ fontSize: 13, color: color.text.secondary, width: 130, flexShrink: 0 }}>{def.name}</label>
+              <div key={def.id} style={{ display: 'flex', alignItems: def.type === 'text' ? 'flex-start' : 'center', gap: 10 }}>
+                <label style={{ fontSize: 13, color: color.text.secondary, width: 130, flexShrink: 0, paddingTop: def.type === 'text' ? 8 : 0 }}>{def.name}</label>
                 <CustomFieldInput
                   def={def}
                   value={conv.customFields?.[def.id] ?? ''}
@@ -894,17 +894,55 @@ export function CustomFieldInput({ def, value, onCommit }: CustomFieldInputProps
     );
   }
 
-  const type = def.type === 'number' ? 'number' : def.type === 'date' ? 'date' : 'text';
+  if (def.type === 'text') {
+    return <AutoGrowTextField value={draft} onDraft={setDraft} onCommit={() => { if (draft !== value) onCommit(draft); }} style={inputStyle} />;
+  }
+
+  const type = def.type === 'number' ? 'number' : 'date';
   const commitOnChange = def.type === 'date';
   return (
     <input
       type={type}
       value={draft}
-      placeholder={def.type === 'text' ? 'Add value…' : ''}
       onChange={(e) => { setDraft(e.target.value); if (commitOnChange) onCommit(e.target.value); }}
       onBlur={() => { if (!commitOnChange && draft !== value) onCommit(draft); }}
       onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
       style={inputStyle}
+    />
+  );
+}
+
+/**
+ * Free-text field that grows with its content up to a cap, then scrolls, so a
+ * note longer than a few words can be read in full. Saves on blur or Enter;
+ * Shift+Enter adds a new line.
+ */
+function AutoGrowTextField({ value, onDraft, onCommit, style }: {
+  value: string;
+  onDraft: (v: string) => void;
+  onCommit: () => void;
+  style: React.CSSProperties;
+}) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight + 2}px`; // + top/bottom border
+  }, [value]);
+  return (
+    <textarea
+      ref={ref}
+      rows={1}
+      value={value}
+      placeholder="Add value…"
+      onChange={(e) => onDraft(e.target.value)}
+      onBlur={onCommit}
+      onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.currentTarget.blur(); } }}
+      style={{
+        ...style, resize: 'none', maxHeight: 160, overflowY: 'auto', lineHeight: '18px',
+        fontFamily: 'inherit', boxSizing: 'border-box', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere',
+      }}
     />
   );
 }
