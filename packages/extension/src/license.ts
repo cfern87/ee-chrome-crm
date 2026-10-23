@@ -14,8 +14,8 @@
 // the user is signed out, we fail CLOSED to the free tier — but we never delete
 // data that already exists locally.
 
-const SUPABASE_URL = 'https://jivkzbtqnepzjgwzycjw.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_Lem1Q30_kVgPt0jO3kU5dQ_Wa906jkN';
+export const SUPABASE_URL = 'https://jivkzbtqnepzjgwzycjw.supabase.co';
+export const SUPABASE_ANON_KEY ='sb_publishable_Lem1Q30_kVgPt0jO3kU5dQ_Wa906jkN';
 
 /** The web platform (sign-up, billing, support). */
 export const PLATFORM_URL = 'https://notanothersocialcrm.com';
@@ -175,7 +175,7 @@ export async function signOut(): Promise<void> {
 }
 
 /** A valid access token, refreshing it if needed. Null when signed out. */
-async function getAccessToken(): Promise<string | null> {
+export async function getAccessToken(): Promise<string | null> {
   const session = await getStoredSession();
   if (!session) return null;
   if (session.expiresAt > Date.now() + TOKEN_SKEW_MS) return session.accessToken;

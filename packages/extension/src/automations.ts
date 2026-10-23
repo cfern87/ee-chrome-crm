@@ -493,7 +493,8 @@ export interface AutomationRun {
   automationId: string;
   running: boolean;
   phase?: 'scanning' | 'saving';
-  trigger: 'manual' | 'schedule';
+  /** 'webhook' = started by an incoming webhook (inbound.ts). */
+  trigger: 'manual' | 'schedule' | 'webhook';
   startedAt: number;
   finishedAt?: number;
   rowsSeen: number;

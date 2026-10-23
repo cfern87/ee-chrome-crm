@@ -43,6 +43,7 @@ import {
 import { OnlineDot } from './Campaigns';
 import { PresetActionsSettings } from './PresetActionsSettings';
 import { WebhookSettings } from './WebhookSettings';
+import { InboundWebhookSettings } from './InboundWebhookSettings';
 
 /** Sections of Settings. */
 export type SettingsView = 'account' | 'sync' | 'data' | 'behavior' | 'about';
@@ -293,6 +294,8 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
       <CaptureDiagnostics store={store} />
 
       <WebhookSettings store={store} updateStore={updateStore} />
+
+      <InboundWebhookSettings store={store} updateStore={updateStore} />
 
       <ContactsMaintenance store={store} updateStore={updateStore} />
       </>

@@ -38,9 +38,14 @@ import {
   adoptExternalSession,
   openWebSignIn,
   isSignedIn,
+  getAccessToken,
+  SUPABASE_URL,
+  SUPABASE_ANON_KEY,
   ENTITLEMENT_ALARM,
   ENTITLEMENT_PERIOD_MINUTES,
 } from './license';
+import { pollInbound, readInboundSettings, type InboundDeps, type InboundStatus } from './inbound';
+import { makeInboundClient } from './inboundClient';
 
 import {
   Campaign,
@@ -1268,12 +1273,25 @@ function patchAutomationRun(id: string, patch: Partial<AutomationRun> | Automati
   return run;
 }
 
-async function startAutomation(id: string, trigger: AutomationRun['trigger']): Promise<{ success: boolean; error?: string }> {
+/**
+ * Optional per-run changes, used by incoming webhooks (inbound.ts). Absent for
+ * manual and scheduled runs, which behave exactly as before.
+ */
+interface AutomationRunOptions {
+  /** Applied to the automation as loaded at run time (vars, dryRun). */
+  transform?: (a: Automation) => Automation;
+  /** Act on exactly these contacts instead of the automation's own source. */
+  ids?: string[];
+  /** Receives the job once it has started, so the caller can wait for it. */
+  onJob?: (job: Promise<void>) => void;
+}
+
+async function startAutomation(id: string, trigger: AutomationRun['trigger'], opts: AutomationRunOptions = {}): Promise<{ success: boolean; error?: string }> {
   // A saved-search automation is pure CRM work: no Facebook window, so it
   // neither needs nor takes the `scanning` claim, and can run alongside a
-  // reply check or the send queue.
+  // reply check or the send queue. Same for any run given explicit contacts.
   const peek = readAutomations(await loadStore()).find((a) => a.id === id);
-  if (peek?.kind === 'search') return startSearchAutomation(id, trigger);
+  if (peek?.kind === 'search' || opts.ids) return startSearchAutomation(id, trigger, opts);
 
   if (scanning) {
     return { success: false, error: runningAutomationId ? 'Another automation is already running.' : 'A reply check is running. Try again when it finishes.' };
@@ -1304,7 +1322,9 @@ async function startAutomation(id: string, trigger: AutomationRun['trigger']): P
 
     handedOff = true;
     runningAutomationId = id;
-    void runAutomationJob(automation).finally(() => { scanning = false; runningAutomationId = null; });
+    const job = runAutomationJob(automation, opts.transform).finally(() => { scanning = false; runningAutomationId = null; });
+    opts.onJob?.(job);
+    void job;
     return { success: true };
   } catch (e) {
     return { success: false, error: String((e as Error)?.message || e) };
@@ -1316,7 +1336,7 @@ async function startAutomation(id: string, trigger: AutomationRun['trigger']): P
 /** Saved-search automations in flight. They don't hold `scanning`, so they're tracked here. */
 const runningSearchIds = new Set<string>();
 
-async function startSearchAutomation(id: string, trigger: AutomationRun['trigger']): Promise<{ success: boolean; error?: string }> {
+async function startSearchAutomation(id: string, trigger: AutomationRun['trigger'], opts: AutomationRunOptions = {}): Promise<{ success: boolean; error?: string }> {
   if (runningSearchIds.has(id)) return { success: false, error: 'This automation is already running.' };
   runningSearchIds.add(id);
   let handedOff = false;
@@ -1332,7 +1352,9 @@ async function startSearchAutomation(id: string, trigger: AutomationRun['trigger
       automationId: id, running: true, phase: 'saving', trigger, startedAt: Date.now(), rowsSeen: 0,
     }, true);
     handedOff = true;
-    void runSearchAutomationJob(id).finally(() => { runningSearchIds.delete(id); });
+    const job = runSearchAutomationJob(id, opts).finally(() => { runningSearchIds.delete(id); });
+    opts.onJob?.(job);
+    void job;
     return { success: true };
   } catch (e) {
     return { success: false, error: String((e as Error)?.message || e) };
@@ -1341,15 +1363,19 @@ async function startSearchAutomation(id: string, trigger: AutomationRun['trigger
   }
 }
 
-async function runSearchAutomationJob(id: string): Promise<void> {
+async function runSearchAutomationJob(id: string, opts: AutomationRunOptions = {}): Promise<void> {
   try {
     const store = await loadStore();
-    const automation = readAutomations(store).find((a) => a.id === id);
-    if (!automation) throw new Error('The automation was deleted while it was running.');
-    const search = automation.savedSearchId ? store.savedSearches[automation.savedSearchId] : undefined;
-    if (!search) throw new Error('Its saved search no longer exists.');
+    const stored = readAutomations(store).find((a) => a.id === id);
+    if (!stored) throw new Error('The automation was deleted while it was running.');
+    const automation = opts.transform ? opts.transform(stored) : stored;
 
-    const ids = matchSavedSearch(search, store).map((c) => c.id);
+    let ids = opts.ids;
+    if (!ids) {
+      const search = automation.savedSearchId ? store.savedSearches[automation.savedSearchId] : undefined;
+      if (!search) throw new Error('Its saved search no longer exists.');
+      ids = matchSavedSearch(search, store).map((c) => c.id);
+    }
     const result = await applyAutomationActions(automation, ids);
     await patchAutomationRun(id, {
       running: false, phase: undefined, finishedAt: Date.now(), matched: ids.length, error: undefined, ...result,
@@ -1472,7 +1498,7 @@ async function applyAutomationActions(automation: Automation, ids: string[]): Pr
   return out;
 }
 
-async function runAutomationJob(automation: Automation): Promise<void> {
+async function runAutomationJob(automation: Automation, transform?: (a: Automation) => Automation): Promise<void> {
   const log: string[] = [];
   const id = automation.id;
   try {
@@ -1499,8 +1525,9 @@ async function runAutomationJob(automation: Automation): Promise<void> {
     // can take minutes, and in that time the automation may have been edited or
     // deleted, or contacts tagged by hand.
     const store = await loadStore();
-    const current = readAutomations(store).find((a) => a.id === id);
-    if (!current) throw new Error('The automation was deleted while it was running.');
+    const stored = readAutomations(store).find((a) => a.id === id);
+    if (!stored) throw new Error('The automation was deleted while it was running.');
+    const current = transform ? transform(stored) : stored;
     const resolved = resolveUnread(current, report.unread, store);
 
     // New contacts first, so the actions below can act on them too.
@@ -1559,6 +1586,88 @@ async function runDueAutomations(): Promise<void> {
   } catch (e) {
     console.warn('[CRM] automation schedule check failed', e);
   }
+}
+
+// ---- incoming webhooks (EXPERIMENTAL, off by default) ----
+//
+// See inbound.ts. Every minute the machine holding the sender lease asks
+// Supabase for pending commands, runs them, and reports back. While the
+// setting is off the poll returns before touching the network.
+
+const INBOUND_ALARM = 'crm-inbound';
+const INBOUND_POLL_MINUTES = 1;
+const INBOUND_STATUS_KEY = 'crm_inbound_status';
+
+const inboundClient = makeInboundClient({
+  baseUrl: SUPABASE_URL,
+  anonKey: SUPABASE_ANON_KEY,
+  getToken: getAccessToken,
+  // Late-bound so it's the worker's global fetch at call time.
+  fetch: (input, init) => fetch(input, init),
+});
+
+function ensureInboundAlarm(): void {
+  try {
+    chrome.alarms?.get(INBOUND_ALARM, (existing) => {
+      void chrome.runtime.lastError;
+      if (existing) return;
+      try { chrome.alarms?.create(INBOUND_ALARM, { delayInMinutes: INBOUND_POLL_MINUTES, periodInMinutes: INBOUND_POLL_MINUTES }); }
+      catch (e) { console.warn('[CRM] alarms unavailable (inbound):', e); }
+    });
+  } catch (e) { console.warn('[CRM] alarms unavailable (inbound):', e); }
+}
+
+/** Run an (already overridden) automation for a webhook and wait for its run record. */
+async function runInboundAutomation(overridden: Automation, ids: string[] | undefined): Promise<AutomationRun> {
+  let job = null as Promise<void> | null;
+  const res = await startAutomation(overridden.id, 'webhook', {
+    // Applied to the automation as loaded when the job runs: its current steps,
+    // with the request's message overrides.
+    transform: (stored) => ({ ...stored, message: overridden.message }),
+    ...(ids ? { ids } : {}),
+    onJob: (j) => { job = j; },
+  });
+  if (!res.success) throw new Error(res.error || 'The automation could not start.');
+  if (job) await job;
+  const run = (await getAutomationRuns())[overridden.id];
+  if (!run) throw new Error('The automation finished without a run record.');
+  return run;
+}
+
+const inboundDeps: InboundDeps = {
+  loadStore,
+  getSettings: async () => readInboundSettings(await loadStore()),
+  isSignedIn,
+  isSender: canSendFromThisMachine,
+  deviceId: getDeviceId,
+  version: (() => { try { return chrome.runtime.getManifest().version; } catch { return 'unknown'; } })(),
+  claim: (device) => inboundClient.claim(device),
+  complete: (id, outcome) => inboundClient.complete(id, outcome),
+  runAutomation: runInboundAutomation,
+  saveStatus: (s) => new Promise<void>((resolve) => {
+    try { chrome.storage.local.set({ [INBOUND_STATUS_KEY]: s }, () => { void chrome.runtime.lastError; resolve(); }); }
+    catch { resolve(); }
+  }),
+  now: () => Date.now(),
+};
+
+let inboundPolling: Promise<InboundStatus> | null = null;
+
+/** One poll at a time: a slow automation must not be claimed twice by overlapping alarms. */
+function pollInboundNow(): Promise<InboundStatus> {
+  if (!inboundPolling) inboundPolling = pollInbound(inboundDeps).finally(() => { inboundPolling = null; });
+  return inboundPolling;
+}
+
+function getInboundStatus(): Promise<InboundStatus | null> {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(INBOUND_STATUS_KEY, (res) => {
+        if (chrome.runtime.lastError) { resolve(null); return; }
+        resolve((res?.[INBOUND_STATUS_KEY] as InboundStatus) ?? null);
+      });
+    } catch { resolve(null); }
+  });
 }
 
 // ---- multi-machine coordination ----
@@ -2319,6 +2428,7 @@ try {
     else if (alarm.name === DRIVE_SYNC_ALARM) void syncDriveNow();
     else if (alarm.name === ENTITLEMENT_ALARM) void refreshEntitlement().catch(() => { /* offline — cache stands */ });
     else if (alarm.name === AUTOMATION_ALARM) void runDueAutomations();
+    else if (alarm.name === INBOUND_ALARM) void pollInboundNow();
 
   });
 } catch (e) {
@@ -2333,6 +2443,7 @@ ensureWatchdog();
 ensureDriveSync();
 ensureEntitlementCheck();
 ensureAutomationAlarm();
+ensureInboundAlarm();
 
 
 // On startup, push up any local edits that didn't reach Drive last session.
@@ -2680,6 +2791,32 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         // ---- automations ----
         //
         // Not in QUEUE_MUTATING, for the same reason as the reply check.
+        // ---- incoming webhooks ----
+        case 'INBOUND_INFO': {
+          sendResponse({ endpointUrl: inboundClient.endpointUrl, status: await getInboundStatus() });
+          break;
+        }
+        case 'INBOUND_POLL_NOW': {
+          sendResponse(await pollInboundNow());
+          break;
+        }
+        case 'INBOUND_TOKENS': {
+          sendResponse(await inboundClient.listTokens());
+          break;
+        }
+        case 'INBOUND_TOKEN_CREATE': {
+          sendResponse(await inboundClient.createToken(String(request.payload?.label || '').slice(0, 60)));
+          break;
+        }
+        case 'INBOUND_TOKEN_REVOKE': {
+          sendResponse(await inboundClient.revokeToken(String(request.payload?.id || '')));
+          break;
+        }
+        case 'INBOUND_RECENT': {
+          sendResponse(await inboundClient.listRecent(20));
+          break;
+        }
+
         case 'RUN_AUTOMATION': {
           sendResponse(await startAutomation(String(request.payload?.automationId || ''), 'manual'));
           break;
