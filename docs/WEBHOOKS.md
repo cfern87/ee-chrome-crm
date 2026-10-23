@@ -178,6 +178,14 @@ sent with its HTTP status, or failed with a short reason — is written to that
 contact's history in the dashboard. A failed request is never retried and never
 stops the rest of the quick action or the other contacts.
 
+**Only send one webhook with all contacts affected.** Tick this on the step (in
+a quick action or an automation) and a run sends a single request instead,
+whatever the number of contacts. Its `data` is `preset`, `batch: true`,
+`count`, and `contacts: [ { … }, … ]` (the same contact shape, as an array) in
+place of `contact`. Its one outcome is written to every included contact's
+history. Use it when a run can touch hundreds of contacts and your endpoint
+shouldn't take hundreds of requests.
+
 ---
 
 ## 4. Security — read this

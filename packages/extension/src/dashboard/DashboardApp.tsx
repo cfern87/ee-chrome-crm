@@ -1205,11 +1205,12 @@ export default function DashboardApp() {
     for (const send of sends) {
       let host = send.url;
       try { host = new URL(send.url).host; } catch { /* shown as typed */ }
-      // Generous: one POST per contact, four at a time, each up to 10s.
-      const timeout = 30_000 + send.conversationIds.length * 3_000;
+      // Generous: one POST per contact, four at a time, each up to 10s — or a
+      // single POST for a "one request for all" step.
+      const timeout = send.batch ? 60_000 : 30_000 + send.conversationIds.length * 3_000;
       const res = await sendBg<{ success: boolean; sent: number; failed: number; error?: string }>({
         type: 'SEND_PRESET_WEBHOOK',
-        payload: { url: send.url, presetLabel: preset.label, conversationIds: send.conversationIds },
+        payload: { url: send.url, presetLabel: preset.label, conversationIds: send.conversationIds, batch: !!send.batch },
       }, timeout);
       if (!res) {
         setBulkPresetWarn(true);

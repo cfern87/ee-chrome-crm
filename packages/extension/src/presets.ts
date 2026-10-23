@@ -87,7 +87,9 @@ type PresetStepBody =
   // store edit: the background delivers it — one POST per contact, so a bulk
   // press of fifty is fifty POSTs — and logs each outcome in that contact's
   // history. A failed POST never stops the rest of the preset or the batch.
-  | { kind: 'sendWebhook'; url: string }
+  // `batch` sends ONE POST carrying every matched contact instead, so a run
+  // over hundreds of contacts is one request (webhooks.ts buildBatchPresetPayload).
+  | { kind: 'sendWebhook'; url: string; batch?: boolean }
   | { kind: 'archive' }
   | { kind: 'unarchive' }
   | { kind: 'deleteContact' };
@@ -251,7 +253,9 @@ function normalizeStepBody(raw: unknown): PresetStepBody | null {
         }
         : null;
     case 'sendWebhook':
-      return typeof o.url === 'string' ? { kind: 'sendWebhook', url: o.url } : null;
+      return typeof o.url === 'string'
+        ? { kind: 'sendWebhook', url: o.url, ...(o.batch === true ? { batch: true } : {}) }
+        : null;
     case 'archive':
     case 'unarchive':
     case 'deleteContact':
@@ -546,6 +550,8 @@ export function campaignSendsFor(
 export interface PresetWebhookSend {
   url: string;
   conversationIds: string[];
+  /** One POST with every contact, instead of one POST per contact. */
+  batch?: boolean;
 }
 
 /**
@@ -569,7 +575,7 @@ export function webhookSendsFor(
       if (step.when && !matchesQuery(conv, step.when, ctx)) continue;
       ids.add(conv.id);
     }
-    if (ids.size) out.push({ url: step.url.trim(), conversationIds: [...ids] });
+    if (ids.size) out.push({ url: step.url.trim(), conversationIds: [...ids], ...(step.batch ? { batch: true } : {}) });
   }
   return out;
 }
@@ -608,7 +614,8 @@ export function describePreset(preset: PresetAction, store: Store): string {
       }
       case 'sendWebhook': {
         if (!s.url.trim()) return 'send to webhook (no URL yet)';
-        try { return `send to webhook ${new URL(s.url).host}`; } catch { return 'send to webhook (bad URL)'; }
+        const how = s.batch ? ' (one request for all)' : '';
+        try { return `send to webhook ${new URL(s.url).host}${how}`; } catch { return 'send to webhook (bad URL)'; }
       }
     }
   }

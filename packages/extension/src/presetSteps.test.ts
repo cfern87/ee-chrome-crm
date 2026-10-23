@@ -2,7 +2,7 @@
 // "set funnel step" action. The merge side of presets is in presets.test.ts.
 
 import { describe, it, expect } from 'vitest';
-import { stepsFor, readPresetActions, campaignSendsFor, webhookSendsFor, needsConfirm, PRESET_ACTIONS_KEY, type PresetAction, type PresetStep } from './presets';
+import { stepsFor, readPresetActions, campaignSendsFor, webhookSendsFor, needsConfirm, normalizeSteps, PRESET_ACTIONS_KEY, type PresetAction, type PresetStep } from './presets';
 import { applyMutations } from './mutations';
 import { parseHistory, webhookFailureArg, messageFromArg } from './history';
 import { EMPTY_STORE, type Conversation, type Store, type Tag, type TagGroup } from './storage';
@@ -184,6 +184,18 @@ describe('send to webhook', () => {
     const store = { ...storeWith(a), conversations: { a, b } };
     const p = preset([{ kind: 'sendWebhook', url: ' https://x.test/h ', when: hasTag('lead') }]);
     expect(webhookSendsFor(p, [a, b], store)).toEqual([{ url: 'https://x.test/h', conversationIds: ['a'] }]);
+  });
+
+  it('carries the "one request for all" flag through, and keeps it on save', () => {
+    const a = contact('a', []);
+    const b = contact('b', []);
+    const store = { ...storeWith(a), conversations: { a, b } };
+    const p = preset([{ kind: 'sendWebhook', url: 'https://x.test/h', batch: true }]);
+    expect(webhookSendsFor(p, [a, b], store)).toEqual([{ url: 'https://x.test/h', conversationIds: ['a', 'b'], batch: true }]);
+    expect(normalizeSteps([{ kind: 'sendWebhook', url: 'https://x.test/h', batch: true }]))
+      .toEqual([{ kind: 'sendWebhook', url: 'https://x.test/h', batch: true }]);
+    expect(normalizeSteps([{ kind: 'sendWebhook', url: 'https://x.test/h', batch: 'yes' }]))
+      .toEqual([{ kind: 'sendWebhook', url: 'https://x.test/h' }]);
   });
 
   it('is not a store edit, needs no confirmation, and a blank URL sends nothing', () => {

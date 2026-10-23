@@ -1592,7 +1592,7 @@ async function queuePresetCampaign(send: PresetCampaignSend): Promise<{ text: st
 async function sendPanelWebhook(send: PresetWebhookSend, presetLabel: string): Promise<{ text: string; error: boolean }> {
   const res = await sendBg<{ success: boolean; sent: number; failed: number; error?: string }>({
     type: 'SEND_PRESET_WEBHOOK',
-    payload: { url: send.url, presetLabel, conversationIds: send.conversationIds },
+    payload: { url: send.url, presetLabel, conversationIds: send.conversationIds, batch: !!send.batch },
   }, 30_000);
   if (!res) return { text: 'Webhook: no answer yet — the result will show in this contact’s history.', error: true };
   if (res.failed) return { text: `Webhook failed${res.error ? ` (${res.error})` : ''} — logged in this contact’s history.`, error: true };

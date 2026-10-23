@@ -321,6 +321,26 @@ export function buildPresetPayload(
   });
 }
 
+/**
+ * The `preset.action` payload for a "one request for all" step: every contact
+ * in `data.contacts`, with `data.batch: true` and a count, so a receiver can
+ * tell it apart from the one-contact shape (which uses `data.contact`).
+ */
+export function buildBatchPresetPayload(
+  hook: WebhookConfig,
+  presetLabel: string,
+  contacts: WebhookContact[],
+  test = false,
+): WebhookPayload {
+  return buildPayload(hook, 'preset.action', {
+    preset: presetLabel,
+    batch: true,
+    count: contacts.length,
+    contacts,
+    ...(test ? { test: true, note: 'Test delivery from Not Another Social CRM. No CRM data changed.' } : {}),
+  });
+}
+
 /** What the test button sends in place of a real contact. */
 export const TEST_CONTACT: WebhookContact = {
   id: 'test_contact', name: 'Test Contact', tags: ['example'], archived: false,

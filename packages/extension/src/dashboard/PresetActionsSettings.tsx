@@ -754,7 +754,7 @@ function WebhookStepFields({ step, onChange }: {
     setResult(null);
     const granted = await ensureHostPermission(step.url);
     const res = await sendBg<{ ok: boolean; status?: number; error?: string }>(
-      { type: 'TEST_PRESET_WEBHOOK', payload: { url: step.url, presetLabel: 'Test' } },
+      { type: 'TEST_PRESET_WEBHOOK', payload: { url: step.url, presetLabel: 'Test', batch: !!step.batch } },
       20000,
     );
     setTesting(false);
@@ -782,6 +782,23 @@ function WebhookStepFields({ step, onChange }: {
       </Button>
       {invalid && <Text size="micro" tone="danger">{invalid}</Text>}
       {result && <Text size="micro" tone={result.ok ? 'success' : 'danger'}>{result.text}</Text>}
+      <div style={{ flexBasis: '100%' }}>
+        <Toggle
+          labelFirst={false}
+          label="Only send one webhook with all contacts affected"
+          checked={!!step.batch}
+          onChange={(e) => {
+            setResult(null);
+            const { batch: _b, ...rest } = step;
+            onChange(e.target.checked ? { ...rest, batch: true } : rest);
+          }}
+        />
+        <Text as="div" size="micro" tone="muted">
+          {step.batch
+            ? 'One POST with every contact in data.contacts — easier on your server for big runs.'
+            : 'Off: one POST per contact (data.contact), so 300 contacts means 300 requests.'}
+        </Text>
+      </div>
       <Text as="div" size="micro" tone="muted" style={{ flexBasis: '100%' }}>{TEST_PERMISSION_NOTE}</Text>
     </>
   );

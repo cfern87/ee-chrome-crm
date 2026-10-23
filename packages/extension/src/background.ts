@@ -111,7 +111,7 @@ import {
 } from './automations';
 import {
   readWebhooks, subscribersOf, buildPayload, deliver, diffContactEvents,
-  writeWebhooks, isValidWebhookUrl, presetHook, buildPresetPayload, contactSummary, TEST_CONTACT,
+  writeWebhooks, isValidWebhookUrl, presetHook, buildPresetPayload, buildBatchPresetPayload, contactSummary, TEST_CONTACT,
   type WebhookEvent, type PendingEvent, type WebhookConfig, type WebhookDelivery,
 } from './webhooks';
 import { webhookFailureArg } from './history';
@@ -293,7 +293,7 @@ interface PresetWebhookResult {
  * have already happened and must not be reported as failed because the
  * bookkeeping hiccupped.
  */
-async function sendPresetWebhook(url: string, presetLabel: string, conversationIds: string[]): Promise<PresetWebhookResult> {
+async function sendPresetWebhook(url: string, presetLabel: string, conversationIds: string[], batch = false): Promise<PresetWebhookResult> {
   const result: PresetWebhookResult = { success: true, sent: 0, failed: 0 };
   const reasons = new Map<string, number>();
   try {
@@ -301,6 +301,32 @@ async function sendPresetWebhook(url: string, presetLabel: string, conversationI
     const contacts = conversationIds.map((id) => store.conversations[id]).filter((c): c is Conversation => !!c);
     const invalid = isValidWebhookUrl(url);
     const hook = presetHook(url, presetLabel);
+
+    // "One request for all": a single POST with every contact, its one outcome
+    // logged on each of them. Counted per contact so the notices read the same.
+    if (batch) {
+      if (contacts.length === 0) return result;
+      let delivery: WebhookDelivery;
+      try {
+        delivery = invalid
+          ? { at: Date.now(), ok: false, error: invalid }
+          : await deliver(hook, buildBatchPresetPayload(hook, presetLabel, contacts.map((c) => contactSummary(c, store))));
+      } catch (e) {
+        delivery = { at: Date.now(), ok: false, error: String(e) };
+      }
+      const why = delivery.ok ? undefined : (invalid ? 'bad URL' : webhookFailureArg(delivery));
+      if (delivery.ok) result.sent = contacts.length;
+      else { result.failed = contacts.length; result.error = why; }
+      const arg = delivery.ok ? (delivery.status ? String(delivery.status) : undefined) : why;
+      for (let start = 0; start < contacts.length; start += PRESET_WEBHOOK_LOG_CHUNK) {
+        const logs: Mutation[] = contacts.slice(start, start + PRESET_WEBHOOK_LOG_CHUNK).map((conv): Mutation => ({
+          op: 'logWebhook', conversationId: conv.id, ok: delivery.ok, at: delivery.at, arg,
+        }));
+        try { await mutateStore(logs); } catch (e) { console.warn('[CRM] could not log webhook results', e); }
+      }
+      console.info(`[CRM] Preset "${presetLabel}" batch webhook (${contacts.length} contacts): ${delivery.ok ? 'sent' : `failed (${why})`}`);
+      return result;
+    }
 
     for (let start = 0; start < contacts.length; start += PRESET_WEBHOOK_LOG_CHUNK) {
       const chunk = contacts.slice(start, start + PRESET_WEBHOOK_LOG_CHUNK);
@@ -1433,7 +1459,7 @@ async function applyAutomationActions(automation: Automation, ids: string[]): Pr
   const hookTally = { sent: 0, failed: 0 };
   const sendHooks = async () => {
     for (const h of hooks) {
-      const r = await sendPresetWebhook(h.url, automation.name, h.conversationIds);
+      const r = await sendPresetWebhook(h.url, automation.name, h.conversationIds, !!h.batch);
       hookTally.sent += r.sent;
       hookTally.failed += r.failed;
     }
@@ -2883,7 +2909,7 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         case 'SEND_PRESET_WEBHOOK': {
           const p = request.payload || {};
           const ids = Array.isArray(p.conversationIds) ? p.conversationIds.filter((x: unknown): x is string => typeof x === 'string') : [];
-          sendResponse(await sendPresetWebhook(String(p.url || ''), String(p.presetLabel || ''), ids));
+          sendResponse(await sendPresetWebhook(String(p.url || ''), String(p.presetLabel || ''), ids, p.batch === true));
           break;
         }
 
@@ -2894,7 +2920,9 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           const invalid = isValidWebhookUrl(url);
           if (invalid) { sendResponse({ ok: false, error: invalid }); break; }
           const hook = presetHook(url, String(request.payload?.presetLabel || 'Test'));
-          const delivery = await deliver(hook, buildPresetPayload(hook, hook.name || 'Test', TEST_CONTACT, true));
+          const delivery = await deliver(hook, request.payload?.batch === true
+            ? buildBatchPresetPayload(hook, hook.name || 'Test', [TEST_CONTACT], true)
+            : buildPresetPayload(hook, hook.name || 'Test', TEST_CONTACT, true));
           sendResponse({ ok: delivery.ok, status: delivery.status, error: delivery.error });
           break;
         }
