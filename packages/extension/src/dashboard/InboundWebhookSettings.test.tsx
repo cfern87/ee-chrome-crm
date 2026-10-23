@@ -49,7 +49,7 @@ function baseStore(enabled: boolean): Store {
   return { ...EMPTY_STORE, settings };
 }
 
-async function render(store: Store, updateStore = vi.fn(async () => ({ ok: true }) as never)) {
+async function render(store: Store, updateStore = vi.fn(async (_s: Store) => ({ ok: true }) as never)) {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
@@ -113,5 +113,85 @@ describe('InboundWebhookSettings', () => {
     await act(async () => { btn.click(); await new Promise((r) => setTimeout(r, 5)); });
     expect(sent.some((m) => m.type === 'INBOUND_TOKEN_CREATE')).toBe(true);
     expect(container!.textContent).toContain('crm_in_secret123');
+  });
+});
+
+describe('InboundWebhookSettings — after creating a token', () => {
+  async function created() {
+    fakeBackground({
+      INBOUND_INFO: INFO,
+      INBOUND_TOKENS: { ok: true, tokens: [] },
+      INBOUND_RECENT: { ok: true, commands: [] },
+      INBOUND_TOKEN_CREATE: { ok: true, token: { id: 't1', token: 'crm_in_secret123', token_prefix: 'crm_in_s' } },
+    });
+    const writeText = vi.fn(async (_text: string) => {});
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    const store = baseStore(true);
+    store.settings = writeInboundSettings(store.settings, { enabled: true, automationIds: ['a1'] });
+    await render(store);
+    const btn = Array.from(container!.querySelectorAll('button')).find((b) => b.textContent === 'Create token')!;
+    await act(async () => { btn.click(); await new Promise((r) => setTimeout(r, 5)); });
+    const setup = container!.querySelector('[data-testid="inbound-setup"]') as HTMLElement;
+    const copyButtons = () => Array.from(setup.querySelectorAll('button'));
+    const click = async (label: string) => {
+      const b = copyButtons().find((x) => x.getAttribute('title') === label)!;
+      expect(b, `button titled "${label}"`).toBeTruthy();
+      await act(async () => { b.click(); await Promise.resolve(); });
+    };
+    return { setup, writeText, click };
+  }
+
+  it('copies the token with one click', async () => {
+    const { writeText, click } = await created();
+    await click('Copy token');
+    expect(writeText).toHaveBeenLastCalledWith('crm_in_secret123');
+  });
+
+  it('shows the URL, header and body to paste, filled in with the real token', async () => {
+    const { setup } = await created();
+    const text = setup.textContent || '';
+    expect(text).toContain(INFO.endpointUrl);
+    expect(text).toContain('Authorization');
+    expect(text).toContain('Bearer crm_in_secret123');
+    expect(text).toContain('"command":"automation.run"');
+    expect(text).toContain('"automation":"Follow up"');
+  });
+
+  it('copies each piece separately, and a complete curl command', async () => {
+    const { writeText, click } = await created();
+    await click('Copy URL');
+    expect(writeText).toHaveBeenLastCalledWith(INFO.endpointUrl);
+    await click('Copy header value');
+    expect(writeText).toHaveBeenLastCalledWith('Bearer crm_in_secret123');
+    await click('Copy body');
+    expect(JSON.parse(writeText.mock.calls.at(-1)![0] as string)).toEqual({
+      command: 'automation.run', payload: { automation: 'Follow up', dryRun: true },
+    });
+    await click('Copy curl command');
+    const curl = writeText.mock.calls.at(-1)![0] as string;
+    expect(curl).toContain(`curl -X POST '${INFO.endpointUrl}'`);
+    expect(curl).toContain("Authorization: Bearer crm_in_secret123");
+  });
+
+  it('uses ping in the example when no automation is ticked yet', async () => {
+    fakeBackground({
+      INBOUND_INFO: INFO,
+      INBOUND_TOKENS: { ok: true, tokens: [] },
+      INBOUND_RECENT: { ok: true, commands: [] },
+      INBOUND_TOKEN_CREATE: { ok: true, token: { id: 't1', token: 'crm_in_x', token_prefix: 'crm_in_x' } },
+    });
+    await render(baseStore(true));
+    const btn = Array.from(container!.querySelectorAll('button')).find((b) => b.textContent === 'Create token')!;
+    await act(async () => { btn.click(); await new Promise((r) => setTimeout(r, 5)); });
+    const setup = container!.querySelector('[data-testid="inbound-setup"]') as HTMLElement;
+    expect(setup.textContent).toContain('"command":"ping"');
+  });
+
+  it('"Done, I\'ve saved it" hides the token for good', async () => {
+    const { setup } = await created();
+    const done = Array.from(setup.querySelectorAll('button')).find((b) => b.textContent?.includes('saved it'))!;
+    await act(async () => { done.click(); });
+    expect(container!.textContent).not.toContain('crm_in_secret123');
+    expect(container!.querySelector('[data-testid="inbound-setup"]')).toBeNull();
   });
 });

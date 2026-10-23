@@ -22,8 +22,12 @@ If no browser is running, commands wait — and expire after 24 hours (or
 Settings → Data → **Incoming webhooks**:
 
 1. Switch it **On** (off by default; while off nothing is checked).
-2. **Create token** and copy it — it's shown once.
-3. Tick the automations a webhook may run. Nothing is allowed by default.
+2. Tick the automations a webhook may run. Nothing is allowed by default.
+3. **Create token**. The screen then shows everything to paste into Zapier
+   ("Webhooks by Zapier" → POST), Make, or your own code — the URL, the
+   `Authorization` header value and an example body — each with a Copy button,
+   plus a ready-to-run curl command. The token is shown only this once; the
+   server keeps just a hash of it. Lost it? Revoke it and create another.
 
 ## Request
 
