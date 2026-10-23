@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const ENDPOINT = process.env.CRM_INBOUND_URL || 'https://jivkzbtqnepzjgwzycjw.supabase.co/functions/v1/crm-inbox';
+const ENDPOINT = process.env.CRM_INBOUND_URL || 'https://notanothersocialcrm.com/api/public/crm-inbox';
 const tokenFile = join(root, '.inbound-token');
 const TOKEN = (process.env.CRM_INBOUND_TOKEN || (existsSync(tokenFile) ? readFileSync(tokenFile, 'utf8') : '')).trim();
 const AUTOMATION = process.env.CRM_INBOUND_AUTOMATION || '';

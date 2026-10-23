@@ -8,7 +8,7 @@ direction to [WEBHOOKS.md](WEBHOOKS.md).
 The extension runs in a browser and can't receive HTTP, so requests go to a
 mailbox on the server first:
 
-1. You POST a command to `https://jivkzbtqnepzjgwzycjw.supabase.co/functions/v1/crm-inbox`.
+1. You POST a command to `https://notanothersocialcrm.com/api/public/crm-inbox`.
 2. It's stored and you get **202** with an `id` straight away.
 3. Within about a minute, the user's **sending machine** (the one browser that
    sends messages, see Settings → Machines) picks it up and runs it.
@@ -32,7 +32,7 @@ Settings → Data → **Incoming webhooks**:
 ## Request
 
 ```
-POST /functions/v1/crm-inbox
+POST /api/public/crm-inbox
 Authorization: Bearer crm_in_…
 Content-Type: application/json
 ```
@@ -98,7 +98,7 @@ afterwards, and the regular outgoing `message.sent` webhooks report them.
 ## Reading the result
 
 ```
-GET /functions/v1/crm-inbox?id=<id>
+GET /api/public/crm-inbox?id=<id>
 Authorization: Bearer crm_in_…
 ```
 

@@ -41,11 +41,12 @@ import {
   getAccessToken,
   SUPABASE_URL,
   SUPABASE_ANON_KEY,
+  PLATFORM_URL,
   ENTITLEMENT_ALARM,
   ENTITLEMENT_PERIOD_MINUTES,
 } from './license';
 import { pollInbound, readInboundSettings, type InboundDeps, type InboundStatus } from './inbound';
-import { makeInboundClient } from './inboundClient';
+import { makeInboundClient, inboundEndpointUrl } from './inboundClient';
 
 import {
   Campaign,
@@ -1601,6 +1602,7 @@ const INBOUND_STATUS_KEY = 'crm_inbound_status';
 const inboundClient = makeInboundClient({
   baseUrl: SUPABASE_URL,
   anonKey: SUPABASE_ANON_KEY,
+  endpointUrl: inboundEndpointUrl(PLATFORM_URL),
   getToken: getAccessToken,
   // Late-bound so it's the worker's global fetch at call time.
   fetch: (input, init) => fetch(input, init),

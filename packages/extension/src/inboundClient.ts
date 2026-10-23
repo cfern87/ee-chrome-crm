@@ -7,7 +7,16 @@
 
 import type { ClaimResult, CompleteOutcome, InboundCommandRow } from './inbound';
 
-export const INBOUND_FUNCTION_PATH = '/functions/v1/crm-inbox';
+/**
+ * Where outside systems POST. It lives on the website (Lovable hosts server
+ * code there, not in Supabase edge functions); the website writes into the
+ * same Supabase tables this client reads.
+ */
+export const INBOUND_ENDPOINT_PATH = '/api/public/crm-inbox';
+
+export function inboundEndpointUrl(platformUrl: string): string {
+  return `${platformUrl.replace(/\/+$/, '')}${INBOUND_ENDPOINT_PATH}`;
+}
 export const CLAIM_LIMIT = 5;
 
 export const SETUP_PENDING_MESSAGE =
@@ -36,8 +45,11 @@ export interface InboundCommandSummary {
 type Fail = { ok: false; error: string; status?: number };
 
 export interface InboundClientDeps {
+  /** Supabase project URL — for the extension's own table reads and RPCs. */
   baseUrl: string;
   anonKey: string;
+  /** The public endpoint shown to users (see inboundEndpointUrl). */
+  endpointUrl: string;
   getToken(): Promise<string | null>;
   fetch: typeof fetch;
 }
@@ -76,7 +88,7 @@ export function makeInboundClient(deps: InboundClientDeps) {
   const failed = (r: { ok: true; data: unknown } | Fail): r is Fail => 'error' in r;
 
   return {
-    endpointUrl: `${deps.baseUrl}${INBOUND_FUNCTION_PATH}`,
+    endpointUrl: deps.endpointUrl,
 
     async claim(deviceId: string): Promise<ClaimResult> {
       const r = await rpc('claim_inbound_commands', { p_device: deviceId, p_limit: CLAIM_LIMIT });

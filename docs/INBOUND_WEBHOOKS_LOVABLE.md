@@ -1,5 +1,17 @@
 # Incoming webhooks — instructions for Lovable
 
+> **As built (2026-10-23)** — Lovable implemented this with three deviations:
+> 1. The public endpoint is a **website route**,
+>    `https://notanothersocialcrm.com/api/public/crm-inbox`, not a Supabase edge
+>    function (Lovable keeps server code in the website). Same behaviour.
+> 2. `user_id` is a plain uuid with **no foreign key** to `auth.users`, so
+>    deleting an account does not cascade-delete its tokens/commands.
+> 3. **No cleanup job** (`pg_cron` not available) — finished commands are kept.
+>
+> The tables and functions are in the same Supabase project the extension
+> signs into, named exactly as below. The rollback in §6 still applies, minus
+> the cron line; remove the website route instead of an edge function.
+
 Paste everything below the line into Lovable. It is self-contained.
 
 It only **adds** things (two tables, five database functions, one edge

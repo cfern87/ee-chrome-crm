@@ -1,23 +1,29 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  makeInboundClient, INBOUND_FUNCTION_PATH, SETUP_PENDING_MESSAGE,
+  makeInboundClient, inboundEndpointUrl, INBOUND_ENDPOINT_PATH, SETUP_PENDING_MESSAGE,
 } from './inboundClient';
 
 const BASE = 'https://example.supabase.co';
 const ANON = 'anon-key';
+const SITE = 'https://site.example';
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
 function client(fetchImpl: typeof fetch, token: string | null = 'user-jwt') {
-  return makeInboundClient({ baseUrl: BASE, anonKey: ANON, getToken: async () => token, fetch: fetchImpl });
+  return makeInboundClient({
+    baseUrl: BASE, anonKey: ANON, endpointUrl: inboundEndpointUrl(SITE), getToken: async () => token, fetch: fetchImpl,
+  });
 }
 
 describe('inbound client', () => {
-  it('exposes the public endpoint URL callers POST to', () => {
-    expect(client(vi.fn()).endpointUrl).toBe(`${BASE}${INBOUND_FUNCTION_PATH}`);
-    expect(INBOUND_FUNCTION_PATH).toBe('/functions/v1/crm-inbox');
+  it('callers POST to the website, not to Supabase', () => {
+    // Lovable hosts server code inside the website, so the public endpoint is
+    // <platform>/api/public/crm-inbox. Only the extension's own reads/RPCs go to Supabase.
+    expect(INBOUND_ENDPOINT_PATH).toBe('/api/public/crm-inbox');
+    expect(client(vi.fn()).endpointUrl).toBe('https://site.example/api/public/crm-inbox');
+    expect(inboundEndpointUrl('https://notanothersocialcrm.com/')).toBe('https://notanothersocialcrm.com/api/public/crm-inbox');
   });
 
   it('claims via the claim_inbound_commands RPC with the user token', async () => {
