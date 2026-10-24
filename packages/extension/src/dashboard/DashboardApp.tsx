@@ -992,6 +992,21 @@ export default function DashboardApp() {
     if (firstSelectionKey.current) { firstSelectionKey.current = false; return; }
     clearBulkSelection();
   }, [selectionResetKey]);
+  // Same search, but a selected contact stopped matching it (a tag or field
+  // edit moved it out). Deselect it, so the "N selected" count and every bulk
+  // action cover exactly the contacts still in the results. Before this the
+  // count kept the stale ids while some actions (Open) skipped them and others
+  // (tag, delete, message) still acted on them, off screen.
+  useEffect(() => {
+    if (selectedIds.size === 0) return;
+    const visible = new Set(filtered.map((c) => c.id));
+    let stale = false;
+    for (const id of selectedIds) if (!visible.has(id)) { stale = true; break; }
+    if (!stale) return;
+    const kept = Array.from(selectedIds).filter((id) => visible.has(id));
+    if (kept.length === 0) clearBulkSelection();
+    else setSelectedIds(new Set(kept));
+  });
   // Clamp when the list shrinks underneath us (e.g. after a bulk delete).
   useEffect(() => { if (page !== currentPage) setPage(currentPage); }, [page, currentPage]);
 
