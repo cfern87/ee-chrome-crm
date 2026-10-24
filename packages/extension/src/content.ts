@@ -19,7 +19,7 @@ import {
 } from './storage';
 import type { Store, Tag, Conversation, CustomFieldDef, TagGroup } from './storage';
 import { bucketTags, showsGroupLabels, tagDisplayOrder, type TagBucket } from './tagGrouping';
-import { funnelsFor, stageEditsFor, isNoOpStageEdit, describeStage, stagePosition, stageTitle, type FunnelView } from './funnel';
+import { funnelsFor, hiddenFunnelIds, stageEditsFor, isNoOpStageEdit, describeStage, stagePosition, stageTitle, type FunnelView } from './funnel';
 import {
   readPresetActions, stepsFor, describePreset, isDestructive, needsConfirm, campaignSendsFor, webhookSendsFor,
   type PresetAction, type PresetCampaignSend, type PresetWebhookSend,
@@ -1954,7 +1954,7 @@ async function renderPanelContent() {
 
       ${tasksSectionHtml(conv)}
 
-      ${funnelBarsHtml(funnelsFor(conv, store.tags, store.tagGroups), conv.hiddenFunnels || [])}
+      ${funnelBarsHtml(funnelsFor(conv, store.tags, store.tagGroups), hiddenFunnelIds(conv, store.tagGroups))}
 
       ${choiceGroupsHtml(conv, store)}
 

@@ -40,6 +40,8 @@ export interface TagsPanelProps {
   onSetGroupMode: (groupId: string, mode: TagGroupMode) => void;
   /** "One tag from this group only" for a funnel group — see TagGroup.funnelExclusive. */
   onSetGroupFunnelExclusive: (groupId: string, exclusive: boolean) => void;
+  /** "Hidden by default on profile cards" for a funnel group — see TagGroup.funnelHiddenByDefault. */
+  onSetGroupFunnelHiddenByDefault: (groupId: string, hidden: boolean) => void;
   onDeleteGroup: (groupId: string) => void;
 }
 
@@ -48,7 +50,7 @@ export function TagsPanel(props: TagsPanelProps) {
     tags, tagGroups, conversations,
     newTagName, setNewTagName, newTagColor, setNewTagColor, newTagGroup, setNewTagGroup,
     newGroupName, setNewGroupName, newGroupColor, setNewGroupColor,
-    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onSetTagHidden, onReorderTags, onAddGroup, onRenameGroup, onRecolorGroup, onSetGroupMode, onSetGroupFunnelExclusive, onDeleteGroup,
+    onAddTag, onDeleteTag, onRenameTag, onRecolorTag, onSetTagGroup, onSetTagHidden, onReorderTags, onAddGroup, onRenameGroup, onRecolorGroup, onSetGroupMode, onSetGroupFunnelExclusive, onSetGroupFunnelHiddenByDefault, onDeleteGroup,
   } = props;
 
   const usageOf = (tagId: string) => conversations.filter((c) => c.tags.includes(tagId)).length;
@@ -336,6 +338,23 @@ export function TagsPanel(props: TagsPanelProps) {
                   />
                   One tag from this group only
                 </label>
+                <label
+                  title="Contacts who already hid or unhid this funnel keep their own choice"
+                  style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 6, fontSize: 12, color: color.text.secondary, fontWeight: 600, cursor: 'pointer', width: 'fit-content' }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={!!group.funnelHiddenByDefault}
+                    onChange={(e) => onSetGroupFunnelHiddenByDefault(group.id, e.target.checked)}
+                    style={{ cursor: 'pointer', margin: 0 }}
+                  />
+                  Hidden by default on profile cards
+                </label>
+                {group.funnelHiddenByDefault && (
+                  <div style={{ marginTop: 2, paddingLeft: 18 }}>
+                    Collapsed to an "Unhide" link on each contact. Contacts who already hid or unhid this funnel keep their own choice.
+                  </div>
+                )}
               </div>
             )}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>

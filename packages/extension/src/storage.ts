@@ -108,6 +108,10 @@ export interface TagGroup {
   // one. Absent = false: picking a stage ADDS that tag and removes nothing,
   // and picking a stage the contact already holds removes just that one.
   funnelExclusive?: boolean;
+  // Funnel groups only: "Hidden by default" on profile cards. Applies to every
+  // contact that hasn't hidden or unhidden this funnel themselves
+  // (Conversation.hiddenFunnels / shownFunnels win) — see isFunnelHiddenFor.
+  funnelHiddenByDefault?: boolean;
   // SINGLE CHOICE: the group works like a dropdown — a contact holds at most
   // one of its tags, and adding one takes the others off (enforced in the
   // mutation layer, so it holds for every surface that tags). The panel shows
@@ -351,8 +355,12 @@ export interface Conversation {
   tasks?: FollowUpTask[];
   // Funnel groups (TagGroup ids) not shown in this contact's panel — a funnel
   // that doesn't apply to them. Display only: the group's tags stay on the
-  // contact and still show as chips. Absent = every funnel shown.
+  // contact and still show as chips. Absent = no funnel hidden by hand.
   hiddenFunnels?: string[];
+  // Funnel groups someone explicitly UNHID for this contact. Recorded so a
+  // group's "hidden by default" setting doesn't re-hide them. hiddenFunnels
+  // wins if a group is somehow in both (e.g. after merging duplicates).
+  shownFunnels?: string[];
 }
 
 export interface Store {

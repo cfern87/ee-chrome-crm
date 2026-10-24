@@ -517,12 +517,24 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
     case 'setFunnelHidden': {
       const conv = store.conversations[m.conversationId];
       if (!conv) return { store, changed: false };
-      const current = conv.hiddenFunnels || [];
-      if (current.includes(m.groupId) === m.hidden) return { store, changed: false, conversationId: m.conversationId };
-      const hidden = m.hidden ? [...current, m.groupId] : current.filter((id) => id !== m.groupId);
+      // Both directions are recorded as a manual choice — hiding in
+      // hiddenFunnels, unhiding in shownFunnels — so a group's "hidden by
+      // default" setting never overrides what someone picked for this contact.
+      const hiddenNow = conv.hiddenFunnels || [];
+      const shownNow = conv.shownFunnels || [];
+      const [addTo, takeFrom] = m.hidden ? [hiddenNow, shownNow] : [shownNow, hiddenNow];
+      if (addTo.includes(m.groupId) && !takeFrom.includes(m.groupId)) {
+        return { store, changed: false, conversationId: m.conversationId };
+      }
+      const added = addTo.includes(m.groupId) ? addTo : [...addTo, m.groupId];
+      const taken = takeFrom.filter((id) => id !== m.groupId);
+      const hidden = m.hidden ? added : taken;
+      const shown = m.hidden ? taken : added;
       const nextConv = { ...conv, updatedAt: now };
       if (hidden.length) nextConv.hiddenFunnels = hidden;
       else delete nextConv.hiddenFunnels;
+      if (shown.length) nextConv.shownFunnels = shown;
+      else delete nextConv.shownFunnels;
       const next = copy(store);
       next.conversations[m.conversationId] = nextConv;
       return { store: next, changed: true, conversationId: m.conversationId };

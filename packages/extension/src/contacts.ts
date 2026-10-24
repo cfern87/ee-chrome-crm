@@ -144,6 +144,11 @@ export function mergeConversations(store: Store, ids: string[], primaryId?: stri
   // A funnel hidden on any duplicate stays hidden on the merged contact.
   const hiddenFunnels = new Set(present.flatMap((c) => c.hiddenFunnels || []));
   if (hiddenFunnels.size) merged.hiddenFunnels = Array.from(hiddenFunnels);
+  else delete merged.hiddenFunnels;
+  // Explicit unhides carry over too, unless another duplicate hid it.
+  const shownFunnels = new Set(present.flatMap((c) => c.shownFunnels || []).filter((id) => !hiddenFunnels.has(id)));
+  if (shownFunnels.size) merged.shownFunnels = Array.from(shownFunnels);
+  else delete merged.shownFunnels;
 
   // The keys we're about to drop are real thread ids Facebook still uses — the
   // Messenger sidebar looks contacts up by them. Losing the numeric one here

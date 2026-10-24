@@ -1758,6 +1758,18 @@ export default function DashboardApp() {
     await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: touchDef(nextGroup) } });
   };
 
+  // "Hidden by default on profile cards". Read at render time (funnel.ts
+  // isFunnelHiddenFor), so it reaches every contact without a manual
+  // hide/unhide at once — no per-contact writes.
+  const setTagGroupFunnelHiddenByDefault = async (groupId: string, hidden: boolean) => {
+    const g = store.tagGroups[groupId];
+    if (!g || !!g.funnelHiddenByDefault === hidden) return;
+    const nextGroup: TagGroup = { ...g };
+    if (hidden) nextGroup.funnelHiddenByDefault = true;
+    else delete nextGroup.funnelHiddenByDefault;
+    await updateStore({ ...store, tagGroups: { ...store.tagGroups, [groupId]: touchDef(nextGroup) } });
+  };
+
   // Deleting a group leaves its tags intact but ungrouped.
   const deleteTagGroup = async (groupId: string) => {
     const ts = Date.now();
@@ -2669,6 +2681,7 @@ export default function DashboardApp() {
                 onRecolorGroup={recolorTagGroup}
                 onSetGroupMode={setTagGroupMode}
                 onSetGroupFunnelExclusive={setTagGroupFunnelExclusive}
+                onSetGroupFunnelHiddenByDefault={setTagGroupFunnelHiddenByDefault}
                 onDeleteGroup={deleteTagGroup}
               />
             )}

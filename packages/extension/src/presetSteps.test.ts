@@ -4,6 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { stepsFor, readPresetActions, campaignSendsFor, webhookSendsFor, needsConfirm, normalizeSteps, PRESET_ACTIONS_KEY, type PresetAction, type PresetStep } from './presets';
 import { applyMutations } from './mutations';
+import { isFunnelHiddenFor } from './funnel';
 import { parseHistory, webhookFailureArg, messageFromArg } from './history';
 import { EMPTY_STORE, type Conversation, type Store, type Tag, type TagGroup } from './storage';
 import type { QueryGroup } from './search';
@@ -135,6 +136,33 @@ describe('setFunnelHidden', () => {
 
     const shown = applyMutations(hidden.store, [{ op: 'setFunnelHidden', conversationId: 'c1', groupId: 'pipe', hidden: false }]);
     expect(shown.store.conversations.c1.hiddenFunnels).toBeUndefined();
+    // The unhide is remembered, so "hidden by default" can't re-hide it.
+    expect(shown.store.conversations.c1.shownFunnels).toEqual(['pipe']);
+
+    const again = applyMutations(shown.store, [{ op: 'setFunnelHidden', conversationId: 'c1', groupId: 'pipe', hidden: true }]);
+    expect(again.store.conversations.c1.hiddenFunnels).toEqual(['pipe']);
+    expect(again.store.conversations.c1.shownFunnels).toBeUndefined();
+  });
+
+  it('unhiding a funnel that is only hidden by default records the choice', () => {
+    const c = conv([]);
+    const s = storeWith(c, [group('pipe', { funnelHiddenByDefault: true })]);
+    const r = applyMutations(s, [{ op: 'setFunnelHidden', conversationId: 'c1', groupId: 'pipe', hidden: false }]);
+    expect(r.changed).toBe(true);
+    expect(r.store.conversations.c1.shownFunnels).toEqual(['pipe']);
+  });
+});
+
+describe('isFunnelHiddenFor', () => {
+  const g = (hiddenByDefault: boolean) => ({ id: 'pipe', funnelHiddenByDefault: hiddenByDefault });
+  it('follows the group default when the contact made no choice', () => {
+    expect(isFunnelHiddenFor({}, g(true))).toBe(true);
+    expect(isFunnelHiddenFor({}, g(false))).toBe(false);
+  });
+  it('keeps a manual hide or unhide regardless of the default', () => {
+    expect(isFunnelHiddenFor({ hiddenFunnels: ['pipe'] }, g(false))).toBe(true);
+    expect(isFunnelHiddenFor({ shownFunnels: ['pipe'] }, g(true))).toBe(false);
+    expect(isFunnelHiddenFor({ hiddenFunnels: ['pipe'], shownFunnels: ['pipe'] }, g(false))).toBe(true);
   });
 });
 

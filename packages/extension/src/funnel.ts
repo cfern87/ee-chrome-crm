@@ -88,6 +88,28 @@ export function funnelsFor(
   }));
 }
 
+/**
+ * Whether a funnel bar is hidden on this contact's card. A manual choice wins:
+ * hidden by hand → hidden; unhidden by hand → shown. Only contacts with no
+ * manual choice follow the group's "hidden by default" setting, so turning
+ * that setting on or off changes them and nobody else.
+ */
+export function isFunnelHiddenFor(
+  conv: Pick<Conversation, 'hiddenFunnels' | 'shownFunnels'>,
+  group: Pick<TagGroup, 'id' | 'funnelHiddenByDefault'>
+): boolean {
+  if (conv.hiddenFunnels?.includes(group.id)) return true;
+  if (conv.shownFunnels?.includes(group.id)) return false;
+  return !!group.funnelHiddenByDefault;
+}
+
+/** Ids of the funnel groups hidden on this contact's card — see isFunnelHiddenFor. */
+export function hiddenFunnelIds(conv: Conversation, tagGroups: Record<string, TagGroup>): string[] {
+  return Object.values(tagGroups)
+    .filter((g) => g.funnel && isFunnelHiddenFor(conv, g))
+    .map((g) => g.id);
+}
+
 /** The tag ids to add and to remove to move a contact to a given stage. */
 export interface StageEdits {
   add: string[];
