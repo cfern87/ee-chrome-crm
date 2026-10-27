@@ -28,7 +28,7 @@ import {
   openTasksOf, sortTasks, isOverdue, formatDue, priorityOf, newTask, dueFromOffset, inputsToDue, rescheduleDue,
   RESCHEDULE_DAYS, TASK_TITLE_MAX,
 } from './tasks';
-import { PRODUCT_NAME } from './product';
+import { PRODUCT_NAME, WORKER_NOT_LOADED } from './product';
 import { readableFill, chipOutline, ON_DARK } from './ui/contrast';
 import { eyeOffSvgMarkup } from './ui/icons';
 import type { Mutation } from './mutations';
@@ -469,7 +469,7 @@ function showSaveFailedNotice(): void {
     'border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.28);';
   el.innerHTML =
     '<strong style="display:block;margin-bottom:4px;">That change wasn\'t saved</strong>' +
-    'The extension\'s background worker didn\'t respond. Reload this tab and try again.';
+    `${WORKER_NOT_LOADED} Reload this tab and try again.`;
   document.body.appendChild(el);
   setTimeout(() => el.remove(), 12_000);
 }
@@ -1583,7 +1583,7 @@ async function queuePresetCampaign(send: PresetCampaignSend): Promise<{ text: st
     console.info(`[CRM] Queued preset campaign for ${send.recipients[0].threadId}${send.dryRun ? ' (dry run)' : ''}`);
     return { text: `Added to a campaign${send.dryRun ? ' (dry run)' : ''} — it will send with your usual pacing.`, error: false };
   }
-  return { text: `Not messaged: ${res?.error || 'the extension background is not responding.'}`, error: true };
+  return { text: `Not messaged: ${res?.error || WORKER_NOT_LOADED}`, error: true };
 }
 
 /**
@@ -3854,8 +3854,9 @@ async function openChatDropdown(): Promise<boolean> {
   ).filter((b) => /^messenger$/i.test((b.getAttribute('aria-label') || '').trim()));
 
   for (const button of buttons) {
+    if (readScanCancelled) break;
     try { button.click(); } catch { continue; }
-    if (await pollFor(() => hasConversationListRows(), 4_000, 250)) return true;
+    if (await pollFor(() => readScanCancelled || hasConversationListRows(), 4_000, 250)) break;
   }
   return hasConversationListRows();
 }
@@ -3884,6 +3885,7 @@ async function selectChatFilter(filter: ChatFilter): Promise<boolean> {
   if (!tabs.length) return false;
 
   for (const tab of tabs) {
+    if (readScanCancelled) return false;
     if (tab.getAttribute('aria-selected') === 'true') return true;
     // Switching tabs throws the whole list away, scroll container included, and
     // builds a new one. Measured live 2026-09-19: the old container is detached
@@ -3894,8 +3896,9 @@ async function selectChatFilter(filter: ChatFilter): Promise<boolean> {
     // list to actually go, and then for the new one to arrive.
     const before = firstRowLink();
     try { tab.click(); } catch { continue; }
-    if (before) await pollFor(() => !before.isConnected, 4_000, 150);
-    if (await pollFor(() => hasConversationListRows() && firstRowLink(), 4_000, 250)) {
+    if (before) await pollFor(() => readScanCancelled || !before.isConnected, 4_000, 150);
+    if (await pollFor(() => readScanCancelled || (hasConversationListRows() && firstRowLink()), 4_000, 250)) {
+      if (readScanCancelled) return false;
       await sleep(600); // let the first screenful settle before harvesting
       return true;
     }
@@ -3982,15 +3985,22 @@ async function walkConversationList(opts: {
   // a /t/ link — the feed's Contacts rail alone supplies dozens — which is how
   // both scans used to conclude the list was already up, never open the
   // dropdown, and report nothing at all. See hasConversationListRows.
+  //
+  // Stop is checked after every wait below, so pressing it while the list is
+  // still opening ends the scan in well under a second rather than after the
+  // waits time out. Stopped is not "couldn't reach the list", so it isn't null.
   if (!hasConversationListRows()) await openChatDropdown();
+  if (readScanCancelled) return { exhausted: false };
   if (!hasConversationListRows()) return null;
 
   if (opts.filter) await selectChatFilter(opts.filter);
+  if (readScanCancelled) return { exhausted: false };
   if (!hasConversationListRows()) return null;
 
   // Give the list a moment to hydrate — a scan that starts on an empty pane
   // would call the list exhausted before Messenger had drawn a single row.
-  await pollFor(() => firstRowLink(), 15_000, 300);
+  await pollFor(() => readScanCancelled || firstRowLink(), 15_000, 300);
+  if (readScanCancelled) return { exhausted: false };
 
   const activeThreadId = isMessagesPage() ? getActiveThreadId() : null;
   let container = scrollParentOf(firstRowLink());
@@ -4023,8 +4033,9 @@ async function walkConversationList(opts: {
       // anything new arrived, so rows that appear mid-wait are picked up rather
       // than raced past. Requiring several stalls in a row rather than one
       // keeps a slow network from being mistaken for the end of the list.
-      const grew = !!(await pollFor(() => opts.harvest(root, activeThreadId) > 0, READ_SCAN_ROW_WAIT_MS, 200));
+      const grew = !!(await pollFor(() => readScanCancelled || opts.harvest(root, activeThreadId) > 0, READ_SCAN_ROW_WAIT_MS, 200));
       opts.onProgress();
+      if (readScanCancelled) break;
       // A scroll through rows already harvested adds nothing, and that is not
       // the end of the list. The Unread tab draws its first ~29 rows at once and
       // fetches the next page only when scrolled to the very BOTTOM (measured
@@ -4227,7 +4238,7 @@ async function scanUnreadThreads(depth: number, budgetMs: number): Promise<Unrea
     cancelled: readScanCancelled,
     // Neither pass could even find a list to read — an empty result here means
     // "we couldn't look", not "you have no unread messages".
-    unreachable: !unreadPass && !allPass,
+    unreachable: !readScanCancelled && !unreadPass && !allPass,
   };
 }
 

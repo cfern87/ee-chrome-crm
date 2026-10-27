@@ -13,6 +13,7 @@ import type { InboundCommandSummary, InboundToken } from '../inboundClient';
 import { Banner, Button, Card, Input, Stack, Text, Toggle, Field as FormField, color, radius, space } from '../ui/primitives';
 import { sendBg, formatRelativeTime, CopyButton } from './shared';
 import { helpUrl } from '../helpLinks';
+import { WORKER_NOT_LOADED } from '../product';
 
 type Fail = { ok: false; error: string };
 
@@ -102,7 +103,7 @@ export function InboundWebhookSettings({ store, updateStore }: {
     setBusy(true);
     const res = await sendBg<{ ok: true; token: { token: string } } | Fail>({ type: 'INBOUND_TOKEN_CREATE', payload: { label: label.trim() || 'Untitled' } });
     setBusy(false);
-    if (!res) { setError("The extension's background service didn't respond."); return; }
+    if (!res) { setError(WORKER_NOT_LOADED); return; }
     if ('error' in res) { setError(res.error); return; }
     setNewToken(res.token.token);
     setLabel('');

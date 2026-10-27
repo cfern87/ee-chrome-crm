@@ -21,6 +21,7 @@ import { pickVariation, countVariations, variationIssue, VARIATION_COUNT_CAP } f
 import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo } from '../devices';
 import { isDisconnected } from '../syncHealth';
 import { IS_UNPACKED } from '../devMode';
+import { WORKER_NOT_LOADED } from '../product';
 import {
   Banner, Button, Card, EmptyState, Input, Stack, Text,
   color, fontSize, fontWeight, radius, space,
@@ -61,7 +62,7 @@ export interface HistoryFocus {
  */
 const NO_BACKGROUND_ERROR = IS_UNPACKED
   ? 'No response from the extension background. Fully reload the extension at chrome://extensions (Developer mode → ⟳ on this extension), then refresh this page — the messaging feature needs the new "alarms" permission.'
-  : "The extension's background service didn't respond, so nothing was sent. Refresh this page and try again. If it keeps happening, switch the extension off and back on at chrome://extensions, or restart your browser.";
+  : `${WORKER_NOT_LOADED} Nothing was sent. Refresh this page and try again. If it keeps happening, switch the extension off and back on at chrome://extensions, or restart your browser.`;
 
 export function statusColor(s: RecipientStatus): string {
   switch (s) {

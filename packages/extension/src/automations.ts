@@ -493,6 +493,8 @@ export interface AutomationRun {
   automationId: string;
   running: boolean;
   phase?: 'scanning' | 'saving';
+  /** Stop was pressed; the scan is winding down and will keep what it found. */
+  stopping?: boolean;
   /** 'webhook' = started by an incoming webhook (inbound.ts). */
   trigger: 'manual' | 'schedule' | 'webhook';
   startedAt: number;
@@ -527,6 +529,7 @@ export const AUTOMATION_RUNS_KEY = 'facebook_crm_automation_runs';
 /** One-line result for a finished run. */
 export function describeRun(run: AutomationRun): string {
   if (run.running) {
+    if (run.stopping && run.phase !== 'saving') return `Stopping — keeping the ${run.unreadFound ?? 0} unread found so far…`;
     return run.phase === 'saving'
       ? 'Applying actions…'
       : `Looking through conversations — ${run.rowsSeen} checked`;

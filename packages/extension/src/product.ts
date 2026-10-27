@@ -12,5 +12,11 @@
 
 export const PRODUCT_NAME = 'Not Another Social CRM';
 
+/**
+ * The first sentence of every "the background service worker never answered"
+ * error, so the person can tell which extension is at fault.
+ */
+export const WORKER_NOT_LOADED = `The ${PRODUCT_NAME} worker didn't load.`;
+
 /** For filenames of things the user downloads. */
 export const PRODUCT_SLUG = 'not-another-social-crm';

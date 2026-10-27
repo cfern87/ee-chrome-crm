@@ -89,7 +89,15 @@ export function AutomationsPanel({ store, updateStore, onOpenTags, onOpenSearch 
     await refreshRuns();
   };
 
-  const cancel = async () => {
+  // Set the moment Stop is clicked, so the card answers the click straight away
+  // instead of after the background's next progress write.
+  const [stoppingId, setStoppingId] = useState<string | null>(null);
+  useEffect(() => {
+    if (stoppingId && !runningIds.includes(stoppingId)) setStoppingId(null);
+  }, [stoppingId, runningIds]);
+
+  const cancel = async (id: string) => {
+    setStoppingId(id);
     await sendBg({ type: 'CANCEL_AUTOMATION' });
     await refreshRuns();
   };
@@ -166,7 +174,8 @@ export function AutomationsPanel({ store, updateStore, onOpenTags, onOpenSearch 
             scanBusy={a.kind === 'tagUnread' && !!scanRunningId}
             confirmingDelete={confirmDelete === a.id}
             onRun={() => run(a.id)}
-            onCancel={cancel}
+            stopping={stoppingId === a.id}
+            onCancel={() => cancel(a.id)}
             onEdit={() => { setDraftNew(null); setEditingId(a.id); }}
             onOpenSearch={onOpenSearch}
             onToggleEnabled={(enabled) => persist(automations.map((x) => (x.id === a.id ? { ...x, enabled } : x)))}
@@ -191,11 +200,11 @@ function describeSource(a: Automation, store: Store): string {
     return s ? `Everyone in the saved search “${s.name}”` : 'A saved search that no longer exists';
   }
   return `Unread conversations among your ${a.depth} most recent` +
-    (a.createContacts ? ' (adds people who aren’t in the CRM yet)' : '');
+    (a.createContacts ? ' (adds people who aren’t in the CRM yet)' : ' (existing contacts only)');
 }
 
 function AutomationCard({
-  automation: a, store, run, isRunning, scanBusy, confirmingDelete,
+  automation: a, store, run, isRunning, scanBusy, confirmingDelete, stopping: stoppingLocal,
   onRun, onCancel, onEdit, onOpenSearch, onToggleEnabled, onAskDelete, onConfirmDelete, onCancelDelete,
 }: {
   automation: Automation;
@@ -205,6 +214,8 @@ function AutomationCard({
   /** Another unread scan holds the Facebook window. */
   scanBusy: boolean;
   confirmingDelete: boolean;
+  /** Stop was just clicked here. */
+  stopping: boolean;
   onRun: () => void;
   onCancel: () => void;
   onEdit: () => void;
@@ -220,6 +231,8 @@ function AutomationCard({
   const interrupted = !!run?.running && !isRunning;
   const scheduled = a.everyMinutes > 0;
   const search = a.kind === 'search' && a.savedSearchId ? store.savedSearches[a.savedSearchId] : undefined;
+  const stopping = stoppingLocal || !!run?.stopping;
+  const shownRun = run && stopping ? { ...run, stopping: true } : run;
 
   return (
     <Card>
@@ -253,17 +266,21 @@ function AutomationCard({
 
         {blocked && <Banner tone="warning">{blocked} Edit this automation to fix it.</Banner>}
 
-        {isRunning && run && (
+        {isRunning && shownRun && (
           <div
             role="status"
             style={{ background: color.surface.selected, borderRadius: radius.sm, padding: `${space.sm}px ${space.md}px` }}
           >
             <Stack direction="row" gap="sm" align="center" justify="space-between">
               <Text size="small" weight="semibold" tone="accent">
-                {describeRun(run)}
-                {run.phase !== 'saving' && run.unreadFound ? ` · ${run.unreadFound} unread so far` : ''}
+                {describeRun(shownRun)}
+                {!stopping && shownRun.phase !== 'saving' && shownRun.unreadFound ? ` · ${shownRun.unreadFound} unread so far` : ''}
               </Text>
-              {a.kind === 'tagUnread' && run.phase !== 'saving' && <Button size="sm" variant="link" onClick={onCancel}>Stop</Button>}
+              {a.kind === 'tagUnread' && shownRun.phase !== 'saving' && (
+                <Button size="sm" variant="link" onClick={onCancel} disabled={stopping}>
+                  {stopping ? 'Stopping…' : 'Stop'}
+                </Button>
+              )}
             </Stack>
           </div>
         )}
@@ -418,12 +435,24 @@ function AutomationEditor({ initial, store, isNew, onSave, onCancel, onOpenTags,
             )}
             {draft.kind === 'tagUnread' && (
               <>
-                <Toggle
-                  labelFirst={false}
-                  label="Also add people who aren’t in the CRM yet"
-                  checked={draft.createContacts}
-                  onChange={(e) => set({ createContacts: e.target.checked })}
-                />
+                <FormField
+                  label="Act on"
+                  hint={draft.createContacts
+                    ? 'Anyone with an unread conversation who isn’t a contact yet is added first, then gets the actions.'
+                    : 'Unread conversations with people who aren’t contacts are left alone — nobody new is added.'}
+                >
+                  {(fp) => (
+                    <Select
+                      {...fp}
+                      value={draft.createContacts ? 'create' : 'existing'}
+                      onChange={(e) => set({ createContacts: e.target.value === 'create' })}
+                      style={{ width: 340 }}
+                    >
+                      <option value="existing">Only contacts already in the CRM</option>
+                      <option value="create">Contacts in the CRM, and add anyone who isn’t</option>
+                    </Select>
+                  )}
+                </FormField>
                 <Text size="small" tone="muted">
                   Reads the conversation list in a background Facebook window and never opens a conversation, so
                   nothing gets marked as read. Contacts you deleted are never added back.

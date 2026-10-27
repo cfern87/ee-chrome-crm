@@ -809,9 +809,13 @@ function PresetBar({
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // Per machine, like the other reading preferences. Collapsed still shows the
+  // active search, so you can tell which one is applied.
+  const [collapsed, setCollapsed] = useLocalPref<boolean>('search.savedCollapsed', false);
 
   const presets = sortSavedSearches(savedSearches);
   const active = activeId ? savedSearches[activeId] : undefined;
+  const shown = collapsed ? presets.filter((p) => p.id === activeId) : presets;
 
   const submitNew = () => {
     const name = draftName.trim();
@@ -824,13 +828,28 @@ function PresetBar({
   return (
     <div style={{ marginBottom: 10 }}>
       <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-        <span style={{ fontSize: 11, fontWeight: 700, color: color.text.secondary }}>Saved searches</span>
+        {presets.length > 0 ? (
+          <button
+            onClick={() => { setCollapsed(!collapsed); setManaging(false); }}
+            aria-expanded={!collapsed}
+            title={collapsed ? 'Show saved searches' : 'Hide saved searches'}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 4, padding: 0, border: 'none', background: 'none',
+              fontSize: 11, fontWeight: 700, color: color.text.secondary, cursor: 'pointer',
+            }}
+          >
+            <span aria-hidden style={{ display: 'inline-block', width: 10 }}>{collapsed ? '▸' : '▾'}</span>
+            Saved searches{collapsed ? ` (${presets.length})` : ''}
+          </button>
+        ) : (
+          <span style={{ fontSize: 11, fontWeight: 700, color: color.text.secondary }}>Saved searches</span>
+        )}
 
         {presets.length === 0 && (
           <span style={{ fontSize: 11, color: color.text.muted }}>none yet — build a query and save it</span>
         )}
 
-        {presets.map((p) => {
+        {shown.map((p) => {
           const isActive = p.id === activeId;
           return (
             <button
@@ -865,7 +884,7 @@ function PresetBar({
           <button onClick={() => { setNaming(!naming); setManaging(false); }} style={addBtn}>
             {naming ? 'Cancel' : '+ Save current'}
           </button>
-          {presets.length > 0 && (
+          {presets.length > 0 && !collapsed && (
             <button onClick={() => { setManaging(!managing); setNaming(false); }} style={addBtn}>
               {managing ? 'Done' : 'Manage'}
             </button>
@@ -897,7 +916,7 @@ function PresetBar({
         </div>
       )}
 
-      {managing && (
+      {managing && !collapsed && (
         <div style={{ marginTop: 8, border: `1px solid ${color.border.subtle}`, borderRadius: 6, background: color.surface.sunken, padding: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
           {presets.map((p, i) => (
             <div key={p.id} style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>

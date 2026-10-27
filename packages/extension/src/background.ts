@@ -1253,6 +1253,24 @@ const AUTOMATION_CHECK_MINUTES = 5;
 /** The automation holding `scanning`, when it's an automation rather than a reply check. */
 let runningAutomationId: string | null = null;
 
+// Stop pressed on the running unread automation. Kept here as well as in the
+// content script because the job can be stopped before the scan has started —
+// while the Facebook window is still opening or loading — and the content
+// script resets its own flag when a scan begins.
+let automationStopRequested = false;
+let automationStopSignal: { promise: Promise<'stopped'>; fire: () => void } = makeStopSignal();
+
+function makeStopSignal(): { promise: Promise<'stopped'>; fire: () => void } {
+  let fire = () => {};
+  const promise = new Promise<'stopped'>((resolve) => { fire = () => resolve('stopped'); });
+  return { promise, fire };
+}
+
+/** `work`, or 'stopped' as soon as Stop is pressed — whichever comes first. */
+function unlessStopped<T>(work: Promise<T>): Promise<T | 'stopped'> {
+  return Promise.race([work, automationStopSignal.promise]);
+}
+
 function ensureAutomationAlarm(): void {
   try {
     chrome.alarms?.get(AUTOMATION_ALARM, (existing) => {
@@ -1349,6 +1367,8 @@ async function startAutomation(id: string, trigger: AutomationRun['trigger'], op
 
     handedOff = true;
     runningAutomationId = id;
+    automationStopRequested = false;
+    automationStopSignal = makeStopSignal();
     const job = runAutomationJob(automation, opts.transform).finally(() => { scanning = false; runningAutomationId = null; });
     opts.onJob?.(job);
     void job;
@@ -1529,12 +1549,21 @@ async function runAutomationJob(automation: Automation, transform?: (a: Automati
   const log: string[] = [];
   const id = automation.id;
   try {
+    // Stopped before the scan began: there is nothing found to apply, so finish
+    // straight away rather than opening Messenger only to close it again.
+    const finishStopped = () => patchAutomationRun(id, {
+      running: false, phase: undefined, stopping: undefined, finishedAt: Date.now(),
+      rowsSeen: 0, unreadFound: 0, cancelled: true, error: undefined,
+    });
+
     // The feed, not a Messenger URL — see runReadScan for why.
     const tabId = await ensureSenderTab('https://www.facebook.com/', log);
+    if (automationStopRequested) { await finishStopped(); return; }
     if (tabId == null) throw new Error('Could not open a Facebook window.');
-    if (!(await waitForContentReady(tabId, log, 'list'))) {
-      throw new Error('Facebook did not finish loading.');
-    }
+    const ready = await unlessStopped(waitForContentReady(tabId, log, 'list'));
+    if (ready === 'stopped' || automationStopRequested) { await finishStopped(); return; }
+    if (!ready) throw new Error('Facebook did not finish loading.');
+    if (automationStopRequested) { await finishStopped(); return; }
 
     const report = await sendViaPort<UnreadScanReport>(
       tabId,
@@ -1566,27 +1595,44 @@ async function runAutomationJob(automation: Automation, transform?: (a: Automati
     await patchAutomationRun(id, {
       running: false,
       phase: undefined,
+      stopping: undefined,
       finishedAt: Date.now(),
       rowsSeen: report.rowsSeen,
       unreadFound: report.unread.length,
       created: resolved.createdIds.length,
       notInCrm: resolved.notInCrm,
       exhausted: report.exhausted,
-      cancelled: report.cancelled,
+      cancelled: report.cancelled || automationStopRequested,
       error: undefined,
       ...result,
     });
   } catch (e) {
     console.warn('[CRM] automation failed', e, log);
-    await patchAutomationRun(id, { running: false, phase: undefined, finishedAt: Date.now(), error: String((e as Error)?.message || e) });
+    await patchAutomationRun(id, { running: false, phase: undefined, stopping: undefined, finishedAt: Date.now(), error: String((e as Error)?.message || e) });
   }
 }
 
-/** Stop the running automation. Like cancelReadScan: the scan returns what it has, and that is still applied. */
+/**
+ * Stop the running automation. Like cancelReadScan: the scan returns what it
+ * has, and that is still applied. The run record says "Stopping…" at once, so
+ * the dashboard reacts to the click rather than to the scan winding down.
+ */
 async function cancelAutomation(): Promise<{ success: boolean }> {
-  if (!runningAutomationId) return { success: true };
+  const id = runningAutomationId;
+  if (!id) return { success: true };
+  automationStopRequested = true;
+  automationStopSignal.fire();
+  await patchAutomationRun(id, { stopping: true });
   const tabId = await getStoredSenderTab();
-  if (tabId != null) await sendToTab(tabId, { type: 'CRM_CANCEL_READ_SCAN' });
+  // Not awaited: the scan's own port is busy, and the reply can lag behind it.
+  if (tabId != null) {
+    void sendToTab(tabId, { type: 'CRM_CANCEL_READ_SCAN' });
+    // Once more shortly after, in case Stop landed just as the scan was
+    // starting — starting a scan clears the content script's flag.
+    setTimeout(() => {
+      if (runningAutomationId === id) void sendToTab(tabId, { type: 'CRM_CANCEL_READ_SCAN' });
+    }, 1500);
+  }
   return { success: true };
 }
 

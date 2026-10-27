@@ -29,6 +29,7 @@ import { DraftInput, sendBg } from './shared';
 import { isValidWebhookUrl } from '../webhooks';
 import { ensureHostPermission, TEST_PERMISSION_NOTE } from './WebhookSettings';
 import { QueryEditor } from './SearchBuilder';
+import { WORKER_NOT_LOADED } from '../product';
 
 const STEP_LABELS: Record<PresetStepKind, string> = {
   addTag: 'Add tag',
@@ -758,7 +759,7 @@ function WebhookStepFields({ step, onChange }: {
       20000,
     );
     setTesting(false);
-    if (!res) { setResult({ ok: false, text: 'The extension background didn’t respond — try again.' }); return; }
+    if (!res) { setResult({ ok: false, text: `${WORKER_NOT_LOADED} Try again.` }); return; }
     setResult(res.ok
       ? { ok: true, text: `Test payload delivered${res.status ? ` (HTTP ${res.status})` : ''}.` }
       : { ok: false, text: `Test failed: ${res.error || 'no response'}${granted ? '' : ' — Chrome wasn’t given permission to reach this host'}.` });

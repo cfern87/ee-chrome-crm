@@ -24,6 +24,7 @@ import {
 } from '../ui/primitives';
 import { sendBg, formatRelativeTime, DraftInput } from './shared';
 import { helpUrl } from '../helpLinks';
+import { WORKER_NOT_LOADED } from '../product';
 
 /**
  * Ask for permission to reach `url`'s origin.
@@ -110,7 +111,7 @@ export function WebhookSettings({ store, updateStore }: {
       payload: { id: h.id },
     }, 20000);
     setTesting(null);
-    if (!res) { setStatus("The extension's background service didn't respond. Refresh this page and try again."); return; }
+    if (!res) { setStatus(`${WORKER_NOT_LOADED} Refresh this page and try again.`); return; }
     setStatus(res.ok
       ? `Test delivered${res.status ? ` (HTTP ${res.status})` : ''}.`
       : `Test failed: ${res.error || 'no response from the endpoint'}.`);
