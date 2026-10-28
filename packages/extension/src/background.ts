@@ -25,7 +25,7 @@
 // periodic watchdog alarm self-heals any stall (e.g. if the worker was killed
 // mid-step).
 
-import { loadStore, saveStore, flushDriveIfDirty, syncDriveNow, isDriveEnabled, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, removeTagsFrom } from './storage';
+import { loadStore, saveStore, flushDriveIfDirty, syncDriveNow, isDriveEnabled, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, removeTagsFrom, isStoreChangeKey } from './storage';
 import type { Store, SaveResult, Conversation } from './storage';
 import { applyMutations } from './mutations';
 import type { Mutation } from './mutations';
@@ -47,6 +47,8 @@ import {
 } from './license';
 import { pollInbound, readInboundSettings, type InboundDeps, type InboundStatus } from './inbound';
 import { makeInboundClient, inboundEndpointUrl } from './inboundClient';
+import { makeTeamClient, TEAM_SYNC_ALARM, TEAM_SYNC_PERIOD_MINUTES } from './team';
+import { makeTeamService } from './teamService';
 
 import {
   Campaign,
@@ -1756,6 +1758,7 @@ async function runDueAutomations(): Promise<void> {
   try {
     if (!(await isSignedIn())) return;
     if (!(await canSendFromThisMachine())) return;
+    if (!(await teamService.mayRunScheduledAutomations())) return;
     const store = await loadStore();
     const runs = await getAutomationRuns();
     const now = Date.now();
@@ -2653,6 +2656,42 @@ async function watchdog(): Promise<void> {
   void processTick();
 }
 
+// ---- team workspaces (see teamService.ts, docs/TEAM_WORKSPACES.md) ----
+
+const teamService = makeTeamService({
+  client: makeTeamClient({
+    baseUrl: SUPABASE_URL,
+    anonKey: SUPABASE_ANON_KEY,
+    getToken: getAccessToken,
+    fetch: (input, init) => fetch(input, init),
+  }),
+  withStoreLock,
+  isPro: async () => (await getEntitlement()).isPro,
+  myEmail: async () => (await getStoredSession())?.email || null,
+});
+
+function ensureTeamSyncAlarm(): void {
+  try {
+    chrome.alarms?.get(TEAM_SYNC_ALARM, (existing) => {
+      void chrome.runtime.lastError;
+      if (existing) return;
+      try {
+        chrome.alarms?.create(TEAM_SYNC_ALARM, { delayInMinutes: TEAM_SYNC_PERIOD_MINUTES, periodInMinutes: TEAM_SYNC_PERIOD_MINUTES });
+      } catch (e) { console.warn('[CRM] alarms unavailable (team sync):', e); }
+    });
+  } catch (e) { console.warn('[CRM] alarms unavailable (team sync):', e); }
+}
+
+// A save in a team workspace marks it dirty and bumps the store revision; push
+// it shortly after (debounced inside the service).
+try {
+  chrome.storage?.onChanged.addListener((changes, area) => {
+    if (area === 'local' && Object.keys(changes).some(isStoreChangeKey)) void teamService.onStoreChanged();
+  });
+} catch (e) {
+  console.warn('[CRM] could not register team sync listener:', e);
+}
+
 try {
   chrome.alarms?.onAlarm.addListener((alarm) => {
     if (alarm.name === TICK_ALARM) processTick();
@@ -2661,6 +2700,7 @@ try {
     else if (alarm.name === ENTITLEMENT_ALARM) void refreshEntitlement().catch(() => { /* offline — cache stands */ });
     else if (alarm.name === AUTOMATION_ALARM) void runDueAutomations();
     else if (alarm.name === INBOUND_ALARM) void pollInboundNow();
+    else if (alarm.name === TEAM_SYNC_ALARM) void teamService.onAlarm();
 
   });
 } catch (e) {
@@ -2676,6 +2716,8 @@ ensureDriveSync();
 ensureEntitlementCheck();
 ensureAutomationAlarm();
 ensureInboundAlarm();
+ensureTeamSyncAlarm();
+void teamService.syncActiveTeam();
 
 
 // On startup, push up any local edits that didn't reach Drive last session.
@@ -3024,6 +3066,48 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         //
         // Not in QUEUE_MUTATING, for the same reason as the reply check.
         // ---- incoming webhooks ----
+        // ---- team workspaces ----
+        case 'TEAM_WORKSPACES': {
+          sendResponse(await teamService.getWorkspaces(!!request.payload?.refresh));
+          break;
+        }
+        case 'TEAM_SWITCH': {
+          sendResponse(await teamService.switchTo(String(request.payload?.id || '')));
+          break;
+        }
+        case 'TEAM_SYNC_NOW': {
+          sendResponse(await teamService.syncActiveTeam());
+          break;
+        }
+        case 'TEAM_CREATE': {
+          sendResponse(await teamService.createTeam(String(request.payload?.name || '').slice(0, 60), request.payload?.seed !== false));
+          break;
+        }
+        case 'TEAM_MEMBERS': {
+          sendResponse(await teamService.members(String(request.payload?.teamId || '')));
+          break;
+        }
+        case 'TEAM_INVITE': {
+          sendResponse(await teamService.invite(String(request.payload?.teamId || ''), String(request.payload?.email || '')));
+          break;
+        }
+        case 'TEAM_REMOVE_MEMBER': {
+          sendResponse(await teamService.removeMember(String(request.payload?.teamId || ''), String(request.payload?.email || '')));
+          break;
+        }
+        case 'TEAM_ACCEPT': {
+          sendResponse(await teamService.accept(String(request.payload?.teamId || '')));
+          break;
+        }
+        case 'TEAM_LEAVE': {
+          sendResponse(await teamService.leave(String(request.payload?.teamId || '')));
+          break;
+        }
+        case 'TEAM_DELETE': {
+          sendResponse(await teamService.deleteTeam(String(request.payload?.teamId || '')));
+          break;
+        }
+
         case 'INBOUND_INFO': {
           sendResponse({ endpointUrl: inboundClient.endpointUrl, status: await getInboundStatus() });
           break;

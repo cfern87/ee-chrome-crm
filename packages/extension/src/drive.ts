@@ -880,6 +880,11 @@ export async function getDriveStatus(): Promise<DriveStatus> {
 
 // ---- helpers ----
 
+/** A Store with every collection present (exported for the team sync). */
+export function normalizeStoreShape(s: Partial<Store>): Store {
+  return normalizeStore(s);
+}
+
 function normalizeStore(s: Partial<Store>): Store {
   return {
     conversations: s.conversations || {},
