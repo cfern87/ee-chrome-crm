@@ -48,7 +48,7 @@ import {
 import { pollInbound, readInboundSettings, type InboundDeps, type InboundStatus } from './inbound';
 import {
   DAILY_REPORT_ALARM, REPORT_CHECK_MINUTES, appendReportLog, buildReportPayload, computeReportMetrics, isReportDue,
-  localDay, readReportConfig, readReportLog, reportChannels, reportHook, sendReportEmail,
+  localDay, readReportConfig, readReportLog, reportChannels, reportHook,
   type DailyReportConfig, type ReportDelivery,
 } from './dailyReport';
 import { makeInboundClient, inboundEndpointUrl } from './inboundClient';
@@ -2676,7 +2676,7 @@ function ensureDailyReportAlarm(): void {
   } catch (e) { console.warn('[CRM] alarms unavailable (daily report):', e); }
 }
 
-/** Send the report on every configured channel and log the outcome. */
+/** Send the report to its webhook and log the outcome. */
 async function sendDailyReport(trigger: 'scheduled' | 'test', cfg: DailyReportConfig): Promise<ReportDelivery[]> {
   const now = Date.now();
   const metrics = computeReportMetrics(await loadStore(), now);
@@ -2689,14 +2689,6 @@ async function sendDailyReport(trigger: 'scheduled' | 'test', cfg: DailyReportCo
     out.push({
       at: d.at, channel: 'webhook', ok: d.ok, trigger, target: cfg.webhookUrl, payload,
       ...(d.status !== undefined ? { status: d.status } : {}), ...(d.error ? { error: d.error } : {}),
-    });
-  }
-  if (channels.includes('email')) {
-    const r = await sendReportEmail(PLATFORM_URL, await getAccessToken(), cfg.emails, metrics, test);
-    out.push({
-      at: Date.now(), channel: 'email', ok: r.ok, trigger, target: cfg.emails.join(', '),
-      payload: { to: cfg.emails, test, report: metrics },
-      ...(r.status !== undefined ? { status: r.status } : {}), ...(r.error ? { error: r.error } : {}),
     });
   }
   await withStoreLock(async () => {
@@ -3190,12 +3182,12 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           break;
         }
 
-        // Settings → Data → Daily report → "Send test now": every configured
-        // channel, real numbers, logged as a test (doesn't count as today's).
+        // Settings → Data → Daily report → "Send test now": the webhook, real
+        // numbers, logged as a test (doesn't count as today's).
         case 'TEST_DAILY_REPORT': {
           const cfg = readReportConfig((await loadStore()).settings);
           if (reportChannels(cfg).length === 0) {
-            sendResponse({ ok: false, deliveries: [], error: 'Add a webhook URL or an email address first.' });
+            sendResponse({ ok: false, deliveries: [], error: 'Add a webhook URL first.' });
             break;
           }
           const deliveries = await sendDailyReport('test', cfg);

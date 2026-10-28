@@ -31,7 +31,7 @@ import { Button, Chip, EmptyState, Input, SectionTitle, Text, color, radius, spa
 import { previewTags, formatRelativeTime } from './shared';
 import { useLocalPref } from '../ui/prefs';
 import {
-  readReportConfig, readReportLog, isReportConfigured, formatReportTime, reportChannels, localDay,
+  readReportConfig, readReportLog, isReportConfigured, formatReportTime, localDay,
 } from '../dailyReport';
 
 /** How many matching contacts the preview lists before it stops. */
@@ -104,7 +104,7 @@ function DailyReportLine({ settings, onConfigure }: { settings: Record<string, u
           border: `1px solid ${color.border.subtle}`, fontSize: 13,
         }}
       >
-        <span style={{ flex: 1, minWidth: 200, color: color.text.secondary }}>Get these numbers every morning by webhook or email.</span>
+        <span style={{ flex: 1, minWidth: 200, color: color.text.secondary }}>Get these numbers sent to a webhook every morning.</span>
         <a
           href="#daily-report"
           onClick={(e) => { e.preventDefault(); onConfigure(); }}
@@ -117,11 +117,6 @@ function DailyReportLine({ settings, onConfigure }: { settings: Record<string, u
     );
   }
 
-  const channels = reportChannels(cfg);
-  const via = [
-    channels.includes('webhook') ? 'webhook' : null,
-    channels.includes('email') ? `${cfg.emails.length} email${cfg.emails.length !== 1 ? 's' : ''}` : null,
-  ].filter(Boolean).join(' + ');
   const lastScheduled = log.entries.filter((e) => e.trigger === 'scheduled');
   const lastRunAt = lastScheduled[0]?.at;
   const lastRun = lastRunAt ? lastScheduled.filter((e) => Math.abs(e.at - lastRunAt) < 60_000) : [];
@@ -132,7 +127,7 @@ function DailyReportLine({ settings, onConfigure }: { settings: Record<string, u
 
   return (
     <div data-report-status style={{ fontSize: 12, marginBottom: 14, color: failed ? color.danger.base : color.text.muted }}>
-      Daily report · {formatReportTime(cfg.time)} via {via}
+      Daily report · {formatReportTime(cfg.time)} via webhook
       {when && (failed ? ` · last attempt failed ${when}` : ` · last sent ${when} ✓`)}
       {' · '}
       <a href="#daily-report" onClick={(e) => { e.preventDefault(); onConfigure(); }} style={{ fontWeight: 600, color: failed ? color.danger.base : color.accent.base }}>

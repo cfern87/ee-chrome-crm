@@ -1,14 +1,14 @@
 // Settings → Data → Daily report.
 //
-// The Dashboard's numbers, sent once a day by webhook and/or email. See
+// The Dashboard's numbers, sent once a day by webhook. See
 // ../dailyReport.ts for scheduling and what is sent. Sits right after Webhooks:
 // it is another outbound delivery, and the URL/token fields work the same way.
 
 import React, { useState } from 'react';
 import type { Store, SaveResult } from '../storage';
 import {
-  readReportConfig, writeReportConfig, readReportLog, parseEmailList, reportChannels,
-  MAX_REPORT_EMAILS, REPORT_LOG_LIMIT, type DailyReportConfig, type ReportDelivery,
+  readReportConfig, writeReportConfig, readReportLog, reportChannels,
+  REPORT_LOG_LIMIT, type DailyReportConfig, type ReportDelivery,
 } from '../dailyReport';
 import { isValidWebhookUrl } from '../webhooks';
 import { Banner, Button, Card, Input, Stack, Text, Toggle, Field as FormField, color, radius, space } from '../ui/primitives';
@@ -20,7 +20,7 @@ import { WORKER_NOT_LOADED } from '../product';
 export const DAILY_REPORT_SECTION_ID = 'daily-report';
 
 function describeDelivery(d: ReportDelivery): string {
-  const what = d.channel === 'webhook' ? 'Webhook' : 'Email';
+  const what = 'Webhook';
   const outcome = d.ok
     ? d.status ? `HTTP ${d.status}` : 'sent'
     : d.error || (d.status ? `HTTP ${d.status}` : 'failed');
@@ -66,7 +66,6 @@ export function DailyReportSettings({ store, updateStore }: {
   const cfg = readReportConfig(store.settings);
   const log = readReportLog(store.settings);
   const [urlError, setUrlError] = useState<string | null>(null);
-  const [emailError, setEmailError] = useState<string | null>(null);
   const [status, setStatus] = useState<{ tone: 'success' | 'danger' | 'info'; msg: string } | null>(null);
   const [testing, setTesting] = useState(false);
 
@@ -85,14 +84,6 @@ export function DailyReportSettings({ store, updateStore }: {
     }
     setUrlError(null);
     await persist({ webhookUrl: url });
-  };
-
-  const commitEmails = async (raw: string) => {
-    const { emails, invalid } = parseEmailList(raw);
-    if (invalid.length) { setEmailError(`Not an email address: ${invalid.join(', ')}`); return; }
-    if (emails.length > MAX_REPORT_EMAILS) { setEmailError(`Up to ${MAX_REPORT_EMAILS} addresses.`); return; }
-    setEmailError(null);
-    await persist({ emails });
   };
 
   const test = async () => {
@@ -119,8 +110,8 @@ export function DailyReportSettings({ store, updateStore }: {
         <Toggle label="On" labelFirst={false} checked={cfg.enabled} onChange={(e) => void persist({ enabled: e.target.checked })} />
       </Stack>
       <Text as="p" size="small" tone="muted" leading="relaxed" style={{ margin: `${space.xs}px 0 ${space.md}px` }}>
-        Once a day, send the numbers on your Dashboard (every tile, as they stand at send time) to a webhook,
-        to email, or both.
+        Once a day, POST the numbers on your Dashboard (every tile, as they stand at send time) to a
+        webhook: your own endpoint, or Zapier/Make to forward them on.
       </Text>
 
       <Stack gap="md">
@@ -152,23 +143,13 @@ export function DailyReportSettings({ store, updateStore }: {
           </FormField>
         </Stack>
 
-        <FormField
-          label="Email to"
-          hint={`Up to ${MAX_REPORT_EMAILS} addresses, separated by commas. Email needs you to be signed in (Account & plan).`}
-          error={emailError || undefined}
-        >
-          {(p) => (
-            <DraftInput {...p} value={cfg.emails.join(', ')} onCommit={(v) => void commitEmails(v)} placeholder="you@example.com" style={{ width: 360 }} />
-          )}
-        </FormField>
-
         <Stack direction="row" gap="sm" align="center" wrap>
           <Button variant="secondary" onClick={() => void test()} disabled={testing || channels.length === 0}>
             {testing ? 'Sending…' : 'Send test now'}
           </Button>
           <Text size="micro" tone="muted" style={{ flex: 1 }}>
             {channels.length === 0
-              ? 'Add a webhook URL or an email address to send to.'
+              ? 'Add a webhook URL to send to.'
               : !cfg.enabled
                 ? 'Off. Turn it on to send every day; you can still send a test.'
                 : log.lastSentDay

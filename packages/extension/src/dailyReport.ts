@@ -1,9 +1,8 @@
-// The daily report: once a day, the Dashboard's numbers sent by POST webhook
-// and/or email.
+// The daily report: once a day, the Dashboard's numbers sent by POST webhook.
 //
 // What is sent is exactly what the Dashboard shows — the same tiles, in the
 // same order, counted by the same matcher (ratioTiles.ts makeMatcher /
-// readRatio) — so a number in the morning email can be checked by opening the
+// readRatio) — so a number in the morning report can be checked by opening the
 // Dashboard and finding the same number on the same tile.
 //
 // Scheduling has no server either (see webhooks.ts): the background worker
@@ -17,7 +16,7 @@
 // synced on purpose, so the history can be read on any machine, not only on
 // the one that happened to send.
 //
-// Pure except for `sendReportEmail`, which takes its fetch as a parameter.
+// Pure: the background sends the payload through webhooks.ts deliver().
 
 import type { Store } from './storage';
 import type { SettingsBag } from './settingsMerge';
@@ -32,13 +31,9 @@ export const DAILY_REPORT_LOG_KEY = 'dailyReportLog';
 
 /** Deliveries kept in the log. Each one carries its payload, so keep it short. */
 export const REPORT_LOG_LIMIT = 10;
-export const MAX_REPORT_EMAILS = 5;
 /** How often the background checks whether the report is due. */
 export const REPORT_CHECK_MINUTES = 5;
 export const DAILY_REPORT_ALARM = 'crm-daily-report';
-
-/** Where the server-side mailer lives (see docs/DAILY_REPORT_EMAIL_LOVABLE.md). */
-export const REPORT_EMAIL_PATH = '/api/public/daily-report-email';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -51,7 +46,6 @@ export interface DailyReportConfig {
   webhookUrl: string;
   /** Sent as X-CRM-Token, same meaning (and same non-secrecy) as on webhooks. */
   webhookSecret: string;
-  emails: string[];
   /** When this configuration was saved — the merge stamp. */
   at: number;
 }
@@ -59,7 +53,7 @@ export interface DailyReportConfig {
 export const DEFAULT_REPORT_TIME = '08:00';
 
 export function defaultReportConfig(): DailyReportConfig {
-  return { enabled: false, time: DEFAULT_REPORT_TIME, webhookUrl: '', webhookSecret: '', emails: [], at: 0 };
+  return { enabled: false, time: DEFAULT_REPORT_TIME, webhookUrl: '', webhookSecret: '', at: 0 };
 }
 
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -74,9 +68,6 @@ export function readReportConfig(settings: SettingsBag | undefined): DailyReport
     time: typeof o.time === 'string' && TIME_RE.test(o.time) ? o.time : base.time,
     webhookUrl: typeof o.webhookUrl === 'string' ? o.webhookUrl : '',
     webhookSecret: typeof o.webhookSecret === 'string' ? o.webhookSecret : '',
-    emails: Array.isArray(o.emails)
-      ? o.emails.filter((e): e is string => typeof e === 'string' && isEmail(e)).slice(0, MAX_REPORT_EMAILS)
-      : [],
     at: typeof o.at === 'number' && Number.isFinite(o.at) ? o.at : 0,
   };
 }
@@ -91,30 +82,15 @@ export function writeReportConfig(
     time: TIME_RE.test(cfg.time) ? cfg.time : DEFAULT_REPORT_TIME,
     webhookUrl: cfg.webhookUrl.trim(),
     webhookSecret: cfg.webhookSecret.trim(),
-    emails: [...new Set(cfg.emails.map((e) => e.trim().toLowerCase()).filter(isEmail))].slice(0, MAX_REPORT_EMAILS),
     at: now,
   };
   return { ...(settings || {}), [DAILY_REPORT_KEY]: next };
-}
-
-export function isEmail(s: string): boolean {
-  return /^[^\s@,;<>"]+@[^\s@,;<>"]+\.[^\s@,;<>"]+$/.test(s.trim());
-}
-
-/** Split a typed recipient list ("a@x.com, b@y.com") into good and bad entries. */
-export function parseEmailList(raw: string): { emails: string[]; invalid: string[] } {
-  const parts = raw.split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean);
-  const emails: string[] = [];
-  const invalid: string[] = [];
-  for (const p of parts) (isEmail(p) ? emails : invalid).push(p);
-  return { emails: [...new Set(emails.map((e) => e.toLowerCase()))], invalid };
 }
 
 /** The channels this config would actually deliver to. */
 export function reportChannels(cfg: DailyReportConfig): Channel[] {
   const out: Channel[] = [];
   if (cfg.webhookUrl && !isValidWebhookUrl(cfg.webhookUrl)) out.push('webhook');
-  if (cfg.emails.length > 0) out.push('email');
   return out;
 }
 
@@ -135,7 +111,8 @@ export function formatReportTime(time: string): string {
 // Log
 // ---------------------------------------------------------------------------
 
-export type Channel = 'webhook' | 'email';
+/** Only webhook today; kept on each log entry so another channel can join the same log. */
+export type Channel = 'webhook';
 
 export interface ReportDelivery {
   at: number;
@@ -146,7 +123,7 @@ export interface ReportDelivery {
   /** HTTP status, when there was a response. */
   status?: number;
   error?: string;
-  /** Webhook URL, or the email recipients. */
+  /** Where it was sent (the webhook URL). */
   target: string;
   /** What was sent, for the expandable row in Settings. */
   payload?: unknown;
@@ -176,7 +153,7 @@ export function readReportLog(settings: SettingsBag | undefined): ReportLog {
 
 /**
  * `settings` with these deliveries added to the front of the log. A scheduled
- * send also marks `day` as done — even if a channel failed, so a dead endpoint
+ * send also marks `day` as done — even if it failed, so a dead endpoint
  * gets one attempt a day rather than one every five minutes.
  */
 export function appendReportLog(
@@ -310,44 +287,4 @@ export function buildReportPayload(cfg: DailyReportConfig, metrics: ReportMetric
     ...metrics,
     ...(test ? { test: true, note: 'Test delivery from Not Another Social CRM. Real numbers, sent on request.' } : {}),
   });
-}
-
-export interface EmailResult { ok: boolean; status?: number; error?: string }
-
-/**
- * Ask the website to email the report. The server renders the email from the
- * numbers itself (it never takes HTML from here) and enforces its own limits on
- * recipients and sends per day — see docs/DAILY_REPORT_EMAIL_LOVABLE.md.
- */
-export async function sendReportEmail(
-  platformUrl: string,
-  accessToken: string | null,
-  to: string[],
-  metrics: ReportMetrics,
-  test: boolean,
-  fetchImpl: typeof fetch = fetch,
-  timeoutMs = 15_000,
-): Promise<EmailResult> {
-  if (!accessToken) return { ok: false, error: 'Sign in (Settings → Account & plan) to send the report by email.' };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetchImpl(`${platformUrl.replace(/\/+$/, '')}${REPORT_EMAIL_PATH}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
-      body: JSON.stringify({ to, test, report: metrics }),
-      signal: controller.signal,
-    });
-    if (res.ok) return { ok: true, status: res.status };
-    let detail = '';
-    try { const j = await res.json(); detail = typeof j?.error === 'string' ? j.error : ''; } catch { /* not JSON */ }
-    if (res.status === 404) return { ok: false, status: 404, error: 'Email sending is not set up on the server yet.' };
-    if (res.status === 401) return { ok: false, status: 401, error: 'Your sign-in has expired. Sign in again in Settings → Account & plan.' };
-    if (res.status === 429) return { ok: false, status: 429, error: detail || 'Daily email limit reached. Try again tomorrow.' };
-    return { ok: false, status: res.status, error: detail || `Server replied ${res.status}` };
-  } catch (e) {
-    return { ok: false, error: controller.signal.aborted ? `No response within ${timeoutMs / 1000}s` : String(e) };
-  } finally {
-    clearTimeout(timer);
-  }
 }

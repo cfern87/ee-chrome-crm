@@ -64,16 +64,15 @@ describe('daily report line on the Dashboard', () => {
 
   it('shows the schedule and last send once configured, and flags a failure', () => {
     const now = Date.now();
-    let settings = writeReportConfig({}, { enabled: true, time: '08:00', webhookUrl: 'https://x.com/h', webhookSecret: '', emails: ['a@b.com'] });
+    let settings = writeReportConfig({}, { enabled: true, time: '08:00', webhookUrl: 'https://x.com/h', webhookSecret: '' });
     settings = appendReportLog(settings, [
-      { at: now, channel: 'webhook', ok: true, trigger: 'scheduled', target: 'x' },
-      { at: now, channel: 'email', ok: false, trigger: 'scheduled', target: 'a@b.com', error: 'boom' },
+      { at: now, channel: 'webhook', ok: false, trigger: 'scheduled', target: 'x', error: 'boom' },
     ], localDay(now));
     const open = vi.fn();
     const el = mount(settings, open);
     expect(el.querySelector('[data-report-prompt]')).toBeNull();
     const line = el.querySelector('[data-report-status]')!;
-    expect(line.textContent).toContain('8:00 AM via webhook + 1 email');
+    expect(line.textContent).toContain('8:00 AM via webhook');
     expect(line.textContent).toContain('last attempt failed today');
     click(line.querySelector('a')!);
     expect(open).toHaveBeenCalledTimes(1);

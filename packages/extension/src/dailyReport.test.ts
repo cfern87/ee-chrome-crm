@@ -1,7 +1,7 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import {
-  readReportConfig, writeReportConfig, parseEmailList, isReportConfigured, isReportDue, localDay,
-  readReportLog, appendReportLog, computeReportMetrics, sendReportEmail, formatReportTime,
+  readReportConfig, writeReportConfig, isReportConfigured, isReportDue, localDay,
+  readReportLog, appendReportLog, computeReportMetrics, formatReportTime,
   REPORT_LOG_LIMIT, DAILY_REPORT_KEY, DAILY_REPORT_LOG_KEY, type ReportDelivery,
 } from './dailyReport';
 import { mergeSettings } from './settingsMerge';
@@ -13,26 +13,22 @@ const at = (h: number, m = 0) => new Date(2026, 9, 28, h, m).getTime();
 
 const cfg = (over: Record<string, unknown> = {}) =>
   readReportConfig(writeReportConfig({}, {
-    enabled: true, time: '08:00', webhookUrl: 'https://example.com/hook', webhookSecret: '', emails: [], ...over,
+    enabled: true, time: '08:00', webhookUrl: 'https://example.com/hook', webhookSecret: '', ...over,
   }, 1));
 
 describe('config', () => {
-  it('round-trips and drops bad emails and times', () => {
+  it('round-trips and drops a bad time', () => {
     const c = readReportConfig(writeReportConfig({}, {
-      enabled: true, time: '25:00', webhookUrl: ' https://x.com/h ', webhookSecret: '', emails: ['A@B.com', 'nope', 'a@b.com'],
+      enabled: true, time: '25:00', webhookUrl: ' https://x.com/h ', webhookSecret: '',
     }, 5));
-    expect(c).toEqual({ enabled: true, time: '08:00', webhookUrl: 'https://x.com/h', webhookSecret: '', emails: ['a@b.com'], at: 5 });
-  });
-
-  it('parses a typed recipient list', () => {
-    expect(parseEmailList('a@b.com, c@d.org;bad  e@f.io')).toEqual({ emails: ['a@b.com', 'c@d.org', 'e@f.io'], invalid: ['bad'] });
+    expect(c).toEqual({ enabled: true, time: '08:00', webhookUrl: 'https://x.com/h', webhookSecret: '', at: 5 });
   });
 
   it('is configured only when on and with a valid channel', () => {
     expect(isReportConfigured(cfg())).toBe(true);
     expect(isReportConfigured(cfg({ enabled: false }))).toBe(false);
     expect(isReportConfigured(cfg({ webhookUrl: 'http://example.com' }))).toBe(false);
-    expect(isReportConfigured(cfg({ webhookUrl: '', emails: ['a@b.com'] }))).toBe(true);
+    expect(isReportConfigured(cfg({ webhookUrl: '' }))).toBe(false);
   });
 
   it('formats the time for people', () => {
@@ -72,7 +68,7 @@ describe('schedule', () => {
 
   it('keeps only the newest entries', () => {
     let s = {};
-    for (let i = 0; i < REPORT_LOG_LIMIT + 4; i++) s = appendReportLog(s, [{ at: i, channel: 'email', ok: true, trigger: 'test', target: 'x' }], null, i);
+    for (let i = 0; i < REPORT_LOG_LIMIT + 4; i++) s = appendReportLog(s, [{ at: i, channel: 'webhook', ok: true, trigger: 'test', target: 'x' }], null, i);
     const log = readReportLog(s);
     expect(log.entries).toHaveLength(REPORT_LOG_LIMIT);
     expect(log.entries[0].at).toBe(REPORT_LOG_LIMIT + 3);
@@ -103,25 +99,5 @@ describe('metrics', () => {
     expect(m.tiles[0]).toMatchObject({ kind: 'ratio', value: 0.5, numerator: 1, denominator: 2 });
     expect(m.tiles[1]).toMatchObject({ kind: 'count', count: 1 });
     expect(m.tiles[2]).toMatchObject({ kind: 'count', count: 2 });
-  });
-});
-
-describe('email', () => {
-  const metrics = { day: '2026-10-28', generatedAt: 0, totals: { contacts: 0, active: 0, archived: 0 }, tiles: [] };
-
-  it('needs a sign-in', async () => {
-    const f = vi.fn();
-    const r = await sendReportEmail('https://site', null, ['a@b.com'], metrics, false, f as any);
-    expect(r.ok).toBe(false);
-    expect(f).not.toHaveBeenCalled();
-  });
-
-  it('posts the numbers with the bearer token, and explains a missing server route', async () => {
-    const f = vi.fn().mockResolvedValue({ ok: false, status: 404, json: async () => ({}) });
-    const r = await sendReportEmail('https://site/', 'tok', ['a@b.com'], metrics, true, f as any);
-    expect(f.mock.calls[0][0]).toBe('https://site/api/public/daily-report-email');
-    expect(f.mock.calls[0][1].headers.Authorization).toBe('Bearer tok');
-    expect(JSON.parse(f.mock.calls[0][1].body)).toEqual({ to: ['a@b.com'], test: true, report: metrics });
-    expect(r).toMatchObject({ ok: false, status: 404, error: expect.stringContaining('not set up') });
   });
 });
