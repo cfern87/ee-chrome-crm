@@ -105,7 +105,7 @@ import {
 import { MAX_READ_STATE_WRITES } from './mutations';
 import { e2eeVariantOf } from './threadUrl';
 import {
-  readAutomations, resolveUnread, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable,
+  readAutomations, resolveUnread, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable, automationChangesOf,
   AUTOMATION_RUNS_KEY,
   type Automation, type AutomationRun, type AutomationRuns, type UnreadScanReport,
 } from './automations';
@@ -114,7 +114,7 @@ import {
   writeWebhooks, isValidWebhookUrl, presetHook, buildPresetPayload, buildBatchPresetPayload, contactSummary, TEST_CONTACT,
   type WebhookEvent, type PendingEvent, type WebhookConfig, type WebhookDelivery,
 } from './webhooks';
-import { webhookFailureArg } from './history';
+import { webhookFailureArg, type AutomationChange } from './history';
 import { webhookSendsFor, isDestructive } from './presets';
 
 const TICK_ALARM = 'crm-campaign-tick';
@@ -1329,6 +1329,18 @@ interface AutomationRunOptions {
   ids?: string[];
   /** Receives the job once it has started, so the caller can wait for it. */
   onJob?: (job: Promise<void>) => void;
+  /** What started it, in the user's words (an incoming webhook's token label), for contact history. */
+  source?: string;
+}
+
+/** How a run is written into each touched contact's history (history.ts, 'a' events). */
+interface RunLogContext {
+  trigger: AutomationRun['trigger'];
+  source?: string;
+  /** When the run's actions began. Events from then until the log is written are grouped under it. */
+  startedAt: number;
+  /** Log these contacts even if nothing changed for them (contacts a webhook named, contacts the run added). */
+  alwaysLog?: string[];
 }
 
 async function startAutomation(id: string, trigger: AutomationRun['trigger'], opts: AutomationRunOptions = {}): Promise<{ success: boolean; error?: string }> {
@@ -1369,7 +1381,7 @@ async function startAutomation(id: string, trigger: AutomationRun['trigger'], op
     runningAutomationId = id;
     automationStopRequested = false;
     automationStopSignal = makeStopSignal();
-    const job = runAutomationJob(automation, opts.transform).finally(() => { scanning = false; runningAutomationId = null; });
+    const job = runAutomationJob(automation, trigger, opts).finally(() => { scanning = false; runningAutomationId = null; });
     opts.onJob?.(job);
     void job;
     return { success: true };
@@ -1399,7 +1411,7 @@ async function startSearchAutomation(id: string, trigger: AutomationRun['trigger
       automationId: id, running: true, phase: 'saving', trigger, startedAt: Date.now(), rowsSeen: 0,
     }, true);
     handedOff = true;
-    const job = runSearchAutomationJob(id, opts).finally(() => { runningSearchIds.delete(id); });
+    const job = runSearchAutomationJob(id, trigger, opts).finally(() => { runningSearchIds.delete(id); });
     opts.onJob?.(job);
     void job;
     return { success: true };
@@ -1410,8 +1422,9 @@ async function startSearchAutomation(id: string, trigger: AutomationRun['trigger
   }
 }
 
-async function runSearchAutomationJob(id: string, opts: AutomationRunOptions = {}): Promise<void> {
+async function runSearchAutomationJob(id: string, trigger: AutomationRun['trigger'], opts: AutomationRunOptions = {}): Promise<void> {
   try {
+    const startedAt = Date.now();
     const store = await loadStore();
     const stored = readAutomations(store).find((a) => a.id === id);
     if (!stored) throw new Error('The automation was deleted while it was running.');
@@ -1423,7 +1436,12 @@ async function runSearchAutomationJob(id: string, opts: AutomationRunOptions = {
       if (!search) throw new Error('Its saved search no longer exists.');
       ids = matchSavedSearch(search, store).map((c) => c.id);
     }
-    const result = await applyAutomationActions(automation, ids);
+    const result = await applyAutomationActions(automation, ids, {
+      trigger, source: opts.source, startedAt,
+      // Contacts a webhook named explicitly are logged even when nothing
+      // changed, so "did my request reach them?" has an answer.
+      ...(opts.ids ? { alwaysLog: ids } : {}),
+    });
     await patchAutomationRun(id, {
       running: false, phase: undefined, finishedAt: Date.now(), matched: ids.length, error: undefined, ...result,
     });
@@ -1466,7 +1484,51 @@ async function noteAutomationMessaged(automationId: string, threadIds: string[])
  * the message against the store AFTER the steps, so a step that deletes or
  * archives someone is respected.
  */
-async function applyAutomationActions(automation: Automation, ids: string[]): Promise<Partial<AutomationRun>> {
+async function applyAutomationActions(automation: Automation, ids: string[], ctx: RunLogContext): Promise<Partial<AutomationRun>> {
+  // Who this run touched, and the changes history has no event of its own for.
+  // Written to each of them as one 'a' event at the end — in `finally`, so a
+  // run that fails half-way still shows on the contacts it did reach.
+  const touched = new Map<string, Set<AutomationChange>>();
+  const touch = (id: string, changes: AutomationChange[] = []) => {
+    let s = touched.get(id);
+    if (!s) touched.set(id, (s = new Set()));
+    for (const c of changes) s.add(c);
+  };
+  for (const id of ctx.alwaysLog || []) touch(id);
+  let failed = false;
+  try {
+    return await applyAutomationActionsInner(automation, ids, touch);
+  } catch (e) {
+    failed = true;
+    throw e;
+  } finally {
+    if (touched.size) {
+      try {
+        await mutateStore([{
+          op: 'logAutomationRun',
+          at: ctx.startedAt,
+          run: {
+            trigger: ctx.trigger,
+            automationId: automation.id,
+            durationMs: Date.now() - ctx.startedAt,
+            ...(ctx.source ? { source: ctx.source } : {}),
+            ...(failed ? { failed: true } : {}),
+          },
+          entries: [...touched].map(([conversationId, s]) => ({ conversationId, changes: [...s] })),
+        }]);
+      } catch (e) {
+        // Bookkeeping: the actions have already happened.
+        console.warn('[CRM] could not log the automation run in contact history', e);
+      }
+    }
+  }
+}
+
+async function applyAutomationActionsInner(
+  automation: Automation,
+  ids: string[],
+  touch: (id: string, changes?: AutomationChange[]) => void,
+): Promise<Partial<AutomationRun>> {
   const store = await loadStore();
   const plan = planActions(automation, ids, store);
 
@@ -1482,20 +1544,24 @@ async function applyAutomationActions(automation: Automation, ids: string[]): Pr
       const r = await sendPresetWebhook(h.url, automation.name, h.conversationIds, !!h.batch);
       hookTally.sent += r.sent;
       hookTally.failed += r.failed;
+      for (const id of h.conversationIds) touch(id);
     }
   };
   const deletesFirst = isDestructive(asPreset);
   if (deletesFirst) await sendHooks();
 
-  const chunks: Mutation[][] = [];
+  const chunks: Array<{ start: number; mutations: Mutation[] }> = [];
   for (let i = 0; i < plan.groups.length; i += MAX_READ_STATE_WRITES) {
-    chunks.push(plan.groups.slice(i, i + MAX_READ_STATE_WRITES).flat());
+    chunks.push({ start: i, mutations: plan.groups.slice(i, i + MAX_READ_STATE_WRITES).flat() });
   }
   // Paced like the reply check's writes, and for the same storage-quota
   // reason — see chunkDelayMs.
   const delay = chunkDelayMs(await isDriveEnabled());
   for (let i = 0; i < chunks.length; i++) {
-    const res = await mutateStore(chunks[i]);
+    const res = await mutateStore(chunks[i].mutations);
+    for (let g = chunks[i].start; g < Math.min(chunks[i].start + MAX_READ_STATE_WRITES, plan.groups.length); g++) {
+      touch(plan.groupIds[g], automationChangesOf(plan.groups[g]));
+    }
     if (res.changed && i < chunks.length - 1) await new Promise((r) => setTimeout(r, delay));
   }
   if (!deletesFirst) await sendHooks();
@@ -1539,13 +1605,15 @@ async function applyAutomationActions(automation: Automation, ids: string[]): Pr
       if (!res.success) throw new Error(res.error || 'Could not queue the message.');
       out.messaged = mp.recipients.length;
       out.campaignId = res.campaignId;
+      for (const r of mp.recipients) touch(r.threadId);
       await noteAutomationMessaged(automation.id, mp.recipients.map((r) => r.threadId));
     }
   }
   return out;
 }
 
-async function runAutomationJob(automation: Automation, transform?: (a: Automation) => Automation): Promise<void> {
+async function runAutomationJob(automation: Automation, trigger: AutomationRun['trigger'], opts: AutomationRunOptions = {}): Promise<void> {
+  const transform = opts.transform;
   const log: string[] = [];
   const id = automation.id;
   try {
@@ -1586,11 +1654,15 @@ async function runAutomationJob(automation: Automation, transform?: (a: Automati
     const current = transform ? transform(stored) : stored;
     const resolved = resolveUnread(current, report.unread, store);
 
-    // New contacts first, so the actions below can act on them too.
+    // New contacts first, so the actions below can act on them too. Their
+    // "Added to CRM" falls inside the run's window, so it's grouped under it.
+    const actionsStartedAt = Date.now();
     for (let i = 0; i < resolved.creates.length; i += MAX_READ_STATE_WRITES) {
       await mutateStore(resolved.creates.slice(i, i + MAX_READ_STATE_WRITES));
     }
-    const result = await applyAutomationActions(current, [...resolved.ownerIds, ...resolved.createdIds]);
+    const result = await applyAutomationActions(current, [...resolved.ownerIds, ...resolved.createdIds], {
+      trigger, source: opts.source, startedAt: actionsStartedAt, alwaysLog: resolved.createdIds,
+    });
 
     await patchAutomationRun(id, {
       running: false,
@@ -1692,13 +1764,14 @@ function ensureInboundAlarm(): void {
 }
 
 /** Run an (already overridden) automation for a webhook and wait for its run record. */
-async function runInboundAutomation(overridden: Automation, ids: string[] | undefined): Promise<AutomationRun> {
+async function runInboundAutomation(overridden: Automation, ids: string[] | undefined, source?: string): Promise<AutomationRun> {
   let job = null as Promise<void> | null;
   const res = await startAutomation(overridden.id, 'webhook', {
     // Applied to the automation as loaded when the job runs: its current steps,
     // with the request's message overrides.
     transform: (stored) => ({ ...stored, message: overridden.message }),
     ...(ids ? { ids } : {}),
+    ...(source ? { source } : {}),
     onJob: (j) => { job = j; },
   });
   if (!res.success) throw new Error(res.error || 'The automation could not start.');
@@ -1707,6 +1780,9 @@ async function runInboundAutomation(overridden: Automation, ids: string[] | unde
   if (!run) throw new Error('The automation finished without a run record.');
   return run;
 }
+
+/** Token labels, cached for a minute so a poll with several requests lists them once. */
+let tokenLabels: { at: number; byId: Map<string, string> } | null = null;
 
 const inboundDeps: InboundDeps = {
   loadStore,
@@ -1718,6 +1794,15 @@ const inboundDeps: InboundDeps = {
   claim: (device) => inboundClient.claim(device),
   complete: (id, outcome) => inboundClient.complete(id, outcome),
   runAutomation: runInboundAutomation,
+  tokenLabel: async (tokenId) => {
+    // Up to CLAIM_LIMIT requests per poll, so one listing per poll at most.
+    const now = Date.now();
+    if (!tokenLabels || now - tokenLabels.at > 60_000) {
+      const r = await inboundClient.listTokens();
+      tokenLabels = { at: now, byId: new Map('tokens' in r ? r.tokens.map((t) => [t.id, t.label || t.token_prefix]) : []) };
+    }
+    return tokenLabels.byId.get(tokenId);
+  },
   saveStatus: (s) => new Promise<void>((resolve) => {
     try { chrome.storage.local.set({ [INBOUND_STATUS_KEY]: s }, () => { void chrome.runtime.lastError; resolve(); }); }
     catch { resolve(); }
@@ -2876,6 +2961,10 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         }
         case 'INBOUND_TOKENS': {
           sendResponse(await inboundClient.listTokens());
+          break;
+        }
+        case 'INBOUND_TOKEN_HISTORY': {
+          sendResponse(await inboundClient.listForToken(String(request.payload?.id || '')));
           break;
         }
         case 'INBOUND_TOKEN_CREATE': {

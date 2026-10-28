@@ -42,6 +42,15 @@ export interface InboundCommandSummary {
   expires_at: string;
 }
 
+/** One request in a token's history: the summary plus what was asked and what came back. */
+export interface InboundCommandDetail extends InboundCommandSummary {
+  payload: unknown;
+  result: Record<string, unknown> | null;
+}
+
+/** Requests shown per token. The server keeps more; this is just what the history lists. */
+export const TOKEN_HISTORY_LIMIT = 10;
+
 type Fail = { ok: false; error: string; status?: number };
 
 export interface InboundClientDeps {
@@ -126,6 +135,13 @@ export function makeInboundClient(deps: InboundClientDeps) {
     async listRecent(limit = 20): Promise<{ ok: true; commands: InboundCommandSummary[] } | Fail> {
       const r = await call('GET', `/rest/v1/inbound_commands?select=id,command,status,error,created_at,claimed_at,finished_at,expires_at&order=created_at.desc&limit=${limit}`);
       return failed(r) ? r : { ok: true, commands: Array.isArray(r.data) ? (r.data as InboundCommandSummary[]) : [] };
+    },
+
+    /** The last requests that came in with one token, newest first. */
+    async listForToken(tokenId: string, limit = TOKEN_HISTORY_LIMIT): Promise<{ ok: true; commands: InboundCommandDetail[] } | Fail> {
+      const n = Math.max(1, Math.min(50, Math.floor(limit) || TOKEN_HISTORY_LIMIT));
+      const r = await call('GET', `/rest/v1/inbound_commands?select=id,command,status,error,payload,result,created_at,claimed_at,finished_at,expires_at&token_id=eq.${encodeURIComponent(tokenId)}&order=created_at.desc&limit=${n}`);
+      return failed(r) ? r : { ok: true, commands: Array.isArray(r.data) ? (r.data as InboundCommandDetail[]) : [] };
     },
   };
 }

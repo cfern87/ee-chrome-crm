@@ -298,8 +298,14 @@ describe('executeInboundCommand', () => {
   it('runs the automation on its own source when no contacts are given', async () => {
     const d = deps(storeWith());
     const out = await executeInboundCommand(row('automation.run', { automation: 'a1' }), d);
-    expect(d.runAutomation).toHaveBeenCalledWith(expect.objectContaining({ id: 'a1' }), undefined);
+    expect(d.runAutomation).toHaveBeenCalledWith(expect.objectContaining({ id: 'a1' }), undefined, 'Incoming webhook');
     expect(out).toMatchObject({ status: 'done', result: { automationId: 'a1', matched: 2, tagged: 2 } });
+  });
+
+  it('names the webhook by its token label for contact history', async () => {
+    const d = deps(storeWith(), { tokenLabel: vi.fn(async (id: string) => (id === 't1' ? 'Zapier' : undefined)) });
+    await executeInboundCommand({ ...row('automation.run', { automation: 'a1' }), token_id: 't1' }, d);
+    expect(d.runAutomation).toHaveBeenCalledWith(expect.objectContaining({ id: 'a1' }), undefined, 'Zapier');
   });
 
   it('runs on exactly the matched contacts and reports the unmatched ones', async () => {
@@ -307,7 +313,7 @@ describe('executeInboundCommand', () => {
     const out = await executeInboundCommand(row('automation.run', {
       automation: 'a1', contacts: [{ id: '222' }, { id: '999' }],
     }), d);
-    expect(d.runAutomation).toHaveBeenCalledWith(expect.objectContaining({ id: 'a1' }), ['222']);
+    expect(d.runAutomation).toHaveBeenCalledWith(expect.objectContaining({ id: 'a1' }), ['222'], 'Incoming webhook');
     expect(out.result).toMatchObject({ notFound: [{ id: '999' }] });
   });
 

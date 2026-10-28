@@ -72,6 +72,8 @@ export interface InboundCommandRow {
   payload: unknown;
   created_at: string;
   expires_at?: string;
+  /** The token the request came in with (null once that token is deleted). */
+  token_id?: string | null;
 }
 
 export interface ContactRef {
@@ -279,9 +281,12 @@ export interface InboundDeps {
   complete(id: string, outcome: CompleteOutcome): Promise<{ ok: boolean; error?: string }>;
   /**
    * Run the automation (already overridden) and resolve with its finished run
-   * record. `ids` undefined = its own source. May throw.
+   * record. `ids` undefined = its own source. `source` names the webhook for
+   * the contacts' history. May throw.
    */
-  runAutomation(automation: Automation, ids: string[] | undefined): Promise<AutomationRun>;
+  runAutomation(automation: Automation, ids: string[] | undefined, source?: string): Promise<AutomationRun>;
+  /** The label of the token a request came in with, for contact history. Optional; never throws. */
+  tokenLabel?(tokenId: string): Promise<string | undefined>;
   saveStatus(s: InboundStatus): Promise<void>;
   now(): number;
 }
@@ -307,7 +312,11 @@ export async function executeInboundCommand(row: InboundCommandRow, deps: Inboun
       notFound = r.notFound;
     }
 
-    const run = await deps.runAutomation(withInboundOverrides(found.automation, parsed), ids);
+    let label: string | undefined;
+    if (row.token_id && deps.tokenLabel) {
+      try { label = await deps.tokenLabel(row.token_id); } catch { /* cosmetic */ }
+    }
+    const run = await deps.runAutomation(withInboundOverrides(found.automation, parsed), ids, label || 'Incoming webhook');
     const { running: _r, phase: _p, ...summary } = run;
     const result: Record<string, unknown> = { ...summary, automationName: found.automation.name, dryRun: parsed.dryRun };
     if (parsed.contacts) result.notFound = notFound;

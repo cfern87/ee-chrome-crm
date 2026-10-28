@@ -4,7 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   parseHistory, appendHistory, mergeHistory, mergeHistoryMaps, recordHistory, combineHistoryInto,
-  displayHistory, MAX_HISTORY_EVENTS,
+  displayHistory, MAX_HISTORY_EVENTS, automationRunArg, parseAutomationRunArg, groupHistory,
 } from './history';
 import { EMPTY_STORE, type Conversation, type Store } from './storage';
 
@@ -119,5 +119,49 @@ describe('displayHistory', () => {
   it('keeps same-second events in the order they happened, newest first', () => {
     const s = appendHistory('', [{ at: T0, op: '+', arg: 'a' }, { at: T0, op: '-', arg: 'a' }]);
     expect(displayHistory(conv('c1', [], { createdAt: 0 }), s).map((e) => e.op)).toEqual(['-', '+']);
+  });
+});
+
+describe('automation runs in history', () => {
+  it('round-trips a run, including odd characters in the webhook name', () => {
+    const run = {
+      trigger: 'webhook' as const, automationId: 'au_x_1', durationMs: 4200,
+      source: 'Zapier, main | prod', changes: ['field' as const, 'task' as const], failed: true,
+    };
+    const s = appendHistory('', [{ at: T0, op: 'a', arg: automationRunArg(run) }]);
+    const [e] = parseHistory(s);
+    expect(e.op).toBe('a');
+    expect(parseAutomationRunArg(e.arg)).toEqual({ ...run, durationMs: 5000 });
+  });
+
+  it('keeps a plain run small', () => {
+    expect(automationRunArg({ trigger: 'schedule', automationId: 'au_1', durationMs: 0 })).toBe('s0|au_1');
+  });
+
+  it('groups the events inside a run under it, oldest first, and leaves the rest alone', () => {
+    const s = appendHistory('', [
+      { at: T0 - 60_000, op: '+', arg: 'before' },
+      { at: T0, op: '+', arg: 'x' },
+      { at: T0 + 2000, op: 'q', arg: 'hi' },
+      { at: T0, op: 'a', arg: automationRunArg({ trigger: 'manual', automationId: 'au_1', durationMs: 3000 }) },
+      { at: T0 + 60_000, op: '-', arg: 'after' },
+    ]);
+    const items = groupHistory(displayHistory(conv('c1', [], { createdAt: 0 }), s));
+    expect(items.map((i) => i.kind)).toEqual(['event', 'run', 'event']);
+    const run = items[1];
+    if (run.kind !== 'run') throw new Error('expected a run');
+    expect(run.children.map((c) => c.arg)).toEqual(['x', 'hi']);
+  });
+
+  it('gives an event inside two overlapping runs to the later one', () => {
+    const s = appendHistory('', [
+      { at: T0, op: 'a', arg: automationRunArg({ trigger: 'manual', automationId: 'a1', durationMs: 60_000 }) },
+      { at: T0 + 10_000, op: 'a', arg: automationRunArg({ trigger: 'schedule', automationId: 'a2', durationMs: 5_000 }) },
+      { at: T0 + 12_000, op: '+', arg: 't' },
+    ]);
+    const items = groupHistory(displayHistory(conv('c1', [], { createdAt: 0 }), s));
+    const byId = Object.fromEntries(items.map((i) => [i.kind === 'run' ? i.run.automationId : 'x', i]));
+    expect(byId.a2.kind === 'run' && byId.a2.children.length).toBe(1);
+    expect(byId.a1.kind === 'run' && byId.a1.children.length).toBe(0);
   });
 });

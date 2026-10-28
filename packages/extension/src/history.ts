@@ -14,11 +14,11 @@
 //          width until 2089, which is what lets tokens sort as plain strings)
 //   op   — 'c' contact added, '+' tag added, '-' tag removed, 'm' message sent,
 //          'q' message queued in a campaign, 'w' sent to a webhook by a quick
-//          action, 'x' that webhook failed
+//          action, 'x' that webhook failed, 'a' an automation ran on them
 //   arg  — the tag id for '+' / '-', the HTTP status for 'w', a short reason
 //          for 'x' (see webhookFailureArg), the message text for 'q' and 'm'
-//          (see messageArg — absent on an 'm' from a manual send), empty
-//          otherwise
+//          (see messageArg — absent on an 'm' from a manual send), the run
+//          (see automationRunArg) for 'a', empty otherwise
 // e.g. "3ukq0ac,3ukq0c+lx3k9a4f2q,3ukqa1m". A tag event is ~22 bytes of JSON,
 // against ~70 for the same thing as an object — this map can get long.
 //
@@ -29,9 +29,122 @@
 
 import type { Conversation, Store } from './storage';
 
-export type HistoryOp = 'c' | '+' | '-' | 'm' | 'q' | 'w' | 'x';
+export type HistoryOp = 'c' | '+' | '-' | 'm' | 'q' | 'w' | 'x' | 'a';
 
-const OPS = 'c+-mqwx';
+const OPS = 'c+-mqwxa';
+
+// ---- automation runs ('a') ----
+//
+// One 'a' event per contact an automation run actually touched (or, for an
+// incoming webhook that named contacts, every contact it named). Stamped at the
+// run's START, carrying how long it took, so the details pane can gather the
+// tag / webhook / queued-message events inside that window under it — those
+// are still logged exactly as before, by the saveStore diff and the log
+// mutations. Steps history has no event of its own for (a field set, a task
+// added, a rename, archiving) travel in the 'a' event as one-letter codes.
+//
+// Written once, when the run's actions are done, so it knows who was touched.
+// A contact skipped entirely ("already tagged") gets nothing: a saved-search
+// automation every 15 minutes over hundreds of contacts would otherwise fill
+// every one of their logs with "nothing to do".
+//
+// Arg: `<trigger><duration secs, base36>|<automation id>|<source>|<codes>`,
+// fields URI-encoded (that encodes '|' and ','). Old builds don't know 'a' and
+// skip it when reading, but still carry it through merges.
+
+export type AutomationTrigger = 'manual' | 'schedule' | 'webhook';
+
+/** Changes made by an automation that history has no event of its own for. */
+export type AutomationChange = 'field' | 'task' | 'tasksDone' | 'archived' | 'unarchived' | 'renamed';
+
+const TRIGGER_CODE: Record<AutomationTrigger, string> = { manual: 'm', schedule: 's', webhook: 'h' };
+const CHANGE_CODE: Record<AutomationChange, string> = {
+  field: 'f', task: 'k', tasksDone: 't', archived: 'r', unarchived: 'u', renamed: 'n',
+};
+/** The run ended in an error (some actions may not have happened). */
+const FAILED_CODE = 'e';
+
+export interface AutomationRunInfo {
+  trigger: AutomationTrigger;
+  automationId: string;
+  /** How long the run's actions took, ms. Events inside [at, at + durationMs] are grouped under it. */
+  durationMs: number;
+  /** What started it, in the user's words — an incoming webhook's token label. */
+  source?: string;
+  changes?: AutomationChange[];
+  failed?: boolean;
+}
+
+export function automationRunArg(r: AutomationRunInfo): string {
+  const secs = Math.max(0, Math.ceil(r.durationMs / 1000));
+  const codes = Array.from(new Set((r.changes || []).map((c) => CHANGE_CODE[c]))).join('') + (r.failed ? FAILED_CODE : '');
+  return [
+    TRIGGER_CODE[r.trigger] + secs.toString(36),
+    encodeURIComponent(r.automationId),
+    encodeURIComponent((r.source || '').slice(0, 60)),
+    codes,
+  ].join('|').replace(/\|+$/, '');
+}
+
+export function parseAutomationRunArg(arg: string | undefined): AutomationRunInfo | null {
+  if (!arg) return null;
+  const [head, id, source, codes = ''] = arg.split('|');
+  const trigger = (Object.keys(TRIGGER_CODE) as AutomationTrigger[]).find((t) => TRIGGER_CODE[t] === head[0]);
+  const secs = parseInt(head.slice(1), 36);
+  if (!trigger || !Number.isFinite(secs) || !id) return null;
+  const dec = (s: string | undefined) => { try { return decodeURIComponent(s || ''); } catch { return s || ''; } };
+  const changes = (Object.keys(CHANGE_CODE) as AutomationChange[]).filter((c) => codes.includes(CHANGE_CODE[c]));
+  const src = dec(source);
+  return {
+    trigger,
+    automationId: dec(id),
+    durationMs: secs * 1000,
+    ...(src ? { source: src } : {}),
+    ...(changes.length ? { changes } : {}),
+    ...(codes.includes(FAILED_CODE) ? { failed: true } : {}),
+  };
+}
+
+/** Ops that can belong to an automation run in the details pane. */
+const RUN_CHILD_OPS: HistoryOp[] = ['c', '+', '-', 'w', 'x', 'q'];
+
+export type HistoryItem =
+  | { kind: 'event'; event: HistoryEvent }
+  | { kind: 'run'; event: HistoryEvent; run: AutomationRunInfo; children: HistoryEvent[] };
+
+/**
+ * Fold a newest-first event list (displayHistory) into what the details pane
+ * lists: each automation run with the events that happened during it, and
+ * everything else as it was. An event inside two overlapping runs goes to the
+ * one that started last. Times are second-precision, so the window is
+ * widened by a second at the end.
+ */
+export function groupHistory(events: HistoryEvent[]): HistoryItem[] {
+  const runs = events
+    .map((event) => ({ event, run: event.op === 'a' ? parseAutomationRunArg(event.arg) : null }))
+    .filter((x): x is { event: HistoryEvent; run: AutomationRunInfo } => !!x.run);
+  const owner = new Map<HistoryEvent, HistoryEvent>();
+  const children = new Map<HistoryEvent, HistoryEvent[]>();
+  for (const r of runs) children.set(r.event, []);
+  for (const e of events) {
+    if (!RUN_CHILD_OPS.includes(e.op)) continue;
+    let best: { event: HistoryEvent; run: AutomationRunInfo } | undefined;
+    for (const r of runs) {
+      if (e.at < r.event.at || e.at > r.event.at + r.run.durationMs + 1000) continue;
+      if (!best || r.event.at > best.event.at) best = r;
+    }
+    if (best) { owner.set(e, best.event); children.get(best.event)!.push(e); }
+  }
+  const out: HistoryItem[] = [];
+  for (const e of events) {
+    if (owner.has(e)) continue;
+    const r = runs.find((x) => x.event === e);
+    // Oldest first inside a run, so it reads in the order it happened.
+    if (r) out.push({ kind: 'run', event: e, run: r.run, children: [...children.get(e)!].reverse() });
+    else out.push({ kind: 'event', event: e });
+  }
+  return out;
+}
 
 /**
  * A message as a history arg. URI-encoded because the token format reserves

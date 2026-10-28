@@ -19,7 +19,11 @@ import {
 } from './shared';
 import { funnelsFor, describeStage, stagePosition, stageTitle, type FunnelView } from '../funnel';
 import { ContactTasks, type TaskHandlers } from './TasksPanel';
-import { displayHistory, messageFromArg, type HistoryEvent } from '../history';
+import {
+  displayHistory, groupHistory, messageFromArg,
+  type AutomationChange, type AutomationRunInfo, type HistoryEvent,
+} from '../history';
+import { readAutomations } from '../automations';
 
 export const TAG_FILTER_VISIBLE = 12;
 
@@ -765,37 +769,122 @@ const HISTORY_PREVIEW = 8;
  */
 function ContactHistory({ conv, store }: { conv: Conversation; store: Store }) {
   const [showAll, setShowAll] = useState(false);
-  useEffect(() => { setShowAll(false); }, [conv.id]);
-  const events = useMemo(() => displayHistory(conv, store.history?.[conv.id]), [conv, store.history]);
-  if (events.length === 0) return null;
-  const shown = showAll ? events : events.slice(0, HISTORY_PREVIEW);
+  const [openRuns, setOpenRuns] = useState<Set<string>>(() => new Set());
+  useEffect(() => { setShowAll(false); setOpenRuns(new Set()); }, [conv.id]);
+  const items = useMemo(() => groupHistory(displayHistory(conv, store.history?.[conv.id])), [conv, store.history]);
+  const automationNames = useMemo(() => new Map(readAutomations(store).map((a) => [a.id, a.name])), [store]);
+  if (items.length === 0) return null;
+  const shown = showAll ? items : items.slice(0, HISTORY_PREVIEW);
+  const toggleRun = (key: string) => setOpenRuns((prev) => {
+    const next = new Set(prev);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
 
   return (
     <div style={{ marginBottom: 20 }}>
       <div style={{ fontSize: 12, fontWeight: 600, color: color.text.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>History</div>
       <ol style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {shown.map((e, i) => (
-          <li key={`${e.at}-${e.op}-${e.arg ?? ''}-${i}`} style={{ display: 'flex', alignItems: 'baseline', gap: 10, fontSize: 13, color: color.text.secondary }}>
-            <span
-              title={new Date(e.at).toLocaleString()}
-              style={{ fontSize: 12, color: color.text.muted, width: 132, flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}
-            >
-              {new Date(e.at).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}
-            </span>
-            <span style={{ minWidth: 0 }}>{describeHistoryEvent(e, store)}</span>
-          </li>
-        ))}
+        {shown.map((item, i) => {
+          const e = item.event;
+          const key = `${e.at}-${e.op}-${e.arg ?? ''}-${i}`;
+          if (item.kind === 'event') {
+            return (
+              <li key={key} style={historyRow}>
+                <HistoryTime at={e.at} />
+                <span style={{ minWidth: 0 }}>{describeHistoryEvent(e, store)}</span>
+              </li>
+            );
+          }
+          const open = openRuns.has(key);
+          const lines = runDetailLines(item.run);
+          const count = item.children.length + lines.length;
+          return (
+            <li key={key} style={{ ...historyRow, flexDirection: 'column', alignItems: 'stretch', gap: 4 }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+                <HistoryTime at={e.at} />
+                <span style={{ minWidth: 0 }}>
+                  {describeRunHeader(item.run, automationNames)}
+                  {' '}
+                  <button
+                    onClick={() => toggleRun(key)}
+                    aria-expanded={open}
+                    style={{ background: 'none', border: 'none', padding: 0, color: color.accent.base, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                  >
+                    {open ? 'Hide' : count ? `${count} action${count === 1 ? '' : 's'}` : 'Details'} {open ? '▴' : '▾'}
+                  </button>
+                </span>
+              </div>
+              {open && (
+                <ol style={{ listStyle: 'none', margin: '0 0 0 142px', padding: '0 0 0 10px', borderLeft: `2px solid ${color.border.subtle}`, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {item.children.map((c, j) => (
+                    <li key={`${c.at}-${c.op}-${c.arg ?? ''}-${j}`} style={{ fontSize: 13, color: color.text.secondary }}>
+                      {describeHistoryEvent(c, store)}
+                    </li>
+                  ))}
+                  {lines.map((l) => (
+                    <li key={l} style={{ fontSize: 13, color: color.text.secondary }}>{l}</li>
+                  ))}
+                  {count === 0 && <li style={{ fontSize: 13, color: color.text.muted }}>Nothing needed changing.</li>}
+                  {item.run.failed && (
+                    <li style={{ fontSize: 13, color: color.danger.base }}>The run stopped with an error — later steps may not have happened.</li>
+                  )}
+                </ol>
+              )}
+            </li>
+          );
+        })}
       </ol>
-      {events.length > HISTORY_PREVIEW && (
+      {items.length > HISTORY_PREVIEW && (
         <button
           onClick={() => setShowAll(!showAll)}
           style={{ marginTop: 8, background: 'none', border: 'none', padding: 0, color: color.accent.base, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
         >
-          {showAll ? 'Show less' : `Show all ${events.length}`}
+          {showAll ? 'Show less' : `Show all ${items.length}`}
         </button>
       )}
     </div>
   );
+}
+
+const historyRow: React.CSSProperties = { display: 'flex', alignItems: 'baseline', gap: 10, fontSize: 13, color: color.text.secondary };
+
+function HistoryTime({ at }: { at: number }) {
+  return (
+    <span
+      title={new Date(at).toLocaleString()}
+      style={{ fontSize: 12, color: color.text.muted, width: 132, flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}
+    >
+      {new Date(at).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}
+    </span>
+  );
+}
+
+/** "Automation “Follow up” ran (incoming webhook: Zapier)". Names resolved now, so a rename shows. */
+function describeRunHeader(run: AutomationRunInfo, names: Map<string, string>): React.ReactNode {
+  const name = names.get(run.automationId);
+  const how = run.trigger === 'webhook'
+    ? `incoming webhook${run.source ? `: ${run.source}` : ''}`
+    : run.trigger === 'schedule' ? 'on its schedule' : 'run by hand';
+  return (
+    <>
+      {name ? <>Automation <strong style={{ fontWeight: 600 }}>{name}</strong></> : <em title={run.automationId}>A deleted automation</em>}
+      {' '}ran ({how}){run.failed ? <span style={{ color: color.danger.base }}> — stopped with an error</span> : null}
+    </>
+  );
+}
+
+/** The changes history has no event of its own for (see history.ts). */
+function runDetailLines(run: AutomationRunInfo): string[] {
+  const words: Record<AutomationChange, string> = {
+    field: 'Custom field updated',
+    task: 'Task added',
+    tasksDone: 'Open tasks completed',
+    archived: 'Archived',
+    unarchived: 'Unarchived',
+    renamed: 'Name changed',
+  };
+  return (run.changes || []).map((c) => words[c]);
 }
 
 function describeHistoryEvent(e: HistoryEvent, store: Store): React.ReactNode {
@@ -820,6 +909,8 @@ function describeHistoryEvent(e: HistoryEvent, store: Store): React.ReactNode {
     }
     case 'w': return `Sent to webhook${e.arg ? ` (HTTP ${e.arg})` : ''}`;
     case 'x': return <span style={{ color: color.danger.base }}>Webhook failed{e.arg ? `: ${e.arg}` : ''}</span>;
+    // Only reached for an 'a' groupHistory couldn't read; readable ones render as a group.
+    case 'a': return 'An automation ran';
     case '+':
     case '-': {
       const tag = e.arg ? store.tags[e.arg] : undefined;

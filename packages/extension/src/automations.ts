@@ -42,6 +42,7 @@
 
 import type { Store, Conversation } from './storage';
 import type { Mutation } from './mutations';
+import type { AutomationChange } from './history';
 import { buildThreadIndex } from './contacts';
 import { normalizeSteps, stepsFor, describePreset, type PresetStep } from './presets';
 import { filterByQuery, normalizeQuery, type SavedSearch } from './search';
@@ -423,6 +424,8 @@ export function matchSavedSearch(search: SavedSearch, store: Store, now = Date.n
 export interface ActionPlan {
   /** One group per contact, so the caller can chunk writes without splitting a contact. */
   groups: Mutation[][];
+  /** The contact each group is for (same order as `groups`). */
+  groupIds: string[];
   /** Contacts the actions changed. */
   changed: number;
   /** Contacts the actions left as they were (conditions not met, or nothing to do). */
@@ -431,15 +434,32 @@ export interface ActionPlan {
 
 /** The automation's steps for each contact — exactly what a quick action would do to them. */
 export function planActions(automation: Automation, ids: string[], store: Store, now = Date.now()): ActionPlan {
-  const plan: ActionPlan = { groups: [], changed: 0, unchanged: 0 };
+  const plan: ActionPlan = { groups: [], groupIds: [], changed: 0, unchanged: 0 };
   const preset = { id: automation.id, label: automation.name, order: 0, createdAt: 0, steps: automation.steps };
   for (const id of ids) {
     const conv = store.conversations[id];
     if (!conv) continue;
     const m = automation.steps.length ? stepsFor(preset, conv, store, now) : [];
-    if (m.length) { plan.groups.push(m); plan.changed++; } else plan.unchanged++;
+    if (m.length) { plan.groups.push(m); plan.groupIds.push(id); plan.changed++; } else plan.unchanged++;
   }
   return plan;
+}
+
+/**
+ * What a contact's planned mutations did that history has no event of its own
+ * for — logged on the run's 'a' event (history.ts). Tag changes are left out:
+ * the saveStore diff already logs those.
+ */
+export function automationChangesOf(mutations: Mutation[]): AutomationChange[] {
+  const out = new Set<AutomationChange>();
+  for (const m of mutations) {
+    if (m.op === 'setCustomField') out.add('field');
+    else if (m.op === 'addTask') out.add('task');
+    else if (m.op === 'completeOpenTasks') out.add('tasksDone');
+    else if (m.op === 'setArchived') out.add(m.archived ? 'archived' : 'unarchived');
+    else if (m.op === 'renameContact') out.add('renamed');
+  }
+  return [...out];
 }
 
 export interface MessagePlan {

@@ -23,7 +23,7 @@
 // Everything here is pure: no chrome, no DOM, no I/O. The background owns the
 // load/save around it.
 
-import { appendHistory, messageArg } from './history';
+import { appendHistory, automationRunArg, messageArg, type AutomationChange, type AutomationRunInfo } from './history';
 import type { Store, Conversation, Tag, NameDiag } from './storage';
 import {
   addTagsTo, removeTagsFrom, tombstone, singleChoiceRemovals,
@@ -93,6 +93,13 @@ export type Mutation =
   // Record a quick action's webhook POST in the contact's history ('w' sent,
   // 'x' failed). `arg` is the HTTP status, or a short failure reason.
   | { op: 'logWebhook'; conversationId: string; ok: boolean; arg?: string; at: number }
+  // An automation run touched these contacts ('a' events; see history.ts).
+  // `at` is when the run's actions started.
+  | {
+      op: 'logAutomationRun'; at: number;
+      run: Omit<AutomationRunInfo, 'changes'>;
+      entries: Array<{ conversationId: string; changes: AutomationChange[] }>;
+    }
   | { op: 'setResolvedThread'; conversationId: string; threadId: string; chatUrl?: string }
   // Point a contact at a chat URL that has just been proven to work, without
   // touching its thread ids — the e2ee repair, where the id was right all along
@@ -605,6 +612,19 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
         { at: m.at, op: m.ok ? 'w' : 'x', ...(m.arg ? { arg: m.arg } : {}) },
       ]);
       return { store: next, changed: true, conversationId: m.conversationId };
+    }
+
+    case 'logAutomationRun': {
+      const entries = m.entries.filter((e) => store.conversations[e.conversationId]);
+      if (!entries.length) return { store, changed: false };
+      const next = copy(store);
+      next.history = { ...(store.history || {}) };
+      for (const e of entries) {
+        next.history[e.conversationId] = appendHistory(next.history[e.conversationId], [
+          { at: m.at, op: 'a', arg: automationRunArg({ ...m.run, ...(e.changes.length ? { changes: e.changes } : {}) }) },
+        ]);
+      }
+      return { store: next, changed: true };
     }
 
     case 'resolveProfileThread': {
