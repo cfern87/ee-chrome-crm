@@ -21,13 +21,18 @@ import {
   emptyQuery, isQueryEmpty, filterByQuery, normalizeQuery, describeQuery, sortSavedSearches,
 } from '../search';
 import {
-  intersectionSize, intersectionView, makeMatcher, newRatioTile, ratioTileId, type RatioTile,
+  intersectionView, makeMatcher, newRatioTile, ratioTileId, readRatio,
+  type RatioReading, type RatioSide, type RatioTile,
 } from '../ratioTiles';
-import { checkFormula, evaluate, formatValue, fractionOf, textToFormula, type FormulaNode } from '../tileFormula';
+import { formatValue } from '../tileFormula';
 import AdvancedSearch from './SearchBuilder';
 import { RatioTileEditor } from './RatioTileEditor';
 import { Button, Chip, EmptyState, Input, SectionTitle, Text, color, radius, space } from '../ui/primitives';
 import { previewTags, formatRelativeTime } from './shared';
+import { useLocalPref } from '../ui/prefs';
+import {
+  readReportConfig, readReportLog, isReportConfigured, formatReportTime, reportChannels, localDay,
+} from '../dailyReport';
 
 /** How many matching contacts the preview lists before it stops. */
 const PREVIEW_LIMIT = 50;
@@ -46,32 +51,6 @@ function inScope(convs: Conversation[], scope: ArchiveScope | undefined): Conver
   if (scope === 'all') return convs;
   if (scope === 'archived') return convs.filter((c) => c.archived);
   return convs.filter((c) => !c.archived);
-}
-
-/**
- * A ratio tile's result and its two sides. Never throws and never yields NaN:
- * a broken formula or a deleted search comes back as `problem`, division by
- * zero as "—".
- */
-function readRatio(
-  tile: RatioTile,
-  searches: Record<string, SavedSearch>,
-  idsFor: (preset: SavedSearch) => Set<string>,
-): RatioReading {
-  const tokens = textToFormula(tile.formula);
-  const check = checkFormula(tokens, (l) =>
-    !tile.terms[l] ? 'unknown' : !searches[tile.terms[l]] ? 'deleted' : 'ok');
-  if (!check.ok) return { text: '—', problem: check.error.message };
-  const count = (letters: string[]) => intersectionSize(letters.map((l) => idsFor(searches[tile.terms[l]])));
-  const side = (node: FormulaNode): Side => ({
-    value: evaluate(node, count),
-    ...(node.k === 'set' ? { letters: node.letters } : {}),
-  });
-  const fraction = fractionOf(check.node);
-  return {
-    text: formatValue(evaluate(check.node, count), tile.format),
-    ...(fraction ? { num: side(fraction.num), den: side(fraction.den) } : {}),
-  };
 }
 
 export interface DashboardPanelProps {
@@ -99,6 +78,68 @@ export interface DashboardPanelProps {
   onDeleteRatioTile: (id: string) => Promise<void>;
   /** Open an ad-hoc view (an intersection of searches) in the contact list. */
   onOpenQueryInContacts: (view: { query: QueryGroup; archiveScope: ArchiveScope }) => void;
+  /** store.settings — for the daily report status line. */
+  settings?: Record<string, unknown>;
+  /** Open Settings → Data → Daily report. */
+  onConfigureReport?: () => void;
+}
+
+/**
+ * Under the tile header: a prompt to set up the daily report while it isn't,
+ * then one status line once it is. Both link to its Settings section.
+ */
+function DailyReportLine({ settings, onConfigure }: { settings: Record<string, unknown> | undefined; onConfigure: () => void }) {
+  const [dismissed, setDismissed] = useLocalPref<boolean>('dashboard.reportPromptDismissed', false);
+  const cfg = readReportConfig(settings);
+  const log = readReportLog(settings);
+
+  if (!isReportConfigured(cfg)) {
+    if (dismissed) return null;
+    return (
+      <div
+        data-report-prompt
+        style={{
+          display: 'flex', alignItems: 'center', gap: space.sm, flexWrap: 'wrap', marginBottom: 14,
+          padding: '8px 12px', borderRadius: radius.md, background: color.accent.subtle,
+          border: `1px solid ${color.border.subtle}`, fontSize: 13,
+        }}
+      >
+        <span style={{ flex: 1, minWidth: 200, color: color.text.secondary }}>Get these numbers every morning by webhook or email.</span>
+        <a
+          href="#daily-report"
+          onClick={(e) => { e.preventDefault(); onConfigure(); }}
+          style={{ fontWeight: 700, color: color.accent.base }}
+        >
+          Set up a daily report →
+        </a>
+        <button onClick={() => setDismissed(true)} style={{ ...linkStyle, color: color.text.muted }}>Not now</button>
+      </div>
+    );
+  }
+
+  const channels = reportChannels(cfg);
+  const via = [
+    channels.includes('webhook') ? 'webhook' : null,
+    channels.includes('email') ? `${cfg.emails.length} email${cfg.emails.length !== 1 ? 's' : ''}` : null,
+  ].filter(Boolean).join(' + ');
+  const lastScheduled = log.entries.filter((e) => e.trigger === 'scheduled');
+  const lastRunAt = lastScheduled[0]?.at;
+  const lastRun = lastRunAt ? lastScheduled.filter((e) => Math.abs(e.at - lastRunAt) < 60_000) : [];
+  const failed = lastRun.some((e) => !e.ok);
+  const when = lastRunAt
+    ? (localDay(lastRunAt) === localDay(Date.now()) ? `today ${new Date(lastRunAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : formatRelativeTime(lastRunAt))
+    : null;
+
+  return (
+    <div data-report-status style={{ fontSize: 12, marginBottom: 14, color: failed ? color.danger.base : color.text.muted }}>
+      Daily report · {formatReportTime(cfg.time)} via {via}
+      {when && (failed ? ` · last attempt failed ${when}` : ` · last sent ${when} ✓`)}
+      {' · '}
+      <a href="#daily-report" onClick={(e) => { e.preventDefault(); onConfigure(); }} style={{ fontWeight: 600, color: failed ? color.danger.base : color.accent.base }}>
+        {failed ? 'View log' : 'Edit'}
+      </a>
+    </div>
+  );
 }
 
 /** One tile on the grid, whichever kind it is. */
@@ -106,19 +147,7 @@ type PanelTile =
   | { kind: 'search'; id: string; name: string; preset: SavedSearch }
   | { kind: 'ratio'; id: string; name: string; tile: RatioTile };
 
-/** A ratio tile's numbers, worked out for display. */
-interface RatioReading {
-  /** The formatted result, "—" when there is none. */
-  text: string;
-  /** "12 of 48", when the formula is a top-level division. */
-  num?: Side;
-  den?: Side;
-  /** Why there is no result, when the formula itself is broken. */
-  problem?: string;
-}
-
-/** One side of the fraction; `letters` set when it is a plain group of contacts. */
-interface Side { value: number | null; letters?: string[] }
+type Side = RatioSide;
 
 const linkStyle: React.CSSProperties = {
   background: 'none', border: 'none', padding: 0, fontSize: 11, fontWeight: 600, color: color.accent.base, cursor: 'pointer',
@@ -142,7 +171,7 @@ function RatioTileBody({
   onCancelDelete: () => void;
   onDelete: () => void;
 }) {
-  const r = reading ?? { text: '—' };
+  const r: RatioReading = reading ?? { text: '—', value: null };
   const sideView = (side: Side, which: string) => {
     const text = side.value === null ? '—' : formatValue(side.value, 'number');
     if (!side.letters || !side.value) return <span data-side={which}>{text}</span>;
@@ -222,6 +251,7 @@ export function DashboardPanel({
   onOpenInContacts, onCreateTile, onUpdateTile, onRemoveTile,
   tileOrder, onReorderTiles,
   ratioTiles, onSaveRatioTile, onDeleteRatioTile, onOpenQueryInContacts,
+  settings, onConfigureReport,
 }: DashboardPanelProps) {
   const [editing, setEditing] = useState<Editing>(null);
   const [draftQuery, setDraftQuery] = useState<QueryGroup>(emptyQuery());
@@ -505,6 +535,8 @@ export function DashboardPanel({
       <div aria-live="polite" style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap' }}>
         {announce}
       </div>
+
+      {tiles.length > 0 && onConfigureReport && <DailyReportLine settings={settings} onConfigure={onConfigureReport} />}
 
       {tiles.length === 0 ? (
         <EmptyState

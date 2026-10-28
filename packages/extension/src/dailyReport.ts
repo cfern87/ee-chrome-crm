@@ -1,0 +1,353 @@
+// The daily report: once a day, the Dashboard's numbers sent by POST webhook
+// and/or email.
+//
+// What is sent is exactly what the Dashboard shows — the same tiles, in the
+// same order, counted by the same matcher (ratioTiles.ts makeMatcher /
+// readRatio) — so a number in the morning email can be checked by opening the
+// Dashboard and finding the same number on the same tile.
+//
+// Scheduling has no server either (see webhooks.ts): the background worker
+// checks every few minutes whether today's report is due, and only the SENDING
+// machine (the one holding the sender lease) sends, so two open browsers don't
+// send it twice. If Chrome is closed at the set time, it goes out on the next
+// check after Chrome starts, the same day.
+//
+// Config and log both live in `store.settings` as whole values stamped `at`
+// (settingsMerge.ts stampedKeys): the newest write wins as a whole. The log is
+// synced on purpose, so the history can be read on any machine, not only on
+// the one that happened to send.
+//
+// Pure except for `sendReportEmail`, which takes its fetch as a parameter.
+
+import type { Store } from './storage';
+import type { SettingsBag } from './settingsMerge';
+import type { QueryContext } from './search';
+import { describeQuery, normalizeQuery, sortSavedSearches } from './search';
+import { arrangeTiles, readTileOrder, searchTileId } from './dashboardTiles';
+import { makeMatcher, ratioTileId, readRatio, readRatioTiles } from './ratioTiles';
+import { buildPayload, isValidWebhookUrl, type WebhookConfig, type WebhookPayload } from './webhooks';
+
+export const DAILY_REPORT_KEY = 'dailyReport';
+export const DAILY_REPORT_LOG_KEY = 'dailyReportLog';
+
+/** Deliveries kept in the log. Each one carries its payload, so keep it short. */
+export const REPORT_LOG_LIMIT = 10;
+export const MAX_REPORT_EMAILS = 5;
+/** How often the background checks whether the report is due. */
+export const REPORT_CHECK_MINUTES = 5;
+export const DAILY_REPORT_ALARM = 'crm-daily-report';
+
+/** Where the server-side mailer lives (see docs/DAILY_REPORT_EMAIL_LOVABLE.md). */
+export const REPORT_EMAIL_PATH = '/api/public/daily-report-email';
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+export interface DailyReportConfig {
+  enabled: boolean;
+  /** Local time of day, "HH:MM" (24h). */
+  time: string;
+  webhookUrl: string;
+  /** Sent as X-CRM-Token, same meaning (and same non-secrecy) as on webhooks. */
+  webhookSecret: string;
+  emails: string[];
+  /** When this configuration was saved — the merge stamp. */
+  at: number;
+}
+
+export const DEFAULT_REPORT_TIME = '08:00';
+
+export function defaultReportConfig(): DailyReportConfig {
+  return { enabled: false, time: DEFAULT_REPORT_TIME, webhookUrl: '', webhookSecret: '', emails: [], at: 0 };
+}
+
+const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+export function readReportConfig(settings: SettingsBag | undefined): DailyReportConfig {
+  const raw = settings?.[DAILY_REPORT_KEY];
+  const base = defaultReportConfig();
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return base;
+  const o = raw as Record<string, unknown>;
+  return {
+    enabled: o.enabled === true,
+    time: typeof o.time === 'string' && TIME_RE.test(o.time) ? o.time : base.time,
+    webhookUrl: typeof o.webhookUrl === 'string' ? o.webhookUrl : '',
+    webhookSecret: typeof o.webhookSecret === 'string' ? o.webhookSecret : '',
+    emails: Array.isArray(o.emails)
+      ? o.emails.filter((e): e is string => typeof e === 'string' && isEmail(e)).slice(0, MAX_REPORT_EMAILS)
+      : [],
+    at: typeof o.at === 'number' && Number.isFinite(o.at) ? o.at : 0,
+  };
+}
+
+export function writeReportConfig(
+  settings: SettingsBag | undefined,
+  cfg: Omit<DailyReportConfig, 'at'>,
+  now = Date.now(),
+): SettingsBag {
+  const next: DailyReportConfig = {
+    enabled: cfg.enabled,
+    time: TIME_RE.test(cfg.time) ? cfg.time : DEFAULT_REPORT_TIME,
+    webhookUrl: cfg.webhookUrl.trim(),
+    webhookSecret: cfg.webhookSecret.trim(),
+    emails: [...new Set(cfg.emails.map((e) => e.trim().toLowerCase()).filter(isEmail))].slice(0, MAX_REPORT_EMAILS),
+    at: now,
+  };
+  return { ...(settings || {}), [DAILY_REPORT_KEY]: next };
+}
+
+export function isEmail(s: string): boolean {
+  return /^[^\s@,;<>"]+@[^\s@,;<>"]+\.[^\s@,;<>"]+$/.test(s.trim());
+}
+
+/** Split a typed recipient list ("a@x.com, b@y.com") into good and bad entries. */
+export function parseEmailList(raw: string): { emails: string[]; invalid: string[] } {
+  const parts = raw.split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean);
+  const emails: string[] = [];
+  const invalid: string[] = [];
+  for (const p of parts) (isEmail(p) ? emails : invalid).push(p);
+  return { emails: [...new Set(emails.map((e) => e.toLowerCase()))], invalid };
+}
+
+/** The channels this config would actually deliver to. */
+export function reportChannels(cfg: DailyReportConfig): Channel[] {
+  const out: Channel[] = [];
+  if (cfg.webhookUrl && !isValidWebhookUrl(cfg.webhookUrl)) out.push('webhook');
+  if (cfg.emails.length > 0) out.push('email');
+  return out;
+}
+
+/** On, and has somewhere to send — what the Dashboard's "set up" banner checks. */
+export function isReportConfigured(cfg: DailyReportConfig): boolean {
+  return cfg.enabled && reportChannels(cfg).length > 0;
+}
+
+/** "8:00 AM" — for the Dashboard status line. */
+export function formatReportTime(time: string): string {
+  const m = TIME_RE.exec(time);
+  if (!m) return time;
+  const h = Number(m[1]);
+  return `${h % 12 === 0 ? 12 : h % 12}:${m[2]} ${h < 12 ? 'AM' : 'PM'}`;
+}
+
+// ---------------------------------------------------------------------------
+// Log
+// ---------------------------------------------------------------------------
+
+export type Channel = 'webhook' | 'email';
+
+export interface ReportDelivery {
+  at: number;
+  channel: Channel;
+  ok: boolean;
+  /** 'scheduled' for the daily send, 'test' for "Send test now". */
+  trigger: 'scheduled' | 'test';
+  /** HTTP status, when there was a response. */
+  status?: number;
+  error?: string;
+  /** Webhook URL, or the email recipients. */
+  target: string;
+  /** What was sent, for the expandable row in Settings. */
+  payload?: unknown;
+}
+
+export interface ReportLog {
+  /** Newest first. */
+  entries: ReportDelivery[];
+  /** Local day ("YYYY-MM-DD") the scheduled report last went out — the dedupe across machines. */
+  lastSentDay?: string;
+  at: number;
+}
+
+export function readReportLog(settings: SettingsBag | undefined): ReportLog {
+  const raw = settings?.[DAILY_REPORT_LOG_KEY];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { entries: [], at: 0 };
+  const o = raw as Record<string, unknown>;
+  const entries = Array.isArray(o.entries)
+    ? (o.entries.filter((e) => e && typeof e === 'object' && typeof (e as ReportDelivery).at === 'number') as ReportDelivery[])
+    : [];
+  return {
+    entries: entries.slice(0, REPORT_LOG_LIMIT),
+    ...(typeof o.lastSentDay === 'string' ? { lastSentDay: o.lastSentDay } : {}),
+    at: typeof o.at === 'number' && Number.isFinite(o.at) ? o.at : 0,
+  };
+}
+
+/**
+ * `settings` with these deliveries added to the front of the log. A scheduled
+ * send also marks `day` as done — even if a channel failed, so a dead endpoint
+ * gets one attempt a day rather than one every five minutes.
+ */
+export function appendReportLog(
+  settings: SettingsBag | undefined,
+  deliveries: ReportDelivery[],
+  day: string | null,
+  now = Date.now(),
+): SettingsBag {
+  const prev = readReportLog(settings);
+  const next: ReportLog = {
+    entries: [...deliveries, ...prev.entries].slice(0, REPORT_LOG_LIMIT),
+    ...(day ? { lastSentDay: day } : prev.lastSentDay ? { lastSentDay: prev.lastSentDay } : {}),
+    at: now,
+  };
+  return { ...(settings || {}), [DAILY_REPORT_LOG_KEY]: next };
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling
+// ---------------------------------------------------------------------------
+
+/** Local calendar day, "YYYY-MM-DD". */
+export function localDay(ts: number): string {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** Today's send time as a timestamp. */
+export function sendTimeToday(time: string, now: number): number {
+  const m = TIME_RE.exec(time) || TIME_RE.exec(DEFAULT_REPORT_TIME)!;
+  const d = new Date(now);
+  d.setHours(Number(m[1]), Number(m[2]), 0, 0);
+  return d.getTime();
+}
+
+/** Whether the scheduled report should go out now. */
+export function isReportDue(cfg: DailyReportConfig, log: ReportLog, now: number): boolean {
+  if (!isReportConfigured(cfg)) return false;
+  if (log.lastSentDay === localDay(now)) return false;
+  return now >= sendTimeToday(cfg.time, now);
+}
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+export type ReportTile =
+  | { kind: 'count'; name: string; description?: string; count: number; query: string }
+  | {
+      kind: 'ratio'; name: string; formula: string; format: string;
+      value: number | null; display: string;
+      numerator?: number | null; denominator?: number | null;
+      problem?: string;
+    };
+
+export interface ReportMetrics {
+  /** Local day the numbers are for. */
+  day: string;
+  generatedAt: number;
+  totals: { contacts: number; active: number; archived: number };
+  /** The Dashboard's tiles, in the Dashboard's order. */
+  tiles: ReportTile[];
+}
+
+/**
+ * The Dashboard's numbers, computed from a store. Same tiles, same order and
+ * same counting as DashboardPanel, so the two can't disagree.
+ */
+export function computeReportMetrics(
+  store: Pick<Store, 'conversations' | 'savedSearches' | 'settings' | 'tags' | 'tagGroups' | 'fieldDefs' | 'history'>,
+  now: number,
+): ReportMetrics {
+  const convs = Object.values(store.conversations);
+  const ctx: QueryContext = {
+    now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs, history: store.history,
+  };
+  const idsFor = makeMatcher(convs, ctx);
+  const searches = store.savedSearches || {};
+
+  type Src = { id: string; tile: () => ReportTile };
+  const defaults: Src[] = [
+    ...sortSavedSearches(searches).filter((s) => s.onDashboard).map((p): Src => ({
+      id: searchTileId(p.id),
+      tile: () => ({
+        kind: 'count', name: p.name,
+        ...(p.description ? { description: p.description } : {}),
+        count: idsFor(p).size,
+        query: describeQuery(normalizeQuery(p.query), ctx),
+      }),
+    })),
+    ...readRatioTiles(store.settings).map((t): Src => ({
+      id: ratioTileId(t.id),
+      tile: () => {
+        const r = readRatio(t, searches, idsFor);
+        return {
+          kind: 'ratio', name: t.name || 'Untitled tile', formula: t.formula, format: t.format,
+          value: r.value, display: r.text,
+          ...(r.num ? { numerator: r.num.value } : {}),
+          ...(r.den ? { denominator: r.den.value } : {}),
+          ...(r.problem ? { problem: r.problem } : {}),
+        };
+      },
+    })),
+  ];
+  const ordered = arrangeTiles(defaults, (s) => s.id, readTileOrder(store.settings)?.ids);
+  const archived = convs.filter((c) => c.archived).length;
+  return {
+    day: localDay(now),
+    generatedAt: now,
+    totals: { contacts: convs.length, active: convs.length - archived, archived },
+    tiles: ordered.map((s) => s.tile()),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Delivery
+// ---------------------------------------------------------------------------
+
+/** A stand-in webhook so the report goes through webhooks.ts deliver(). Never stored. */
+export function reportHook(cfg: DailyReportConfig): WebhookConfig {
+  return {
+    id: 'daily-report', url: cfg.webhookUrl, events: ['report.daily'], enabled: true,
+    name: 'Daily report', ...(cfg.webhookSecret ? { secret: cfg.webhookSecret } : {}), createdAt: 0,
+  };
+}
+
+/** The `report.daily` webhook payload. */
+export function buildReportPayload(cfg: DailyReportConfig, metrics: ReportMetrics, test: boolean): WebhookPayload {
+  return buildPayload(reportHook(cfg), 'report.daily', {
+    ...metrics,
+    ...(test ? { test: true, note: 'Test delivery from Not Another Social CRM. Real numbers, sent on request.' } : {}),
+  });
+}
+
+export interface EmailResult { ok: boolean; status?: number; error?: string }
+
+/**
+ * Ask the website to email the report. The server renders the email from the
+ * numbers itself (it never takes HTML from here) and enforces its own limits on
+ * recipients and sends per day — see docs/DAILY_REPORT_EMAIL_LOVABLE.md.
+ */
+export async function sendReportEmail(
+  platformUrl: string,
+  accessToken: string | null,
+  to: string[],
+  metrics: ReportMetrics,
+  test: boolean,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs = 15_000,
+): Promise<EmailResult> {
+  if (!accessToken) return { ok: false, error: 'Sign in (Settings → Account & plan) to send the report by email.' };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(`${platformUrl.replace(/\/+$/, '')}${REPORT_EMAIL_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify({ to, test, report: metrics }),
+      signal: controller.signal,
+    });
+    if (res.ok) return { ok: true, status: res.status };
+    let detail = '';
+    try { const j = await res.json(); detail = typeof j?.error === 'string' ? j.error : ''; } catch { /* not JSON */ }
+    if (res.status === 404) return { ok: false, status: 404, error: 'Email sending is not set up on the server yet.' };
+    if (res.status === 401) return { ok: false, status: 401, error: 'Your sign-in has expired. Sign in again in Settings → Account & plan.' };
+    if (res.status === 429) return { ok: false, status: 429, error: detail || 'Daily email limit reached. Try again tomorrow.' };
+    return { ok: false, status: res.status, error: detail || `Server replied ${res.status}` };
+  } catch (e) {
+    return { ok: false, error: controller.signal.aborted ? `No response within ${timeoutMs / 1000}s` : String(e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}

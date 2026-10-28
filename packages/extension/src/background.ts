@@ -46,6 +46,11 @@ import {
   ENTITLEMENT_PERIOD_MINUTES,
 } from './license';
 import { pollInbound, readInboundSettings, type InboundDeps, type InboundStatus } from './inbound';
+import {
+  DAILY_REPORT_ALARM, REPORT_CHECK_MINUTES, appendReportLog, buildReportPayload, computeReportMetrics, isReportDue,
+  localDay, readReportConfig, readReportLog, reportChannels, reportHook, sendReportEmail,
+  type DailyReportConfig, type ReportDelivery,
+} from './dailyReport';
 import { makeInboundClient, inboundEndpointUrl } from './inboundClient';
 
 import {
@@ -2653,9 +2658,79 @@ async function watchdog(): Promise<void> {
   void processTick();
 }
 
+// ---- daily report ----
+//
+// See dailyReport.ts. Checked every few minutes; sent by the sending machine
+// only, so two open browsers don't each send it. The log entry and the "sent
+// today" mark are written in one store write, and synced, so the next machine
+// to check sees it is done.
+
+function ensureDailyReportAlarm(): void {
+  try {
+    chrome.alarms?.get(DAILY_REPORT_ALARM, (existing) => {
+      void chrome.runtime.lastError;
+      if (existing) return;
+      try { chrome.alarms?.create(DAILY_REPORT_ALARM, { delayInMinutes: 1, periodInMinutes: REPORT_CHECK_MINUTES }); }
+      catch (e) { console.warn('[CRM] alarms unavailable (daily report):', e); }
+    });
+  } catch (e) { console.warn('[CRM] alarms unavailable (daily report):', e); }
+}
+
+/** Send the report on every configured channel and log the outcome. */
+async function sendDailyReport(trigger: 'scheduled' | 'test', cfg: DailyReportConfig): Promise<ReportDelivery[]> {
+  const now = Date.now();
+  const metrics = computeReportMetrics(await loadStore(), now);
+  const test = trigger === 'test';
+  const out: ReportDelivery[] = [];
+  const channels = reportChannels(cfg);
+  if (channels.includes('webhook')) {
+    const payload = buildReportPayload(cfg, metrics, test);
+    const d = await deliver(reportHook(cfg), payload);
+    out.push({
+      at: d.at, channel: 'webhook', ok: d.ok, trigger, target: cfg.webhookUrl, payload,
+      ...(d.status !== undefined ? { status: d.status } : {}), ...(d.error ? { error: d.error } : {}),
+    });
+  }
+  if (channels.includes('email')) {
+    const r = await sendReportEmail(PLATFORM_URL, await getAccessToken(), cfg.emails, metrics, test);
+    out.push({
+      at: Date.now(), channel: 'email', ok: r.ok, trigger, target: cfg.emails.join(', '),
+      payload: { to: cfg.emails, test, report: metrics },
+      ...(r.status !== undefined ? { status: r.status } : {}), ...(r.error ? { error: r.error } : {}),
+    });
+  }
+  await withStoreLock(async () => {
+    const store = await loadStore();
+    const day = trigger === 'scheduled' ? localDay(now) : null;
+    await saveStore({ ...store, settings: appendReportLog(store.settings, out, day) });
+  });
+  console.info(`[CRM] Daily report (${trigger}): ${out.map((d) => `${d.channel} ${d.ok ? 'ok' : `failed — ${d.error}`}`).join('; ') || 'no channels'}`);
+  return out;
+}
+
+let dailyReportRunning: Promise<void> | null = null;
+
+/** One check at a time, so an overlapping alarm can't send the report twice. */
+function runDailyReportIfDue(): Promise<void> {
+  if (dailyReportRunning) return dailyReportRunning;
+  dailyReportRunning = (async () => {
+    try {
+      const store = await loadStore();
+      const cfg = readReportConfig(store.settings);
+      if (!isReportDue(cfg, readReportLog(store.settings), Date.now())) return;
+      if (!(await canSendFromThisMachine())) return;
+      await sendDailyReport('scheduled', cfg);
+    } catch (e) {
+      console.warn('[CRM] Daily report check failed:', e);
+    }
+  })().finally(() => { dailyReportRunning = null; });
+  return dailyReportRunning;
+}
+
 try {
   chrome.alarms?.onAlarm.addListener((alarm) => {
     if (alarm.name === TICK_ALARM) processTick();
+    else if (alarm.name === DAILY_REPORT_ALARM) void runDailyReportIfDue();
     else if (alarm.name === WATCHDOG_ALARM) watchdog();
     else if (alarm.name === DRIVE_SYNC_ALARM) void syncDriveNow();
     else if (alarm.name === ENTITLEMENT_ALARM) void refreshEntitlement().catch(() => { /* offline — cache stands */ });
@@ -2676,6 +2751,7 @@ ensureDriveSync();
 ensureEntitlementCheck();
 ensureAutomationAlarm();
 ensureInboundAlarm();
+ensureDailyReportAlarm();
 
 
 // On startup, push up any local edits that didn't reach Drive last session.
@@ -3111,6 +3187,19 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           }));
           await recordDeliveries([{ id: hook.id, delivery }]);
           sendResponse({ ok: delivery.ok, status: delivery.status, error: delivery.error });
+          break;
+        }
+
+        // Settings → Data → Daily report → "Send test now": every configured
+        // channel, real numbers, logged as a test (doesn't count as today's).
+        case 'TEST_DAILY_REPORT': {
+          const cfg = readReportConfig((await loadStore()).settings);
+          if (reportChannels(cfg).length === 0) {
+            sendResponse({ ok: false, deliveries: [], error: 'Add a webhook URL or an email address first.' });
+            break;
+          }
+          const deliveries = await sendDailyReport('test', cfg);
+          sendResponse({ ok: deliveries.every((d) => d.ok), deliveries });
           break;
         }
 

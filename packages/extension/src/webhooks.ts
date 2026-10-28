@@ -49,7 +49,10 @@ export type WebhookEvent =
   | 'message.failed'
   // Sent by a quick action's "Send to webhook" step, not by a subscription —
   // so it is deliberately absent from WEBHOOK_EVENTS below.
-  | 'preset.action';
+  | 'preset.action'
+  // Sent by the daily report (dailyReport.ts), configured on its own in
+  // Settings rather than subscribed to — also absent from WEBHOOK_EVENTS.
+  | 'report.daily';
 
 export interface WebhookEventDef {
   event: WebhookEvent;

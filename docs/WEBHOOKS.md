@@ -186,6 +186,33 @@ place of `contact`. Its one outcome is written to every included contact's
 history. Use it when a run can touch hundreds of contacts and your endpoint
 shouldn't take hundreds of requests.
 
+### Daily report event
+
+| Event | `data` |
+| --- | --- |
+| `report.daily` | `day` (local `YYYY-MM-DD`), `generatedAt`, `totals: { contacts, active, archived }`, `tiles: [ … ]`, and `test: true` + `note` on a test |
+
+Not a subscription either: it's configured in **Settings → Data → Daily
+report** (URL and optional `X-CRM-Token`), and sent once a day at the chosen
+local time by the sending machine. If Chrome is closed at that time, it goes out
+when Chrome next starts that day. **Send test now** sends the same payload with
+`test: true`.
+
+`tiles` are the Dashboard's tiles, in the Dashboard's order:
+
+```json
+[
+  { "kind": "count", "name": "Hot leads", "count": 42, "query": "Tags has any of Hot" },
+  { "kind": "ratio", "name": "Replied rate", "formula": "A & B / A", "format": "percent",
+    "value": 0.25, "display": "25%", "numerator": 10, "denominator": 40 }
+]
+```
+
+`value` is `null` (and `display` is `"—"`) when there is no result: a division
+by zero, or a broken formula, which also adds `problem` with the reason. Every
+attempt is listed under **Last 10 deliveries** in that section, with the payload
+that was sent.
+
 ---
 
 ## 4. Security — read this

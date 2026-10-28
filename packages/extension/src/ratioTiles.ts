@@ -20,7 +20,10 @@ import {
   filterByQuery, newGroup, normalizeQuery,
   type ArchiveScope, type QueryContext, type QueryGroup, type QueryNode, type SavedSearch,
 } from './search';
-import { LETTERS, formulaToText, lettersUsed, simpleFormula, textToFormula, type TileFormat } from './tileFormula';
+import {
+  LETTERS, checkFormula, evaluate, formatValue, formulaToText, fractionOf, lettersUsed, simpleFormula, textToFormula,
+  type FormulaNode, type TileFormat,
+} from './tileFormula';
 
 export const RATIO_TILES_KEY = 'ratioTiles';
 export const RATIO_TILES_DELETED_KEY = 'ratioTilesDeleted';
@@ -223,4 +226,52 @@ export function intersectionView(presets: SavedSearch[]): { query: QueryGroup; a
   const archiveScope: ArchiveScope = scopes.size === 1 ? [...scopes][0] : 'all';
   const query = newGroup('and', presets.map((p, i) => reId(normalizeQuery(p.query), String.fromCharCode(97 + i))));
   return { query, archiveScope };
+}
+
+// ---------------------------------------------------------------------------
+// Reading a tile
+// ---------------------------------------------------------------------------
+
+/** One side of a top-level fraction; `letters` set when it is a plain group of contacts. */
+export interface RatioSide { value: number | null; letters?: string[] }
+
+/** A ratio tile's numbers, worked out for display (the Dashboard) or sending (the daily report). */
+export interface RatioReading {
+  /** The formatted result, "—" when there is none. */
+  text: string;
+  /** The unformatted result, null when there is none (broken formula, ÷ 0). */
+  value: number | null;
+  /** "12 of 48", when the formula is a top-level division. */
+  num?: RatioSide;
+  den?: RatioSide;
+  /** Why there is no result, when the formula itself is broken. */
+  problem?: string;
+}
+
+/**
+ * A ratio tile's result and its two sides. Never throws and never yields NaN:
+ * a broken formula or a deleted search comes back as `problem`, division by
+ * zero as "—".
+ */
+export function readRatio(
+  tile: RatioTile,
+  searches: Record<string, SavedSearch>,
+  idsFor: (preset: SavedSearch) => Set<string>,
+): RatioReading {
+  const tokens = textToFormula(tile.formula);
+  const check = checkFormula(tokens, (l) =>
+    !tile.terms[l] ? 'unknown' : !searches[tile.terms[l]] ? 'deleted' : 'ok');
+  if (!check.ok) return { text: '—', value: null, problem: check.error.message };
+  const count = (letters: string[]) => intersectionSize(letters.map((l) => idsFor(searches[tile.terms[l]])));
+  const side = (node: FormulaNode): RatioSide => ({
+    value: evaluate(node, count),
+    ...(node.k === 'set' ? { letters: node.letters } : {}),
+  });
+  const fraction = fractionOf(check.node);
+  const value = evaluate(check.node, count);
+  return {
+    text: formatValue(value, tile.format),
+    value,
+    ...(fraction ? { num: side(fraction.num), den: side(fraction.den) } : {}),
+  };
 }

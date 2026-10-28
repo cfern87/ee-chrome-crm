@@ -42,6 +42,7 @@ import { CLEARED_FAILURES_COLLECTION, FAILED_NOTICE_ACK_KEY } from './campaigns'
 import { AUTOMATION_COLLECTION } from './automations';
 import { DASHBOARD_TILE_ORDER_KEY } from './dashboardTiles';
 import { RATIO_TILE_COLLECTION } from './ratioTiles';
+import { DAILY_REPORT_KEY, DAILY_REPORT_LOG_KEY } from './dailyReport';
 
 /** The `settings` bag. Untyped by design — it holds every feature's keys. */
 export type SettingsBag = Record<string, unknown>;
@@ -124,7 +125,7 @@ function monotonicKeys(): string[] {
  * (an order nobody arranged) is right. Resolved at call time, as above.
  */
 function stampedKeys(): string[] {
-  return [DASHBOARD_TILE_ORDER_KEY];
+  return [DASHBOARD_TILE_ORDER_KEY, DAILY_REPORT_KEY, DAILY_REPORT_LOG_KEY];
 }
 
 function stampOf(v: unknown): number | undefined {

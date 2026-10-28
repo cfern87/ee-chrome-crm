@@ -44,6 +44,7 @@ import { OnlineDot } from './Campaigns';
 import { PresetActionsSettings } from './PresetActionsSettings';
 import { WebhookSettings } from './WebhookSettings';
 import { InboundWebhookSettings } from './InboundWebhookSettings';
+import { DailyReportSettings } from './DailyReportSettings';
 
 /** Sections of Settings. */
 export type SettingsView = 'account' | 'sync' | 'data' | 'behavior' | 'about';
@@ -57,11 +58,37 @@ export interface SettingsPanelProps {
   tags: Tag[];
   syncUsage: SyncUsage | null;
   onStoreReplaced: (s: Store) => Promise<void>;
+  /**
+   * A section something else asked to show (the Dashboard's "Set up a daily
+   * report" link): switch to its tab, scroll its card into view and focus its
+   * heading. `nonce` makes the same request work twice in a row.
+   */
+  focus?: SettingsFocus | null;
 }
 
-export function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onStoreReplaced }: SettingsPanelProps) {
+export interface SettingsFocus { view: SettingsView; sectionId: string; nonce: number }
+
+export function SettingsPanel({ store, updateStore, conversations, tags, syncUsage, onStoreReplaced, focus }: SettingsPanelProps) {
   const settings = store.settings as Record<string, unknown>;
   const [view, setView] = useLocalPref<SettingsView>('settingsView', 'account');
+  useEffect(() => {
+    if (focus) setView(focus.view);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once per request (nonce)
+  }, [focus?.nonce]);
+  // Scroll once per request, not again every time the user comes back to the tab.
+  const focusDone = React.useRef<number | null>(null);
+  useEffect(() => {
+    if (!focus || view !== focus.view || focusDone.current === focus.nonce) return;
+    // After the tab's cards have rendered.
+    const t = setTimeout(() => {
+      const el = document.getElementById(focus.sectionId);
+      if (!el) return;
+      focusDone.current = focus.nonce;
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      (el.querySelector('[data-section-heading]') as HTMLElement | null)?.focus({ preventScroll: true });
+    }, 50);
+    return () => clearTimeout(t);
+  }, [focus?.nonce, view]);
   // Backup import/export result. Shown in place rather than through alert(),
   // which is browser chrome: it can't be styled, isn't announced in context,
   // and blocks the page.
@@ -294,6 +321,8 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
       <CaptureDiagnostics store={store} />
 
       <WebhookSettings store={store} updateStore={updateStore} />
+
+      <DailyReportSettings store={store} updateStore={updateStore} />
 
       <InboundWebhookSettings store={store} updateStore={updateStore} />
 

@@ -58,7 +58,8 @@ import {
 import {
   MachineView, sendBg, ensureSignedIn, downloadText, tsStamp, formatRelativeTime, previewTags, SubNav, ReadStateChip,
 } from './shared';
-import { SettingsPanel } from './SettingsPanel';
+import { SettingsPanel, type SettingsFocus, type SettingsView } from './SettingsPanel';
+import { DAILY_REPORT_SECTION_ID } from './DailyReportSettings';
 import { TagFilter, ConvDetail, type TagFilterMode } from './ContactDetail';
 import { TagsPanel, FieldsPanel } from './SchemaPanels';
 import { DashboardPanel } from './DashboardPanel';
@@ -313,6 +314,14 @@ export default function DashboardApp() {
   const openFailure = useCallback((f: { campaignId: string; threadId: string }) => {
     setHistoryFocus({ campaignId: f.campaignId, threadId: f.threadId, nonce: Date.now() });
     go('campaigns', 'past');
+  }, [go]);
+
+  // A Settings section something else asked to show — the Dashboard's daily
+  // report link. Same shape as historyFocus: a target plus a nonce.
+  const [settingsFocus, setSettingsFocus] = useState<SettingsFocus | null>(null);
+  const openSettingsSection = useCallback((view: SettingsView, sectionId: string) => {
+    setSettingsFocus({ view, sectionId, nonce: Date.now() });
+    go('settings');
   }, [go]);
 
   const [search, setSearch] = useState('');
@@ -2631,6 +2640,8 @@ export default function DashboardApp() {
             onSaveRatioTile={saveRatioTileDef}
             onDeleteRatioTile={deleteRatioTileDef}
             onOpenQueryInContacts={openQueryInContacts}
+            settings={store.settings}
+            onConfigureReport={() => openSettingsSection('data', DAILY_REPORT_SECTION_ID)}
           />
         )}
 
@@ -2781,7 +2792,7 @@ export default function DashboardApp() {
         )}
 
         {route === 'settings' && (
-          <SettingsPanel store={store} updateStore={updateStore} conversations={conversations} tags={tags} syncUsage={syncUsage} onStoreReplaced={async (s) => { setStore(s); getSyncUsage().then(setSyncUsage).catch(() => {}); }} />
+          <SettingsPanel store={store} updateStore={updateStore} conversations={conversations} tags={tags} syncUsage={syncUsage} onStoreReplaced={async (s) => { setStore(s); getSyncUsage().then(setSyncUsage).catch(() => {}); }} focus={settingsFocus} />
         )}
       </div>
       )}
