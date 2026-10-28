@@ -1,7 +1,7 @@
 // @vitest-environment node
 // Pure string functions: no DOM needed.
 import { describe, expect, it } from 'vitest';
-import { checkSender, currentUserFromHtml, detectSenderIdentity, parseCookies, senderRequirementFrom } from './senderIdentity';
+import { checkSender, currentUserFromHtml, detectSenderIdentity, parseCookies, senderModeFrom, senderRequirementFrom } from './senderIdentity';
 
 const cuBlock = (userId: string, accountId: string, name: string) =>
   `["CurrentUserInitialData",[],{"ACCOUNT_ID":"${accountId}","USER_ID":"${userId}","NAME":"${name}","SHORT_NAME":"x","IS_BUSINESS_PERSON_ACCOUNT":false},270]`;
@@ -63,14 +63,36 @@ describe('checkSender', () => {
   const personal = detectSenderIdentity('c_user=56503077', PERSONAL_HTML);
   const unknown = detectSenderIdentity('c_user=56503077', '');
 
-  it('allows anything when the mode is off', () => {
-    const off = senderRequirementFrom({});
-    expect(checkSender(personal, off)).toBeNull();
-    expect(checkSender(unknown, off)).toBeNull();
+  it('defaults to personal-profile mode, which is what every older send used', () => {
+    expect(senderModeFrom({})).toBe('profile');
+    expect(senderModeFrom({ requirePageSender: true })).toBe('page');
+    expect(senderModeFrom({ senderMode: 'profile', requirePageSender: true })).toBe('profile');
+    expect(senderRequirementFrom({ senderMode: 'page' }).requirePage).toBe(true);
+  });
+
+  it('profile mode allows the personal profile, and missing page data when cookies say personal', () => {
+    const prof = senderRequirementFrom({ senderMode: 'profile' });
+    expect(checkSender(personal, prof)).toBeNull();
+    expect(checkSender(unknown, prof)).toBeNull();
+  });
+
+  it('profile mode refuses a Page and any sign of another profile', () => {
+    const prof = senderRequirementFrom({ senderMode: 'profile' });
+    expect(checkSender(page, prof)).toMatch(/personal profile" is selected/);
+    // Tab loaded as the person, cookie switched to a Page in another tab.
+    expect(checkSender(detectSenderIdentity('c_user=56503077; i_user=100064000000001', PERSONAL_HTML), prof)).toMatch(/couldn't verify/);
+    // Tab loaded as the Page, cookie switched back.
+    expect(checkSender(detectSenderIdentity('c_user=56503077', PAGE_HTML), prof)).toMatch(/couldn't verify/);
+    // Logged out.
+    expect(checkSender(detectSenderIdentity('', PERSONAL_HTML), prof)).toMatch(/couldn't verify/);
+  });
+
+  it('profile mode ignores a saved Page id', () => {
+    expect(senderRequirementFrom({ senderMode: 'profile', requiredPageId: '123' }).pageId).toBeUndefined();
   });
 
   it('refuses personal and unverified senders when on', () => {
-    const on = senderRequirementFrom({ requirePageSender: true });
+    const on = senderRequirementFrom({ senderMode: 'page' });
     expect(checkSender(personal, on)).toMatch(/personal profile/);
     expect(checkSender(unknown, on)).toMatch(/couldn't verify/);
     expect(checkSender(page, on)).toBeNull();

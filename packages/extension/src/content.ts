@@ -4268,7 +4268,7 @@ function currentSenderIdentity(): SenderIdentity {
 }
 
 interface SendOptions {
-  // "Only send as a Page" (Settings). Checked before anything is typed.
+  // Settings → Send as (Page or personal profile). Checked before anything is typed.
   requireSender?: SenderRequirement;
   // Recovery path only: when set, an already-delivered copy of this message in
   // this thread counts as success instead of being sent again. See DupGuard for
@@ -5000,8 +5000,11 @@ function handleCrmRequest(request: any): Promise<unknown> | null {
   const guard: DupGuard | undefined =
     payload.skipIfDelivered === 'sent-only' || payload.skipIfDelivered === 'not-failed' ? payload.skipIfDelivered : undefined;
   const skipIfUnread = !!payload.skipIfUnread;
-  const requireSender: SenderRequirement | undefined = payload.requireSender?.requirePage === true
-    ? { requirePage: true, pageId: typeof payload.requireSender.pageId === 'string' ? payload.requireSender.pageId : undefined }
+  const requireSender: SenderRequirement | undefined = typeof payload.requireSender?.requirePage === 'boolean'
+    ? {
+        requirePage: payload.requireSender.requirePage,
+        pageId: typeof payload.requireSender.pageId === 'string' ? payload.requireSender.pageId : undefined,
+      }
     : undefined;
   switch (request?.type) {
     case 'CRM_SEND_MESSAGE':

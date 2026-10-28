@@ -23,6 +23,9 @@ export interface SenderIdentity {
   actorId: string | null;
   // The logged-in person behind it.
   accountId: string | null;
+  // Who the cookies say (i_user, else c_user). Can differ from actorId when the
+  // profile was switched in another tab after this one loaded.
+  cookieActorId: string | null;
   name: string | null;
   // Why `kind` came out the way it did, for the send log.
   reason: string;
@@ -64,51 +67,78 @@ export function detectSenderIdentity(cookie: string, html: string): SenderIdenti
   const cu = currentUserFromHtml(html);
 
   if (!cUser) {
-    return { kind: 'unknown', actorId: null, accountId: null, name: null, reason: 'not logged in (no c_user cookie)' };
+    return { kind: 'unknown', actorId: null, accountId: null, cookieActorId: null, name: null, reason: 'not logged in (no c_user cookie)' };
   }
   const cookieActor = iUser && iUser !== cUser ? iUser : cUser;
   if (!cu || !cu.userId) {
     // No page data to cross-check (e.g. read too early, or a layout without it).
-    return { kind: 'unknown', actorId: cookieActor, accountId: cUser, name: null, reason: 'no CurrentUserInitialData on the page' };
+    return { kind: 'unknown', actorId: cookieActor, accountId: cUser, cookieActorId: cookieActor, name: null, reason: 'no CurrentUserInitialData on the page' };
   }
   if (cu.userId !== cookieActor) {
     return {
-      kind: 'unknown', actorId: cu.userId, accountId: cUser, name: cu.name,
+      kind: 'unknown', actorId: cu.userId, accountId: cUser, cookieActorId: cookieActor, name: cu.name,
       reason: `page loaded as ${cu.userId} but cookies now say ${cookieActor} — profile was switched in another tab; reload first`,
     };
   }
   if (cookieActor !== cUser) {
-    return { kind: 'page', actorId: cookieActor, accountId: cUser, name: cu.name, reason: `acting as ${cookieActor} (i_user) for account ${cUser}` };
+    return { kind: 'page', actorId: cookieActor, accountId: cUser, cookieActorId: cookieActor, name: cu.name, reason: `acting as ${cookieActor} (i_user) for account ${cUser}` };
   }
   if (cu.accountId && cu.accountId !== cu.userId) {
     // Page data says "someone else" but no i_user cookie. Not a state we have
     // seen; don't call it either way.
-    return { kind: 'unknown', actorId: cu.userId, accountId: cUser, name: cu.name, reason: 'USER_ID differs from ACCOUNT_ID without an i_user cookie' };
+    return { kind: 'unknown', actorId: cu.userId, accountId: cUser, cookieActorId: cookieActor, name: cu.name, reason: 'USER_ID differs from ACCOUNT_ID without an i_user cookie' };
   }
-  return { kind: 'personal', actorId: cUser, accountId: cUser, name: cu.name, reason: 'personal profile (no i_user, USER_ID = ACCOUNT_ID)' };
+  return { kind: 'personal', actorId: cUser, accountId: cUser, cookieActorId: cookieActor, name: cu.name, reason: 'personal profile (no i_user, USER_ID = ACCOUNT_ID)' };
 }
 
 // Settings keys (store.settings, synced across machines).
+//
+// SENDER_MODE_KEY is the current one: 'page' or 'profile', and one of the two
+// is always in force. REQUIRE_PAGE_SENDER_KEY is the earlier on/off toggle,
+// still read so a saved "on" keeps meaning Page.
+export const SENDER_MODE_KEY = 'senderMode';
 export const REQUIRE_PAGE_SENDER_KEY = 'requirePageSender';
 export const REQUIRED_PAGE_ID_KEY = 'requiredPageId';
 
+export type SenderMode = 'page' | 'profile';
+
 export interface SenderRequirement {
-  // Only send while acting as a Page.
+  // true: only send while acting as a Page. false: only as the personal profile.
   requirePage: boolean;
-  // ...and, when set, only as this Page.
+  // Page mode only: when set, only as this Page.
   pageId?: string;
+}
+
+export function senderModeFrom(settings: Record<string, unknown> | undefined): SenderMode {
+  const s = settings || {};
+  if (s[SENDER_MODE_KEY] === 'page' || s[SENDER_MODE_KEY] === 'profile') return s[SENDER_MODE_KEY] as SenderMode;
+  // Nothing chosen yet: the old toggle if it was on, else the personal profile,
+  // which is what every send before this setting existed went out as.
+  return s[REQUIRE_PAGE_SENDER_KEY] === true ? 'page' : 'profile';
 }
 
 export function senderRequirementFrom(settings: Record<string, unknown> | undefined): SenderRequirement {
   const s = settings || {};
   const id = typeof s[REQUIRED_PAGE_ID_KEY] === 'string' ? String(s[REQUIRED_PAGE_ID_KEY]).trim() : '';
-  return { requirePage: s[REQUIRE_PAGE_SENDER_KEY] === true, pageId: /^\d+$/.test(id) ? id : undefined };
+  const requirePage = senderModeFrom(s) === 'page';
+  return { requirePage, pageId: requirePage && /^\d+$/.test(id) ? id : undefined };
 }
 
 // null = allowed; otherwise the reason the send is refused.
 export function checkSender(id: SenderIdentity, req: SenderRequirement): string | null {
-  if (!req.requirePage) return null;
-  if (id.kind === 'personal') return `Not sent — acting as your personal profile${id.name ? ` (${id.name})` : ''}, and "Only send as a Page" is on`;
+  if (!req.requirePage) {
+    // Profile mode. Refuse on evidence of a Page: detected as one, or the
+    // cookie / page data pointing at a profile other than the logged-in
+    // person. Missing page data alone is not refused when the cookies say
+    // personal — this mode is the default, and a layout without the data
+    // block must not stop every existing campaign.
+    if (id.kind === 'page') return `Not sent — acting as the Page ${id.name || id.actorId}, and "Only send as personal profile" is selected`;
+    if (id.kind === 'unknown' && (!id.accountId || id.actorId !== id.accountId || id.cookieActorId !== id.accountId)) {
+      return `Not sent — couldn't verify the sender is your personal profile (${id.reason})`;
+    }
+    return null;
+  }
+  if (id.kind === 'personal') return `Not sent — acting as your personal profile${id.name ? ` (${id.name})` : ''}, and "Only send as a Page" is selected`;
   if (id.kind !== 'page') return `Not sent — couldn't verify the sender is a Page (${id.reason})`;
   if (req.pageId && id.actorId !== req.pageId) {
     return `Not sent — acting as ${id.name || id.actorId}, not the required Page ${req.pageId}`;

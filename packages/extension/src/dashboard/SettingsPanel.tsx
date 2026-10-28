@@ -47,7 +47,7 @@ import { InboundWebhookSettings } from './InboundWebhookSettings';
 import { DailyReportSettings } from './DailyReportSettings';
 import { TeamPanel, TeamSyncNotice, useTeamWorkspaceActive } from './TeamSettings';
 import {
-  REQUIRE_PAGE_SENDER_KEY, REQUIRED_PAGE_ID_KEY, senderRequirementFrom, type SenderIdentity,
+  REQUIRE_PAGE_SENDER_KEY, REQUIRED_PAGE_ID_KEY, SENDER_MODE_KEY, senderRequirementFrom, type SenderIdentity,
 } from '../senderIdentity';
 
 /** Sections of Settings. */
@@ -487,19 +487,28 @@ export function SenderIdentitySettings({ store, updateStore }: { store: Store; u
     <Card style={{ marginBottom: space.md }}>
       <Text as="h3" size="strong" weight="semibold" style={{ margin: 0 }}>Send as</Text>
       <Text as="p" size="small" tone="muted" leading="relaxed" style={{ margin: `${space.xs}px 0 ${space.lg}px` }}>
-        Facebook can act as you or as a Page you manage, and switching applies to every tab. Turn this on to make
-        campaigns, automations and the send queue refuse to send unless Facebook is acting as a Page. The first refusal
-        pauses all running campaigns. A Page can only message people who messaged it in the last 24 hours.
+        Facebook can act as you or as a Page you manage, and switching applies to every tab. Campaigns, automations
+        and the send queue only send as the identity picked here; anything else is refused before typing, and the
+        first refusal pauses all running campaigns. A Page can only message people who messaged it in the last 24 hours.
       </Text>
       <Stack gap="md">
-        <div style={{ padding: `${space.sm}px ${space.md}px`, background: color.surface.sunken, borderRadius: radius.sm }}>
-          <Toggle
-            label="Only send as a Page"
-            checked={req.requirePage}
-            onChange={(e) => void save({ [REQUIRE_PAGE_SENDER_KEY]: e.target.checked })}
-          />
+        <div role="radiogroup" aria-label="Send as" style={{ padding: `${space.sm}px ${space.md}px`, background: color.surface.sunken, borderRadius: radius.sm, display: 'flex', flexDirection: 'column', gap: space.xs }}>
+          {([
+            ['profile', 'Only send as personal profile'],
+            ['page', 'Only send as a Page'],
+          ] as const).map(([mode, label]) => (
+            <label key={mode} style={{ display: 'flex', alignItems: 'center', gap: space.sm, cursor: 'pointer', fontSize: fontSize.small }}>
+              <input
+                type="radio"
+                name="crm-sender-mode"
+                checked={(req.requirePage ? 'page' : 'profile') === mode}
+                onChange={() => void save({ [SENDER_MODE_KEY]: mode, [REQUIRE_PAGE_SENDER_KEY]: mode === 'page' })}
+              />
+              {label}
+            </label>
+          ))}
         </div>
-        <Stack direction="row" gap="sm" align="flex-end" wrap>
+        {req.requirePage && <Stack direction="row" gap="sm" align="flex-end" wrap>
           <FormField label="Only this Page id (optional)">
             {(p) => (
               <Input
@@ -512,9 +521,9 @@ export function SenderIdentitySettings({ store, updateStore }: { store: Store; u
               />
             )}
           </FormField>
-          <Button variant="ghost" onClick={check}>Check who Facebook is acting as</Button>
-        </Stack>
-        {badPageId && <Banner tone="danger" live>A Page id is digits only. Use “Check who Facebook is acting as” while switched into the Page to see it.</Banner>}
+        </Stack>}
+        <div><Button variant="ghost" onClick={check}>Check who Facebook is acting as</Button></div>
+        {req.requirePage && badPageId && <Banner tone="danger" live>A Page id is digits only. Use “Check who Facebook is acting as” while switched into the Page to see it.</Banner>}
         {typeof seen === 'string' && <Text as="p" size="small" tone="muted" style={{ margin: 0 }}>{seen}</Text>}
         {seen && typeof seen === 'object' && (
           <Banner tone={seen.kind === 'page' ? 'success' : seen.kind === 'personal' ? 'info' : 'warning'} live>

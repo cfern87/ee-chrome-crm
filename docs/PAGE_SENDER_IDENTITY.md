@@ -33,9 +33,14 @@ unknown; page data ≠ cookie actor → unknown ("reload first"); `i_user` ≠
 
 ## 2. The guard (implemented)
 
-- Settings → Behavior → **Send as**: "Only send as a Page" toggle, optional
-  "Only this Page id", and a read-only "Check who Facebook is acting as" button.
-  Stored in synced settings (`requirePageSender`, `requiredPageId`).
+- Settings → Behavior → **Send as**: a required choice, "Only send as personal
+  profile" (the default) or "Only send as a Page". With Page, an optional "Only
+  this Page id". Plus a read-only "Check who Facebook is acting as" button.
+  Stored in synced settings (`senderMode`, `requiredPageId`; the earlier
+  `requirePageSender: true` still reads as Page).
+- Personal-profile mode refuses a detected Page, or any cookie/page-data
+  mismatch with the logged-in person. Missing page data alone is allowed when
+  the cookies say personal, so a layout change can't halt existing campaigns.
 - The check runs in `typeSendAndConfirm` (content.ts), shared by the thread
   and drawer send paths, **before anything is typed**. Campaigns, automations
   (they queue campaigns) and the send queue all go through it.

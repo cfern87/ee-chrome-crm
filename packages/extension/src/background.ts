@@ -788,12 +788,11 @@ type DupGuard = 'sent-only' | 'not-failed';
 // the only place that can see the conversation and answer them.
 interface SendGate { skipIfUnread?: boolean; requireSender?: SenderRequirement }
 
-// "Only send as a Page" (Settings), read fresh for every send so turning it on
-// takes effect on the very next message.
+// Settings → Send as (Page or personal profile; one is always selected), read
+// fresh for every send so a change takes effect on the very next message.
 async function loadSenderRequirement(): Promise<SenderRequirement | undefined> {
   try {
-    const req = senderRequirementFrom((await loadStore()).settings);
-    return req.requirePage ? req : undefined;
+    return senderRequirementFrom((await loadStore()).settings);
   } catch {
     return undefined;
   }
@@ -994,7 +993,9 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
   const log: string[] = [];
   const gate: SendGate = { ...gateIn, requireSender: gateIn.requireSender ?? (await loadSenderRequirement()) };
   if (gate.requireSender) {
-    log.push(`sender guard on: only as a Page${gate.requireSender.pageId ? ` (${gate.requireSender.pageId})` : ''}`);
+    log.push(gate.requireSender.requirePage
+      ? `sender guard: only as a Page${gate.requireSender.pageId ? ` (${gate.requireSender.pageId})` : ''}`
+      : 'sender guard: only as the personal profile');
   }
   const chatUrl = await resolveChatUrl(r, log);
   if (!chatUrl) {
@@ -2267,7 +2268,7 @@ async function processTick(): Promise<void> {
       if (result.sentAs) rr.sentAs = result.sentAs;
       if (!result.ok && result.failureKind === 'wrong-sender') {
         // Every later send would be refused the same way until the user
-        // switches into the Page, so stop the queue instead of burning through
+        // switches profile, so stop the queue instead of burning through
         // the list. The recipient goes back to pending; nothing was typed.
         rr.status = 'pending';
         rr.attempts = Math.max(0, rr.attempts - 1);
