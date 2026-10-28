@@ -157,6 +157,61 @@ function tagTextColor(hex) {
   return lum > 0.45 ? '#1c1e21' : '#ffffff';
 }
 
+/**
+ * The stage after `tag` when it is a funnel stage that isn't the last, else
+ * null. Mirrors nextStageAfter in funnel.ts (and tagDisplayOrder in
+ * tagGrouping.ts for the order) — this is a plain script and cannot import
+ * them. It only decides whether to DRAW the icon; the background works out the
+ * actual edits with the real funnel.ts.
+ */
+function nextFunnelStage(tag) {
+  const groups = (store && store.tagGroups) || {};
+  const group = tag.groupId ? groups[tag.groupId] : null;
+  if (!group || !group.funnel) return null;
+  const byOrder = (a, b) => {
+    if (a.order !== undefined && b.order !== undefined) return a.order - b.order || a.createdAt - b.createdAt;
+    if (a.order !== undefined) return -1;
+    if (b.order !== undefined) return 1;
+    return a.createdAt - b.createdAt;
+  };
+  const stages = Object.values(store.tags || {}).filter((t) => t.groupId === group.id).sort(byOrder);
+  const i = stages.findIndex((t) => t.id === tag.id);
+  return i >= 0 && i + 1 < stages.length ? { group, next: stages[i + 1] } : null;
+}
+
+/**
+ * The small "advance" icon beside a funnel tag chip. A span rather than a
+ * button because it sits inside the row's button (buttons can't nest), so it
+ * stops the click from also opening the conversation.
+ */
+function advanceIcon(c, tag, step) {
+  const icon = document.createElement('span');
+  icon.className = 'pop-tag-advance';
+  icon.setAttribute('role', 'button');
+  icon.tabIndex = 0;
+  icon.textContent = '▸';
+  const how = step.group.funnelExclusive ? ` (replaces ${tag.name})` : '';
+  icon.title = `Move to ${step.next.name}${how}`;
+  icon.setAttribute('aria-label', icon.title);
+
+  const go = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (icon.dataset.busy) return;
+    icon.dataset.busy = '1';
+    icon.style.opacity = '0.4';
+    send({ type: 'ADVANCE_FUNNEL', payload: { conversationId: c.id, tagId: tag.id } }, (res) => {
+      // Repaint from what the background actually saved.
+      if (res && res.store) store = res.store;
+      renderPinned();
+      renderResults($('quickSearch').value);
+    });
+  };
+  icon.addEventListener('click', go);
+  icon.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') go(e); });
+  return icon;
+}
+
 /** The clickable part of a contact row: name, tag chips, and a sub-line. */
 function contactButton(c) {
   const btn = document.createElement('button');
@@ -181,6 +236,8 @@ function contactButton(c) {
       chip.style.background = t.color || '#8a8d91';
       chip.style.color = tagTextColor(t.color);
       row.appendChild(chip);
+      const step = nextFunnelStage(t);
+      if (step) row.appendChild(advanceIcon(c, t, step));
     }
     btn.appendChild(row);
   }

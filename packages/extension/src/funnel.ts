@@ -165,6 +165,52 @@ function exclusiveEdits(view: FunnelView, conv: Conversation, index: number): St
   return { add, remove };
 }
 
+/**
+ * The stage after `tagId` in its funnel, or null when the tag isn't a funnel
+ * stage or is the last one. Drives the popup's "advance" icon on a tag chip.
+ */
+export function nextStageAfter(
+  tagId: string,
+  tags: Record<string, Tag>,
+  tagGroups: Record<string, TagGroup>
+): { group: TagGroup; stages: Tag[]; index: number } | null {
+  for (const { group, stages } of funnelStages(tags, tagGroups)) {
+    const i = stages.findIndex((s) => s.id === tagId);
+    if (i < 0) continue;
+    return i + 1 < stages.length ? { group, stages, index: i + 1 } : null;
+  }
+  return null;
+}
+
+/**
+ * Advance a contact one stage past `tagId`, the way that funnel works.
+ *
+ * Additive: the next stage's tag is added; nothing is removed.
+ * Exclusive ("one tag from this group only"): the next stage's tag is added
+ * and every other stage of the group the contact holds is removed — the tag
+ * clicked included.
+ *
+ * Unlike stageEditsFor this never toggles anything off by landing on a stage
+ * already held: advancing only ever moves forward. Empty edits when there is
+ * nothing to do (not a funnel tag, last stage, or already there).
+ */
+export function advanceEditsFor(
+  conv: Conversation,
+  tagId: string,
+  tags: Record<string, Tag>,
+  tagGroups: Record<string, TagGroup>
+): StageEdits {
+  const next = nextStageAfter(tagId, tags, tagGroups);
+  if (!next) return { add: [], remove: [] };
+  const target = next.stages[next.index];
+  const held = new Set(conv.tags);
+  const add = held.has(target.id) ? [] : [target.id];
+  const remove = isExclusiveFunnel(next.group)
+    ? next.stages.filter((s) => s.id !== target.id && held.has(s.id)).map((s) => s.id)
+    : [];
+  return { add, remove };
+}
+
 /** Nothing to write — the contact is already exactly where this move wants them. */
 export function isNoOpStageEdit(edits: StageEdits): boolean {
   return edits.add.length === 0 && edits.remove.length === 0;

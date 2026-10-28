@@ -55,6 +55,7 @@ import { makeInboundClient, inboundEndpointUrl } from './inboundClient';
 import { makeTeamClient, TEAM_SYNC_ALARM, TEAM_SYNC_PERIOD_MINUTES } from './team';
 import { makeTeamService } from './teamService';
 import { senderRequirementFrom, type SenderRequirement } from './senderIdentity';
+import { advanceEditsFor, isNoOpStageEdit } from './funnel';
 
 import {
   Campaign,
@@ -2943,6 +2944,31 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
             break;
           }
           sendResponse(await mutateStore((request.payload?.mutations || []) as Mutation[]));
+          break;
+        }
+        case 'ADVANCE_FUNNEL': {
+          // The popup's advance icon on a funnel tag chip. The edits are worked
+          // out here, against the store as it is now, rather than from the
+          // popup's few-seconds-old snapshot.
+          if (!(await isSignedIn())) {
+            sendResponse({ success: false, error: 'Signed out' });
+            break;
+          }
+          const conversationId = String(request.payload?.conversationId || '');
+          const tagId = String(request.payload?.tagId || '');
+          const current = await loadStore();
+          const conv = current.conversations[conversationId];
+          const edits = conv ? advanceEditsFor(conv, tagId, current.tags, current.tagGroups) : { add: [], remove: [] };
+          if (isNoOpStageEdit(edits)) {
+            sendResponse({ success: true, changed: false, store: current });
+            break;
+          }
+          // Remove first, in one call, so the contact is never at two stages
+          // of an exclusive funnel (same order as the in-page panel).
+          const mutations: Mutation[] = [];
+          if (edits.remove.length) mutations.push({ op: 'removeTags', conversationId, tagIds: edits.remove });
+          if (edits.add.length) mutations.push({ op: 'addTags', conversationId, tagIds: edits.add });
+          sendResponse(await mutateStore(mutations));
           break;
         }
         case 'SET_STORE': {
