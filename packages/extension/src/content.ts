@@ -57,6 +57,7 @@ import type { UnreadScanReport, UnreadThread } from './automations';
 import type { SendFailureKind } from './campaigns';
 import { isE2eeThreadUrl, threadChatUrl } from './threadUrl';
 import { isPlaceholderThreadText, profileOwnerIdFromHtml, staysPlaceholder } from './profileOwner';
+import { checkSender, detectSenderIdentity, type SenderIdentity, type SenderRequirement } from './senderIdentity';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
 const COLORS = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E2'];
@@ -4252,10 +4253,23 @@ interface SendResult {
   error?: string;
   failureKind?: SendFailureKind;
   deliveryStatus?: DeliveryStatus;
+  // Who Facebook was acting as when the send was made (or refused).
+  sentAs?: SentAs;
   log: string[];
 }
 
+type SentAs = Pick<SenderIdentity, 'kind' | 'actorId' | 'name'>;
+
+// Read fresh at the moment of sending: the cookie follows a profile switch made
+// in any tab, the page data is what this tab loaded as. See senderIdentity.ts.
+function currentSenderIdentity(): SenderIdentity {
+  const html = Array.from(document.scripts, (s) => s.textContent || '').join('\n');
+  return detectSenderIdentity(document.cookie, html);
+}
+
 interface SendOptions {
+  // "Only send as a Page" (Settings). Checked before anything is typed.
+  requireSender?: SenderRequirement;
   // Recovery path only: when set, an already-delivered copy of this message in
   // this thread counts as success instead of being sent again. See DupGuard for
   // what each mode treats as "delivered".
@@ -4288,13 +4302,25 @@ async function typeSendAndConfirm(
   // is seen in the old pane, and then the status lands in a new one that a
   // detached `scope` never sees — 'unknown' on a message that was delivered.
   rescope?: () => HTMLElement | null
-): Promise<{ ok: boolean; error?: string; failureKind?: SendFailureKind; deliveryStatus?: DeliveryStatus }> {
+): Promise<{ ok: boolean; error?: string; failureKind?: SendFailureKind; deliveryStatus?: DeliveryStatus; sentAs?: SentAs }> {
   const target = normalizeText(message);
+
+  // Which profile is about to send. Always logged; refused when "Only send as a
+  // Page" is on and this isn't verifiably that Page. Before the delivered-copy
+  // check on purpose: a copy found in the wrong identity's inbox says nothing.
+  const who = currentSenderIdentity();
+  const sentAs: SentAs = { kind: who.kind, actorId: who.actorId, name: who.name };
+  stamp(`sender: ${who.kind} actor=${who.actorId || '?'}${who.name ? ` "${who.name}"` : ''} — ${who.reason}`);
+  const refused = opts.requireSender ? checkSender(who, opts.requireSender) : null;
+  if (refused) {
+    stamp(`REFUSED by sender guard: ${refused}`);
+    return { ok: false, error: refused, failureKind: 'wrong-sender', sentAs };
+  }
 
   // Recovery path: don't send a second copy of something that already landed.
   if (opts.skipIfDelivered && hasDeliveredCopy(scope, target, opts.skipIfDelivered)) {
     stamp(`message already present in this thread (guard=${opts.skipIfDelivered}) — treating as delivered, not re-sending`);
-    return { ok: true, deliveryStatus: 'sent' };
+    return { ok: true, deliveryStatus: 'sent', sentAs };
   }
 
   // "Only if they've read the last one." Checked BEFORE anything is typed, so a
@@ -4406,7 +4432,7 @@ async function typeSendAndConfirm(
       return { ok: false, error: 'Dry run: typed text did not match the template' };
     }
     stamp('DRY RUN OK — message typed into composer but NOT sent (no Enter, no Send click)');
-    return { ok: true };
+    return { ok: true, sentAs };
   }
 
   // Send. Block mic access for the whole send+confirm window: we used to
@@ -4490,7 +4516,7 @@ async function typeSendAndConfirm(
   }
 
   stamp('CONFIRMED sent (composer cleared, new bubble present, Facebook reports sent)');
-  return { ok: true, deliveryStatus: status };
+  return { ok: true, deliveryStatus: status, sentAs };
 }
 
 // Core send + validate routine. Returns ok only after CONFIRMING the message
@@ -4604,7 +4630,7 @@ async function performAutomatedSend(threadId: string, rawMessage: string, dryRun
   const res = await typeSendAndConfirm(composer, scope, message, dryRun, stamp, opts, () => findComposer(),
     () => document.querySelector('[role="main"]') as HTMLElement | null);
   if (!res.ok) {
-    return { ok: false, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus, log };
+    return { ok: false, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus, sentAs: res.sentAs, log };
   }
 
   // Stamp lastContacted on the saved contact, mirroring manual sends, and log
@@ -4615,7 +4641,7 @@ async function performAutomatedSend(threadId: string, rawMessage: string, dryRun
   // would act on.
   if (!dryRun) noteReadState(threadId, 'unread');
 
-  return { ok: true, deliveryStatus: res.deliveryStatus, log };
+  return { ok: true, deliveryStatus: res.deliveryStatus, sentAs: res.sentAs, log };
 }
 
 // ---- Read-only delivery check ----
@@ -4919,11 +4945,11 @@ async function performDrawerSend(threadId: string, rawMessage: string, dryRun = 
     return live && isMessageComposer(live) ? live : null;
   });
   if (!res.ok) {
-    return { ok: false, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus, log };
+    return { ok: false, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus, sentAs: res.sentAs, log };
   }
   try { await markContacted(threadId, { message, dryRun }); } catch { /* non-fatal */ }
   if (!dryRun) noteReadState(threadId, 'unread');
-  return { ok: true, deliveryStatus: res.deliveryStatus, log };
+  return { ok: true, deliveryStatus: res.deliveryStatus, sentAs: res.sentAs, log };
 }
 
 interface ProfileResolveResult {
@@ -4974,11 +5000,16 @@ function handleCrmRequest(request: any): Promise<unknown> | null {
   const guard: DupGuard | undefined =
     payload.skipIfDelivered === 'sent-only' || payload.skipIfDelivered === 'not-failed' ? payload.skipIfDelivered : undefined;
   const skipIfUnread = !!payload.skipIfUnread;
+  const requireSender: SenderRequirement | undefined = payload.requireSender?.requirePage === true
+    ? { requirePage: true, pageId: typeof payload.requireSender.pageId === 'string' ? payload.requireSender.pageId : undefined }
+    : undefined;
   switch (request?.type) {
     case 'CRM_SEND_MESSAGE':
-      return performAutomatedSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard, skipIfUnread, observeAs: String(payload.threadId) });
+      return performAutomatedSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard, skipIfUnread, requireSender, observeAs: String(payload.threadId) });
     case 'CRM_SEND_VIA_DRAWER':
-      return performDrawerSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard, skipIfUnread, observeAs: String(payload.threadId) });
+      return performDrawerSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard, skipIfUnread, requireSender, observeAs: String(payload.threadId) });
+    case 'CRM_GET_SENDER_IDENTITY':
+      return Promise.resolve(currentSenderIdentity());
     case 'CRM_RESOLVE_PROFILE':
       return resolveProfileThreadFor(String(payload.threadId || ''));
     case 'CRM_CHECK_DELIVERY':

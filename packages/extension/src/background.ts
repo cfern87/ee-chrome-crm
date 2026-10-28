@@ -54,6 +54,7 @@ import {
 import { makeInboundClient, inboundEndpointUrl } from './inboundClient';
 import { makeTeamClient, TEAM_SYNC_ALARM, TEAM_SYNC_PERIOD_MINUTES } from './team';
 import { makeTeamService } from './teamService';
+import { senderRequirementFrom, type SenderRequirement } from './senderIdentity';
 
 import {
   Campaign,
@@ -68,6 +69,7 @@ import {
   nextBatchTarget,
   NewCampaignInput,
   SendFailureKind,
+  type SentAs,
   QueueState,
   QueueMode,
   loadQueue,
@@ -689,7 +691,7 @@ async function ensureSenderTab(chatUrl: string, log: string[]): Promise<number |
   return tabId!;
 }
 
-interface SendResult { ok: boolean; error?: string; failureKind?: SendFailureKind; deliveryStatus?: string; log: string[] }
+interface SendResult { ok: boolean; error?: string; failureKind?: SendFailureKind; deliveryStatus?: string; sentAs?: SentAs; log: string[] }
 
 // The chat URL to navigate to for a recipient. A campaign snapshots each
 // recipient's chatUrl at creation time, but a contact's Facebook profile/chat
@@ -773,7 +775,7 @@ async function recordChatUrl(conversationId: string, chatUrl: string, log: strin
 //
 // `deliveryStatus` is only set once the message's bubble appeared in the
 // thread — i.e. Messenger took it. See postedUnconfirmed.
-interface Attempt { ok: boolean; error?: string; failureKind?: SendFailureKind; deliveryStatus?: string }
+interface Attempt { ok: boolean; error?: string; failureKind?: SendFailureKind; deliveryStatus?: string; sentAs?: SentAs }
 
 const POSTED_UNCONFIRMED_NOTE = 'message was posted but Facebook never showed a status — not retried, to avoid sending it twice';
 
@@ -784,7 +786,18 @@ type DupGuard = 'sent-only' | 'not-failed';
 // Campaign-level conditions on whether a send is allowed to happen at all, as
 // opposed to how it is performed. Threaded down to the content script, which is
 // the only place that can see the conversation and answer them.
-interface SendGate { skipIfUnread?: boolean }
+interface SendGate { skipIfUnread?: boolean; requireSender?: SenderRequirement }
+
+// "Only send as a Page" (Settings), read fresh for every send so turning it on
+// takes effect on the very next message.
+async function loadSenderRequirement(): Promise<SenderRequirement | undefined> {
+  try {
+    const req = senderRequirementFrom((await loadStore()).settings);
+    return req.requirePage ? req : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 // A first attempt that read an explicit "Couldn't send" proves both that the
 // message didn't go out AND that status reading works on this page, so the
@@ -804,7 +817,7 @@ const SEND_PORT_TIMEOUT_MS = 180_000;
 async function attemptSend(tabId: number, r: Campaign['recipients'][number], dryRun: boolean, skipIfDelivered: DupGuard | undefined, log: string[], opts: SendGate = {}, reloaded = false): Promise<Attempt> {
   const res = await sendViaPort<SendResult>(tabId, {
     type: 'CRM_SEND_MESSAGE',
-    payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered, skipIfUnread: opts.skipIfUnread },
+    payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered, skipIfUnread: opts.skipIfUnread, requireSender: opts.requireSender },
   }, SEND_PORT_TIMEOUT_MS);
   if (!res) {
     log.push('send port closed without a response');
@@ -825,7 +838,7 @@ async function attemptSend(tabId: number, r: Campaign['recipients'][number], dry
     return { ok: false, error: 'No response from content script (tab closed or send timed out)' };
   }
   log.push(...(res.log || []));
-  const out: Attempt = { ok: res.ok, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus };
+  const out: Attempt = { ok: res.ok, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus, sentAs: res.sentAs };
   if (dryRun || !postedUnconfirmed(out)) return out;
 
   // Posted, but no status within the wait. Reload the chat and read again
@@ -935,7 +948,7 @@ async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: bool
   const drawerTabId = tabId;
   const drawer = await sendViaPort<SendResult>(drawerTabId, {
     type: 'CRM_SEND_VIA_DRAWER',
-    payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered: guard, skipIfUnread: opts.skipIfUnread },
+    payload: { threadId: r.threadId, message: r.renderedMessage, dryRun, skipIfDelivered: guard, skipIfUnread: opts.skipIfUnread, requireSender: opts.requireSender },
   }, SEND_PORT_TIMEOUT_MS);
   if (drawer) log.push(...(drawer.log || []));
 
@@ -959,7 +972,7 @@ async function recoverViaProfile(r: Campaign['recipients'][number], dryRun: bool
     log.push('recovery: no response from the drawer send');
     return null;
   }
-  return { ok: drawer.ok, error: drawer.error, failureKind: drawer.failureKind, deliveryStatus: drawer.deliveryStatus };
+  return { ok: drawer.ok, error: drawer.error, failureKind: drawer.failureKind, deliveryStatus: drawer.deliveryStatus, sentAs: drawer.sentAs };
 }
 
 // A first attempt that ended in anything other than a confirmed "sent" gets the
@@ -973,11 +986,16 @@ function shouldRecover(a: Attempt): boolean {
   // send went nowhere BECAUSE we decided it shouldn't. Recovering it would open
   // the profile and send through the drawer, i.e. do the exact thing the option
   // was ticked to prevent.
-  return a.failureKind !== 'no-composer' && a.failureKind !== 'unavailable' && a.failureKind !== 'unread';
+  // 'wrong-sender' likewise: the profile can't change who you're logged in as.
+  return a.failureKind !== 'no-composer' && a.failureKind !== 'unavailable' && a.failureKind !== 'unread' && a.failureKind !== 'wrong-sender';
 }
 
-async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolean, gate: SendGate = {}): Promise<SendResult> {
+async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolean, gateIn: SendGate = {}): Promise<SendResult> {
   const log: string[] = [];
+  const gate: SendGate = { ...gateIn, requireSender: gateIn.requireSender ?? (await loadSenderRequirement()) };
+  if (gate.requireSender) {
+    log.push(`sender guard on: only as a Page${gate.requireSender.pageId ? ` (${gate.requireSender.pageId})` : ''}`);
+  }
   const chatUrl = await resolveChatUrl(r, log);
   if (!chatUrl) {
     return { ok: false, error: 'No saved chat URL for this contact', log: [...log, 'missing chatUrl — cannot navigate'] };
@@ -993,12 +1011,13 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
   } else {
     first = await attemptSend(tabId, r, dryRun, undefined, log, gate);
   }
-  if (first.ok) return { ok: true, log };
+  const sentAs = first.sentAs;
+  if (first.ok) return { ok: true, sentAs, log };
   if (postedUnconfirmed(first)) {
     log.push(POSTED_UNCONFIRMED_NOTE);
-    return { ok: false, error: 'Posted, but Facebook never showed it as sent — check the conversation', failureKind: 'unconfirmed', log };
+    return { ok: false, error: 'Posted, but Facebook never showed it as sent — check the conversation', failureKind: 'unconfirmed', sentAs, log };
   }
-  if (!shouldRecover(first)) return { ok: false, error: first.error, failureKind: first.failureKind, log };
+  if (!shouldRecover(first)) return { ok: false, error: first.error, failureKind: first.failureKind, sentAs, log };
 
   // Cheapest repair first: the same id on the encrypted route. An e2ee thread
   // opened at /messages/t/<id> is an empty shell whose sends all come back
@@ -1017,7 +1036,7 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
         const retry = await attemptSend(t, r, dryRun, 'sent-only', log, gate);
         if (retry.ok) {
           await recordChatUrl(r.threadId, e2eeUrl, log);
-          return { ok: true, log };
+          return { ok: true, sentAs: retry.sentAs || sentAs, log };
         }
         if (postedUnconfirmed(retry)) {
           log.push(POSTED_UNCONFIRMED_NOTE);
@@ -1030,7 +1049,7 @@ async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolea
 
   // Not confirmed sent. Try to repair the conversation link via the profile.
   const recovery = await recoverViaProfile(r, dryRun, dupGuardFor(first), log, gate);
-  if (recovery?.ok) return { ok: true, log };
+  if (recovery?.ok) return { ok: true, sentAs: recovery.sentAs || sentAs, log };
   if (recovery && postedUnconfirmed(recovery)) {
     return { ok: false, error: 'Posted, but Facebook never showed it as sent — check the conversation', failureKind: 'unconfirmed', log };
   }
@@ -2245,6 +2264,34 @@ async function processTick(): Promise<void> {
 
     if (after && rr) {
       const b = after.batches[after.batches.length - 1] || batch;
+      if (result.sentAs) rr.sentAs = result.sentAs;
+      if (!result.ok && result.failureKind === 'wrong-sender') {
+        // Every later send would be refused the same way until the user
+        // switches into the Page, so stop the queue instead of burning through
+        // the list. The recipient goes back to pending; nothing was typed.
+        rr.status = 'pending';
+        rr.attempts = Math.max(0, rr.attempts - 1);
+        rr.error = result.error;
+        rr.errorKind = 'wrong-sender';
+        rr.log = result.log;
+        for (const c of all2) {
+          if (c.status === 'running') { c.status = 'paused'; c.nextSendAt = undefined; }
+        }
+        after.cursor = Math.min(after.cursor, after.recipients.indexOf(rr));
+        console.warn(`[CRM] sender guard refused a send — all running campaigns paused: ${result.error}`);
+        void dispatchWebhook('message.failed', {
+          campaign: { id: after.id, name: after.name, dryRun: after.dryRun },
+          contact: { id: rr.threadId, name: rr.participantName, chatUrl: rr.chatUrl },
+          error: rr.error || '',
+          reason: 'wrong-sender',
+          skipped: true,
+        });
+        await saveCampaigns(all2);
+        await saveQueue(q);
+        if (await isDriveEnabled()) await announceQueueNow();
+        clearTick();
+        return;
+      }
       if (result.ok) {
         rr.status = 'sent';
         rr.sentAt = Date.now();

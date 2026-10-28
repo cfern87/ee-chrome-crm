@@ -88,7 +88,16 @@ export type CampaignStatus = 'running' | 'paused' | 'completed' | 'cancelled';
 // so the person is visible and requeueable rather than silently dropped, but
 // never retried and never recovered — the profile can't change whether someone
 // has read their messages.
-export type SendFailureKind = 'unavailable' | 'no-composer' | 'not-delivered' | 'unconfirmed' | 'unread';
+//
+// 'wrong-sender': "Only send as a Page" is on and the tab wasn't verifiably
+// acting as that Page. Nothing was typed. Never recovered (the profile page
+// can't change who you are), and the queue pauses, since every later send
+// would hit the same wall until the user switches profile.
+export type SendFailureKind = 'unavailable' | 'no-composer' | 'not-delivered' | 'unconfirmed' | 'unread' | 'wrong-sender';
+
+// Which Facebook profile a send went out as (or was refused as). See
+// senderIdentity.ts.
+export interface SentAs { kind: 'personal' | 'page' | 'unknown'; actorId: string | null; name: string | null }
 
 export interface CampaignRecipient {
   threadId: string;
@@ -103,6 +112,7 @@ export interface CampaignRecipient {
   errorKind?: SendFailureKind;  // machine-readable classification of `error`
   failedAt?: number;            // when it was marked failed (drives the dashboard notice)
   log?: string[];               // detailed diagnostics (esp. for failures)
+  sentAs?: SentAs;              // the profile the last attempt ran as
   // Last change to THIS recipient, for cross-machine merge. Stamped by
   // saveCampaigns, never by hand.
   updatedAt?: number;
