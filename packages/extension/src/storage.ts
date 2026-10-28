@@ -27,6 +27,11 @@ import { mergeSettingsWithBase, reconcileCollections, type SettingsBag } from '.
 import { getEntitlement, isSignedIn, FREE_CONTACT_LIMIT } from './license';
 import type { SavedSearch } from './search';
 import type { FollowUpTask } from './tasks';
+import {
+  ACTIVE_WORKSPACE_KEY, PERSONAL_WORKSPACE, getActiveWorkspaceId, getWorkspaceInfo,
+  isTeamWorkspace, teamCacheKey, teamDirtyKey, teamSyncMetaKey, teamArrivalsKey, localGet, localSet,
+} from './team';
+import { arrivalsBetween, guardStaleWrite, type Arrivals } from './teamMerge';
 
 
 export const STORAGE_KEY = 'facebook_crm_store';
@@ -391,6 +396,14 @@ export interface Store {
   // Drive-mode is where it is carried between machines — the legacy
   // chrome.storage.sync shards don't hold it (it would eat the item quota).
   history?: Record<string, string>;
+  // Which workspace this copy was LOADED from (see team.ts). Stamped by
+  // loadStore, never persisted (normalize drops it), and checked by saveStore:
+  // a tab that loaded Personal must not save its copy into a team workspace
+  // just because the user switched workspaces in another tab meanwhile.
+  workspace?: string;
+  // When that copy was read (epoch ms, this machine's clock). Team saves use it
+  // to tell a stale copy from a deliberate edit — see guardStaleWrite.
+  workspaceReadAt?: number;
 }
 
 export const EMPTY_STORE: Store = {
@@ -600,13 +613,13 @@ function openIDB(): Promise<IDBDatabase> {
   });
 }
 
-export async function idbGet(): Promise<Store | null> {
+async function idbGetRaw<T>(key: string): Promise<T | null> {
   try {
     const db = await openIDB();
     return new Promise((resolve) => {
       const tx = db.transaction(IDB_STORE, 'readonly');
-      const req = tx.objectStore(IDB_STORE).get(IDB_KEY);
-      req.onsuccess = () => resolve(req.result ? normalize(req.result) : null);
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => resolve((req.result as T) ?? null);
       req.onerror = () => resolve(null);
     });
   } catch {
@@ -614,12 +627,31 @@ export async function idbGet(): Promise<Store | null> {
   }
 }
 
-export async function idbSet(store: Store): Promise<void> {
+export async function idbGet(key: string = IDB_KEY): Promise<Store | null> {
+  const raw = await idbGetRaw<Partial<Store>>(key);
+  return raw ? normalize(raw) : null;
+}
+
+export async function idbSet(store: unknown, key: string = IDB_KEY): Promise<void> {
   try {
     const db = await openIDB();
     return new Promise((resolve) => {
       const tx = db.transaction(IDB_STORE, 'readwrite');
-      tx.objectStore(IDB_STORE).put(store, IDB_KEY);
+      tx.objectStore(IDB_STORE).put(store, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch {
+    /* IDB unavailable — ignore */
+  }
+}
+
+async function idbDelete(key: string): Promise<void> {
+  try {
+    const db = await openIDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).delete(key);
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();
     });
@@ -630,13 +662,13 @@ export async function idbSet(store: Store): Promise<void> {
 
 // ---- chrome.storage.local (single-key local backup) ----
 
-function chromeLocalGet(): Promise<Store | null> {
+function chromeLocalGet(key: string = STORAGE_KEY): Promise<Store | null> {
   if (!isExtensionAlive()) return Promise.resolve(null);
   return new Promise((resolve) => {
     try {
-      chrome.storage.local.get(STORAGE_KEY, (result) => {
+      chrome.storage.local.get(key, (result) => {
         if (!isExtensionAlive() || chrome.runtime.lastError) { resolve(null); return; }
-        const s = result[STORAGE_KEY];
+        const s = result[key];
         resolve(s ? normalize(s) : null);
       });
     } catch {
@@ -645,11 +677,11 @@ function chromeLocalGet(): Promise<Store | null> {
   });
 }
 
-function chromeLocalSet(store: Store): Promise<void> {
+function chromeLocalSet(store: Store, key: string = STORAGE_KEY): Promise<void> {
   if (!isExtensionAlive()) return Promise.resolve();
   return new Promise((resolve) => {
     try {
-      chrome.storage.local.set({ [STORAGE_KEY]: store }, () => resolve());
+      chrome.storage.local.set({ [key]: store }, () => resolve());
     } catch {
       resolve();
     }
@@ -1306,13 +1338,161 @@ export interface LoadOptions {
  */
 export function loadStore(opts: LoadOptions = {}): Promise<Store> {
   const maxAge = opts.maxAgeMs ?? LOAD_FRESH_MS;
-  if (loadedStore && Date.now() - loadedAt < maxAge) return Promise.resolve(loadedStore);
+  if (loadedStore && Date.now() - loadedAt < maxAge &&
+      (activeWorkspaceSeen === null || loadedStore.workspace === activeWorkspaceSeen)) {
+    return Promise.resolve(loadedStore);
+  }
   if (loadInFlight) return loadInFlight;
 
-  loadInFlight = loadStoreUncached()
-    .then((s) => { loadedStore = s; loadedAt = Date.now(); return s; })
-    .finally(() => { loadInFlight = null; });
+  loadInFlight = (async () => {
+    const ws = await getActiveWorkspaceId();
+    activeWorkspaceSeen = ws;
+    const s = isTeamWorkspace(ws) ? await loadStoreTeam(ws) : await loadStoreUncached();
+    // Stamp a copy, never the object a cache helper may still hold.
+    const stamped: Store = { ...s, workspace: ws, workspaceReadAt: Date.now() };
+    loadedStore = stamped;
+    loadedAt = Date.now();
+    return stamped;
+  })().finally(() => { loadInFlight = null; });
   return loadInFlight;
+}
+
+// ---- Team workspaces (see team.ts / teamSync.ts / docs/TEAM_WORKSPACES.md) ----
+//
+// A team workspace has its own local cache key, so nothing here ever reads or
+// writes the personal cache, Drive, or chrome.storage.sync. Loads and saves are
+// purely local; the background worker reconciles the cache with the server.
+
+// The workspace this context last saw as active, kept current by the listener
+// below so a switch made in another tab drops this context's cached store at
+// once instead of serving the previous workspace for up to LOAD_FRESH_MS.
+let activeWorkspaceSeen: string | null = null;
+try {
+  if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || !(ACTIVE_WORKSPACE_KEY in changes)) return;
+      const v = changes[ACTIVE_WORKSPACE_KEY].newValue;
+      activeWorkspaceSeen = typeof v === 'string' && v ? v : PERSONAL_WORKSPACE;
+      invalidateLoadCache();
+    });
+  }
+} catch { /* not in an extension context (tests) */ }
+
+const teamIdbKey = (teamId: string) => teamCacheKey(IDB_KEY, teamId);
+const teamBaseIdbKey = (teamId: string) => `base@team:${teamId}`;
+
+async function loadStoreTeam(teamId: string): Promise<Store> {
+  return (await chromeLocalGet(teamCacheKey(STORAGE_KEY, teamId))) ||
+    (await idbGet(teamIdbKey(teamId))) ||
+    clone(EMPTY_STORE);
+}
+
+/** The personal workspace's local cache, whichever workspace is active. */
+export async function readPersonalCache(): Promise<Store | null> {
+  return (await chromeLocalGet()) || (await idbGet());
+}
+
+/** The team workspace's local cache (background sync reads this). */
+export function readTeamCache(teamId: string): Promise<Store | null> {
+  return chromeLocalGet(teamCacheKey(STORAGE_KEY, teamId));
+}
+
+/**
+ * Replace the team cache with what a sync pass produced, and tell every open
+ * view. Not a user save: no tombstone inference, no history, no webhooks.
+ */
+export async function replaceTeamCache(teamId: string, next: Store): Promise<void> {
+  const clean = normalize(next);
+  const key = teamCacheKey(STORAGE_KEY, teamId);
+  const previous = await chromeLocalGet(key);
+  const prior = (await localGet<Arrivals>(teamArrivalsKey(teamId))) || {};
+  await localSet(teamArrivalsKey(teamId), arrivalsBetween(previous, clean, Date.now(), prior));
+  await chromeLocalSet(clean, key);
+  void idbSet(clean, teamIdbKey(teamId));
+  invalidateLoadCache();
+  await bumpStoreRev();
+}
+
+/** Last document this machine and the server agreed on (the merge base). */
+export async function readTeamBase(teamId: string): Promise<{ version: number; store: Store } | null> {
+  const raw = await idbGetRaw<{ version: number; store: Partial<Store> }>(teamBaseIdbKey(teamId));
+  return raw && typeof raw.version === 'number' && raw.store ? { version: raw.version, store: normalize(raw.store) } : null;
+}
+
+export function writeTeamBase(teamId: string, b: { version: number; store: Store }): Promise<void> {
+  return idbSet({ version: b.version, store: normalize(b.store) }, teamBaseIdbKey(teamId));
+}
+
+export function isTeamDirty(teamId: string): Promise<boolean> {
+  return localFlagGet(teamDirtyKey(teamId));
+}
+
+export function setTeamDirty(teamId: string, dirty: boolean): Promise<void> {
+  return localFlagSet(teamDirtyKey(teamId), dirty);
+}
+
+/** Drop everything this machine holds for a team (left, removed, or deleted). */
+export async function forgetTeamCache(teamId: string): Promise<void> {
+  if (isExtensionAlive()) {
+    await new Promise<void>((resolve) => {
+      try {
+        chrome.storage.local.remove(
+          [teamCacheKey(STORAGE_KEY, teamId), teamDirtyKey(teamId), teamSyncMetaKey(teamId), teamArrivalsKey(teamId)],
+          () => { void chrome.runtime.lastError; resolve(); },
+        );
+      } catch { resolve(); }
+    });
+  }
+  await idbDelete(teamIdbKey(teamId));
+  await idbDelete(teamBaseIdbKey(teamId));
+}
+
+/**
+ * Make `id` the active workspace in every context. The workspace key and the
+ * store revision change in ONE write, so every listener that reloads on the
+ * revision already sees the new workspace when it does.
+ */
+export async function switchWorkspace(id: string): Promise<void> {
+  const ws = id || PERSONAL_WORKSPACE;
+  invalidateLoadCache();
+  activeWorkspaceSeen = ws;
+  if (!isExtensionAlive()) return;
+  lastKnownRev = Math.max(lastKnownRev + 1, Date.now());
+  await new Promise<void>((resolve) => {
+    try {
+      chrome.storage.local.set({ [ACTIVE_WORKSPACE_KEY]: ws, [STORE_REV_KEY]: lastKnownRev }, () => { void chrome.runtime.lastError; resolve(); });
+    } catch { resolve(); }
+  });
+}
+
+async function saveStoreTeam(input: Store, teamId: string): Promise<SaveResult> {
+  const info = await getWorkspaceInfo(teamId);
+  if (info && !info.active) {
+    return {
+      ok: false, pending: 0, itemLimitReached: false,
+      reason: "This team workspace is read-only: the team owner's Pro plan isn't active.",
+    };
+  }
+  const key = teamCacheKey(STORAGE_KEY, teamId);
+  const previous = (await chromeLocalGet(key)) || (await idbGet(teamIdbKey(teamId)));
+  // Keep teammates' pulled edits that this copy predates (see guardStaleWrite),
+  // then the same tombstone/history/diagnostics handling as a personal save.
+  // No contact cap: a team runs on its owner's plan, checked by the server.
+  const arrivals = (await localGet<Arrivals>(teamArrivalsKey(teamId))) || {};
+  const guarded = previous
+    ? guardStaleWrite(previous, normalize(input), arrivals, input.workspaceReadAt || 0)
+    : normalize(input);
+  const store = recordHistory(previous, pruneDiagnostics(previous
+    ? tombstone(guarded, removedConversationIds(previous, guarded))
+    : pruneTombstones(guarded)));
+
+  await Promise.all([chromeLocalSet(store, key), idbSet(store, teamIdbKey(teamId))]);
+  loadedStore = { ...store, workspace: teamId, workspaceReadAt: Date.now() };
+  loadedAt = Date.now();
+  await setTeamDirty(teamId, true);
+  // The background worker listens for this and pushes shortly after.
+  await bumpStoreRev();
+  return { ok: true, pending: 0, itemLimitReached: false };
 }
 
 async function loadStoreUncached(): Promise<Store> {
@@ -1432,6 +1612,15 @@ export async function saveStore(input: Store): Promise<SaveResult> {
     };
   }
 
+  const ws = await getActiveWorkspaceId();
+  if (input.workspace && input.workspace !== ws) {
+    return {
+      ok: false, pending: 0, itemLimitReached: false,
+      reason: 'You switched workspace since this was loaded, so nothing was saved. Reload and try again.',
+    };
+  }
+  if (isTeamWorkspace(ws)) return saveStoreTeam(input, ws);
+
   // Auto-tombstone whatever this write dropped. The dashboard and popup still
   // write the store wholesale, so without this a delete made there would carry
   // no tombstone and would be resurrected by the next merge. Computed against
@@ -1459,7 +1648,7 @@ export async function saveStore(input: Store): Promise<SaveResult> {
   await Promise.all([chromeLocalSet(store), idbSet(store)]);
   // This context's own view is now authoritative; serve it to callers inside
   // the freshness window rather than re-reading what we just wrote.
-  loadedStore = store;
+  loadedStore = { ...store, workspace: PERSONAL_WORKSPACE, workspaceReadAt: Date.now() };
   loadedAt = Date.now();
 
   if (driveMode) {

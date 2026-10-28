@@ -45,6 +45,7 @@ import { PresetActionsSettings } from './PresetActionsSettings';
 import { WebhookSettings } from './WebhookSettings';
 import { InboundWebhookSettings } from './InboundWebhookSettings';
 import { DailyReportSettings } from './DailyReportSettings';
+import { TeamPanel, TeamSyncNotice, useTeamWorkspaceActive } from './TeamSettings';
 
 /** Sections of Settings. */
 export type SettingsView = 'account' | 'sync' | 'data' | 'behavior' | 'about';
@@ -97,6 +98,10 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
   const [pushConfirm, setPushConfirm] = useState(false);
   // Chrome Sync is legacy once Drive is canonical, so it starts collapsed.
   const [syncOpen, setSyncOpen] = useState(false);
+  // In a team workspace `store` is the TEAM's data, so the personal-only push
+  // controls (Drive, Chrome Sync) are hidden: they would copy it into the
+  // personal store.
+  const teamActive = useTeamWorkspaceActive();
 
   const handlePull = async () => {
     setSyncStatus({ type: 'info', msg: 'Pulling from Chrome sync…' });
@@ -134,7 +139,10 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
     const blocked = await ensureSignedIn('export your data');
     if (blocked) { setDataStatus({ tone: 'danger', msg: blocked }); return; }
     setDataStatus(null);
-    const data = JSON.stringify(store, null, 2);
+    // Drop the load stamp (see Store.workspace): a backup isn't tied to the
+    // workspace it was exported from.
+    const { workspace: _ws, workspaceReadAt: _readAt, ...portable } = store;
+    const data = JSON.stringify(portable, null, 2);
     const a = document.createElement('a');
     a.href = 'data:text/plain;charset=utf-8,' + encodeURIComponent(data);
     a.download = `${PRODUCT_SLUG}-backup-${tsStamp()}.json`;
@@ -154,7 +162,10 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
       const reader = new FileReader();
       reader.onload = async (ev) => {
         try {
-          const data = JSON.parse(ev.target?.result as string);
+          const parsed = JSON.parse(ev.target?.result as string);
+          // A backup restores into whichever workspace is open now, so any
+          // stamp from where it was exported must not make saveStore refuse it.
+          const { workspace: _ws, workspaceReadAt: _readAt, ...data } = parsed;
           const save = await updateStore(data);
           // Report what actually happened. The background refuses the write when
           // there's no account, and claiming success there would be a lie that
@@ -195,7 +206,12 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
 
       <div style={{ maxWidth: 620 }}>
 
-      {view === 'account' && <AccountPanel contactCount={conversations.length} />}
+      {view === 'account' && (
+      <>
+      <AccountPanel contactCount={conversations.length} />
+      <TeamPanel />
+      </>
+      )}
 
       {view === 'behavior' && (
       <>
@@ -228,7 +244,14 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
       </>
       )}
 
-      {view === 'sync' && (
+      {view === 'sync' && teamActive && (
+      <>
+      <TeamSyncNotice />
+      <MachinesPanel />
+      </>
+      )}
+
+      {view === 'sync' && !teamActive && (
       <>
       {/* Drive first: it is the supported path, and Chrome Sync is what it
           replaced. The old order put a legacy mechanism above the current one

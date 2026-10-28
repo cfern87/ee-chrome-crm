@@ -31,6 +31,7 @@ import { isDriveConfigured, getDriveStatus, getDriveAuthState, connectDrive, dis
 import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo, type DeviceOverview } from '../devices';
 import { isDisconnected, type SyncStatusView, type SendHoldReason } from '../syncHealth';
 import { AppShell, type NavItem } from '../ui/AppShell';
+import { WorkspaceSwitcher } from './TeamSettings';
 import {
   Banner, Button, Card, Chip, EmptyState, Input, Option, Pager, SectionTitle, Select, Stack, Text, Toggle,
   // `Field` is already taken in this file by the CSV mapping type.
@@ -1971,6 +1972,7 @@ export default function DashboardApp() {
       onToggleRail={() => setRailCollapsed((v) => !v)}
       title={ROUTE_TITLE[route]}
       meta={contactsMeta || undefined}
+      actions={<WorkspaceSwitcher />}
       contentScroll={route !== 'contacts'}
       drawerOpen={drawerOpen}
       onDrawerOpenChange={setDrawerOpen}

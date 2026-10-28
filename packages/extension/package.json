@@ -1,6 +1,6 @@
 {
   "name": "facebook-crm-extension",
-  "version": "1.1.91",
+  "version": "1.1.92",
   "description": "Chrome extension for Facebook Messenger CRM",
   "scripts": {
     "dev": "vite",

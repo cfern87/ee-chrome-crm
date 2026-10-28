@@ -443,9 +443,55 @@ $('acctUpgradeBtn').addEventListener('click', () => {
   chrome.tabs.create({ url: PLATFORM_URL + '/account/billing' });
 });
 
+// ---- Team workspaces -------------------------------------------------------
+//
+// Which set of contacts this browser is working in. New Messenger contacts are
+// saved into the workspace picked here, so it sits near the top.
+
+function loadWorkspaces() {
+  send({ type: 'TEAM_WORKSPACES' }, (view) => {
+    const teams = view && Array.isArray(view.list) ? view.list.filter((w) => w.status === 'active') : [];
+    const invites = view && Array.isArray(view.list) ? view.list.filter((w) => w.status === 'invited') : [];
+    show($('workspaceBlock'), teams.length > 0 || invites.length > 0);
+    const sel = $('workspaceSelect');
+    sel.textContent = '';
+    const add = (value, label) => {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = label;
+      sel.appendChild(o);
+    };
+    add('personal', 'Personal');
+    for (const w of teams) add(w.id, w.name + (w.active ? '' : ' (read-only)'));
+    sel.value = view && teams.some((w) => w.id === view.active) ? view.active : 'personal';
+    show(sel, teams.length > 0);
+    const hint = $('workspaceHint');
+    hint.textContent = invites.length
+      ? 'You have a team invite — accept it in the dashboard under Settings → Account & plan.'
+      : '';
+    show(hint, invites.length > 0);
+  });
+}
+
+$('workspaceSelect').addEventListener('change', (e) => {
+  const sel = e.target;
+  sel.disabled = true;
+  send({ type: 'TEAM_SWITCH', payload: { id: sel.value } }, (res) => {
+    sel.disabled = false;
+    if (!res || !res.ok) {
+      const hint = $('workspaceHint');
+      hint.textContent = (res && res.error) || 'Could not switch workspace.';
+      show(hint, true);
+    }
+    loadWorkspaces();
+    loadStoreThen(() => { renderStatus(); renderPinned(); renderResults($('quickSearch').value); });
+  });
+});
+
 // ---- Wiring --------------------------------------------------------------
 
 loadAccount();
+loadWorkspaces();
 
 // Signed in or out elsewhere (the website's hand-off, another surface).
 try {

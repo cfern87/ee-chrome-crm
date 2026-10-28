@@ -238,6 +238,13 @@
     <div class="pop-body">
       <button class="crm-btn crm-btn--primary crm-btn--md" id="openDashboardBtn">Open dashboard</button>
 
+      <!-- Team workspaces: only shown to people who are in a team. -->
+      <div id="workspaceBlock" hidden>
+        <div class="pop-section-label">Workspace</div>
+        <select class="crm-select" id="workspaceSelect" aria-label="Workspace"></select>
+        <div class="pop-hint" id="workspaceHint" hidden></div>
+      </div>
+
       <div>
         <div class="pop-section-label">Status</div>
         <div class="pop-status" id="statusBlock">
