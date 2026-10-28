@@ -193,6 +193,23 @@ export interface Campaign {
   // automation's "message each contact once" knows, on every machine, who it
   // has already messaged.
   automationId?: string;
+  // Which Facebook identity this campaign may send as. Chosen when the
+  // campaign is made and never changed. Every send checks it before typing
+  // (see senderIdentity.ts); a mismatch pauses all running campaigns. Absent
+  // on campaigns made before this existed, which read as 'profile' — the only
+  // identity anything was sent as until then.
+  sendAs?: SendAsMode;
+  // sendAs 'page' only: when set, only this Page (its numeric profile id).
+  sendAsPageId?: string;
+}
+
+export type SendAsMode = 'profile' | 'page';
+
+/** A campaign's sender identity, defaulting older campaigns to the personal profile. */
+export function campaignSendAs(c: Pick<Campaign, 'sendAs' | 'sendAsPageId'>): { mode: SendAsMode; pageId?: string } {
+  const mode: SendAsMode = c.sendAs === 'page' ? 'page' : 'profile';
+  const id = (c.sendAsPageId || '').trim();
+  return { mode, pageId: mode === 'page' && /^\d+$/.test(id) ? id : undefined };
 }
 
 // ---- Pure helpers ----
@@ -246,6 +263,9 @@ export interface NewCampaignInput {
   dryRun?: boolean;
   skipIfUnread?: boolean;
   automationId?: string;
+  // Sender identity; omitted means the personal profile. See Campaign.sendAs.
+  sendAs?: SendAsMode;
+  sendAsPageId?: string;
   // Drop anyone already waiting in a live campaign with this SAME template.
   // Not stored on the campaign — it only shapes who is in it. Quick actions set
   // it, so pressing "Add to campaign" twice doesn't message someone twice.
@@ -275,6 +295,7 @@ export function createCampaign(input: NewCampaignInput): Campaign {
     dryRun: !!input.dryRun,
     skipIfUnread: !!input.skipIfUnread,
     ...(input.automationId ? { automationId: input.automationId } : {}),
+    ...campaignSendAsFields(input),
     createdAt: now,
     status: 'running',
     recipients: input.recipients.map((r) => ({
@@ -408,6 +429,11 @@ export function stampCampaigns(prev: Campaign[], next: Campaign[], now = Date.no
     stamped.updatedAt = scalarsChanged ? now : (before.updatedAt ?? now);
     return stamped;
   });
+}
+
+function campaignSendAsFields(input: Pick<NewCampaignInput, 'sendAs' | 'sendAsPageId'>): Pick<Campaign, 'sendAs' | 'sendAsPageId'> {
+  const { mode, pageId } = campaignSendAs(input);
+  return { sendAs: mode, ...(pageId ? { sendAsPageId: pageId } : {}) };
 }
 
 function campaignScalars(c: Campaign): string {
@@ -593,7 +619,7 @@ export function failureReport(c: Campaign, profileUrlFor: (threadId: string) => 
 
   const out: string[] = [
     `Campaign: ${c.name} (${c.id})`,
-    `Status: ${c.status}${c.dryRun ? ' · DRY RUN' : ''}${c.skipIfUnread ? ' · skip-if-unread' : ''}`,
+    `Status: ${c.status}${c.dryRun ? ' · DRY RUN' : ''}${c.skipIfUnread ? ' · skip-if-unread' : ''} · send as ${campaignSendAs(c).mode}${c.sendAsPageId ? ` ${c.sendAsPageId}` : ''}`,
     `Started: ${new Date(c.startedAt || c.createdAt).toISOString()}${c.completedAt ? ` · finished ${new Date(c.completedAt).toISOString()}` : ''}`,
     `Totals: ${sum.sent} sent · ${sum.errors} failed · ${sum.pending} pending · ${sum.total} total`,
     `Report copied: ${new Date().toISOString()}`,

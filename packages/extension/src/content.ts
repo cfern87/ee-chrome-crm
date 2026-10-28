@@ -1577,6 +1577,8 @@ async function queuePresetCampaign(send: PresetCampaignSend): Promise<{ text: st
       recipients: send.recipients,
       skipIfUnread: send.skipIfUnread,
       dryRun: send.dryRun,
+      sendAs: send.sendAs,
+      sendAsPageId: send.sendAsPageId,
       skipAlreadyQueued: true,
     },
   });

@@ -1,6 +1,6 @@
 {
   "name": "not-another-social-crm",
-  "version": "1.2.96",
+  "version": "1.2.97",
   "description": "Not Another Social CRM with tagging and dashboard",
   "private": true,
   "workspaces": [

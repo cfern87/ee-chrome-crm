@@ -37,6 +37,7 @@ import { writeCollection, type SettingsBag, type SettingsCollection } from './se
 import { newTask, dueFromOffset, type TaskPriority } from './tasks';
 import { matchesQuery, normalizeQuery, isQueryEmpty, describeQuery, type QueryGroup, type QueryContext } from './search';
 import { isExclusiveFunnel } from './funnel';
+import type { SendAsMode } from './campaigns';
 
 /**
  * One edit inside a preset, optionally gated by a condition.
@@ -82,7 +83,9 @@ type PresetStepBody =
   // into ONE campaign — one send queue entry, one card in history — rather than
   // one campaign per contact. The template is a copy, typed in or taken from a
   // recent campaign when the preset was built; it never tracks that campaign.
-  | { kind: 'addToCampaign'; template: string; skipIfUnread?: boolean; dryRun?: boolean }
+  // sendAs: which Facebook identity the campaign may send as (Campaign.sendAs);
+  // absent = the personal profile.
+  | { kind: 'addToCampaign'; template: string; skipIfUnread?: boolean; dryRun?: boolean; sendAs?: SendAsMode; sendAsPageId?: string }
   // POST the contact to a URL (webhooks.ts buildPresetPayload). Also not a
   // store edit: the background delivers it — one POST per contact, so a bulk
   // press of fifty is fifty POSTs — and logs each outcome in that contact's
@@ -250,6 +253,9 @@ function normalizeStepBody(raw: unknown): PresetStepBody | null {
           template: o.template,
           ...(o.skipIfUnread === true ? { skipIfUnread: true } : {}),
           ...(o.dryRun === true ? { dryRun: true } : {}),
+          ...(o.sendAs === 'page' ? { sendAs: 'page' as const } : {}),
+          ...(o.sendAs === 'page' && typeof o.sendAsPageId === 'string' && /^\d+$/.test(o.sendAsPageId.trim())
+            ? { sendAsPageId: o.sendAsPageId.trim() } : {}),
         }
         : null;
     case 'sendWebhook':
@@ -504,6 +510,8 @@ export interface PresetCampaignSend {
   template: string;
   skipIfUnread: boolean;
   dryRun: boolean;
+  sendAs: SendAsMode;
+  sendAsPageId?: string;
   recipients: Array<{ threadId: string; participantName: string; chatUrl: string }>;
   /** Matched the step but have no saved chat link, so can't be messaged. */
   noChatLink: number;
@@ -530,6 +538,8 @@ export function campaignSendsFor(
       template: step.template,
       skipIfUnread: !!step.skipIfUnread,
       dryRun: !!step.dryRun,
+      sendAs: step.sendAs === 'page' ? 'page' : 'profile',
+      ...(step.sendAs === 'page' && step.sendAsPageId ? { sendAsPageId: step.sendAsPageId } : {}),
       recipients: [],
       noChatLink: 0,
     };

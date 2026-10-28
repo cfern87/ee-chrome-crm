@@ -1207,6 +1207,8 @@ export default function DashboardApp() {
           recipients: send.recipients,
           skipIfUnread: send.skipIfUnread,
           dryRun: send.dryRun,
+          sendAs: send.sendAs,
+          sendAsPageId: send.sendAsPageId,
           skipAlreadyQueued: true,
         },
       });

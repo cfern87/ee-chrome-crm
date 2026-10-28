@@ -33,12 +33,15 @@ unknown; page data ≠ cookie actor → unknown ("reload first"); `i_user` ≠
 
 ## 2. The guard (implemented)
 
-- Settings → Behavior → **Send as**: a required choice, "Only send as personal
-  profile" (the default) or "Only send as a Page". With Page, an optional "Only
-  this Page id". Plus a read-only "Check who Facebook is acting as" button.
-  Stored in synced settings (`senderMode`, `requiredPageId`; the earlier
-  `requirePageSender: true` still reads as Page).
-- Personal-profile mode refuses a detected Page, or any cookie/page-data
+- **Send as is chosen per campaign**, not globally: "Personal profile" or "A
+  Page" (exactly one, default personal profile), plus an optional Page id when
+  Page is picked. The picker (`dashboard/SendAsPicker.tsx`) is in the campaign
+  composer, the automation "send a message" action and the quick-action "Add
+  to campaign" step, and has a read-only "Check who Facebook is acting as"
+  button. Stored as `Campaign.sendAs` / `sendAsPageId`, set at creation and
+  never changed; campaigns made before this read as personal profile. Page
+  campaigns show an "As a Page" chip.
+- Personal-profile campaigns refuse a detected Page, or any cookie/page-data
   mismatch with the logged-in person. Missing page data alone is allowed when
   the cookies say personal, so a layout change can't halt existing campaigns.
 - The check runs in `typeSendAndConfirm` (content.ts), shared by the thread

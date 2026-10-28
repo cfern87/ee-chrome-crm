@@ -91,37 +91,12 @@ export function detectSenderIdentity(cookie: string, html: string): SenderIdenti
   return { kind: 'personal', actorId: cUser, accountId: cUser, cookieActorId: cookieActor, name: cu.name, reason: 'personal profile (no i_user, USER_ID = ACCOUNT_ID)' };
 }
 
-// Settings keys (store.settings, synced across machines).
-//
-// SENDER_MODE_KEY is the current one: 'page' or 'profile', and one of the two
-// is always in force. REQUIRE_PAGE_SENDER_KEY is the earlier on/off toggle,
-// still read so a saved "on" keeps meaning Page.
-export const SENDER_MODE_KEY = 'senderMode';
-export const REQUIRE_PAGE_SENDER_KEY = 'requirePageSender';
-export const REQUIRED_PAGE_ID_KEY = 'requiredPageId';
-
-export type SenderMode = 'page' | 'profile';
-
+// What a send requires, from its campaign's "Send as" (Campaign.sendAs).
 export interface SenderRequirement {
   // true: only send while acting as a Page. false: only as the personal profile.
   requirePage: boolean;
   // Page mode only: when set, only as this Page.
   pageId?: string;
-}
-
-export function senderModeFrom(settings: Record<string, unknown> | undefined): SenderMode {
-  const s = settings || {};
-  if (s[SENDER_MODE_KEY] === 'page' || s[SENDER_MODE_KEY] === 'profile') return s[SENDER_MODE_KEY] as SenderMode;
-  // Nothing chosen yet: the old toggle if it was on, else the personal profile,
-  // which is what every send before this setting existed went out as.
-  return s[REQUIRE_PAGE_SENDER_KEY] === true ? 'page' : 'profile';
-}
-
-export function senderRequirementFrom(settings: Record<string, unknown> | undefined): SenderRequirement {
-  const s = settings || {};
-  const id = typeof s[REQUIRED_PAGE_ID_KEY] === 'string' ? String(s[REQUIRED_PAGE_ID_KEY]).trim() : '';
-  const requirePage = senderModeFrom(s) === 'page';
-  return { requirePage, pageId: requirePage && /^\d+$/.test(id) ? id : undefined };
 }
 
 // null = allowed; otherwise the reason the send is refused.
@@ -132,13 +107,13 @@ export function checkSender(id: SenderIdentity, req: SenderRequirement): string 
     // person. Missing page data alone is not refused when the cookies say
     // personal — this mode is the default, and a layout without the data
     // block must not stop every existing campaign.
-    if (id.kind === 'page') return `Not sent — acting as the Page ${id.name || id.actorId}, and "Only send as personal profile" is selected`;
+    if (id.kind === 'page') return `Not sent — acting as the Page ${id.name || id.actorId}, and this campaign sends as your personal profile`;
     if (id.kind === 'unknown' && (!id.accountId || id.actorId !== id.accountId || id.cookieActorId !== id.accountId)) {
       return `Not sent — couldn't verify the sender is your personal profile (${id.reason})`;
     }
     return null;
   }
-  if (id.kind === 'personal') return `Not sent — acting as your personal profile${id.name ? ` (${id.name})` : ''}, and "Only send as a Page" is selected`;
+  if (id.kind === 'personal') return `Not sent — acting as your personal profile${id.name ? ` (${id.name})` : ''}, and this campaign sends as a Page`;
   if (id.kind !== 'page') return `Not sent — couldn't verify the sender is a Page (${id.reason})`;
   if (req.pageId && id.actorId !== req.pageId) {
     return `Not sent — acting as ${id.name || id.actorId}, not the required Page ${req.pageId}`;

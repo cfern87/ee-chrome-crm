@@ -30,6 +30,7 @@ import { isValidWebhookUrl } from '../webhooks';
 import { ensureHostPermission, TEST_PERMISSION_NOTE } from './WebhookSettings';
 import { QueryEditor } from './SearchBuilder';
 import { WORKER_NOT_LOADED } from '../product';
+import { SendAsPicker } from './SendAsPicker';
 
 const STEP_LABELS: Record<PresetStepKind, string> = {
   addTag: 'Add tag',
@@ -676,6 +677,13 @@ function CampaignStepEditor({ step, onChange }: {
           onChange={(e) => toggle('dryRun', e.target.checked)}
         />
       </Stack>
+      <SendAsPicker
+        value={{ sendAs: step.sendAs === 'page' ? 'page' : 'profile', sendAsPageId: step.sendAsPageId }}
+        onChange={(v) => {
+          const { sendAs: _s, sendAsPageId: _p, ...rest } = step;
+          onChange(v.sendAs === 'page' ? { ...rest, sendAs: 'page', ...(v.sendAsPageId ? { sendAsPageId: v.sendAsPageId } : {}) } : rest);
+        }}
+      />
     </Stack>
   );
 }

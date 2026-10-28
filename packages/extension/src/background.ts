@@ -54,7 +54,7 @@ import {
 import { makeInboundClient, inboundEndpointUrl } from './inboundClient';
 import { makeTeamClient, TEAM_SYNC_ALARM, TEAM_SYNC_PERIOD_MINUTES } from './team';
 import { makeTeamService } from './teamService';
-import { senderRequirementFrom, type SenderRequirement } from './senderIdentity';
+import type { SenderRequirement } from './senderIdentity';
 import { advanceEditsFor, isNoOpStageEdit } from './funnel';
 
 import {
@@ -71,6 +71,7 @@ import {
   NewCampaignInput,
   SendFailureKind,
   type SentAs,
+  campaignSendAs,
   QueueState,
   QueueMode,
   loadQueue,
@@ -789,14 +790,11 @@ type DupGuard = 'sent-only' | 'not-failed';
 // the only place that can see the conversation and answer them.
 interface SendGate { skipIfUnread?: boolean; requireSender?: SenderRequirement }
 
-// Settings → Send as (Page or personal profile; one is always selected), read
-// fresh for every send so a change takes effect on the very next message.
-async function loadSenderRequirement(): Promise<SenderRequirement | undefined> {
-  try {
-    return senderRequirementFrom((await loadStore()).settings);
-  } catch {
-    return undefined;
-  }
+// The campaign's own "Send as" choice (Campaign.sendAs), as the content
+// script's sender check wants it.
+function senderRequirementFor(c: Pick<Campaign, 'sendAs' | 'sendAsPageId'>): SenderRequirement {
+  const { mode, pageId } = campaignSendAs(c);
+  return { requirePage: mode === 'page', pageId };
 }
 
 // A first attempt that read an explicit "Couldn't send" proves both that the
@@ -990,9 +988,8 @@ function shouldRecover(a: Attempt): boolean {
   return a.failureKind !== 'no-composer' && a.failureKind !== 'unavailable' && a.failureKind !== 'unread' && a.failureKind !== 'wrong-sender';
 }
 
-async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolean, gateIn: SendGate = {}): Promise<SendResult> {
+async function sendToRecipient(r: Campaign['recipients'][number], dryRun: boolean, gate: SendGate = {}): Promise<SendResult> {
   const log: string[] = [];
-  const gate: SendGate = { ...gateIn, requireSender: gateIn.requireSender ?? (await loadSenderRequirement()) };
   if (gate.requireSender) {
     log.push(gate.requireSender.requirePage
       ? `sender guard: only as a Page${gate.requireSender.pageId ? ` (${gate.requireSender.pageId})` : ''}`
@@ -1670,6 +1667,8 @@ async function applyAutomationActionsInner(
         recipients: mp.recipients,
         dryRun: message.dryRun,
         skipIfUnread: message.skipIfUnread,
+        sendAs: message.sendAs,
+        sendAsPageId: message.sendAsPageId,
         automationId: automation.id,
         name: `${automation.name} (automation)`,
       });
@@ -2248,7 +2247,7 @@ async function processTick(): Promise<void> {
 
     // Perform the actual send (navigates a tab, types, validates). Minutes can
     // pass in here, so everything below re-reads from storage.
-    const result = await sendToRecipient(r, camp.dryRun, { skipIfUnread: !!camp.skipIfUnread });
+    const result = await sendToRecipient(r, camp.dryRun, { skipIfUnread: !!camp.skipIfUnread, requireSender: senderRequirementFor(camp) });
 
     q = await loadQueue();
     q.inFlight = undefined;

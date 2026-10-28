@@ -46,9 +46,6 @@ import { WebhookSettings } from './WebhookSettings';
 import { InboundWebhookSettings } from './InboundWebhookSettings';
 import { DailyReportSettings } from './DailyReportSettings';
 import { TeamPanel, TeamSyncNotice, useTeamWorkspaceActive } from './TeamSettings';
-import {
-  REQUIRE_PAGE_SENDER_KEY, REQUIRED_PAGE_ID_KEY, SENDER_MODE_KEY, senderRequirementFrom, type SenderIdentity,
-} from '../senderIdentity';
 
 /** Sections of Settings. */
 export type SettingsView = 'account' | 'sync' | 'data' | 'behavior' | 'about';
@@ -244,8 +241,6 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
       <PresetActionsSettings store={store} updateStore={updateStore} />
 
       <SendingPaceSettings store={store} updateStore={updateStore} />
-
-      <SenderIdentitySettings store={store} updateStore={updateStore} />
       </>
       )}
 
@@ -441,96 +436,6 @@ export function SendingPaceSettings({ store, updateStore }: { store: Store; upda
             Reset to defaults
           </Button>
         </Stack>
-      </Stack>
-    </Card>
-  );
-}
-
-// --- Send as: personal profile or Page ---
-//
-// Facebook lets one login act as the person or as a Page they manage, and the
-// switch applies to every tab at once. With this on, campaigns, automations and
-// the send queue refuse to type anything unless the tab is verifiably acting as
-// a Page (and, if an id is given, that Page), and the queue pauses on the first
-// refusal. See senderIdentity.ts and docs/PAGE_SENDER_IDENTITY.md.
-
-// Ask an open Facebook tab who it is acting as. Read-only; opens nothing.
-async function readOpenTabIdentity(): Promise<SenderIdentity | string> {
-  try {
-    const tabs = await chrome.tabs.query({ url: ['https://www.facebook.com/*'] });
-    for (const t of tabs) {
-      if (t.id == null) continue;
-      try {
-        const res = await chrome.tabs.sendMessage(t.id, { type: 'CRM_GET_SENDER_IDENTITY' });
-        if (res && typeof res === 'object' && 'kind' in res) return res as SenderIdentity;
-      } catch { /* no content script in that tab; try the next */ }
-    }
-    return 'Open facebook.com in a tab first (reload it if it was open before the extension updated).';
-  } catch (e) {
-    return String((e as Error)?.message || e);
-  }
-}
-
-export function SenderIdentitySettings({ store, updateStore }: { store: Store; updateStore: (s: Store) => Promise<SaveResult> }) {
-  const settings = (store.settings || {}) as Record<string, unknown>;
-  const req = senderRequirementFrom(settings);
-  const [pageId, setPageId] = useState<string>(typeof settings[REQUIRED_PAGE_ID_KEY] === 'string' ? String(settings[REQUIRED_PAGE_ID_KEY]) : '');
-  const [seen, setSeen] = useState<SenderIdentity | string | null>(null);
-
-  const save = (patch: Record<string, unknown>) =>
-    updateStore({ ...store, settings: { ...settings, ...patch } });
-
-  const check = async () => { setSeen('Checking…'); setSeen(await readOpenTabIdentity()); };
-  const badPageId = pageId.trim() !== '' && !/^\d+$/.test(pageId.trim());
-
-  return (
-    <Card style={{ marginBottom: space.md }}>
-      <Text as="h3" size="strong" weight="semibold" style={{ margin: 0 }}>Send as</Text>
-      <Text as="p" size="small" tone="muted" leading="relaxed" style={{ margin: `${space.xs}px 0 ${space.lg}px` }}>
-        Facebook can act as you or as a Page you manage, and switching applies to every tab. Campaigns, automations
-        and the send queue only send as the identity picked here; anything else is refused before typing, and the
-        first refusal pauses all running campaigns. A Page can only message people who messaged it in the last 24 hours.
-      </Text>
-      <Stack gap="md">
-        <div role="radiogroup" aria-label="Send as" style={{ padding: `${space.sm}px ${space.md}px`, background: color.surface.sunken, borderRadius: radius.sm, display: 'flex', flexDirection: 'column', gap: space.xs }}>
-          {([
-            ['profile', 'Only send as personal profile'],
-            ['page', 'Only send as a Page'],
-          ] as const).map(([mode, label]) => (
-            <label key={mode} style={{ display: 'flex', alignItems: 'center', gap: space.sm, cursor: 'pointer', fontSize: fontSize.small }}>
-              <input
-                type="radio"
-                name="crm-sender-mode"
-                checked={(req.requirePage ? 'page' : 'profile') === mode}
-                onChange={() => void save({ [SENDER_MODE_KEY]: mode, [REQUIRE_PAGE_SENDER_KEY]: mode === 'page' })}
-              />
-              {label}
-            </label>
-          ))}
-        </div>
-        {req.requirePage && <Stack direction="row" gap="sm" align="flex-end" wrap>
-          <FormField label="Only this Page id (optional)">
-            {(p) => (
-              <Input
-                {...p}
-                value={pageId}
-                placeholder="any Page"
-                onChange={(e) => setPageId(e.target.value)}
-                onBlur={() => { if (!badPageId) void save({ [REQUIRED_PAGE_ID_KEY]: pageId.trim() }); }}
-                style={{ width: 200 }}
-              />
-            )}
-          </FormField>
-        </Stack>}
-        <div><Button variant="ghost" onClick={check}>Check who Facebook is acting as</Button></div>
-        {req.requirePage && badPageId && <Banner tone="danger" live>A Page id is digits only. Use “Check who Facebook is acting as” while switched into the Page to see it.</Banner>}
-        {typeof seen === 'string' && <Text as="p" size="small" tone="muted" style={{ margin: 0 }}>{seen}</Text>}
-        {seen && typeof seen === 'object' && (
-          <Banner tone={seen.kind === 'page' ? 'success' : seen.kind === 'personal' ? 'info' : 'warning'} live>
-            {seen.kind === 'page' ? 'Acting as a Page' : seen.kind === 'personal' ? 'Acting as your personal profile' : 'Could not tell'}
-            {seen.name ? `: ${seen.name}` : ''}{seen.actorId ? ` (id ${seen.actorId})` : ''}. {seen.reason}
-          </Banner>
-        )}
       </Stack>
     </Card>
   );

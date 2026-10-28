@@ -24,6 +24,7 @@ import {
   Field as FormField, color, radius, space,
 } from '../ui/primitives';
 import { sendBg, formatRelativeTime } from './shared';
+import { SendAsPicker, sendAsInvalid } from './SendAsPicker';
 import { StepListEditor, RecentCampaignPicker } from './PresetActionsSettings';
 
 interface RunsResponse { runs: AutomationRuns; runningId: string | null; runningIds?: string[] }
@@ -326,7 +327,7 @@ function AutomationCard({
 // ---------------------------------------------------------------------------
 
 function blankMessage(): AutomationMessage {
-  return { template: '', skipIfUnread: false, dryRun: false, oncePerContact: true, maxPerRun: DEFAULT_MESSAGE_CAP };
+  return { template: '', skipIfUnread: false, dryRun: false, oncePerContact: true, maxPerRun: DEFAULT_MESSAGE_CAP, sendAs: 'profile' };
 }
 
 /**
@@ -353,7 +354,8 @@ function AutomationEditor({ initial, store, isNew, onSave, onCancel, onOpenTags,
   const matchCount = useMemo(() => (search ? matchSavedSearch(search, store).length : 0), [search, store]);
 
   const blocked = whyNotRunnable(draft, store);
-  const canSave = draft.name.trim().length > 0 && !blocked;
+  const badSendAs = !!draft.message && sendAsInvalid({ sendAs: draft.message.sendAs, sendAsPageId: draft.message.sendAsPageId });
+  const canSave = draft.name.trim().length > 0 && !blocked && !badSendAs;
 
   return (
     <Card style={{ border: `1px solid ${color.accent.base}` }}>
@@ -515,6 +517,10 @@ function AutomationEditor({ initial, store, isNew, onSave, onCancel, onOpenTags,
                     onChange={(e) => setMessage({ dryRun: e.target.checked })}
                   />
                 </Stack>
+                <SendAsPicker
+                  value={{ sendAs: draft.message.sendAs === 'page' ? 'page' : 'profile', sendAsPageId: draft.message.sendAsPageId }}
+                  onChange={(v) => setMessage({ sendAs: v.sendAs, sendAsPageId: v.sendAsPageId })}
+                />
                 <FormField label="At most, per run">
                   {(fp) => (
                     <Select {...fp} value={String(draft.message!.maxPerRun)} onChange={(e) => setMessage({ maxPerRun: Number(e.target.value) })} style={{ width: 200 }}>

@@ -47,6 +47,7 @@ import { buildThreadIndex } from './contacts';
 import { normalizeSteps, stepsFor, describePreset, type PresetStep } from './presets';
 import { filterByQuery, normalizeQuery, type SavedSearch } from './search';
 import { writeCollection, type SettingsBag, type SettingsCollection } from './settingsMerge';
+import type { SendAsMode } from './campaigns';
 
 /** Where the contacts come from. 'tagUnread' = unread conversations; 'search' = a saved search. */
 export type AutomationKind = 'tagUnread' | 'search';
@@ -67,6 +68,10 @@ export interface AutomationMessage {
   oncePerContact: boolean;
   /** Most contacts one run will message; the rest wait for the next run. */
   maxPerRun: number;
+  /** Which Facebook identity the queued campaign may send as (Campaign.sendAs). Absent = personal profile. */
+  sendAs?: SendAsMode;
+  /** sendAs 'page' only: only this Page id. */
+  sendAsPageId?: string;
 }
 
 export const MESSAGE_CAP_OPTIONS = [10, 25, 50, 100, 250] as const;
@@ -203,6 +208,9 @@ function normalizeMessage(raw: unknown): AutomationMessage | null {
     dryRun: o.dryRun === true,
     oncePerContact: o.oncePerContact !== false,
     maxPerRun: cap,
+    sendAs: o.sendAs === 'page' ? 'page' : 'profile',
+    ...(o.sendAs === 'page' && typeof o.sendAsPageId === 'string' && /^\d+$/.test(o.sendAsPageId.trim())
+      ? { sendAsPageId: o.sendAsPageId.trim() } : {}),
   };
 }
 

@@ -32,6 +32,8 @@ import {
 } from './shared';
 import { bucketTags, showsGroupLabels } from '../tagGrouping';
 import { useSearchTagGrouping } from './SearchBuilder';
+import { SendAsPicker, sendAsInvalid, type SendAsValue } from './SendAsPicker';
+import type { SendAsMode } from '../campaigns';
 
 // Inline code sample in the composer's help text.
 const codeStyle: React.CSSProperties = { background: color.surface.sunken, padding: '1px 5px', borderRadius: 4 };
@@ -98,6 +100,19 @@ export function StatusBadge({ status }: { status: Campaign['status'] }) {
 }
 
 /** Marks a campaign that holds back anyone who hasn't read the last message. */
+/** Shown on campaigns that send as a Page; the personal profile is the norm and gets no chip. */
+export function SendAsChip({ campaign }: { campaign: Pick<Campaign, 'sendAs' | 'sendAsPageId'> }) {
+  if (campaign.sendAs !== 'page') return null;
+  return (
+    <span
+      title={campaign.sendAsPageId ? `Only sends while Facebook is acting as Page ${campaign.sendAsPageId}` : 'Only sends while Facebook is acting as a Page'}
+      style={{ background: color.surface.sunken, color: color.text.secondary, padding: '3px 9px', borderRadius: 12, fontSize: 11, fontWeight: 700, border: `1px solid ${color.border.control}` }}
+    >
+      As a Page{campaign.sendAsPageId ? ` · ${campaign.sendAsPageId}` : ''}
+    </span>
+  );
+}
+
 export function UnreadGateChip() {
   return (
     <span
@@ -164,6 +179,10 @@ export interface ComposerDraft {
   selected: string[];
   dryRun: boolean;
   skipIfUnread: boolean;
+  /** Which identity this campaign may send as. Absent on drafts saved before
+   *  this existed, which read as the personal profile. */
+  sendAs?: SendAsMode;
+  sendAsPageId?: string;
   /** Pace for THIS campaign, seeded from the saved one in Settings. */
   pace: SendingPace;
   /** Picker narrowed to these ids (see ComposeSeed.restrict), or null for everyone. */
@@ -173,7 +192,7 @@ export interface ComposerDraft {
 }
 
 export function emptyComposerDraft(pace: SendingPace): ComposerDraft {
-  return { template: '', selected: [], dryRun: false, skipIfUnread: false, pace, restrictTo: null, note: null };
+  return { template: '', selected: [], dryRun: false, skipIfUnread: false, sendAs: 'profile', pace, restrictTo: null, note: null };
 }
 
 export interface MessagingPanelProps {
@@ -211,6 +230,7 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
   const patch = (p: Partial<ComposerDraft>) => onDraftChange({ ...draft, ...p });
 
   const { template, dryRun, skipIfUnread } = draft;
+  const sendAsValue: SendAsValue = { sendAs: draft.sendAs === 'page' ? 'page' : 'profile', sendAsPageId: draft.sendAsPageId };
   const { minDelay, maxDelay, batchSize, pauseMin, pauseMax } = draft.pace;
   const setPace = (p: Partial<SendingPace>) => patch({ pace: { ...draft.pace, ...p } });
   // Stored as arrays (a draft has to be a plain object), used as sets.
@@ -312,6 +332,7 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
     if (selectedWithUrl.length === 0) { setError('Select at least one recipient with a saved chat URL.'); return; }
     if (minDelay > maxDelay) { setError('Min delay cannot be greater than max delay.'); return; }
     if (pauseMin > pauseMax) { setError('Min pause cannot be greater than max pause.'); return; }
+    if (sendAsInvalid(sendAsValue)) { setError('The Page id must be digits only, or left blank for any Page.'); return; }
 
     setStarting(true);
     const recipients = selectedWithUrl.map((c) => ({ threadId: c.id, participantName: c.participantName, chatUrl: c.chatUrl }));
@@ -323,6 +344,8 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
         recipients,
         dryRun,
         skipIfUnread,
+        sendAs: sendAsValue.sendAs,
+        ...(sendAsValue.sendAs === 'page' && sendAsValue.sendAsPageId?.trim() ? { sendAsPageId: sendAsValue.sendAsPageId.trim() } : {}),
         config: {
           minDelayMs: Math.round(minDelay * 60000),
           maxDelayMs: Math.round(maxDelay * 60000),
@@ -527,6 +550,9 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
               )}
             </span>
           </label>
+          <div style={{ marginBottom: 10 }}>
+            <SendAsPicker value={sendAsValue} onChange={(v) => patch({ sendAs: v.sendAs, sendAsPageId: v.sendAsPageId })} />
+          </div>
           <button
             onClick={start}
             disabled={starting}
@@ -1185,7 +1211,7 @@ export function ActiveCampaignCard({ campaign, queue, isNext, onChanged }: { cam
         <div style={{ minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{campaign.name}</div>
           <MessagePreview campaign={campaign} />
-          <div style={{ marginTop: 4, display: 'flex', gap: 6 }}><StatusBadge status={campaign.status} />{campaign.dryRun && <DryRunChip />}{campaign.skipIfUnread && <UnreadGateChip />}</div>
+          <div style={{ marginTop: 4, display: 'flex', gap: 6 }}><StatusBadge status={campaign.status} />{campaign.dryRun && <DryRunChip />}{campaign.skipIfUnread && <UnreadGateChip />}<SendAsChip campaign={campaign} /></div>
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
           {campaign.status === 'running' && (
@@ -1533,6 +1559,7 @@ export function CampaignHistoryCard({ campaign, onChanged, store, onViewProfile,
           <span>/ {sum.total}</span>
           {campaign.dryRun && <DryRunChip />}
           {campaign.skipIfUnread && <UnreadGateChip />}
+          <SendAsChip campaign={campaign} />
           {campaign.archived && (
             <span title="Filed away — hidden from Past sends by default, and its failures are no longer reported" style={{ background: color.surface.sunken, color: color.text.muted, padding: '3px 9px', borderRadius: 12, fontSize: 11, fontWeight: 700 }}>
               Archived
