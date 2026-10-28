@@ -279,4 +279,12 @@ describe('message text in contact history', () => {
     expect(parseHistory(out.store.history?.a)).toEqual([expect.objectContaining({ op: 'm' })]);
     expect(parseHistory(out.store.history?.a)[0].arg).toBeUndefined();
   });
+
+  it('a dry run is logged but does not count as contacting them', () => {
+    const a = { ...conv([]), id: 'a', lastContactedAt: 5, updatedAt: 5 };
+    const out = applyMutations(storeWith(a), [{ op: 'markContacted', conversationId: 'a', message: 'hi', dryRun: true }]);
+    expect(out.store.conversations.a.lastContactedAt).toBe(5);
+    expect(out.store.conversations.a.updatedAt).toBe(5);
+    expect(parseHistory(out.store.history?.a)).toEqual([expect.objectContaining({ op: 'm' })]);
+  });
 });

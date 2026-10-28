@@ -14,7 +14,7 @@ import {
   QueryGroup, QueryNode, Condition, Combinator, SavedSearch, DurationUnit,
   FieldDef, QueryContext,
   buildFields, findField, operatorsFor, operatorDef,
-  newGroup, newCondition, conditionIssue, describeQuery, isQueryEmpty, sortSavedSearches,
+  newGroup, newCondition, switchConditionField, conditionIssue, describeQuery, isQueryEmpty, sortSavedSearches,
   TODAY_TOKEN, isTodayToken, moveNode,
 } from '../search';
 
@@ -329,13 +329,8 @@ function ConditionRow({ cond, fields, ctx, tagGrouping, onChange, onRemove }: Co
   const def = operatorDef(kind, cond.op);
   const issue = conditionIssue(cond, fields);
 
-  // Switching field resets the operator and every operand — the old ones rarely
-  // make sense against a different kind, and a stale `values` array would
-  // silently keep filtering.
-  const changeField = (key: string) => {
-    const fresh = newCondition(key, findField(fields, key)?.kind ?? 'text');
-    onChange({ ...fresh, id: cond.id });
-  };
+  // Same data type keeps the operator and values; a different one starts over.
+  const changeField = (key: string) => onChange(switchConditionField(cond, fields, key));
 
   const changeOp = (op: string) => {
     const nextArity = operatorDef(kind, op)?.arity;

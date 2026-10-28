@@ -398,6 +398,44 @@ export function newCondition(field = 'name', kind: FieldKind = 'text'): Conditio
   return cond;
 }
 
+// Kinds whose operators and operands are interchangeable. A tag-date field is
+// a date test with a tag picker in front of it, so a date condition can move
+// to or from it without losing "in the last 30 days".
+const isDateKind = (k: FieldKind) => k === 'date' || k === 'tagDate';
+const sameDataType = (a: FieldKind, b: FieldKind) => a === b || (isDateKind(a) && isDateKind(b));
+
+/**
+ * Point a condition at a different field.
+ *
+ * Moving between fields of the same data type (Last contacted → Last
+ * activity, one text field → another) keeps the operator and values: they are
+ * most likely exactly what the user wants to test on the new field. A change
+ * of data type starts over, because the old operands mean nothing there and a
+ * stale `values` array would silently keep filtering. Within a type, operands
+ * that can't apply to the new field are still dropped: enum choices the new
+ * field doesn't offer, a funnel stage from another funnel, and the tag picker
+ * when leaving a per-tag date field.
+ */
+export function switchConditionField(cond: Condition, fields: FieldDef[], nextKey: string): Condition {
+  if (nextKey === cond.field) return cond;
+  const prevKind = findField(fields, cond.field)?.kind;
+  const nextField = findField(fields, nextKey);
+  const nextKind = nextField?.kind ?? 'text';
+  if (!prevKind || !sameDataType(prevKind, nextKind)) {
+    return { ...newCondition(nextKey, nextKind), id: cond.id };
+  }
+  const next: Condition = { ...cond, field: nextKey };
+  if (nextKind !== 'tagDate') delete next.tagIds;
+  if (nextKind === 'enum' && next.values) {
+    const allowed = new Set(nextField?.options || []);
+    next.values = next.values.filter((v) => allowed.has(v));
+  }
+  if (nextKind === 'funnelStage' && next.value && !(nextField?.stages || []).some((s) => s.id === next.value)) {
+    next.value = '';
+  }
+  return next;
+}
+
 export function emptyQuery(): QueryGroup {
   return newGroup('and', []);
 }

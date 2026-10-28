@@ -581,7 +581,11 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
         return { store, changed: false, conversationId: m.conversationId };
       }
       const next = copy(store);
-      next.conversations[m.conversationId] = { ...conv, lastContactedAt: now, updatedAt: now };
+      // "Last contacted" means a message actually went out. A dry run sent
+      // nothing, so it only leaves its history line (marked as a dry run).
+      if (!m.dryRun) {
+        next.conversations[m.conversationId] = { ...conv, lastContactedAt: now, updatedAt: now };
+      }
       // Logged here rather than by saveStore's diff: lastContactedAt also moves
       // on a contact merge or a CSV import, neither of which sent anything.
       next.history = { ...(store.history || {}) };
