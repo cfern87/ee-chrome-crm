@@ -26,3 +26,23 @@ export function profileOwnerIdFromHtml(html: string): string | null {
 export function isPlaceholderThreadText(mainText: string): boolean {
   return /^\s*conversation with facebook user\b/i.test(mainText);
 }
+
+// A real encrypted chat also reads "Facebook user" for its first moments,
+// until the contact's name loads (2026-10-27: 11 real chats were refused this
+// way). So the header only counts once it has stayed a placeholder for the
+// whole wait. Seen live 2026-10-28: Jocelyn Mazelow's 7504243136350899, called
+// a placeholder on 10-18, is her real chat.
+export async function staysPlaceholder(
+  readMainText: () => string,
+  timeoutMs: number,
+  intervalMs = 300,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+  now: () => number = Date.now
+): Promise<boolean> {
+  const deadline = now() + timeoutMs;
+  for (;;) {
+    if (!isPlaceholderThreadText(readMainText())) return false;
+    if (now() >= deadline) return true;
+    await sleep(intervalMs);
+  }
+}

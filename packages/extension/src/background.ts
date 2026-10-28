@@ -73,6 +73,7 @@ import {
   readNoticeState,
   summarize,
   postedUnconfirmed,
+  afterReloadCheck,
 } from './campaigns';
 import {
   heartbeat,
@@ -817,7 +818,49 @@ async function attemptSend(tabId: number, r: Campaign['recipients'][number], dry
     return { ok: false, error: 'No response from content script (tab closed or send timed out)' };
   }
   log.push(...(res.log || []));
-  return { ok: res.ok, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus };
+  const out: Attempt = { ok: res.ok, error: res.error, failureKind: res.failureKind, deliveryStatus: res.deliveryStatus };
+  if (dryRun || !postedUnconfirmed(out)) return out;
+
+  // Posted, but no status within the wait. Reload the chat and read again
+  // (nothing is typed). On 2026-10-27 all 12 of these were delivered, and a
+  // fresh page shows their "Sent" at once. The chat the send ended on is the
+  // one to reload: after a Continue click that is the encrypted chat, not the
+  // URL we navigated to.
+  const url = (await getTab(tabId))?.url || '';
+  if (!/\/messages\/(e2ee\/)?t\//.test(url)) return out;
+  log.push(`posted with no status — reloading ${url} to read it again`);
+  const t = await ensureSenderTab(url, log);
+  if (t == null) return out;
+  const verdict = await checkDeliveryOnTab(t, r.renderedMessage, log);
+  if (verdict === 'sent') log.push('delivery confirmed after reload');
+  return afterReloadCheck(out, verdict);
+}
+
+// Facebook's verdict on a message already in the open chat, from the content
+// script's read-only check. 'unknown' covers "not found" and "no status".
+async function checkDeliveryOnTab(tabId: number, message: string, log: string[]): Promise<'sent' | 'failed' | 'unknown'> {
+  if (!(await waitForContentReady(tabId, log, 'messages'))) return 'unknown';
+  const res = await sendViaPort<{ ok: boolean; status?: string; log?: string[] }>(
+    tabId,
+    { type: 'CRM_CHECK_DELIVERY', payload: { message } },
+    75_000
+  );
+  if (!res) {
+    log.push('delivery check: no response from the page');
+    return 'unknown';
+  }
+  log.push(...(res.log || []));
+  return res.status === 'sent' || res.status === 'failed' ? res.status : 'unknown';
+}
+
+// Open the recipient's chat and check whether an interrupted send got through.
+async function checkInterruptedSend(r: Campaign['recipients'][number], log: string[]): Promise<'sent' | 'failed' | 'unknown'> {
+  const chatUrl = await resolveChatUrl(r, log);
+  if (!chatUrl) return 'unknown';
+  log.push(`checking whether the interrupted send arrived: ${chatUrl}`);
+  const tabId = await ensureSenderTab(chatUrl, log);
+  if (tabId == null) return 'unknown';
+  return checkDeliveryOnTab(tabId, r.renderedMessage, log);
 }
 
 // ---- Recovery: repair the conversation link via the contact's profile ----
@@ -2069,15 +2112,45 @@ async function processTick(): Promise<void> {
     // expensive mistake. So it becomes an explicit decision instead: park it as
     // an unconfirmed failure and let the user hit Requeue once they have looked
     // at the thread.
+    //
+    // Before parking it, look: the chat itself says whether it arrived. All four
+    // interrupted sends on 2026-10-27 had. This only reads, never types, so it
+    // can't cause the duplicate the paragraph above is avoiding.
     if (r.status === 'sending') {
-      r.status = 'error';
-      r.error = 'Interrupted mid-send — delivery unconfirmed';
-      r.errorKind = 'unconfirmed';
-      r.failedAt = Date.now();
-      r.log = [...(r.log || []), `interrupted after ${r.attempts} attempt(s); not retried automatically`];
-      camp.cursor = idx + 1;
-      sweepFinished(all);
-      await saveCampaigns(all);
+      const checkLog: string[] = [`interrupted after ${r.attempts} attempt(s); not retried automatically`];
+      const verdict = camp.dryRun ? 'unknown' : await checkInterruptedSend(r, checkLog);
+
+      // The check navigates and waits, so re-read before writing.
+      const fresh = await loadCampaigns();
+      const fc = fresh.find((c) => c.id === camp.id);
+      const fr = fc?.recipients.find((x) => x.threadId === r.threadId);
+      if (fc && fr && fr.status === 'sending') {
+        fr.log = [...(fr.log || []), ...checkLog];
+        if (verdict === 'sent') {
+          fr.status = 'sent';
+          fr.sentAt = Date.now();
+          fr.error = undefined;
+          fr.errorKind = undefined;
+          fr.failedAt = undefined;
+          fr.log.push('found delivered in the chat — marked sent');
+          void dispatchWebhook('message.sent', {
+            campaign: { id: fc.id, name: fc.name, dryRun: fc.dryRun },
+            contact: { id: fr.threadId, name: fr.participantName, chatUrl: fr.chatUrl },
+            message: fr.renderedMessage,
+            dryRun: fc.dryRun,
+          });
+        } else {
+          fr.status = 'error';
+          fr.error = verdict === 'failed'
+            ? "Interrupted mid-send — Facebook shows it as Couldn't send"
+            : 'Interrupted mid-send — delivery unconfirmed';
+          fr.errorKind = verdict === 'failed' ? 'not-delivered' : 'unconfirmed';
+          fr.failedAt = Date.now();
+        }
+        fc.cursor = fc.recipients.indexOf(fr) + 1;
+      }
+      sweepFinished(fresh);
+      await saveCampaigns(fresh);
       pushQueueSoon();
       scheduleTick(1_000);
       return;

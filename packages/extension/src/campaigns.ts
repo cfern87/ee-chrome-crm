@@ -532,6 +532,26 @@ export function postedUnconfirmed(a: { ok: boolean; deliveryStatus?: string }): 
   return !a.ok && (a.deliveryStatus === 'unknown' || a.deliveryStatus === 'pending');
 }
 
+// What a posted-but-unconfirmed send becomes once the chat has been reloaded
+// and read again (nothing retyped). 'sent' is a success. 'failed' is Facebook's
+// own "Couldn't send", the same verdict a first attempt can read, so it gets
+// the same recovery. 'unknown' leaves the attempt exactly as it was.
+export function afterReloadCheck<A extends { ok: boolean; error?: string; failureKind?: SendFailureKind; deliveryStatus?: string }>(
+  attempt: A,
+  verdict: 'sent' | 'failed' | 'unknown'
+): A | { ok: boolean; error?: string; failureKind?: SendFailureKind; deliveryStatus: string } {
+  if (verdict === 'sent') return { ok: true, deliveryStatus: 'sent' };
+  if (verdict === 'failed') {
+    return {
+      ok: false,
+      error: "Facebook couldn't send the message (seen after reloading the chat)",
+      failureKind: 'not-delivered',
+      deliveryStatus: 'failed',
+    };
+  }
+  return attempt;
+}
+
 export function failedRecipients(c: Campaign): CampaignRecipient[] {
   return c.recipients.filter((r) => r.status === 'error');
 }

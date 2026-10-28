@@ -3,7 +3,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   campaignMatchesQuery, matchingRecipients, failedRecipients, collectUnseenFailures,
-  failureReport, capLog, MAX_LOG_LINES, postedUnconfirmed,
+  failureReport, capLog, MAX_LOG_LINES, postedUnconfirmed, afterReloadCheck,
   type Campaign, type CampaignRecipient,
 } from './campaigns';
 
@@ -191,5 +191,25 @@ describe('postedUnconfirmed', () => {
     expect(postedUnconfirmed({ ok: false })).toBe(false);
     expect(postedUnconfirmed({ ok: false, deliveryStatus: 'failed' })).toBe(false);
     expect(postedUnconfirmed({ ok: true, deliveryStatus: 'sent' })).toBe(false);
+  });
+});
+
+describe('afterReloadCheck', () => {
+  const posted = { ok: false, error: 'Message was not confirmed as sent (status: unknown)', failureKind: 'unconfirmed' as const, deliveryStatus: 'unknown' };
+
+  it('turns a posted message into a success when the reloaded chat shows Sent', () => {
+    expect(afterReloadCheck(posted, 'sent')).toEqual({ ok: true, deliveryStatus: 'sent' });
+  });
+
+  it("treats Couldn't send after reload like any other Couldn't send, so recovery can run", () => {
+    const r = afterReloadCheck(posted, 'failed');
+    expect(r).toMatchObject({ ok: false, failureKind: 'not-delivered', deliveryStatus: 'failed' });
+    expect(postedUnconfirmed(r)).toBe(false);
+  });
+
+  it('leaves the attempt alone when the reload still shows nothing, so nothing is resent', () => {
+    const r = afterReloadCheck(posted, 'unknown');
+    expect(r).toBe(posted);
+    expect(postedUnconfirmed(r)).toBe(true);
   });
 });

@@ -56,7 +56,7 @@ import { noteState, buildReport, emptyReport, type ScanReport } from './readScan
 import type { UnreadScanReport, UnreadThread } from './automations';
 import type { SendFailureKind } from './campaigns';
 import { isE2eeThreadUrl, threadChatUrl } from './threadUrl';
-import { isPlaceholderThreadText, profileOwnerIdFromHtml } from './profileOwner';
+import { isPlaceholderThreadText, profileOwnerIdFromHtml, staysPlaceholder } from './profileOwner';
 
 const THREAD_RE = /\/t\/([^/?#]+)/;
 const COLORS = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E2'];
@@ -3603,6 +3603,11 @@ function deliveryStatuses(scope: HTMLElement, target: string): DeliveryStatus[] 
 // SEND_PORT_TIMEOUT_MS for the whole send, which has to cover this too.
 const DELIVERY_STATUS_TIMEOUT_MS = 60_000;
 
+// How long a "Facebook user" header may take to turn into the contact's name
+// before we believe the thread really is a placeholder. A genuine placeholder
+// never changes (it still read "Loading..." after 15s, measured 2026-10-28).
+const PLACEHOLDER_SETTLE_MS = 10_000;
+
 async function pollDeliveryStatus(paneOf: () => HTMLElement, target: string, timeoutMs: number): Promise<DeliveryStatus> {
   const terminal = await pollFor(() => {
     const all = deliveryStatuses(paneOf(), target);
@@ -4575,14 +4580,26 @@ async function performAutomatedSend(threadId: string, rawMessage: string, dryRun
   stamp('composer found');
 
   // 3. Type, send, and validate against the conversation pane.
-  const scope = (document.querySelector('[role="main"]') as HTMLElement) || document.body;
+  const currentMain = () => (document.querySelector('[role="main"]') as HTMLElement) || document.body;
+  let scope = currentMain();
 
   // A thread id that maps to nobody: refuse before typing rather than send a
   // message Facebook is certain to reject. 'unconfirmed' so the caller still
   // runs profile recovery, which finds the person's real conversation.
+  //
+  // Only once the header has had time to settle. A real encrypted chat ALSO
+  // reads "Conversation with Facebook user" for the first moments of a load,
+  // before the name arrives. Checked the instant the composer appeared, that
+  // sent 11 real conversations into recovery on 2026-10-27, which then landed
+  // back on the same chats and posted with no readable status.
   if (isPlaceholderThreadText(scope.innerText || '')) {
-    stamp(`thread is a "Facebook user" placeholder — this id is not the contact's conversation; nothing typed`);
-    return { ok: false, error: 'Saved chat link opens an empty "Facebook user" conversation', failureKind: 'unconfirmed', log };
+    if (await staysPlaceholder(() => currentMain().innerText || '', PLACEHOLDER_SETTLE_MS)) {
+      stamp(`thread is a "Facebook user" placeholder after ${PLACEHOLDER_SETTLE_MS / 1000}s — this id is not the contact's conversation; nothing typed`);
+      return { ok: false, error: 'Saved chat link opens an empty "Facebook user" conversation', failureKind: 'unconfirmed', log };
+    }
+    scope = currentMain();
+    stamp(`header read "Facebook user" while loading, then settled to "${normalizeText(scope.innerText || '').slice(0, 60)}" — continuing`);
+    composer = findComposer() || composer;
   }
   const res = await typeSendAndConfirm(composer, scope, message, dryRun, stamp, opts, () => findComposer(),
     () => document.querySelector('[role="main"]') as HTMLElement | null);
@@ -4599,6 +4616,51 @@ async function performAutomatedSend(threadId: string, rawMessage: string, dryRun
   if (!dryRun) noteReadState(threadId, 'unread');
 
   return { ok: true, deliveryStatus: res.deliveryStatus, log };
+}
+
+// ---- Read-only delivery check ----
+//
+// Facebook's verdict on a message that is ALREADY in this thread, read from a
+// freshly loaded page. Never types anything.
+//
+// Why it exists: on 2026-10-27, 12 sends made right after clicking Continue
+// (archive → encrypted chat, in the same page) posted their bubble and then
+// showed no status for the full 60s. Every one was delivered: reloaded, the
+// same reader finds "Sent" on them straight away. Four more were cut off
+// mid-send by the worker, and all four were delivered too. So the background
+// reloads and asks here before calling a posted message unconfirmed.
+async function checkDelivery(rawMessage: string): Promise<{ ok: boolean; status: DeliveryStatus; copies: number; log: string[] }> {
+  // normalizeText folds every kind of line break to a space, so this matches
+  // the target performAutomatedSend used.
+  const target = normalizeText(rawMessage);
+  const log: string[] = [];
+  const stamp = (m: string) => log.push(`[${new Date().toISOString()}] ${m}`);
+  const pane = () => (document.querySelector('[role="main"]') as HTMLElement) || document.body;
+  const copies = () => findMessageNodes(pane(), target).length;
+
+  stamp(`delivery check at ${window.location.href}`);
+  await pollFor(() => copies() > 0 || findComposer() || findContinueButton(), 15_000, 300);
+
+  // An account-id URL opens the pre-encryption archive; the message is on the
+  // other side of Continue.
+  if (!copies()) {
+    const cont = findContinueButton();
+    if (cont) {
+      stamp('message not in view — clicking Continue');
+      cont.click();
+      await pollFor(() => findComposer(), 15_000, 300);
+    }
+  }
+  // History can arrive after the composer does.
+  await pollFor(() => copies() > 0, 15_000, 400);
+  const n = copies();
+  if (!n) {
+    stamp('message not found in this thread');
+    return { ok: true, status: 'unknown', copies: 0, log };
+  }
+  const status = await pollDeliveryStatus(pane, target, 15_000);
+  stamp(`${n} cop${n === 1 ? 'y' : 'ies'} of the message here; newest reads ${status} ("${deliveryStatusDetail(pane(), target)}")`);
+  return { ok: true, status, copies: n, log };
 }
 
 // ---- Recovery path: send from the contact's profile ----
@@ -4919,6 +4981,8 @@ function handleCrmRequest(request: any): Promise<unknown> | null {
       return performDrawerSend(String(payload.threadId), String(payload.message), !!payload.dryRun, { skipIfDelivered: guard, skipIfUnread, observeAs: String(payload.threadId) });
     case 'CRM_RESOLVE_PROFILE':
       return resolveProfileThreadFor(String(payload.threadId || ''));
+    case 'CRM_CHECK_DELIVERY':
+      return checkDelivery(String(payload.message || ''));
     case 'CRM_SCAN_READ_STATES':
       return scanReadStates(
         Array.isArray(payload.threadIds) ? payload.threadIds.map(String) : [],
