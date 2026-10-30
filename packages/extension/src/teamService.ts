@@ -5,8 +5,9 @@
 // handler, the alarm, and the "a save happened" listener.
 
 import {
-  forgetTeamCache, isTeamDirty, readPersonalCache, readTeamBase, readTeamCache,
-  replaceTeamCache, setTeamDirty, switchWorkspace, writeTeamBase, EMPTY_STORE, type Store,
+  forgetTeamCache, isTeamDirty, loadStore, readPersonalCache, readTeamBase, readTeamCache,
+  replaceTeamCache, saveStore, setTeamDirty, switchWorkspace, writeTeamBase, EMPTY_STORE,
+  type SaveResult, type Store,
 } from './storage';
 import { normalizeStoreShape } from './drive';
 import {
@@ -15,6 +16,7 @@ import {
   type TeamClient, type TeamSyncMeta, type WorkspaceInfo, type WorkspacesCache,
 } from './team';
 import { syncTeamOnce, type TeamSyncResult } from './teamSync';
+import { foldWorkspaceInto, personalAfterMove, teamSeedFrom, type TeamSeed } from './workspaceTransfer';
 
 export interface TeamServiceDeps {
   client: TeamClient;
@@ -34,6 +36,13 @@ export interface WorkspacesView {
   /** Sync state of the active team workspace. */
   sync?: TeamSyncMeta & { dirty: boolean };
   isPro: boolean;
+  /** The signed-in platform email, lower-cased (for "runs on my computer"). */
+  myEmail?: string;
+}
+
+/** A save that wrote nothing at all (as opposed to one still waiting to sync). */
+function saveFailed(r: SaveResult): boolean {
+  return !!r.signedOut || !!r.planLimitReached || (!r.ok && r.pending === 0);
 }
 
 type Ok<T = object> = { ok: true } & T;
@@ -77,7 +86,11 @@ export function makeTeamService(deps: TeamServiceDeps) {
     let cache: WorkspacesCache & { setupPending?: boolean } = await getCachedWorkspaces();
     if (refresh || Date.now() - cache.checkedAt > WORKSPACES_TTL_MS) cache = await refreshWorkspaces();
     const active = await getActiveWorkspaceId();
-    const view: WorkspacesView = { active, ...cache, isPro: await deps.isPro().catch(() => false) };
+    const me = await deps.myEmail().catch(() => null);
+    const view: WorkspacesView = {
+      active, ...cache, isPro: await deps.isPro().catch(() => false),
+      ...(me ? { myEmail: me.toLowerCase() } : {}),
+    };
     if (isTeamWorkspace(active)) {
       view.sync = { ...(await getTeamSyncMeta(active)), dirty: await isTeamDirty(active) };
     }
@@ -162,32 +175,87 @@ export function makeTeamService(deps: TeamServiceDeps) {
   }
 
   /**
-   * Root account creates its team. When it is NEW, `seedFromPersonal` copies
-   * the personal contacts in as the starting point (the personal workspace
-   * keeps its own copy).
+   * Root account creates its team. When it is NEW, `seed` decides what it
+   * starts with (see TeamSeed):
+   *   * 'copy'  - Personal's contacts, tags, fields and searches are copied in;
+   *   * 'move'  - everything, automations and webhooks included, moves in and
+   *               Personal is emptied - but only once the server has the team's
+   *               copy, so a failed upload can never lose anything;
+   *   * 'empty' - nothing.
    */
-  async function createTeam(name: string, seedFromPersonal: boolean): Promise<Ok<{ id: string }> | Err> {
+  async function createTeam(name: string, seed: TeamSeed): Promise<Ok<{ id: string; moved?: boolean; warning?: string }> | Err> {
     if (!(await deps.isPro())) return { ok: false, error: 'Team workspaces are part of Pro. Upgrade to create one.' };
     const before = await client.myWorkspaces();
     const existed = before.ok && (before as { list: WorkspaceInfo[] }).list.some((w) => w.role === 'owner');
     const r = await client.createTeam(name);
     if (!r.ok) return r as Err;
     const id = (r as { id: string }).id;
-    if (!existed && seedFromPersonal) {
-      const personal = await readPersonalCache();
-      if (personal) {
-        // Contacts and their tags/fields/searches/notes/history — but NOT the
-        // settings bag: it holds webhook URLs, automations and other things
-        // that are this person's, not the team's.
-        await replaceTeamCache(id, { ...personal, settings: {} });
+    let moved = false;
+    let warning: string | undefined;
+    if (!existed && seed !== 'empty') {
+      // Personal's latest, read under the lock so a save in flight lands first.
+      const personal = await deps.withStoreLock(() => readPersonalCache());
+      const start = personal ? teamSeedFrom(personal, seed) : null;
+      if (start) {
+        await replaceTeamCache(id, start);
         await setTeamDirty(id, true);
+        if (seed === 'move') {
+          const up = await syncOnce(id);
+          if (up.ok && !(await isTeamDirty(id))) {
+            if (await clearPersonalAfterMove()) moved = true;
+            else warning = 'The team has a full copy, but your Personal workspace could not be emptied, so it still holds its own copy.';
+          } else {
+            warning = "The team got a copy, but the upload didn't finish, so your Personal workspace was left as it was. Nothing was lost.";
+          }
+        }
       }
     }
     await refreshWorkspaces();
-    // Open the new workspace; this also uploads the seed.
+    // Open the new workspace; for a copy this also uploads the seed.
     const sw = await switchTo(id);
     if (!sw.ok) return sw as Err;
-    return { ok: true, id };
+    return { ok: true, id, ...(moved ? { moved } : {}), ...(warning ? { warning } : {}) };
+  }
+
+  /** Empty Personal after its contents moved to a team. */
+  async function clearPersonalAfterMove(): Promise<boolean> {
+    if ((await getActiveWorkspaceId()) !== PERSONAL_WORKSPACE) await switchWorkspace(PERSONAL_WORKSPACE);
+    return deps.withStoreLock(async () => {
+      const store = await loadStore();
+      return !saveFailed(await saveStore(personalAfterMove(store)));
+    });
+  }
+
+  /**
+   * Fold `source` into workspace `targetId` (Personal or a team this account
+   * can write to). Switches to the target, as that is where the user will
+   * want to look next.
+   */
+  async function mergeInto(targetId: string, source: Store): Promise<Ok | Err> {
+    if (isTeamWorkspace(targetId)) {
+      const sw = await switchTo(targetId);
+      if (!sw.ok) return sw as Err;
+      const pulled = (sw as { sync?: TeamSyncResult }).sync;
+      if (pulled && !pulled.ok) return { ok: false, error: `Couldn't reach the other team workspace: ${(pulled as { error: string }).error}` };
+    } else {
+      await switchWorkspace(PERSONAL_WORKSPACE);
+    }
+    const saved = await deps.withStoreLock(async () => {
+      const store = await loadStore();
+      return saveStore(foldWorkspaceInto(store, source));
+    });
+    if (saveFailed(saved)) return { ok: false, error: saved.reason || 'The merge could not be saved.' };
+    if (isTeamWorkspace(targetId)) {
+      const up = await syncActiveTeam();
+      if (!up.ok) return { ok: false, error: `Merged on this computer, but the upload failed: ${(up as { error: string }).error}` };
+    }
+    return { ok: true };
+  }
+
+  /** Where a team's data may be merged to before it's deleted. */
+  async function mergeTargets(excludeId: string): Promise<string[]> {
+    const list = (await getCachedWorkspaces()).list;
+    return [PERSONAL_WORKSPACE, ...list.filter((w) => w.id !== excludeId && w.status === 'active' && w.active).map((w) => w.id)];
   }
 
   async function invite(teamId: string, email: string): Promise<Ok | Err> {
@@ -220,7 +288,26 @@ export function makeTeamService(deps: TeamServiceDeps) {
     return { ok: true };
   }
 
-  async function deleteTeam(teamId: string): Promise<Ok | Err> {
+  /**
+   * Delete a team. With `mergeIntoId`, its contacts, automations and webhooks
+   * are first merged into that workspace; the team is deleted only once the
+   * merge is saved, so a failure leaves both intact.
+   */
+  async function deleteTeam(teamId: string, mergeIntoId?: string): Promise<Ok | Err> {
+    if (mergeIntoId) {
+      if (!(await mergeTargets(teamId)).includes(mergeIntoId)) {
+        return { ok: false, error: "That workspace can't take the merge (it's read-only, or you're not in it)." };
+      }
+      // Latest copy first, so teammates' last edits come along.
+      const fresh = (await getActiveWorkspaceId()) === teamId ? await syncActiveTeam() : await syncOnce(teamId);
+      if (!fresh.ok) {
+        return { ok: false, error: `Couldn't fetch the team's latest data, so nothing was deleted: ${(fresh as { error: string }).error}` };
+      }
+      const source = await readTeamCache(teamId);
+      if (!source) return { ok: false, error: "This computer has no copy of the team's data, so nothing was deleted." };
+      const merged = await mergeInto(mergeIntoId, normalizeStoreShape(source));
+      if (!merged.ok) return { ok: false, error: `${(merged as Err).error} The team was not deleted.` };
+    }
     const r = await client.deleteTeam(teamId);
     if (!r.ok) return r as Err;
     if ((await getActiveWorkspaceId()) === teamId) await switchWorkspace(PERSONAL_WORKSPACE);
@@ -230,19 +317,24 @@ export function makeTeamService(deps: TeamServiceDeps) {
   }
 
   /**
-   * Scheduled automations stored in a team run only on the owner's machine —
-   * otherwise every member's browser would run the same job.
+   * Scheduled jobs stored in a team run on ONE member's machine, or every
+   * member's browser would run the same job. An automation picks whose
+   * (`runOn`, an email); without one, and for the daily report, it's the
+   * owner's. In Personal every job may run here.
    */
-  async function mayRunScheduledAutomations(): Promise<boolean> {
+  async function mayRunScheduledAutomations(job?: { runOn?: string }): Promise<boolean> {
     const active = await getActiveWorkspaceId();
     if (!isTeamWorkspace(active)) return true;
     const info = (await getCachedWorkspaces()).list.find((w) => w.id === active);
-    return !!info && info.role === 'owner';
+    if (!info || info.status !== 'active') return false;
+    if (!job?.runOn) return info.role === 'owner';
+    const me = (await deps.myEmail().catch(() => null))?.toLowerCase();
+    return !!me && me === job.runOn.toLowerCase();
   }
 
   return {
     getWorkspaces, refreshWorkspaces, syncActiveTeam, onStoreChanged, onAlarm, switchTo,
-    createTeam, invite, removeMember, accept, leave, deleteTeam, mayRunScheduledAutomations,
+    createTeam, invite, removeMember, accept, leave, deleteTeam, mayRunScheduledAutomations, mergeTargets,
     members: (teamId: string) => client.members(teamId),
   };
 }

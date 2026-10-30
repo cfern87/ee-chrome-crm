@@ -83,10 +83,38 @@ dashboard meanwhile.
   sharing a queue between people would be wrong, not just hard.
 - **Drive sync** stays a personal-workspace feature (Settings shows a note in
   a team workspace).
-- **Scheduled automations** stored in a team only run on the **owner's**
-  sending machine, so five members don't run the same automation five times.
-- **Outgoing webhooks** fire from the machine that made the change, as today;
-  pulling a teammate's edits does not re-fire them.
+- **Scheduled automations** stored in a team run on ONE member's sending
+  machine, so five members don't run the same automation five times. Each
+  automation has a "Runs on" choice (`Automation.runOn`, an email): the owner's
+  computer by default, or a member's. A member's new automation defaults to
+  their own computer. That member's Messenger is what an unread scan reads and
+  their Facebook account is what any message goes out from. "Run now" always
+  runs on the computer where it was clicked. The daily report stays owner-only.
+- **Outgoing webhooks** stored in a team are shared like the contacts. They
+  fire from the machine that made the change, as today; pulling a teammate's
+  edits does not re-fire them, so each change is reported once.
+
+## Moving data between workspaces (`workspaceTransfer.ts`)
+
+- **Creating a team** offers three starts:
+  - *Move my whole Personal workspace*: contacts, tags, fields, saved
+    searches, notes, history, automations and webhooks become the team's.
+    Personal is emptied (contacts tombstoned, automations/webhooks given
+    collection tombstones so another machine can't revive and run them), but
+    only after the server confirms the team's copy. If the upload fails,
+    Personal is left untouched and the user is told.
+  - *Copy my contacts, tags and fields*: as before; the settings bag stays
+    personal.
+  - *Start empty*.
+- **Deleting a team** offers to merge it into Personal or another team the
+  owner can write to (or discard it). The team is synced first, merged into the
+  target, and deleted only once the merge is saved, so any failure leaves both
+  intact. The merge (`foldWorkspaceInto`) is additive: the source's deletions
+  are ignored, a contact the target once deleted comes back, the newer copy of
+  a shared contact wins, automations and webhooks are unioned.
+- **Backups** can be merged into the open workspace (same additive merge) or
+  replace it. In a team, replacing deletes teammates' data, so it needs a
+  second click.
 
 ## Stale whole-store saves
 
@@ -108,9 +136,10 @@ edited that contact after it arrived (`guardStaleWrite`).
 - No realtime push; teammates' edits appear within about a minute.
 - A campaign keeps sending while you switch workspaces; its "last contacted"
   stamps land on the matching contact in whichever workspace is open.
-- Creating a team with "start with a copy of my contacts" copies contacts,
-  tags, fields, saved searches, notes and history — not the settings bag
-  (webhook URLs, automations and other personal settings stay personal).
+- Scheduled automations only run for the workspace that is open in the
+  switcher on that computer. A member whose team automation "runs on" them
+  must have the team open for it to fire; the same goes for Personal
+  automations while a team is open.
 - Not verified against a live Supabase yet: the server half has to be applied
   first (see the Lovable doc's acceptance checks).
 - The invite email itself is not sent by the extension — the invitee sees the

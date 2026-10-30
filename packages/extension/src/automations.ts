@@ -104,6 +104,12 @@ export interface Automation {
   order: number;
   createdAt: number;
   updatedAt?: number;
+  /**
+   * Team workspaces only: the email of the member whose computer runs this on
+   * its schedule (it also sends any message from that member's Facebook).
+   * Absent = the team owner's. Ignored in Personal.
+   */
+  runOn?: string;
 }
 
 export const AUTOMATIONS_KEY = 'automations';
@@ -192,6 +198,7 @@ export function normalizeAutomation(raw: unknown): Automation | null {
     order: typeof o.order === 'number' ? o.order : 0,
     createdAt: typeof o.createdAt === 'number' ? o.createdAt : 0,
     ...(typeof o.updatedAt === 'number' ? { updatedAt: o.updatedAt } : {}),
+    ...(typeof o.runOn === 'string' && o.runOn.includes('@') ? { runOn: o.runOn.trim().toLowerCase() } : {}),
   };
 }
 

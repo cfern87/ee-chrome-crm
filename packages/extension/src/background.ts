@@ -54,6 +54,7 @@ import {
 import { makeInboundClient, inboundEndpointUrl } from './inboundClient';
 import { makeTeamClient, TEAM_SYNC_ALARM, TEAM_SYNC_PERIOD_MINUTES } from './team';
 import { makeTeamService } from './teamService';
+import { parseTeamSeed } from './workspaceTransfer';
 import type { SenderRequirement } from './senderIdentity';
 import { advanceEditsFor, isNoOpStageEdit } from './funnel';
 
@@ -1783,11 +1784,14 @@ async function runDueAutomations(): Promise<void> {
   try {
     if (!(await isSignedIn())) return;
     if (!(await canSendFromThisMachine())) return;
-    if (!(await teamService.mayRunScheduledAutomations())) return;
     const store = await loadStore();
     const runs = await getAutomationRuns();
     const now = Date.now();
-    const due = readAutomations(store).filter((a) => isDue(a, runs[a.id]?.startedAt, now) && !whyNotRunnable(a, store));
+    const candidates = readAutomations(store).filter((a) => isDue(a, runs[a.id]?.startedAt, now) && !whyNotRunnable(a, store));
+    // In a team workspace each job runs on one member's computer only (its
+    // "Runs on" choice; the owner's by default).
+    const due: typeof candidates = [];
+    for (const a of candidates) if (await teamService.mayRunScheduledAutomations(a)) due.push(a);
     // Every due saved-search job (no window, cheap), and at most one unread
     // scan — the rest of those wait for the next check.
     for (const a of due.filter((x) => x.kind === 'search')) {
@@ -3224,7 +3228,7 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           break;
         }
         case 'TEAM_CREATE': {
-          sendResponse(await teamService.createTeam(String(request.payload?.name || '').slice(0, 60), request.payload?.seed !== false));
+          sendResponse(await teamService.createTeam(String(request.payload?.name || '').slice(0, 60), parseTeamSeed(request.payload?.seed)));
           break;
         }
         case 'TEAM_MEMBERS': {
@@ -3248,7 +3252,8 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           break;
         }
         case 'TEAM_DELETE': {
-          sendResponse(await teamService.deleteTeam(String(request.payload?.teamId || '')));
+          const into = request.payload?.mergeInto;
+          sendResponse(await teamService.deleteTeam(String(request.payload?.teamId || ''), typeof into === 'string' && into ? into : undefined));
           break;
         }
 

@@ -46,6 +46,8 @@ import { WebhookSettings } from './WebhookSettings';
 import { InboundWebhookSettings } from './InboundWebhookSettings';
 import { DailyReportSettings } from './DailyReportSettings';
 import { TeamPanel, TeamSyncNotice, useTeamWorkspaceActive } from './TeamSettings';
+import { foldWorkspaceInto } from '../workspaceTransfer';
+import { normalizeStoreShape } from '../drive';
 
 /** Sections of Settings. */
 export type SettingsView = 'account' | 'sync' | 'data' | 'behavior' | 'about';
@@ -94,6 +96,7 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
   // which is browser chrome: it can't be styled, isn't announced in context,
   // and blocks the page.
   const [dataStatus, setDataStatus] = useState<{ tone: 'success' | 'warning' | 'danger'; msg: string } | null>(null);
+  const [confirmReplace, setConfirmReplace] = useState(false);
   const [syncStatus, setSyncStatus] = useState<{ type: 'success' | 'error' | 'info'; msg: string } | null>(null);
   const [pushConfirm, setPushConfirm] = useState(false);
   // Chrome Sync is legacy once Drive is canonical, so it starts collapsed.
@@ -149,7 +152,11 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
     a.click();
   };
 
-  const importData = async () => {
+  /**
+   * 'merge' folds the backup into the open workspace (nothing already here is
+   * removed); 'replace' makes the workspace exactly the backup.
+   */
+  const importData = async (mode: 'merge' | 'replace') => {
     const blocked = await ensureSignedIn('import a backup');
     if (blocked) { setDataStatus({ tone: 'danger', msg: blocked }); return; }
     setDataStatus(null);
@@ -166,14 +173,17 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
           // A backup restores into whichever workspace is open now, so any
           // stamp from where it was exported must not make saveStore refuse it.
           const { workspace: _ws, workspaceReadAt: _readAt, ...data } = parsed;
-          const save = await updateStore(data);
+          if (!data || typeof data !== 'object' || typeof data.conversations !== 'object') throw new Error('not a backup');
+          const save = await updateStore(mode === 'merge'
+            ? { ...foldWorkspaceInto(store, normalizeStoreShape(data)), workspace: store.workspace, workspaceReadAt: store.workspaceReadAt }
+            : data);
           // Report what actually happened. The background refuses the write when
           // there's no account, and claiming success there would be a lie that
           // costs the user their backup.
           if (save.signedOut) {
             setDataStatus({ tone: 'danger', msg: save.reason || 'Sign in to import a backup.' });
           } else if (save.ok) {
-            setDataStatus({ tone: 'success', msg: 'Backup restored.' });
+            setDataStatus({ tone: 'success', msg: mode === 'merge' ? 'Backup merged in.' : 'Backup restored.' });
           } else {
             setDataStatus({
               tone: 'warning',
@@ -327,8 +337,27 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
         <Text as="h3" size="strong" weight="semibold" style={{ margin: `0 0 ${space.lg}px` }}>Full backup</Text>
         <Stack direction="row" gap="sm">
           <Button variant="primary" onClick={exportData} block>Export backup</Button>
-          <Button variant="secondary" onClick={importData} block>Import backup</Button>
+          <Button variant="secondary" onClick={() => void importData('merge')} block
+            title="Adds the backup's contacts, tags, fields, automations and webhooks to this workspace. Nothing here is removed.">
+            Merge a backup in
+          </Button>
+          {confirmReplace ? (
+            <Button variant="danger-solid" onClick={() => { setConfirmReplace(false); void importData('replace'); }} block>
+              Pick the file — replaces everything
+            </Button>
+          ) : (
+            <Button variant="danger" onClick={() => setConfirmReplace(true)} block
+              title="Makes this workspace exactly the backup: anything not in it is deleted.">
+              Replace with a backup…
+            </Button>
+          )}
         </Stack>
+        {confirmReplace && (
+          <Text as="p" size="micro" tone="danger" style={{ margin: `${space.sm}px 0 0` }}>
+            Replacing deletes whatever in {teamActive ? 'this team workspace — for every teammate —' : 'this workspace'} isn't in the backup.{' '}
+            <Button variant="link" size="sm" onClick={() => setConfirmReplace(false)}>Cancel</Button>
+          </Text>
+        )}
         {dataStatus && (
           <div style={{ marginTop: space.md }}>
             <Banner tone={dataStatus.tone} live>{dataStatus.msg}</Banner>

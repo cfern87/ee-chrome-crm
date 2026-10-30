@@ -9,10 +9,11 @@ import {
   type TeamMember, type WorkspaceInfo,
 } from '../team';
 import type { WorkspacesView } from '../teamService';
+import type { TeamSeed } from '../workspaceTransfer';
 import { Banner, Button, Card, Input, Select, Stack, Text, color, space } from '../ui/primitives';
 import { sendBg, formatRelativeTime } from './shared';
 
-type Result = { ok: boolean; error?: string };
+type Result = { ok: boolean; error?: string; warning?: string };
 
 /** The workspace list + active workspace, kept current across tabs. */
 export function useWorkspaces(): { view: WorkspacesView | null; reload: (refresh?: boolean) => Promise<void> } {
@@ -91,7 +92,8 @@ export function TeamPanel() {
     setStatus(null);
     const r = await sendBg<Result>(message, timeout);
     setBusy(false);
-    if (r?.ok) setStatus({ tone: 'success', msg: success });
+    if (r?.ok && r.warning) setStatus({ tone: 'warning', msg: r.warning });
+    else if (r?.ok) setStatus({ tone: 'success', msg: success });
     else setStatus({ tone: 'danger', msg: r?.error || 'No answer from the extension. Try again.' });
     await reload();
     return !!r?.ok;
@@ -173,22 +175,61 @@ function ProGate() {
 
 type Run = (message: unknown, success: string, timeout?: number) => Promise<boolean>;
 
+const SEED_CHOICES: { id: TeamSeed; label: string; hint: string }[] = [
+  {
+    id: 'move',
+    label: 'Move my whole Personal workspace into the team',
+    hint: 'Contacts, tags, fields, saved searches, automations and webhooks all become the team\'s. Personal is left empty once the team has its copy.',
+  },
+  {
+    id: 'copy',
+    label: 'Copy my contacts, tags and fields',
+    hint: 'Personal keeps everything; automations and webhooks stay personal.',
+  },
+  { id: 'empty', label: 'Start empty', hint: 'Personal is untouched.' },
+];
+
 function CreateTeam({ busy, run }: { busy: boolean; run: Run }) {
   const [name, setName] = useState('');
-  const [seed, setSeed] = useState(true);
+  const [seed, setSeed] = useState<TeamSeed>('copy');
+  const [confirmMove, setConfirmMove] = useState(false);
+  const create = () => {
+    setConfirmMove(false);
+    const done = seed === 'move'
+      ? 'Team created and your Personal workspace moved into it. Invite people below.'
+      : 'Team created — you are now working in it. Invite people below.';
+    void run({ type: 'TEAM_CREATE', payload: { name: name.trim(), seed } }, done, 120_000);
+  };
   return (
     <Stack gap="sm">
       <Input placeholder="Team name, e.g. Acme Sales" value={name} maxLength={60} onChange={(e) => setName(e.target.value)} />
-      <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12 }}>
-        <input type="checkbox" checked={seed} onChange={(e) => setSeed(e.target.checked)} />
-        Start it with a copy of my contacts, tags and fields (settings, webhooks and automations stay personal)
-      </label>
-      <div>
-        <Button variant="primary" disabled={busy || !name.trim()}
-          onClick={() => void run({ type: 'TEAM_CREATE', payload: { name: name.trim(), seed } }, 'Team created — you are now working in it. Invite people below.', 90_000)}>
-          Create team workspace
-        </Button>
+      <div role="radiogroup" aria-label="What the team starts with" style={{ display: 'flex', flexDirection: 'column', gap: space.xs }}>
+        {SEED_CHOICES.map((c) => (
+          <label key={c.id} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 12, cursor: 'pointer' }}>
+            <input type="radio" name="team-seed" checked={seed === c.id} onChange={() => { setSeed(c.id); setConfirmMove(false); }} style={{ marginTop: 2 }} />
+            <span>
+              <strong>{c.label}</strong>
+              <Text as="span" size="micro" tone="muted" style={{ display: 'block' }}>{c.hint}</Text>
+            </span>
+          </label>
+        ))}
       </div>
+      {confirmMove ? (
+        <Stack direction="row" gap="sm" align="center" wrap>
+          <Text size="micro" tone="warning">
+            Everything in Personal moves to the team, and your teammates will see and edit it. Continue?
+          </Text>
+          <Button variant="primary" size="sm" disabled={busy} onClick={create}>Move and create</Button>
+          <Button variant="ghost" size="sm" onClick={() => setConfirmMove(false)}>Cancel</Button>
+        </Stack>
+      ) : (
+        <div>
+          <Button variant="primary" disabled={busy || !name.trim()}
+            onClick={() => (seed === 'move' ? setConfirmMove(true) : create())}>
+            Create team workspace
+          </Button>
+        </div>
+      )}
     </Stack>
   );
 }
@@ -222,6 +263,9 @@ function OwnerTeam({ team, view, busy, run }: { team: WorkspaceInfo; view: Works
   const [members, setMembers] = useState<TeamMember[] | null>(null);
   const [email, setEmail] = useState('');
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // Where the team's data goes before it's deleted ('' = nowhere).
+  const [mergeInto, setMergeInto] = useState<string>(PERSONAL_WORKSPACE);
+  const mergeTargets = joined(view.list).filter((w) => w.id !== team.id && w.active);
 
   const loadMembers = useCallback(async () => {
     const r = await sendBg<{ ok: boolean; members?: TeamMember[] }>({ type: 'TEAM_MEMBERS', payload: { teamId: team.id } });
@@ -300,19 +344,42 @@ function OwnerTeam({ team, view, busy, run }: { team: WorkspaceInfo; view: Works
             Sync now
           </Button>
         )}
-        {confirmDelete ? (
-          <>
-            <Text size="micro" tone="danger">Delete the team and its shared contacts for everyone?</Text>
-            <Button variant="danger-solid" size="sm" disabled={busy}
-              onClick={() => void run({ type: 'TEAM_DELETE', payload: { teamId: team.id } }, 'Team deleted. Your personal workspace is untouched.')}>
-              Delete team
-            </Button>
-            <Button variant="ghost" size="sm" onClick={() => setConfirmDelete(false)}>Cancel</Button>
-          </>
-        ) : (
+        {confirmDelete ? null : (
           <Button variant="danger" size="sm" disabled={busy} onClick={() => setConfirmDelete(true)}>Delete team…</Button>
         )}
       </Stack>
+      {confirmDelete && (
+        <div style={{ padding: space.md, border: `1px solid ${color.danger.base}`, borderRadius: 8 }}>
+          <Stack gap="sm">
+            <Text as="div" size="small">
+              Delete <strong>{team.name}</strong> for everyone in it? Before it goes, its contacts, tags, fields,
+              saved searches, automations and webhooks can be merged into another workspace.
+            </Text>
+            <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12 }}>
+              Keep its data by merging into
+              <Select aria-label="Merge the team into" value={mergeInto} onChange={(e) => setMergeInto(e.target.value)} style={{ maxWidth: 220 }}>
+                <option value={PERSONAL_WORKSPACE}>Personal</option>
+                {mergeTargets.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
+                <option value="">Nowhere — discard it</option>
+              </Select>
+            </label>
+            <Stack direction="row" gap="sm" align="center">
+              <Button variant="danger-solid" size="sm" disabled={busy}
+                onClick={() => {
+                  const target = mergeInto ? (mergeInto === PERSONAL_WORKSPACE ? 'Personal' : mergeTargets.find((w) => w.id === mergeInto)?.name || 'the other workspace') : '';
+                  void run(
+                    { type: 'TEAM_DELETE', payload: { teamId: team.id, mergeInto: mergeInto || undefined } },
+                    target ? `Team deleted. Its data was merged into ${target}, which is open now.` : 'Team deleted. Your personal workspace is untouched.',
+                    120_000,
+                  ).then((ok) => { if (ok) setConfirmDelete(false); });
+                }}>
+                {mergeInto ? 'Merge and delete team' : 'Delete team'}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setConfirmDelete(false)}>Cancel</Button>
+            </Stack>
+          </Stack>
+        </div>
+      )}
     </Stack>
   );
 }

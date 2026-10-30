@@ -26,6 +26,27 @@ import {
 import { sendBg, formatRelativeTime } from './shared';
 import { SendAsPicker, sendAsInvalid } from './SendAsPicker';
 import { StepListEditor, RecentCampaignPicker } from './PresetActionsSettings';
+import { useWorkspaces } from './TeamSettings';
+import { isTeamWorkspace } from '../team';
+
+/** The open team workspace, for "which computer runs this". Null in Personal. */
+interface TeamRunCtx { ownerEmail: string; myEmail: string }
+
+function useTeamRunCtx(): TeamRunCtx | null {
+  const { view } = useWorkspaces();
+  if (!view || !isTeamWorkspace(view.active)) return null;
+  const team = view.list.find((w) => w.id === view.active);
+  if (!team) return null;
+  return { ownerEmail: (team.ownerEmail || '').toLowerCase(), myEmail: view.myEmail || '' };
+}
+
+/** Whose computer runs `runOn` on its schedule, in words. */
+export function describeRunner(runOn: string | undefined, team: TeamRunCtx): string {
+  const runner = runOn || team.ownerEmail;
+  if (runner && runner === team.myEmail) return 'your computer';
+  if (!runOn) return team.ownerEmail ? `the owner's computer (${team.ownerEmail})` : "the owner's computer";
+  return `${runOn}'s computer`;
+}
 
 interface RunsResponse { runs: AutomationRuns; runningId: string | null; runningIds?: string[] }
 
@@ -37,6 +58,7 @@ export function AutomationsPanel({ store, updateStore, onOpenTags, onOpenSearch 
   onOpenSearch: (search: SavedSearch) => void;
 }) {
   const automations = readAutomations(store);
+  const team = useTeamRunCtx();
   const [runs, setRuns] = useState<AutomationRuns>({});
   const [runningIds, setRunningIds] = useState<string[]>([]);
   // The unread scan borrows the Facebook window, so only one can run at once.
@@ -107,9 +129,12 @@ export function AutomationsPanel({ store, updateStore, onOpenTags, onOpenSearch 
   const startNew = () => {
     setEditingId(null);
     // A saved search is the more general source, so it's the default when one exists.
-    setDraftNew(searches.length
+    const fresh = searches.length
       ? newSearchAutomation(automations.length, searches[0].id)
-      : newTagUnreadAutomation(automations.length));
+      : newTagUnreadAutomation(automations.length);
+    // In a team, a member's new automation runs on their own computer by
+    // default (the owner's is the default otherwise).
+    setDraftNew(team && team.myEmail && team.myEmail !== team.ownerEmail ? { ...fresh, runOn: team.myEmail } : fresh);
   };
 
   return (
@@ -136,6 +161,7 @@ export function AutomationsPanel({ store, updateStore, onOpenTags, onOpenSearch 
         <AutomationEditor
           initial={draftNew}
           store={store}
+          team={team}
           isNew
           onSave={save}
           onCancel={() => setDraftNew(null)}
@@ -160,6 +186,7 @@ export function AutomationsPanel({ store, updateStore, onOpenTags, onOpenSearch 
             key={a.id}
             initial={a}
             store={store}
+            team={team}
             onSave={save}
             onCancel={() => setEditingId(null)}
             onOpenTags={onOpenTags}
@@ -170,6 +197,7 @@ export function AutomationsPanel({ store, updateStore, onOpenTags, onOpenSearch 
             key={a.id}
             automation={a}
             store={store}
+            team={team}
             run={runs[a.id]}
             isRunning={runningIds.includes(a.id)}
             scanBusy={a.kind === 'tagUnread' && !!scanRunningId}
@@ -205,11 +233,12 @@ function describeSource(a: Automation, store: Store): string {
 }
 
 function AutomationCard({
-  automation: a, store, run, isRunning, scanBusy, confirmingDelete, stopping: stoppingLocal,
+  automation: a, store, team, run, isRunning, scanBusy, confirmingDelete, stopping: stoppingLocal,
   onRun, onCancel, onEdit, onOpenSearch, onToggleEnabled, onAskDelete, onConfirmDelete, onCancelDelete,
 }: {
   automation: Automation;
   store: Store;
+  team: TeamRunCtx | null;
   run?: AutomationRun;
   isRunning: boolean;
   /** Another unread scan holds the Facebook window. */
@@ -242,6 +271,7 @@ function AutomationCard({
           <Text size="body" weight="semibold" style={{ flex: 1, minWidth: 180 }}>{a.name}</Text>
           <Text size="small" tone={scheduled && a.enabled ? 'accent' : 'muted'}>
             {scheduled ? (a.enabled ? describeSchedule(a.everyMinutes) : `${describeSchedule(a.everyMinutes)} (paused)`) : 'Manual'}
+            {scheduled && team && ` · on ${describeRunner(a.runOn, team)}`}
           </Text>
           {scheduled && (
             <Toggle
@@ -335,9 +365,10 @@ function blankMessage(): AutomationMessage {
  * sense together — a schedule with no action chosen yet would be a job that
  * runs and does nothing — so, unlike presets, nothing is written field by field.
  */
-function AutomationEditor({ initial, store, isNew, onSave, onCancel, onOpenTags, onOpenSearch }: {
+function AutomationEditor({ initial, store, team, isNew, onSave, onCancel, onOpenTags, onOpenSearch }: {
   initial: Automation;
   store: Store;
+  team: TeamRunCtx | null;
   isNew?: boolean;
   onSave: (a: Automation) => void;
   onCancel: () => void;
@@ -555,6 +586,35 @@ function AutomationEditor({ initial, store, isNew, onSave, onCancel, onOpenTags,
                 </Select>
               )}
             </FormField>
+            {team && (
+              <FormField
+                label="Runs on"
+                hint="This is a team workspace, so one member's computer runs the schedule for everyone. Unread scans read that member's Messenger, and messages go out from their Facebook account. Run now always runs on your own computer."
+              >
+                {(fp) => (
+                  <Select
+                    {...fp}
+                    value={draft.runOn || ''}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setDraft((d) => {
+                        const { runOn: _old, ...rest } = d;
+                        return v ? { ...rest, runOn: v } : rest;
+                      });
+                    }}
+                    style={{ width: 320 }}
+                  >
+                    <option value="">{describeRunner(undefined, team).replace(/^./, (c) => c.toUpperCase())}</option>
+                    {team.myEmail && team.myEmail !== team.ownerEmail && (
+                      <option value={team.myEmail}>My computer ({team.myEmail})</option>
+                    )}
+                    {draft.runOn && draft.runOn !== team.myEmail && draft.runOn !== team.ownerEmail && (
+                      <option value={draft.runOn}>{draft.runOn}'s computer</option>
+                    )}
+                  </Select>
+                )}
+              </FormField>
+            )}
           </Section>
 
           <Stack direction="row" gap="sm" align="center">
