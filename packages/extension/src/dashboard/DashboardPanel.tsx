@@ -14,7 +14,10 @@
 // in one place from needing to be rebuilt in the other.
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { arrangeTiles, dropTile, isDefaultOrder, moveTile, searchTileId } from '../dashboardTiles';
+import {
+  arrangeTiles, dropTile, isDefaultOrder, moveTile, searchTileId, shortnameProblem, type ShortnameOwner,
+} from '../dashboardTiles';
+import { TileShortnameField } from './TileShortnameField';
 import type { Conversation, Tag } from '../storage';
 import {
   QueryGroup, SavedSearch, ArchiveScope, QueryContext,
@@ -60,10 +63,10 @@ export interface DashboardPanelProps {
   ctx: QueryContext;
   /** Open this query in the contact list. */
   onOpenInContacts: (preset: SavedSearch) => void;
-  /** Save a brand new query as a tile. */
-  onCreateTile: (name: string, query: QueryGroup) => Promise<void>;
-  /** Replace an existing tile's query. */
-  onUpdateTile: (id: string, query: QueryGroup) => Promise<void>;
+  /** Save a brand new query as a tile. An empty short name means none. */
+  onCreateTile: (name: string, query: QueryGroup, shortname?: string) => Promise<void>;
+  /** Replace an existing tile's query and short name (empty clears it). */
+  onUpdateTile: (id: string, query: QueryGroup, shortname?: string) => Promise<void>;
   /** Take a tile off the Dashboard, leaving the preset itself alone. */
   onRemoveTile: (id: string) => Promise<void>;
   /** The saved tile order (tile ids, see dashboardTiles.ts), or null for default. */
@@ -144,6 +147,20 @@ type PanelTile =
 
 type Side = RatioSide;
 
+/** A tile's short name under its title, with its id on hover. */
+function ShortnameTag({ shortname, tileId }: { shortname?: string; tileId: string }) {
+  if (!shortname) return null;
+  return (
+    <div
+      data-tile-shortname
+      title={`Short name in the daily report, for tile ${tileId}`}
+      style={{ fontSize: 11, color: color.text.muted, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace' }}
+    >
+      {shortname}
+    </div>
+  );
+}
+
 const linkStyle: React.CSSProperties = {
   background: 'none', border: 'none', padding: 0, fontSize: 11, fontWeight: 600, color: color.accent.base, cursor: 'pointer',
 };
@@ -197,6 +214,7 @@ function RatioTileBody({
       <div style={{ fontSize: 13, fontWeight: 600, color: color.text.primary, overflow: 'hidden', textOverflow: 'ellipsis' }}>
         {tile.name}
       </div>
+      <ShortnameTag shortname={tile.shortname} tileId={ratioTileId(tile.id)} />
       {r.problem && (
         <div role="note" style={{ fontSize: 11, color: color.danger.base, lineHeight: 1.4 }}>{r.problem}</div>
       )}
@@ -251,6 +269,7 @@ export function DashboardPanel({
   const [editing, setEditing] = useState<Editing>(null);
   const [draftQuery, setDraftQuery] = useState<QueryGroup>(emptyQuery());
   const [draftName, setDraftName] = useState('');
+  const [draftShortname, setDraftShortname] = useState('');
   /** The tile whose Remove is waiting on a second click, if any. */
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   /** Tile id being dragged, and where it would land. */
@@ -340,6 +359,14 @@ export function DashboardPanel({
     if (view) onOpenQueryInContacts(view);
   };
 
+  // Every record that can hold a short name — saved searches off the Dashboard
+  // too, since one put back on would bring its short name with it.
+  const shortnameOwners = useMemo((): ShortnameOwner[] => [
+    ...Object.values(savedSearches).map((s) => ({ tileId: searchTileId(s.id), name: s.name, shortname: s.shortname })),
+    ...ratioTiles.map((t) => ({ tileId: ratioTileId(t.id), name: t.name, shortname: t.shortname })),
+  ], [savedSearches, ratioTiles]);
+  const otherOwners = (tileId: string | null) => shortnameOwners.filter((o) => o.tileId !== tileId);
+
   const startNewRatio = () => {
     const order = ratioTiles.length ? Math.max(...ratioTiles.map((t) => t.order)) + 1 : 0;
     setEditing({ mode: 'ratio', tile: newRatioTile(order), isNew: true });
@@ -348,25 +375,33 @@ export function DashboardPanel({
   const startNew = () => {
     setDraftQuery(emptyQuery());
     setDraftName('');
+    setDraftShortname('');
     setEditing({ mode: 'new' });
   };
 
   const startEdit = (preset: SavedSearch) => {
     setDraftQuery(normalizeQuery(preset.query));
     setDraftName(preset.name);
+    setDraftShortname(preset.shortname ?? '');
     setEditing({ mode: 'edit', preset });
   };
 
   const cancel = () => setEditing(null);
 
+  const editingTileId = editing?.mode === 'edit' ? searchTileId(editing.preset.id) : null;
+  const draftShortProblem = editing && editing.mode !== 'ratio'
+    ? shortnameProblem(draftShortname, otherOwners(editingTileId))
+    : null;
+
   const save = async () => {
-    if (!editing) return;
+    if (!editing || draftShortProblem) return;
+    const shortname = draftShortname.trim();
     if (editing.mode === 'new') {
       const name = draftName.trim();
       if (!name) return;
-      await onCreateTile(name, draftQuery);
+      await onCreateTile(name, draftQuery, shortname);
     } else if (editing.mode === 'edit') {
-      await onUpdateTile(editing.preset.id, draftQuery);
+      await onUpdateTile(editing.preset.id, draftQuery, shortname);
     }
     setEditing(null);
   };
@@ -388,6 +423,7 @@ export function DashboardPanel({
         isNew={editing.isNew}
         savedSearches={savedSearches}
         idsFor={idsFor}
+        otherShortnames={otherOwners(ratioTileId(editing.tile.id))}
         onSave={async (tile) => { await onSaveRatioTile(tile); setEditing(null); }}
         onCancel={cancel}
       />
@@ -395,7 +431,7 @@ export function DashboardPanel({
   }
 
   if (editing) {
-    const canSave = editing.mode === 'edit' || draftName.trim().length > 0;
+    const canSave = (editing.mode === 'edit' || draftName.trim().length > 0) && !draftShortProblem;
     return (
       <div style={{ maxWidth: 860 }}>
         <SectionTitle>{editing.mode === 'new' ? 'New dashboard tile' : `Edit “${editing.preset.name}”`}</SectionTitle>
@@ -411,6 +447,14 @@ export function DashboardPanel({
             />
           </div>
         )}
+
+        <TileShortnameField
+          value={draftShortname}
+          onChange={setDraftShortname}
+          tileId={editingTileId}
+          problem={draftShortProblem}
+          onEnter={() => { if (canSave) void save(); }}
+        />
 
         {/* The same builder the contact list uses. Not a copy of it: a query
             built here has to be the same object a preset holds, or the count on
@@ -450,7 +494,11 @@ export function DashboardPanel({
             {editing.mode === 'new' ? 'Save tile' : 'Save changes'}
           </Button>
           <Button variant="ghost" onClick={cancel}>Cancel</Button>
-          {!canSave && <Text size="small" tone="muted">Give the tile a name to save it.</Text>}
+          {!canSave && (
+            <Text size="small" tone="muted">
+              {draftShortProblem ? 'Fix the short name to save it.' : 'Give the tile a name to save it.'}
+            </Text>
+          )}
         </div>
 
         {/* Preview. The point of the whole editing screen: a count on its own
@@ -635,6 +683,7 @@ export function DashboardPanel({
                   <div style={{ fontSize: 13, fontWeight: 600, color: color.text.primary, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {preset.name}
                   </div>
+                  <ShortnameTag shortname={preset.shortname} tileId={tileId} />
                   {preset.description && (
                     <div style={{ fontSize: 11, color: color.text.muted, lineHeight: 1.4 }}>{preset.description}</div>
                   )}

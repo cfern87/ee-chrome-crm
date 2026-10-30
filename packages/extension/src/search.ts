@@ -80,6 +80,8 @@ export interface SavedSearch {
   // merge rule, and a tile that can hand its query straight to the contact list
   // when clicked. Absent = false, so no existing preset appears uninvited.
   onDashboard?: boolean;
+  /** The tile's short name in the daily report (see dashboardTiles.ts). Not copied with the preset. */
+  shortname?: string;
   order: number;
   createdAt: number;
   updatedAt: number;

@@ -202,11 +202,19 @@ when Chrome next starts that day. **Send test now** sends the same payload with
 
 ```json
 [
-  { "kind": "count", "name": "Hot leads", "count": 42, "query": "Tags has any of Hot" },
-  { "kind": "ratio", "name": "Replied rate", "formula": "A & B / A", "format": "percent",
+  { "id": "search:sq_m1x2_ab12", "shortname": "hot_leads", "kind": "count", "name": "Hot leads",
+    "count": 42, "query": "Tags has any of Hot" },
+  { "id": "ratio:rt_m1x3_cd34", "kind": "ratio", "name": "Replied rate", "formula": "A & B / A", "format": "percent",
     "value": 0.25, "display": "25%", "numerator": 10, "denominator": 40 }
 ]
 ```
+
+Every tile has an `id` that never changes (`search:…` for a saved-query tile, `ratio:…`
+for a ratio tile) and, when one was set, a `shortname` — the user's own handle
+for the tile, chosen under **Edit query** or **Edit formula** on the Dashboard.
+Short names are unique across tiles (ignoring case), start with a letter, and use
+only letters, numbers, `_` and `-` (up to 32), so they are safe to key on. A
+tile without one has no `shortname` field.
 
 `value` is `null` (and `display` is `"—"`) when there is no result: a division
 by zero, or a broken formula, which also adds `problem` with the reason. Every

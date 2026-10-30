@@ -16,7 +16,9 @@
 import React, { useMemo, useState } from 'react';
 import type { SavedSearch } from '../search';
 import { sortSavedSearches } from '../search';
-import { intersectionSize, nextLetter, type RatioTile } from '../ratioTiles';
+import { intersectionSize, nextLetter, ratioTileId, type RatioTile } from '../ratioTiles';
+import { shortnameProblem, type ShortnameOwner } from '../dashboardTiles';
+import { TileShortnameField } from './TileShortnameField';
 import {
   OP_LABEL, TILE_FORMATS, checkFormula, evaluate, formatValue, formulaToText, fractionOf,
   readSimple, simpleFormula, textToFormula, tokenLabel,
@@ -30,6 +32,8 @@ export interface RatioTileEditorProps {
   savedSearches: Record<string, SavedSearch>;
   /** Contact ids a saved search matches (the Dashboard's shared matcher). */
   idsFor: (preset: SavedSearch) => Set<string>;
+  /** Every OTHER tile's short name, so this one can't take a name already in use. */
+  otherShortnames?: ShortnameOwner[];
   onSave: (tile: RatioTile) => Promise<void> | void;
   onCancel: () => void;
 }
@@ -44,11 +48,13 @@ const OPERATORS: { op: Op; title: string }[] = [
 
 const plain = (n: number | null) => (n === null ? '—' : formatValue(n, 'number'));
 
-export function RatioTileEditor({ tile, isNew, savedSearches, idsFor, onSave, onCancel }: RatioTileEditorProps) {
+export function RatioTileEditor({ tile, isNew, savedSearches, idsFor, otherShortnames = [], onSave, onCancel }: RatioTileEditorProps) {
   const initialTokens = useMemo(() => textToFormula(tile.formula), [tile.formula]);
   const initialSimple = readSimple(initialTokens);
 
   const [name, setName] = useState(tile.name);
+  const [shortname, setShortname] = useState(tile.shortname ?? '');
+  const shortProblem = shortnameProblem(shortname, otherShortnames);
   const [terms, setTerms] = useState<Record<string, string>>(tile.terms);
   const [tokens, setTokens] = useState<Token[]>(initialTokens);
   const [format, setFormat] = useState<TileFormat>(tile.format);
@@ -114,7 +120,7 @@ export function RatioTileEditor({ tile, isNew, savedSearches, idsFor, onSave, on
   };
 
   const trimmedName = name.trim();
-  const ready = check.ok && trimmedName.length > 0;
+  const ready = check.ok && trimmedName.length > 0 && !shortProblem;
 
   const save = async () => {
     if (!ready || saving) return;
@@ -125,7 +131,12 @@ export function RatioTileEditor({ tile, isNew, savedSearches, idsFor, onSave, on
       : Object.fromEntries(Object.entries(terms).filter(([l]) => l === 'A' || l === 'B'));
     setSaving(true);
     try {
-      await onSave({ ...tile, name: trimmedName, formula: formulaToText(tokens), terms: keptTerms, format });
+      const { shortname: _old, ...rest } = tile;
+      const short = shortname.trim();
+      await onSave({
+        ...rest, name: trimmedName, ...(short ? { shortname: short } : {}),
+        formula: formulaToText(tokens), terms: keptTerms, format,
+      });
     } finally {
       setSaving(false);
     }
@@ -203,6 +214,14 @@ export function RatioTileEditor({ tile, isNew, savedSearches, idsFor, onSave, on
           onKeyDown={(e) => { if (e.key === 'Enter') void save(); }}
         />
       </div>
+
+      <TileShortnameField
+        value={shortname}
+        onChange={setShortname}
+        tileId={ratioTileId(tile.id)}
+        problem={shortProblem}
+        onEnter={() => void save()}
+      />
 
       {!advanced ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: space.md, marginBottom: 16 }}>
@@ -399,6 +418,7 @@ export function RatioTileEditor({ tile, isNew, savedSearches, idsFor, onSave, on
         {!ready && (
           <Text size="small" tone="muted">
             {!trimmedName ? 'Give the tile a name to save it.'
+              : shortProblem ? 'Fix the short name to save it.'
               : advanced ? 'Fix the formula to save it.'
               : 'Pick both searches to save it.'}
           </Text>

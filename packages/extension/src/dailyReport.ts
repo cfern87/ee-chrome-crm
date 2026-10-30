@@ -22,7 +22,7 @@ import type { Store } from './storage';
 import type { SettingsBag } from './settingsMerge';
 import type { QueryContext } from './search';
 import { describeQuery, normalizeQuery, sortSavedSearches } from './search';
-import { arrangeTiles, readTileOrder, searchTileId } from './dashboardTiles';
+import { arrangeTiles, readShortname, readTileOrder, searchTileId } from './dashboardTiles';
 import { makeMatcher, ratioTileId, readRatio, readRatioTiles } from './ratioTiles';
 import { buildPayload, isValidWebhookUrl, type WebhookConfig, type WebhookPayload } from './webhooks';
 
@@ -201,14 +201,20 @@ export function isReportDue(cfg: DailyReportConfig, log: ReportLog, now: number)
 // Metrics
 // ---------------------------------------------------------------------------
 
-export type ReportTile =
+/**
+ * Every tile carries its stable `id` (dashboardTiles.ts: `search:…` / `ratio:…`)
+ * and, when the user gave it one, its `shortname` — so a reader can find a
+ * tile by a name someone chose, and that name stays tied to one tile.
+ */
+export type ReportTile = { id: string; shortname?: string } & (
   | { kind: 'count'; name: string; description?: string; count: number; query: string }
   | {
       kind: 'ratio'; name: string; formula: string; format: string;
       value: number | null; display: string;
       numerator?: number | null; denominator?: number | null;
       problem?: string;
-    };
+    }
+);
 
 export interface ReportMetrics {
   /** Local day the numbers are for. */
@@ -235,10 +241,16 @@ export function computeReportMetrics(
   const searches = store.savedSearches || {};
 
   type Src = { id: string; tile: () => ReportTile };
+  const shortnameOf = (raw: unknown) => {
+    const s = readShortname(raw);
+    return s ? { shortname: s } : {};
+  };
   const defaults: Src[] = [
     ...sortSavedSearches(searches).filter((s) => s.onDashboard).map((p): Src => ({
       id: searchTileId(p.id),
       tile: () => ({
+        id: searchTileId(p.id),
+        ...shortnameOf(p.shortname),
         kind: 'count', name: p.name,
         ...(p.description ? { description: p.description } : {}),
         count: idsFor(p).size,
@@ -250,6 +262,8 @@ export function computeReportMetrics(
       tile: () => {
         const r = readRatio(t, searches, idsFor);
         return {
+          id: ratioTileId(t.id),
+          ...shortnameOf(t.shortname),
           kind: 'ratio', name: t.name || 'Untitled tile', formula: t.formula, format: t.format,
           value: r.value, display: r.text,
           ...(r.num ? { numerator: r.num.value } : {}),

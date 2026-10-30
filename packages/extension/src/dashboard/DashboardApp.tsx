@@ -64,7 +64,7 @@ import { DAILY_REPORT_SECTION_ID } from './DailyReportSettings';
 import { TagFilter, ConvDetail, type TagFilterMode } from './ContactDetail';
 import { TagsPanel, FieldsPanel } from './SchemaPanels';
 import { DashboardPanel } from './DashboardPanel';
-import { DASHBOARD_TILE_ORDER_KEY, readTileOrder, writeTileOrder, type TileOrder } from '../dashboardTiles';
+import { DASHBOARD_TILE_ORDER_KEY, readShortname, readTileOrder, writeTileOrder, type TileOrder } from '../dashboardTiles';
 import { readRatioTiles, saveRatioTile, deleteRatioTile, tilesUsingSearch, type RatioTile } from '../ratioTiles';
 import { PRODUCT_NAME, PRODUCT_SLUG } from '../product';
 
@@ -1496,7 +1496,8 @@ export default function DashboardApp() {
     [store.savedSearches]
   );
 
-  const createDashboardTile = async (name: string, q: QueryGroup) => {
+  const createDashboardTile = async (name: string, q: QueryGroup, shortname?: string) => {
+    const short = readShortname(shortname);
     const order = Object.keys(store.savedSearches).length;
     // Saved with the scope the workspace is currently on, matching what
     // saveNewPreset captures — a tile counting archived contacts is a real
@@ -1506,12 +1507,21 @@ export default function DashboardApp() {
       ...newSavedSearch(name, q, order),
       archiveScope,
       onDashboard: true,
+      ...(short ? { shortname: short } : {}),
     };
     await updateStore({ ...store, savedSearches: { ...store.savedSearches, [preset.id]: preset } });
   };
 
-  const updateDashboardTile = async (id: string, q: QueryGroup) => {
-    await patchPreset(id, { query: JSON.parse(JSON.stringify(q)) });
+  const updateDashboardTile = async (id: string, q: QueryGroup, shortname?: string) => {
+    const existing = store.savedSearches[id];
+    if (!existing) return;
+    // Rebuilt rather than patched, so clearing the short name removes the key.
+    const { shortname: _old, ...rest } = existing;
+    const short = readShortname(shortname);
+    const next: SavedSearch = {
+      ...rest, query: JSON.parse(JSON.stringify(q)), ...(short ? { shortname: short } : {}), updatedAt: Date.now(),
+    };
+    await updateStore({ ...store, savedSearches: { ...store.savedSearches, [id]: next } });
   };
 
   // Takes the tile off the Dashboard WITHOUT deleting the query — it stays a

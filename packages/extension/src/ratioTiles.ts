@@ -24,6 +24,7 @@ import {
   LETTERS, checkFormula, evaluate, formatValue, formulaToText, fractionOf, lettersUsed, simpleFormula, textToFormula,
   type FormulaNode, type TileFormat,
 } from './tileFormula';
+import { readShortname } from './dashboardTiles';
 
 export const RATIO_TILES_KEY = 'ratioTiles';
 export const RATIO_TILES_DELETED_KEY = 'ratioTilesDeleted';
@@ -32,6 +33,8 @@ export const MAX_RATIO_TILES = 40;
 export interface RatioTile {
   id: string;
   name: string;
+  /** Short name in the daily report (see dashboardTiles.ts). */
+  shortname?: string;
   /** The formula as text, e.g. `A & B / B`. See tileFormula.ts. */
   formula: string;
   /** Which saved search each letter stands for: letter → SavedSearch id. */
@@ -63,9 +66,11 @@ export function normalizeRatioTile(raw: unknown): RatioTile | null {
       if (typeof v === 'string' && v) terms[letter] = v;
     }
   }
+  const shortname = readShortname(o.shortname);
   return {
     id: o.id,
     name: typeof o.name === 'string' ? o.name : 'Untitled tile',
+    ...(shortname ? { shortname } : {}),
     formula: typeof o.formula === 'string' ? o.formula : '',
     terms,
     format: FORMATS.includes(o.format as TileFormat) ? (o.format as TileFormat) : 'percent',

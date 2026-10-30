@@ -98,3 +98,43 @@ export function dropTile(ids: string[], draggedId: string, targetId: string, aft
 export function isDefaultOrder(arranged: string[], defaults: string[]): boolean {
   return arranged.length === defaults.length && arranged.every((id, i) => id === defaults[i]);
 }
+
+// ---------------------------------------------------------------------------
+// Short names
+// ---------------------------------------------------------------------------
+//
+// A tile id (`search:sq_…`, `ratio:rt_…`) is unique and stable but means
+// nothing to a person. A short name is the user's own handle for a tile —
+// `hot_leads`, `reply_rate` — sent next to the id in the daily report, so a
+// spreadsheet or automation reading the report can pick a number out by a name
+// someone chose, and keep finding it after the tile is renamed.
+//
+// Stored on the tile's own record (the saved search, or the ratio tile), so it
+// syncs and merges with that record. Optional; unique across tiles, ignoring
+// case, so one short name always means one tile.
+
+export const SHORTNAME_MAX = 32;
+const SHORTNAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+
+/** A stored short name, or undefined when there isn't a usable one. */
+export function readShortname(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const s = raw.trim();
+  return s && s.length <= SHORTNAME_MAX && SHORTNAME_RE.test(s) ? s : undefined;
+}
+
+/** Anything that can carry a short name: a saved search or a ratio tile. */
+export interface ShortnameOwner { tileId: string; name: string; shortname?: string }
+
+/**
+ * Why `value` can't be this tile's short name, or null when it can (an empty
+ * value is fine: it clears the short name). `others` is every OTHER tile.
+ */
+export function shortnameProblem(value: string, others: ShortnameOwner[]): string | null {
+  const s = value.trim();
+  if (!s) return null;
+  if (s.length > SHORTNAME_MAX) return `Keep it to ${SHORTNAME_MAX} characters or fewer.`;
+  if (!SHORTNAME_RE.test(s)) return 'Start with a letter; then letters, numbers, _ or - only (no spaces).';
+  const clash = others.find((o) => o.shortname && o.shortname.toLowerCase() === s.toLowerCase());
+  return clash ? `“${clash.name || 'Another tile'}” already uses this short name.` : null;
+}
