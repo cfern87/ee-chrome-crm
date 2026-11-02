@@ -316,12 +316,13 @@ export function readSimple(tokens: Token[]): { intersect: boolean } | null {
 // Showing the result
 // ---------------------------------------------------------------------------
 
-export type TileFormat = 'percent' | 'number' | 'ratio';
+export type TileFormat = 'percent' | 'number' | 'ratio' | 'colon';
 
 export const TILE_FORMATS: { value: TileFormat; label: string }[] = [
   { value: 'percent', label: 'Percentage' },
   { value: 'number', label: 'Number' },
   { value: 'ratio', label: 'Ratio (1 in 4)' },
+  { value: 'colon', label: 'Ratio (4 : 1)' },
 ];
 
 /** Up to `digits` decimals, trailing zeros dropped. */
@@ -353,6 +354,12 @@ export function formatValue(v: number | null, format: TileFormat): string {
       if (v >= 1) return `${round(v, v >= 10 ? 0 : 1)} to 1`;
       const n = 1 / v;
       return `1 in ${round(n, n >= 10 ? 0 : 1)}`;
+    }
+    case 'colon': {
+      // The same stat as 'ratio', written "N : 1": 1 in 4 is "4 : 1", 3 to 1 is "3 : 1".
+      if (v <= 0) return round(v, 2);
+      const n = v >= 1 ? v : 1 / v;
+      return `${round(n, n >= 10 ? 0 : 1)} : 1`;
     }
   }
 }

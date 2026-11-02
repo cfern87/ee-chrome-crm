@@ -1647,7 +1647,7 @@ function tasksSectionHtml(conv: Conversation): string {
   // own line: the add row is already three controls wide in a 320px panel.
   const datePicker = taskDraft.due === PANEL_DUE_CUSTOM
     ? `<input type="date" id="fb-crm-task-date" class="fb-crm-task-date" aria-label="Due date"
-         min="${dateInputValue(Date.now())}" value="${escapeAttr(taskDraft.date)}" />`
+         min="${dateInputValue(Date.now())}" max="${dateInputValue(Date.now() + 5 * 366 * 86_400_000)}" value="${escapeAttr(taskDraft.date)}" />`
     : '';
 
   return `
@@ -2279,7 +2279,26 @@ function wirePanelTasks(conv: Conversation) {
     // the section has to be redrawn. Every other choice needs no repaint.
     if (taskDraft.due === PANEL_DUE_CUSTOM || dateEl) await renderPanel();
   });
-  dateEl?.addEventListener('change', () => { taskDraft.date = dateEl.value; });
+  if (dateEl) {
+    // Calendar only: typed digits in the year segment run on to six places
+    // ("20266") and produce dates nobody meant. Every key but Tab/Escape is
+    // swallowed, and the calendar opens on click or focus instead.
+    const openCalendar = () => { try { dateEl.showPicker(); } catch { /* needs a user gesture */ } };
+    dateEl.addEventListener('keydown', e => {
+      if (e.key === 'Tab' || e.key === 'Escape') return;
+      e.preventDefault();
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown') openCalendar();
+    });
+    dateEl.addEventListener('paste', e => e.preventDefault());
+    dateEl.addEventListener('click', openCalendar);
+    dateEl.addEventListener('change', () => {
+      // Backstop for a value that got in anyway: outside min..max means a bad year.
+      if (dateEl.value && (dateEl.value < dateEl.min || dateEl.value > dateEl.max)) dateEl.value = '';
+      taskDraft.date = dateEl.value;
+    });
+    // Just chosen from the select: show the calendar straight away.
+    if (!taskDraft.date) openCalendar();
+  }
 
   addEl.addEventListener('click', async () => {
     const title = titleEl.value.trim();
@@ -3826,6 +3845,14 @@ function noteReadState(threadId: string | null | undefined, state: ReadState): v
 const READ_SCAN_MAX_MS = 5 * 60_000;
 /** How long to wait for a scroll to bring in more rows before trying again. */
 const READ_SCAN_ROW_WAIT_MS = 1200;
+/**
+ * How long to wait for the next page once the list is at its bottom. Facebook
+ * fetches the next page only then, and the fetch can take far longer than a
+ * mid-list scroll: measured live 2026-10-31, a foreground walk of the Unread
+ * list ended at 91 of 94 on a single slow fetch, and the automation runs in a
+ * background window where timers and requests are throttled — it gave up at 52.
+ */
+const READ_SCAN_BOTTOM_WAIT_MS = 6000;
 /** Consecutive scrolls that add nothing before the list is called exhausted. */
 const READ_SCAN_STALL_LIMIT = 3;
 
@@ -4041,7 +4068,17 @@ async function walkConversationList(opts: {
       // anything new arrived, so rows that appear mid-wait are picked up rather
       // than raced past. Requiring several stalls in a row rather than one
       // keeps a slow network from being mistaken for the end of the list.
-      const grew = !!(await pollFor(() => readScanCancelled || opts.harvest(root, activeThreadId) > 0, READ_SCAN_ROW_WAIT_MS, 200));
+      let grew = !!(await pollFor(() => readScanCancelled || opts.harvest(root, activeThreadId) > 0, READ_SCAN_ROW_WAIT_MS, 200));
+      // At the bottom with nothing new: the next page is either on its way or
+      // the list has ended. Give a slow fetch a real chance, and nudge the list
+      // up and back down once so Facebook's own "near the bottom" trigger fires
+      // again if it was missed. Only a quiet bottom of this length counts as a stall.
+      if (!grew && !readScanCancelled && container.scrollTop + container.clientHeight >= container.scrollHeight - 8) {
+        container.scrollTop = Math.max(0, container.scrollTop - container.clientHeight * 0.6);
+        await sleep(250);
+        container.scrollTop = container.scrollHeight;
+        grew = !!(await pollFor(() => readScanCancelled || opts.harvest(root, activeThreadId) > 0, READ_SCAN_BOTTOM_WAIT_MS, 200));
+      }
       opts.onProgress();
       if (readScanCancelled) break;
       // A scroll through rows already harvested adds nothing, and that is not

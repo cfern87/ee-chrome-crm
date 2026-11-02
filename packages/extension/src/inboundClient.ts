@@ -132,9 +132,9 @@ export function makeInboundClient(deps: InboundClientDeps) {
       return failed(r) ? r : { ok: true, tokens: Array.isArray(r.data) ? (r.data as InboundToken[]) : [] };
     },
 
-    async listRecent(limit = 20): Promise<{ ok: true; commands: InboundCommandSummary[] } | Fail> {
-      const r = await call('GET', `/rest/v1/inbound_commands?select=id,command,status,error,created_at,claimed_at,finished_at,expires_at&order=created_at.desc&limit=${limit}`);
-      return failed(r) ? r : { ok: true, commands: Array.isArray(r.data) ? (r.data as InboundCommandSummary[]) : [] };
+    async listRecent(limit = 20): Promise<{ ok: true; commands: InboundCommandDetail[] } | Fail> {
+      const r = await call('GET', `/rest/v1/inbound_commands?select=id,command,status,error,payload,result,created_at,claimed_at,finished_at,expires_at&order=created_at.desc&limit=${limit}`);
+      return failed(r) ? r : { ok: true, commands: Array.isArray(r.data) ? (r.data as InboundCommandDetail[]) : [] };
     },
 
     /** The last requests that came in with one token, newest first. */

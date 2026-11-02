@@ -36,7 +36,7 @@ fi
 
 echo ""
 echo "  Extension source changed — rebuilding packages/extension/dist ..."
-if npm run build --workspace packages/extension --silent; then
+if SKIP_VERSION_BUMP=1 npm run build --workspace packages/extension --silent; then
   echo "  ✔ Rebuilt. Reload the extension at chrome://extensions to pick it up."
 else
   echo ""

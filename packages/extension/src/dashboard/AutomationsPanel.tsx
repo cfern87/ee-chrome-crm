@@ -15,10 +15,11 @@ import type { Store, SaveResult } from '../storage';
 import {
   readAutomations, writeAutomations, newTagUnreadAutomation, newSearchAutomation, withLegacyFields,
   whyNotRunnable, describeSchedule, describeRun, describeActions, matchSavedSearch,
-  DEPTH_OPTIONS, SCHEDULE_OPTIONS, MAX_AUTOMATIONS, MESSAGE_CAP_OPTIONS, DEFAULT_MESSAGE_CAP,
+  AUTOMATION_RUNS_KEY, DEPTH_OPTIONS, SCHEDULE_OPTIONS, MAX_AUTOMATIONS, MESSAGE_CAP_OPTIONS, DEFAULT_MESSAGE_CAP,
   type Automation, type AutomationRuns, type AutomationRun, type AutomationMessage,
 } from '../automations';
-import { sortSavedSearches, type SavedSearch } from '../search';
+import { sortSavedSearches, type SavedSearch, type QueryContext } from '../search';
+import { SavedSearchPreview } from './SearchBuilder';
 import {
   Banner, Button, Card, EmptyState, Input, Select, Stack, Text, Textarea, Toggle,
   Field as FormField, color, radius, space,
@@ -87,6 +88,17 @@ export function AutomationsPanel({ store, updateStore, onOpenTags, onOpenSearch 
     const interval = setInterval(refreshRuns, anyRunning ? 1500 : 10_000);
     return () => clearInterval(interval);
   }, [refreshRuns, anyRunning]);
+
+  // Run records live in chrome.storage.local, written by the background worker.
+  // Refresh the moment one changes instead of waiting for the next poll — a
+  // run started by an incoming webhook has no click on this page to trigger one.
+  useEffect(() => {
+    const onChanged = (changes: Record<string, unknown>, area: string) => {
+      if (area === 'local' && AUTOMATION_RUNS_KEY in changes) void refreshRuns();
+    };
+    try { chrome.storage.onChanged.addListener(onChanged); } catch { /* no chrome.storage (tests) */ }
+    return () => { try { chrome.storage.onChanged.removeListener(onChanged); } catch { /* ditto */ } };
+  }, [refreshRuns]);
 
   const persist = async (next: Automation[]) => {
     await updateStore({ ...store, settings: writeAutomations(store.settings, next.map(withLegacyFields)) });
@@ -320,7 +332,7 @@ function AutomationCard({
           <Text size="small" tone={run.error || interrupted ? 'danger' : 'muted'}>
             {interrupted
               ? `Last run ${formatRelativeTime(run.startedAt)} was interrupted before it finished.`
-              : `Last run ${formatRelativeTime(run.finishedAt || run.startedAt)}${run.trigger === 'schedule' ? ' (scheduled)' : ''}: ${describeRun(run)}`}
+              : `Last run ${formatRelativeTime(run.finishedAt || run.startedAt)}${run.trigger === 'schedule' ? ' (scheduled)' : run.trigger === 'webhook' ? ' (webhook)' : ''}: ${describeRun(run)}`}
           </Text>
         )}
         {!run && <Text size="small" tone="muted">Hasn’t run on this computer yet.</Text>}
@@ -382,6 +394,11 @@ function AutomationEditor({ initial, store, team, isNew, onSave, onCancel, onOpe
 
   const searches = sortSavedSearches(store.savedSearches);
   const search = draft.kind === 'search' && draft.savedSearchId ? store.savedSearches[draft.savedSearchId] : undefined;
+  const [showSearch, setShowSearch] = useState(false);
+  const previewCtx: QueryContext = useMemo(
+    () => ({ now: Date.now(), tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs }),
+    [store.tags, store.tagGroups, store.fieldDefs],
+  );
   const matchCount = useMemo(() => (search ? matchSavedSearch(search, store).length : 0), [search, store]);
 
   const blocked = whyNotRunnable(draft, store);
@@ -459,6 +476,16 @@ function AutomationEditor({ initial, store, team, isNew, onSave, onCancel, onOpe
                 You don’t have any saved searches yet. In Contacts, open Advanced search, build the search, and
                 “Save current” — then pick it here.
               </Banner>
+            )}
+            {search && (
+              <>
+                <div>
+                  <Button size="sm" variant="link" aria-expanded={showSearch} onClick={() => setShowSearch((v) => !v)}>
+                    {showSearch ? 'Hide search' : 'Preview search'}
+                  </Button>
+                  {showSearch && <SavedSearchPreview search={search} ctx={previewCtx} />}
+                </div>
+              </>
             )}
             {search && (
               <Text size="small" tone="muted">

@@ -48,7 +48,7 @@ export interface RatioTile {
 /** Tile id for the Dashboard order (see dashboardTiles.ts). */
 export const ratioTileId = (id: string) => `ratio:${id}`;
 
-const FORMATS: TileFormat[] = ['percent', 'number', 'ratio'];
+const FORMATS: TileFormat[] = ['percent', 'number', 'ratio', 'colon'];
 
 /**
  * Defensive read, as for every synced record: a tile can arrive from a newer

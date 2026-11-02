@@ -26,7 +26,7 @@ export function TileShortnameField({
         invalid={!!problem}
         maxLength={SHORTNAME_MAX}
         placeholder="Short name for reports (optional, e.g. hot_leads)"
-        onChange={(e) => onChange(e.target.value)}
+        onChange={(e) => onChange(e.target.value.toLowerCase())}
         onKeyDown={(e) => { if (e.key === 'Enter' && onEnter) onEnter(); }}
         style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace' }}
       />

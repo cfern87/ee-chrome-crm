@@ -99,7 +99,7 @@ describe('divide by zero', () => {
   });
 
   it('shows as a dash in every format', () => {
-    for (const f of ['percent', 'number', 'ratio'] as const) expect(formatValue(null, f)).toBe('—');
+    for (const f of ['percent', 'number', 'ratio', 'colon'] as const) expect(formatValue(null, f)).toBe('—');
     expect(formatValue(NaN, 'percent')).toBe('—');
   });
 
@@ -230,5 +230,9 @@ describe('formatting', () => {
     expect(formatValue(1 / 48, 'ratio')).toBe('1 in 48');
     expect(formatValue(3, 'ratio')).toBe('3 to 1');
     expect(formatValue(0, 'ratio')).toBe('0');
+    expect(formatValue(0.25, 'colon')).toBe('4 : 1');
+    expect(formatValue(0.4, 'colon')).toBe('2.5 : 1');
+    expect(formatValue(3, 'colon')).toBe('3 : 1');
+    expect(formatValue(0, 'colon')).toBe('0');
   });
 });

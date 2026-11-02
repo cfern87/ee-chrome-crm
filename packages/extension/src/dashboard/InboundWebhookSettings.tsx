@@ -9,7 +9,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import type { Store, SaveResult } from '../storage';
 import { readAutomations, describeRun, type AutomationRun } from '../automations';
 import { readInboundSettings, writeInboundSettings, type InboundSettings, type InboundStatus } from '../inbound';
-import { TOKEN_HISTORY_LIMIT, type InboundCommandDetail, type InboundCommandSummary, type InboundToken } from '../inboundClient';
+import { TOKEN_HISTORY_LIMIT, type InboundCommandDetail, type InboundToken } from '../inboundClient';
 import { Banner, Button, Card, Input, Stack, Text, Toggle, Field as FormField, color, radius, space } from '../ui/primitives';
 import { sendBg, formatRelativeTime, CopyButton } from './shared';
 import { helpUrl } from '../helpLinks';
@@ -81,12 +81,38 @@ function describeOutcome(c: InboundCommandDetail): string {
   return c.status === 'failed' ? `Failed: ${c.error || 'unknown error'}` : 'Done';
 }
 
+/** One request as an accordion row: a line to click, then the outcome and the JSON that came in. */
+function RequestRow({ c }: { c: InboundCommandDetail }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ marginTop: 4 }}>
+      <button
+        onClick={() => setOpen(!open)}
+        aria-expanded={open}
+        style={{ all: 'unset', cursor: 'pointer', display: 'block', fontSize: 12, color: c.status === 'failed' ? color.danger.base : color.text.secondary }}
+      >
+        {open ? '▾' : '▸'} {formatRelativeTime(Date.parse(c.created_at))} · {describeRequest(c)} · {c.status}
+      </button>
+      {open && (
+        <div style={{ margin: '4px 0 6px 14px' }}>
+          <Text as="div" size="micro" tone={c.status === 'failed' ? 'danger' : 'muted'}>{describeOutcome(c)}</Text>
+          <Text as="div" size="micro" tone="muted" style={{ marginTop: 2 }}>
+            Received {new Date(c.created_at).toLocaleString()}
+            {c.finished_at ? ` · finished ${new Date(c.finished_at).toLocaleString()}` : ''}
+          </Text>
+          <pre style={{ fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: '4px 0 0', padding: 6, borderRadius: radius.sm, background: color.surface.raised, maxHeight: 260, overflow: 'auto' }}>
+            {JSON.stringify(c.payload ?? {}, null, 2)}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** The last TOKEN_HISTORY_LIMIT requests that came in with one token. Loaded when opened. */
 function TokenHistory({ tokenId }: { tokenId: string }) {
   const [items, setItems] = useState<InboundCommandDetail[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [open, setOpen] = useState<string | null>(null);
-
   const load = useCallback(async () => {
     const r = await sendBg<{ ok: true; commands: InboundCommandDetail[] } | Fail>({ type: 'INBOUND_TOKEN_HISTORY', payload: { id: tokenId } });
     if (!r) { setError(WORKER_NOT_LOADED); return; }
@@ -105,29 +131,7 @@ function TokenHistory({ tokenId }: { tokenId: string }) {
       {error && <Text as="div" size="micro" tone="danger">{error}</Text>}
       {!error && items === null && <Text as="div" size="micro" tone="muted">Loading…</Text>}
       {items?.length === 0 && <Text as="div" size="micro" tone="muted">No requests with this token yet.</Text>}
-      {items?.map((c) => (
-        <div key={c.id} style={{ marginTop: 4 }}>
-          <button
-            onClick={() => setOpen(open === c.id ? null : c.id)}
-            aria-expanded={open === c.id}
-            style={{ all: 'unset', cursor: 'pointer', display: 'block', fontSize: 12, color: c.status === 'failed' ? color.danger.base : color.text.secondary }}
-          >
-            {open === c.id ? '▾' : '▸'} {formatRelativeTime(Date.parse(c.created_at))} · {describeRequest(c)} · {c.status}
-          </button>
-          {open === c.id && (
-            <div style={{ margin: '4px 0 6px 14px' }}>
-              <Text as="div" size="micro" tone={c.status === 'failed' ? 'danger' : 'muted'}>{describeOutcome(c)}</Text>
-              <Text as="div" size="micro" tone="muted" style={{ marginTop: 2 }}>
-                Received {new Date(c.created_at).toLocaleString()}
-                {c.finished_at ? ` · finished ${new Date(c.finished_at).toLocaleString()}` : ''}
-              </Text>
-              <pre style={{ fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: '4px 0 0', padding: 6, borderRadius: radius.sm, background: color.surface.raised }}>
-                {JSON.stringify(c.payload ?? {}, null, 2)}
-              </pre>
-            </div>
-          )}
-        </div>
-      ))}
+      {items?.map((c) => <RequestRow key={c.id} c={c} />)}
     </div>
   );
 }
@@ -145,7 +149,7 @@ export function InboundWebhookSettings({ store, updateStore }: {
   const [endpoint, setEndpoint] = useState('');
   const [status, setStatus] = useState<InboundStatus | null>(null);
   const [tokens, setTokens] = useState<InboundToken[]>([]);
-  const [recent, setRecent] = useState<InboundCommandSummary[]>([]);
+  const [recent, setRecent] = useState<InboundCommandDetail[]>([]);
   const [newToken, setNewToken] = useState<string | null>(null);
   const [label, setLabel] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -159,7 +163,7 @@ export function InboundWebhookSettings({ store, updateStore }: {
     if (info) { setEndpoint(info.endpointUrl); setStatus(info.status); }
     if (!settings.enabled) return;
     const t = await sendBg<{ ok: true; tokens: InboundToken[] } | Fail>({ type: 'INBOUND_TOKENS' });
-    const r = await sendBg<{ ok: true; commands: InboundCommandSummary[] } | Fail>({ type: 'INBOUND_RECENT' });
+    const r = await sendBg<{ ok: true; commands: InboundCommandDetail[] } | Fail>({ type: 'INBOUND_RECENT' });
     if (t && 'error' in t) setError(t.error);
     else if (r && 'error' in r) setError(r.error);
     else setError(null);
@@ -299,11 +303,7 @@ export function InboundWebhookSettings({ store, updateStore }: {
               <Button size="sm" variant="ghost" onClick={() => void refresh()}>Refresh</Button>
             </Stack>
             {recent.length === 0 && <Text size="small" tone="muted">None yet.</Text>}
-            {recent.map((c) => (
-              <Text key={c.id} as="div" size="micro" tone={c.status === 'failed' ? 'danger' : 'muted'}>
-                {formatRelativeTime(Date.parse(c.created_at))} · {c.command} · {c.status}{c.error ? ` — ${c.error}` : ''}
-              </Text>
-            ))}
+            {recent.map((c) => <RequestRow key={c.id} c={c} />)}
           </div>
 
           <div style={box}>

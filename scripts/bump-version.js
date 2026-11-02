@@ -3,11 +3,11 @@
 // which is the file Chrome reads to determine the installed version, and carries
 // that number to every other place the version is recorded.
 //
-// Run by .githooks/pre-commit on every commit to main. The revision (Z) is a
-// running count of commits that a minor release keeps counting; only a major
-// release starts it over. Set BUMP for that one commit:
-//   BUMP=minor git commit ...   x.y.z -> x.(y+1).(z+1)
-//   BUMP=major git commit ...   x.y.z -> (x+1).0.0
+// Run by packages/extension/build.mjs on every build. The revision (Z) is a
+// running count of builds that a minor release keeps counting; only a major
+// release starts it over. Set BUMP for that one build:
+//   BUMP=minor npm run build   x.y.z -> x.(y+1).(z+1)
+//   BUMP=major npm run build   x.y.z -> (x+1).0.0
 const fs = require('fs');
 const path = require('path');
 

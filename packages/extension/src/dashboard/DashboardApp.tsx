@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Store, Conversation, Tag, TagGroup, CustomFieldDef, CustomFieldType, loadStore, saveStore, SaveResult, EMPTY_STORE, getSyncUsage, SyncUsage, forcePullFromSync, forcePushToSync, isDriveEnabled, setDriveEnabled, removeTagsFrom, lastTaggedAt, getDriveSyncInfo, DriveSyncInfo, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, isStoreChangeKey, isCrmSyncKey, touchDef, tagGroupMode, TagGroupMode } from '../storage';
-import { BUILD_INFO } from '../buildInfo';
 import { getEntitlement, PLATFORM_URL, FREE_CONTACT_LIMIT, isSignedIn, SESSION_KEY, EXTENSION_AUTH_PATH, type Entitlement } from '../license';
 
 import {
@@ -1984,7 +1983,7 @@ export default function DashboardApp() {
       onToggleRail={() => setRailCollapsed((v) => !v)}
       title={ROUTE_TITLE[route]}
       meta={contactsMeta || undefined}
-      actions={<WorkspaceSwitcher />}
+      actions={<><WorkspaceSwitcher /><Text size="small" tone="muted">v{chrome.runtime.getManifest().version}</Text></>}
       contentScroll={route !== 'contacts'}
       drawerOpen={drawerOpen}
       onDrawerOpenChange={setDrawerOpen}

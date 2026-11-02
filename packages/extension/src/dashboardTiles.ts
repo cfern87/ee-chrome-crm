@@ -119,7 +119,8 @@ const SHORTNAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
 /** A stored short name, or undefined when there isn't a usable one. */
 export function readShortname(raw: unknown): string | undefined {
   if (typeof raw !== 'string') return undefined;
-  const s = raw.trim();
+  // Lowercase only, so a report reader never has to match on case.
+  const s = raw.trim().toLowerCase();
   return s && s.length <= SHORTNAME_MAX && SHORTNAME_RE.test(s) ? s : undefined;
 }
 

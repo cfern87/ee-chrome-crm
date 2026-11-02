@@ -32,6 +32,9 @@ function applyGate(next) {
 
 applyGate(null);
 
+// Subtle build label in the account footer.
+try { $('popVersion').textContent = 'v' + chrome.runtime.getManifest().version; } catch (e) { /* cosmetic */ }
+
 // ---- Launcher ------------------------------------------------------------
 
 $('openDashboardBtn').addEventListener('click', () => {

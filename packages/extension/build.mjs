@@ -21,7 +21,7 @@ import react from '@vitejs/plugin-react';
 import { resolve, dirname } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, watch as watchDir } from 'fs';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const r = (p) => resolve(__dirname, p);
@@ -36,6 +36,18 @@ function git(args) {
   } catch {
     return ''; // no git available (e.g. building from a source archive)
   }
+}
+
+/**
+ * Bump the revision once per build, before anything reads the manifest, so the
+ * bundle, dist/manifest.json and the zip all carry the new number. Skipped for
+ * --watch rebuilds (writing public/manifest.json would retrigger the watcher)
+ * and when SKIP_VERSION_BUMP is set (the git hooks' automatic rebuilds).
+ * BUMP=minor|major passes through to scripts/bump-version.js.
+ */
+function bumpVersion() {
+  if (process.env.SKIP_VERSION_BUMP) return;
+  execFileSync(process.execPath, [r('../../scripts/bump-version.js')], { stdio: 'inherit' });
 }
 
 function buildInfo() {
@@ -109,10 +121,14 @@ async function emitHelpPages(version) {
   }
 }
 
+let rebuilding = false; // true after the first run: later --watch rebuilds don't bump
+
 async function run() {
   // Restamped on every run, not once at module load: under --watch the process
   // outlives commits, so a stamp captured at startup would report the SHA the
   // watcher started at rather than the one the bundle was built from.
+  if (!rebuilding) bumpVersion();
+  rebuilding = true;
   const BUILD_INFO = buildInfo();
   // Vite splices `define` values in as raw source text, so the replacement has
   // to be a JS string *literal* — hence the double stringify.

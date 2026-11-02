@@ -422,6 +422,7 @@ export function DashboardPanel({
         tile={editing.tile}
         isNew={editing.isNew}
         savedSearches={savedSearches}
+        ctx={ctx}
         idsFor={idsFor}
         otherShortnames={otherOwners(ratioTileId(editing.tile.id))}
         onSave={async (tile) => { await onSaveRatioTile(tile); setEditing(null); }}

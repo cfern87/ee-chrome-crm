@@ -6,7 +6,7 @@
 // there is no lookup-by-id and no risk of a stale subtree overwriting a sibling.
 
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
-import { color } from '../ui/primitives';
+import { color, radius } from '../ui/primitives';
 import { useLocalPref } from '../ui/prefs';
 import { bucketTags, showsGroupLabels } from '../tagGrouping';
 import type { Tag, TagGroup, CustomFieldDef } from '../storage';
@@ -768,6 +768,36 @@ export function QueryEditor({ query, onChange, tags, tagGroups, fieldDefs }: {
         onChange={onChange}
       />
     </QueryDndRoot>
+  );
+}
+
+/**
+ * A saved search's conditions, shown exactly as the search builder shows them
+ * but frozen: for checking what a search does from a place that only picks it
+ * (a ratio tile, a quick action). The disabled fieldset turns every native
+ * control off, and the wrapper swallows pointer events for the rest.
+ */
+export function SavedSearchPreview({ search, ctx }: { search: SavedSearch; ctx: QueryContext }) {
+  const scope = search.archiveScope && search.archiveScope !== 'active' ? ` · archived: ${search.archiveScope}` : '';
+  return (
+    <div
+      data-testid="saved-search-preview"
+      aria-label={`Preview of ${search.name} (read only)`}
+      style={{ marginTop: 6, padding: 8, border: `1px dashed ${color.border.subtle}`, borderRadius: radius.sm, background: color.surface.sunken }}
+    >
+      <div style={{ fontSize: 11, color: color.text.muted, marginBottom: 4 }}>
+        Preview only — edit this search in Contacts{scope}
+      </div>
+      <fieldset disabled style={{ border: 'none', margin: 0, padding: 0, minWidth: 0, pointerEvents: 'none', opacity: 0.9 }}>
+        <QueryEditor
+          query={search.query}
+          onChange={() => { /* read only */ }}
+          tags={ctx.tags}
+          tagGroups={ctx.tagGroups}
+          fieldDefs={ctx.fieldDefs}
+        />
+      </fieldset>
+    </div>
   );
 }
 

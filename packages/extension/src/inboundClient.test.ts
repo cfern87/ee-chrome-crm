@@ -95,7 +95,7 @@ describe('inbound client', () => {
     await c.listRecent(10);
     const urls = f.mock.calls.map((call) => (call as unknown as [string])[0]);
     expect(urls[0]).toBe(`${BASE}/rest/v1/inbound_tokens?select=id,token_prefix,label,created_at,last_used_at,revoked_at&order=created_at.desc`);
-    expect(urls[1]).toBe(`${BASE}/rest/v1/inbound_commands?select=id,command,status,error,created_at,claimed_at,finished_at,expires_at&order=created_at.desc&limit=10`);
+    expect(urls[1]).toBe(`${BASE}/rest/v1/inbound_commands?select=id,command,status,error,payload,result,created_at,claimed_at,finished_at,expires_at&order=created_at.desc&limit=10`);
     const init = (f.mock.calls[0] as unknown as [string, RequestInit])[1];
     expect(init.method).toBe('GET');
   });

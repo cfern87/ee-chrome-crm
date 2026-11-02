@@ -14,7 +14,8 @@
 // underlined where it breaks — not reported after Save.
 
 import React, { useMemo, useState } from 'react';
-import type { SavedSearch } from '../search';
+import type { QueryContext, SavedSearch } from '../search';
+import { SavedSearchPreview } from './SearchBuilder';
 import { sortSavedSearches } from '../search';
 import { intersectionSize, nextLetter, ratioTileId, type RatioTile } from '../ratioTiles';
 import { shortnameProblem, type ShortnameOwner } from '../dashboardTiles';
@@ -30,6 +31,8 @@ export interface RatioTileEditorProps {
   tile: RatioTile;
   isNew: boolean;
   savedSearches: Record<string, SavedSearch>;
+  /** Tags and fields, so a search's conditions can be previewed. */
+  ctx: QueryContext;
   /** Contact ids a saved search matches (the Dashboard's shared matcher). */
   idsFor: (preset: SavedSearch) => Set<string>;
   /** Every OTHER tile's short name, so this one can't take a name already in use. */
@@ -48,7 +51,7 @@ const OPERATORS: { op: Op; title: string }[] = [
 
 const plain = (n: number | null) => (n === null ? '—' : formatValue(n, 'number'));
 
-export function RatioTileEditor({ tile, isNew, savedSearches, idsFor, otherShortnames = [], onSave, onCancel }: RatioTileEditorProps) {
+export function RatioTileEditor({ tile, isNew, savedSearches, ctx, idsFor, otherShortnames = [], onSave, onCancel }: RatioTileEditorProps) {
   const initialTokens = useMemo(() => textToFormula(tile.formula), [tile.formula]);
   const initialSimple = readSimple(initialTokens);
 
@@ -66,6 +69,19 @@ export function RatioTileEditor({ tile, isNew, savedSearches, idsFor, otherShort
   /** "Back to simple" would replace a custom formula — waiting on a second click. */
   const [confirmSimple, setConfirmSimple] = useState(false);
   const [saving, setSaving] = useState(false);
+  /** Letters whose search is shown read-only underneath. */
+  const [previewing, setPreviewing] = useState<Record<string, boolean>>({});
+  const togglePreview = (letter: string) => setPreviewing((p) => ({ ...p, [letter]: !p[letter] }));
+  const previewToggle = (letter: string) => (
+    terms[letter] && savedSearches[terms[letter]] ? (
+      <Button size="sm" variant="link" aria-expanded={!!previewing[letter]} onClick={() => togglePreview(letter)}>
+        {previewing[letter] ? 'Hide search' : 'Preview search'}
+      </Button>
+    ) : null
+  );
+  const previewBody = (letter: string) => (
+    previewing[letter] && savedSearches[terms[letter]] ? <SavedSearchPreview search={savedSearches[terms[letter]]} ctx={ctx} /> : null
+  );
 
   const searches = useMemo(() => sortSavedSearches(savedSearches), [savedSearches]);
   const simple = readSimple(tokens);
@@ -230,6 +246,13 @@ export function RatioTileEditor({ tile, isNew, savedSearches, idsFor, otherShort
             <Text weight="medium">out of</Text>
             {picker('B', 'Search B — the whole')}
           </div>
+          {(['A', 'B'] as const).map((l) => terms[l] && savedSearches[terms[l]] && (
+            <div key={l}>
+              <Text size="small" tone="muted">{l} · <strong>{nameOf(l)}</strong> </Text>
+              {previewToggle(l)}
+              {previewBody(l)}
+            </div>
+          ))}
           <label style={{ display: 'flex', alignItems: 'center', gap: space.sm, fontSize: 13, cursor: 'pointer' }}>
             <input
               type="checkbox"
@@ -253,6 +276,7 @@ export function RatioTileEditor({ tile, isNew, savedSearches, idsFor, otherShort
                 <div key={letter} style={{ display: 'flex', alignItems: 'center', gap: space.sm }}>
                   {letterBadge(letter)}
                   {picker(letter, `Search ${letter}`)}
+                  {previewToggle(letter)}
                   <Button
                     size="sm"
                     variant="ghost"
@@ -264,6 +288,12 @@ export function RatioTileEditor({ tile, isNew, savedSearches, idsFor, otherShort
                   >
                     ×
                   </Button>
+                </div>
+              ))}
+              {Object.keys(terms).sort().map((letter) => previewBody(letter) && (
+                <div key={`preview-${letter}`}>
+                  <Text size="micro" tone="muted">Search {letter}: {nameOf(letter)}</Text>
+                  {previewBody(letter)}
                 </div>
               ))}
               {nextLetter(terms) && (

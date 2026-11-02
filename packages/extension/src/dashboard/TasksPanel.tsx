@@ -132,7 +132,18 @@ export function TaskForm({ initial, submitLabel, submitDisabled, onSubmit, onCan
 
         <Stack direction="row" gap="sm" align="flex-end" wrap>
           <FormField label="Due date">
-            {(fp) => <Input {...fp} type="date" value={date} onChange={(e) => setDate(e.target.value)} style={{ width: 150 }} />}
+            {(fp) => (
+              <Input
+                {...fp}
+                type="date"
+                value={date}
+                min="2000-01-01"
+                max="2099-12-31"
+                onChange={(e) => setDate(e.target.value)}
+                onClick={(e) => { try { e.currentTarget.showPicker(); } catch { /* needs a user gesture */ } }}
+                style={{ width: 150 }}
+              />
+            )}
           </FormField>
           <FormField label="Time (optional)">
             {(fp) => (
