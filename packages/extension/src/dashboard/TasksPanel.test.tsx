@@ -159,10 +159,10 @@ describe('ContactTasks', () => {
     expect(input.allDay).toBe(true);
   });
 
-  it('offers no Tomorrow shortcut', () => {
+  it('offers a Tomorrow shortcut', () => {
     const el = mount(<ContactTasks conv={contact('c1', 'Ana', [])} handlers={handlers()} />);
     click(buttonNamed(el, '+ Add follow-up'));
-    expect(Array.from(el.querySelectorAll('button')).map((b) => b.textContent)).not.toContain('Tomorrow');
+    expect(Array.from(el.querySelectorAll('button')).map((b) => b.textContent)).toContain('Tomorrow');
   });
 
   it('will not add a task with a blank title', () => {

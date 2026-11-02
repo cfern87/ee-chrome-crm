@@ -1258,8 +1258,6 @@ let presetNotice: { text: string; error: boolean } | null = null;
 // "Completed" row; these are the group ids opened back up to show the bar.
 // View state only, so it lives here and resets with the conversation.
 const expandedFunnels = new Set<string>();
-// Whether funnels hidden for this contact are listed (so they can be unhidden).
-let showHiddenFunnels = false;
 // Removing a contact from a funnel clears that funnel's tags, so it is two
 // clicks like delete: the ✕ arms it (holds the group id) and the confirm row
 // under the title does it. Reset with the conversation and on panel close.
@@ -1270,8 +1268,7 @@ let funnelRemoveArmed: string | null = null;
 // use `date`), and `date` is the YYYY-MM-DD a custom pick left behind.
 //
 // Three days is the default because "follow up" almost never means "later
-// today", and no longer tomorrow: same-day-plus-one collides with the rest of
-// the workflow, so it isn't offered here at all.
+// today". Tomorrow is offered as a choice but isn't the default.
 const taskDraft: { title: string; due: string; date: string } = { title: '', due: '3', date: '' };
 let taskTitleFocused = false;
 
@@ -1400,14 +1397,17 @@ function tagSectionHtml(opts: {
  * COMPLETED (at its last stage) collapses to its title and a "✓ Completed"
  * toggle — the bar has nothing left to say and the tags are still in the chips
  * below. And a funnel that doesn't apply to this contact can be hidden for
- * them (Conversation.hiddenFunnels); hidden ones are counted in a one-line
- * toggle at the bottom so they can be brought back.
+ * them (Conversation.hiddenFunnels); each hidden one stays as a one-line
+ * row with an Unhide link, listed after the visible bars — one line each is
+ * cheap, and a separate "show hidden" toggle first was an extra click.
  */
 function funnelBarsHtml(allViews: FunnelView[], hiddenIds: string[]): string {
   if (!allViews.length) return '';
   const hidden = new Set(hiddenIds);
-  const hiddenCount = allViews.filter((v) => hidden.has(v.group.id)).length;
-  const views = showHiddenFunnels ? allViews : allViews.filter((v) => !hidden.has(v.group.id));
+  const views = [
+    ...allViews.filter((v) => !hidden.has(v.group.id)),
+    ...allViews.filter((v) => hidden.has(v.group.id)),
+  ];
 
   const bars = views.map((view) => {
     const accent = view.group.color || '#065fd4';
@@ -1487,12 +1487,7 @@ function funnelBarsHtml(allViews: FunnelView[], hiddenIds: string[]): string {
       <div class="fb-crm-funnel" role="group" aria-label="${escapeHtml(describeStage(view))}">${steps}</div>`;
   }).join('');
 
-  const hiddenToggle = hiddenCount
-    ? `<button class="fb-crm-funnel__link fb-crm-funnel__hidden-toggle" data-funnels-show-hidden="1">
-        ${showHiddenFunnels ? 'Stop showing hidden funnels' : `${hiddenCount} funnel${hiddenCount === 1 ? '' : 's'} hidden for this contact · Show`}
-      </button>`
-    : '';
-  return bars + hiddenToggle;
+  return bars;
 }
 
 /**
@@ -1684,6 +1679,7 @@ const PANEL_DUE_CUSTOM = 'custom';
 
 const PANEL_DUE_CHOICES: { value: string; label: string }[] = [
   { value: '0', label: 'Today' },
+  { value: '1', label: 'Tomorrow' },
   { value: '3', label: '3 days' },
   { value: '7', label: '1 week' },
   { value: '14', label: '2 weeks' },
@@ -1763,7 +1759,30 @@ async function togglePanel() {
  */
 async function renderPanel(): Promise<void> {
   await renderPanelContent();
+  restorePanelScroll();
   if (panelAnchor) positionPanelAt(panelAnchor);
+}
+
+// Where the panel body was scrolled to, for the contact it was showing. Every
+// render replaces the panel's HTML, and a fresh body starts at the top — so
+// with messages arriving (each one a store write, each write a render) the
+// panel kept jumping back up while you were working further down it. Tracked
+// by a scroll listener rather than read just before the render, because a
+// render awaits store reads, and a scroll made during that wait must win.
+let panelScroll: { thread: string | null; top: number } = { thread: null, top: 0 };
+
+function restorePanelScroll(): void {
+  const body = panelEl?.querySelector<HTMLElement>('.fb-crm-body');
+  if (!body) return;
+  if (panelScroll.thread === lastRenderedThread) {
+    if (panelScroll.top > 0) body.scrollTop = panelScroll.top;
+  } else {
+    // Another contact: start at the top.
+    panelScroll = { thread: lastRenderedThread, top: 0 };
+  }
+  body.addEventListener('scroll', () => {
+    panelScroll = { thread: lastRenderedThread, top: body.scrollTop };
+  }, { passive: true });
 }
 
 async function renderPanelContent() {
@@ -1811,7 +1830,6 @@ async function renderPanelContent() {
     editingName = null;
     editingNameFocused = false;
     expandedFunnels.clear();
-    showHiddenFunnels = false;
     taskDraft.title = '';
     taskTitleFocused = false;
   }
@@ -2026,7 +2044,8 @@ async function renderPanelContent() {
   if (newTagNameFocused) {
     const el = panelEl.querySelector<HTMLInputElement>('#fb-crm-new-name');
     if (el) {
-      el.focus();
+      // preventScroll: renderPanel puts the scroll back where it was.
+      el.focus({ preventScroll: true });
       const v = el.value;
       try { el.setSelectionRange(v.length, v.length); } catch { /* ignore */ }
     }
@@ -2224,7 +2243,7 @@ function wirePanelFields(threadId: string, conv: Conversation, defs: CustomField
   if (focusedFieldId) {
     const el = panelEl.querySelector<HTMLInputElement | HTMLTextAreaElement>(`input[data-field="${focusedFieldId}"], textarea[data-field="${focusedFieldId}"]`);
     if (el) {
-      el.focus();
+      el.focus({ preventScroll: true });
       const end = el.value.length;
       const [start, stop] = fieldCaret ?? [end, end];
       try { el.setSelectionRange(Math.min(start, end), Math.min(stop, end)); } catch { /* number inputs have no caret */ }
@@ -2324,7 +2343,7 @@ function wirePanelTasks(conv: Conversation) {
   });
 
   if (taskTitleFocused) {
-    titleEl.focus();
+    titleEl.focus({ preventScroll: true });
     try { titleEl.setSelectionRange(titleEl.value.length, titleEl.value.length); } catch { /* ignore */ }
   }
 }
@@ -2537,7 +2556,13 @@ function wirePanelActions(threadId: string) {
       const conv = store.conversations[threadId];
       if (!conv) return;
       const remove = conv.tags.filter((t) => store.tags[t]?.groupId === groupId);
-      if (remove.length) await mutate([{ op: 'removeTags', conversationId: threadId, tagIds: remove }]);
+      const edits: Mutation[] = remove.length ? [{ op: 'removeTags', conversationId: threadId, tagIds: remove }] : [];
+      // Hidden by default but shown for this contact: out of the funnel, it
+      // goes back to hidden (same rule as the "Remove from funnel" action).
+      if (store.tagGroups[groupId]?.funnelHiddenByDefault && conv.shownFunnels?.includes(groupId)) {
+        edits.push({ op: 'resetFunnelVisibility', conversationId: threadId, groupId });
+      }
+      if (edits.length) await mutate(edits);
       expandedFunnels.delete(groupId);
       await renderPanel();
       await injectSidebarTags();
@@ -2545,10 +2570,6 @@ function wirePanelActions(threadId: string) {
   });
   panelEl.querySelectorAll<HTMLElement>('[data-funnel-unhide]').forEach(btn => {
     btn.addEventListener('click', () => { void setFunnelHidden(btn.dataset.funnelUnhide!, false); });
-  });
-  panelEl.querySelector<HTMLElement>('[data-funnels-show-hidden]')?.addEventListener('click', async () => {
-    showHiddenFunnels = !showHiddenFunnels;
-    await renderPanel();
   });
 
   panelEl.querySelector('#fb-crm-create')?.addEventListener('click', async () => {
@@ -2669,7 +2690,7 @@ function wirePanelActions(threadId: string) {
     // Same as the Details inputs: a re-render rebuilt the field the user was
     // typing in, so put the caret back at the end of what they'd typed.
     if (editingNameFocused) {
-      nameInputEl.focus();
+      nameInputEl.focus({ preventScroll: true });
       const v = nameInputEl.value;
       try { nameInputEl.setSelectionRange(v.length, v.length); } catch { /* ignore */ }
     }
@@ -4118,23 +4139,40 @@ async function walkBothFilters(opts: {
   harvest: (root: ParentNode, activeThreadId: string | null) => number;
   done: () => boolean;
   onProgress: () => void;
-}): Promise<{ exhausted: boolean; reached: boolean }> {
+}): Promise<{ exhausted: boolean; reached: boolean; unreadExhausted: boolean }> {
   const budget = Math.min(opts.budgetMs || READ_SCAN_MAX_MS, READ_SCAN_MAX_MS);
   const unread = await walkConversationList({ ...opts, filter: 'unread', budgetMs: Math.round(budget / 2) });
+  // Read before the All pass: Stop during that pass doesn't undo a finished Unread walk.
+  const unreadExhausted = !!unread?.exhausted && !readScanCancelled;
   if (readScanCancelled || opts.done()) {
-    return { exhausted: !!unread?.exhausted, reached: !!unread };
+    return { exhausted: !!unread?.exhausted, reached: !!unread, unreadExhausted };
   }
   const all = await walkConversationList({ ...opts, filter: 'all', budgetMs: Math.round(budget / 2) });
   return {
     // Exhausted only when the pass that can actually run out did.
     exhausted: !!all?.exhausted,
     reached: !!unread || !!all,
+    unreadExhausted,
   };
 }
 
-async function scanReadStates(threadIds: string[], budgetMs: number): Promise<ScanReport> {
+async function scanReadStates(threadIds: string[], budgetMs: number, aliasGroups: string[][] = []): Promise<ScanReport> {
   readScanCancelled = false;
   const wanted = new Set(threadIds.map((t) => t.toLowerCase()));
+  // A contact answers to several ids (store key, user id, the encrypted-chat
+  // thread id, a vanity handle), and a row's href carries whichever one
+  // Messenger uses for that thread today. Every alias maps back to the id the
+  // background asked about, so a row under ANY of them accounts for the contact.
+  const keyOf = new Map<string, string>();
+  for (const group of aliasGroups) {
+    const key = group[0]?.toLowerCase();
+    if (!key || !wanted.has(key)) continue;
+    for (const alias of group) {
+      const a = alias.toLowerCase();
+      if (a && !keyOf.has(a)) keyOf.set(a, key);
+    }
+  }
+  const canonical = (id: string) => { const lower = id.toLowerCase(); return keyOf.get(lower) ?? lower; };
 
   const states = new Map<string, ReadState>();
   const seenThreadIds = new Set<string>();
@@ -4148,10 +4186,10 @@ async function scanReadStates(threadIds: string[], budgetMs: number): Promise<Sc
     const pass = harvestRows(root, activeThreadId);
     let added = 0;
     for (const id of pass.seenThreadIds) {
-      const key = id.toLowerCase();
+      const key = canonical(id);
       if (!seenThreadIds.has(key)) { seenThreadIds.add(key); added++; }
     }
-    for (const [threadId, state] of pass.states) noteState(states, threadId.toLowerCase(), state);
+    for (const [threadId, state] of pass.states) noteState(states, canonical(threadId), state);
     return added;
   };
 
@@ -4181,6 +4219,7 @@ async function scanReadStates(threadIds: string[], budgetMs: number): Promise<Sc
     exhausted,
     source: 'list',
     at: Date.now(),
+    unreadComplete: walk.unreadExhausted,
   });
 }
 
@@ -5059,7 +5098,10 @@ function handleCrmRequest(request: any): Promise<unknown> | null {
     case 'CRM_SCAN_READ_STATES':
       return scanReadStates(
         Array.isArray(payload.threadIds) ? payload.threadIds.map(String) : [],
-        Number(payload.budgetMs) || 0
+        Number(payload.budgetMs) || 0,
+        Array.isArray(payload.aliasGroups)
+          ? payload.aliasGroups.filter(Array.isArray).map((g: unknown[]) => g.map(String))
+          : [],
       );
     case 'CRM_SCAN_UNREAD_THREADS':
       return scanUnreadThreads(Number(payload.depth) || 0, Number(payload.budgetMs) || 0);

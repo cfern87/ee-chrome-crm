@@ -37,6 +37,8 @@ import { writeCollection, type SettingsBag, type SettingsCollection } from './se
 import { newTask, dueFromOffset, type TaskPriority } from './tasks';
 import { matchesQuery, normalizeQuery, isQueryEmpty, describeQuery, type QueryGroup, type QueryContext } from './search';
 import { isExclusiveFunnel } from './funnel';
+import { tagDisplayOrder } from './tagGrouping';
+import { resolveMessage, templateName } from './templates';
 import type { SendAsMode } from './campaigns';
 
 /**
@@ -74,8 +76,14 @@ type PresetStepBody =
   // stage that has since moved to another group is skipped, not misapplied.
   | { kind: 'setFunnelStage'; groupId: string; tagId: string }
   // Take the contact out of a funnel (or any tag group) entirely: every tag
-  // of that group they hold comes off.
+  // of that group they hold comes off. A funnel that is hidden by default goes
+  // back to hidden for them, even if it had been shown for this contact.
   | { kind: 'removeFromFunnel'; groupId: string }
+  // Move the contact one stage further along a funnel: the stage after the
+  // furthest one they hold, or the first stage if they hold none. Nothing
+  // happens at the last stage. Follows the group's own rule, like
+  // setFunnelStage: exclusive funnels drop the other stages.
+  | { kind: 'advanceFunnel'; groupId: string }
   // Queue a message to the contact as a bulk-messaging campaign (campaigns.ts).
   // Not a store edit, so stepsFor never emits anything for it: the surface that
   // pressed the button collects the recipients with campaignSendsFor and starts
@@ -85,7 +93,9 @@ type PresetStepBody =
   // recent campaign when the preset was built; it never tracks that campaign.
   // sendAs: which Facebook identity the campaign may send as (Campaign.sendAs);
   // absent = the personal profile.
-  | { kind: 'addToCampaign'; template: string; skipIfUnread?: boolean; dryRun?: boolean; sendAs?: SendAsMode; sendAsPageId?: string }
+  // templateId: a saved message template (templates.ts) this step sends. Its
+  // CURRENT text is used when pressed; `template` keeps a copy as the fallback.
+  | { kind: 'addToCampaign'; template: string; templateId?: string; skipIfUnread?: boolean; dryRun?: boolean; sendAs?: SendAsMode; sendAsPageId?: string }
   // POST the contact to a URL (webhooks.ts buildPresetPayload). Also not a
   // store edit: the background delivers it — one POST per contact, so a bulk
   // press of fifty is fifty POSTs — and logs each outcome in that contact's
@@ -120,7 +130,7 @@ export function isDestructive(p: PresetAction): boolean {
 
 /** Presets that message people. These also take a confirmation click — a sent message can't be taken back either. */
 export function sendsMessages(p: PresetAction): boolean {
-  return p.steps.some((s) => s.kind === 'addToCampaign' && !!s.template.trim());
+  return p.steps.some((s) => s.kind === 'addToCampaign' && (!!s.template.trim() || !!s.templateId));
 }
 
 /** Does pressing this preset need the armed second click? */
@@ -245,12 +255,14 @@ function normalizeStepBody(raw: unknown): PresetStepBody | null {
         ? { kind: 'setFunnelStage', groupId: o.groupId, tagId: o.tagId }
         : null;
     case 'removeFromFunnel':
-      return typeof o.groupId === 'string' && o.groupId ? { kind: 'removeFromFunnel', groupId: o.groupId } : null;
+    case 'advanceFunnel':
+      return typeof o.groupId === 'string' && o.groupId ? { kind: o.kind, groupId: o.groupId } : null;
     case 'addToCampaign':
       return typeof o.template === 'string'
         ? {
           kind: 'addToCampaign',
           template: o.template,
+          ...(typeof o.templateId === 'string' && o.templateId ? { templateId: o.templateId } : {}),
           ...(o.skipIfUnread === true ? { skipIfUnread: true } : {}),
           ...(o.dryRun === true ? { dryRun: true } : {}),
           ...(o.sendAs === 'page' ? { sendAs: 'page' as const } : {}),
@@ -429,15 +441,43 @@ export function stepsFor(preset: PresetAction, conv: Conversation, store: Store,
       }
 
       case 'removeFromFunnel': {
-        if (!store.tagGroups[step.groupId]) break;
+        const group = store.tagGroups[step.groupId];
+        if (!group) break;
         // `held`, not conv.tags, so a stage an earlier step added goes too.
         const remove = Object.values(store.tags)
           .filter((t) => t.groupId === step.groupId && held.has(t.id))
           .map((t) => t.id);
-        if (!remove.length) break;
+        // Shown by hand for this contact (usually to pick a stage in it), but
+        // hidden by default: out of the funnel, it goes back to hidden.
+        const rehide = !!group.funnelHiddenByDefault && !!conv.shownFunnels?.includes(group.id);
+        if (!remove.length && !rehide) break;
         flushTags();
-        out.push({ op: 'removeTags', conversationId: id, tagIds: remove });
-        remove.forEach((t) => held.delete(t));
+        if (remove.length) {
+          out.push({ op: 'removeTags', conversationId: id, tagIds: remove });
+          remove.forEach((t) => held.delete(t));
+        }
+        if (rehide) out.push({ op: 'resetFunnelVisibility', conversationId: id, groupId: group.id });
+        break;
+      }
+
+      case 'advanceFunnel': {
+        const group = store.tagGroups[step.groupId];
+        if (!group) break;
+        const stages = Object.values(store.tags).filter((t) => t.groupId === group.id).sort(tagDisplayOrder);
+        let at = -1;
+        stages.forEach((s, i) => { if (held.has(s.id)) at = i; });
+        const target = stages[at + 1];
+        if (!target) break; // last stage already, or an empty group
+        const remove = isExclusiveFunnel(group)
+          ? stages.filter((s) => s.id !== target.id && held.has(s.id)).map((s) => s.id)
+          : [];
+        flushTags();
+        if (remove.length) {
+          out.push({ op: 'removeTags', conversationId: id, tagIds: remove });
+          remove.forEach((t) => held.delete(t));
+        }
+        out.push({ op: 'addTags', conversationId: id, tagIds: [target.id] });
+        held.add(target.id);
         break;
       }
 
@@ -533,9 +573,11 @@ export function campaignSendsFor(
   const ctx: QueryContext = { now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs, history: store.history };
   const out: PresetCampaignSend[] = [];
   for (const step of preset.steps) {
-    if (step.kind !== 'addToCampaign' || !step.template.trim()) continue;
+    if (step.kind !== 'addToCampaign') continue;
+    const template = resolveMessage(store, step.templateId, step.template);
+    if (!template.trim()) continue;
     const send: PresetCampaignSend = {
-      template: step.template,
+      template,
       skipIfUnread: !!step.skipIfUnread,
       dryRun: !!step.dryRun,
       sendAs: step.sendAs === 'page' ? 'page' : 'profile',
@@ -614,10 +656,13 @@ export function describePreset(preset: PresetAction, store: Store): string {
       case 'completeTasks': return 'complete open tasks';
       case 'setFunnelStage': return `${store.tagGroups[s.groupId]?.name || 'deleted funnel'} → ${tagName(s.tagId)}`;
       case 'removeFromFunnel': return `remove from ${store.tagGroups[s.groupId]?.name || 'deleted funnel'}`;
+      case 'advanceFunnel': return `advance in ${store.tagGroups[s.groupId]?.name || 'deleted funnel'}`;
       case 'archive': return 'archive';
       case 'unarchive': return 'unarchive';
       case 'deleteContact': return 'DELETE contact';
       case 'addToCampaign': {
+        const linked = templateName(store, s.templateId);
+        if (linked) return `add to campaign (template "${linked}")${s.dryRun ? ' (dry run)' : ''}`;
         const first = (s.template.split('\n')[0] || '').trim();
         if (!first) return 'add to campaign (no message yet)';
         return `add to campaign "${first.length > 40 ? `${first.slice(0, 40)}…` : first}"${s.dryRun ? ' (dry run)' : ''}`;

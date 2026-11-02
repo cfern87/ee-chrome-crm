@@ -31,12 +31,14 @@ import { ensureHostPermission, TEST_PERMISSION_NOTE } from './WebhookSettings';
 import { QueryEditor } from './SearchBuilder';
 import { WORKER_NOT_LOADED } from '../product';
 import { SendAsPicker } from './SendAsPicker';
+import { LinkedTemplateSelect } from './MessageTemplates';
 
 const STEP_LABELS: Record<PresetStepKind, string> = {
   addTag: 'Add tag',
   removeTag: 'Remove tag',
   setFunnelStage: 'Add to funnel stage',
   removeFromFunnel: 'Remove from funnel',
+  advanceFunnel: 'Advance to next funnel step',
   addToCampaign: 'Add to campaign',
   sendWebhook: 'Send to webhook',
   appendName: 'Append to name',
@@ -50,7 +52,7 @@ const STEP_LABELS: Record<PresetStepKind, string> = {
 };
 
 const STEP_ORDER: PresetStepKind[] = [
-  'addTag', 'removeTag', 'setFunnelStage', 'removeFromFunnel', 'appendName', 'prependName', 'setField', 'addTask', 'completeTasks',
+  'addTag', 'removeTag', 'setFunnelStage', 'advanceFunnel', 'removeFromFunnel', 'appendName', 'prependName', 'setField', 'addTask', 'completeTasks',
   'addToCampaign', 'sendWebhook', 'archive', 'unarchive', 'deleteContact',
 ];
 
@@ -63,13 +65,11 @@ const RECENT_CAMPAIGNS = 15;
  * scheduling follow-ups for March (see dueFromOffset) — so "further out" here
  * means a bigger offset, typed into the box the Custom option reveals, rather
  * than a date picker.
- *
- * No "tomorrow": same-day-plus-one gets in the way of the rest of the workflow,
- * so it isn't offered on any surface.
  */
 const DUE_OFFSETS: { value: string; label: string }[] = [
   { value: '', label: 'No due date' },
   { value: '0', label: 'Due today' },
+  { value: '1', label: 'Due tomorrow' },
   { value: '2', label: 'Due in 2 days' },
   { value: '3', label: 'Due in 3 days' },
   { value: '5', label: 'Due in 5 days' },
@@ -118,6 +118,8 @@ function blankStep(kind: PresetStepKind, store: Store): PresetStep {
     }
     case 'removeFromFunnel':
       return { kind, groupId: groupsForRemoval(store)[0]?.id || '' };
+    case 'advanceFunnel':
+      return { kind, groupId: funnelStages(store.tags, store.tagGroups)[0]?.group.id || '' };
     case 'addToCampaign':
       return { kind, template: '' };
     case 'sendWebhook':
@@ -381,9 +383,9 @@ export function StepListEditor({ steps, store, onChange, emptyText, title = 'Act
         >
           <option value="">+ Add an action…</option>
           {kinds.map((k) => (
-            <option key={k} value={k} disabled={(k === 'setFunnelStage' && !hasFunnels) || (k === 'removeFromFunnel' && !hasGroups)}>
+            <option key={k} value={k} disabled={((k === 'setFunnelStage' || k === 'advanceFunnel') && !hasFunnels) || (k === 'removeFromFunnel' && !hasGroups)}>
               {STEP_LABELS[k]}
-              {k === 'setFunnelStage' && !hasFunnels ? ' (no funnels yet)' : ''}
+              {(k === 'setFunnelStage' || k === 'advanceFunnel') && !hasFunnels ? ' (no funnels yet)' : ''}
               {k === 'removeFromFunnel' && !hasGroups ? ' (no tag groups yet)' : ''}
             </option>
           ))}
@@ -422,7 +424,7 @@ function StepRow({ step, store, kinds, tags, fields, onChange, onRemove, onMove 
         style={{ width: 150 }}
       >
         {(kinds.includes(step.kind) ? kinds : [...kinds, step.kind]).map((k) => (
-          <option key={k} value={k} disabled={k === 'setFunnelStage' && !funnels.length && step.kind !== k}>
+          <option key={k} value={k} disabled={(k === 'setFunnelStage' || k === 'advanceFunnel') && !funnels.length && step.kind !== k}>
             {STEP_LABELS[k]}
           </option>
         ))}
@@ -452,6 +454,19 @@ function StepRow({ step, store, kinds, tags, fields, onChange, onRemove, onMove 
               ))}
             </optgroup>
           ))}
+        </Select>
+      )}
+
+      {step.kind === 'advanceFunnel' && (
+        <Select
+          value={step.groupId}
+          aria-label="Funnel to advance in"
+          title="Moves the contact to the stage after the furthest one they're at (or the first stage). Nothing happens at the last stage."
+          onChange={(e) => onChange({ ...step, groupId: e.target.value })}
+          style={{ width: 220 }}
+        >
+          {!funnels.some((x) => x.group.id === step.groupId) && <option value={step.groupId}>Choose a funnel…</option>}
+          {funnels.map((x) => <option key={x.group.id} value={x.group.id}>{x.group.name}</option>)}
         </Select>
       )}
 
@@ -614,7 +629,7 @@ function StepRow({ step, store, kinds, tags, fields, onChange, onRemove, onMove 
       </div>
     </Stack>
     {step.kind === 'addToCampaign' && (
-      <CampaignStepEditor step={step} onChange={onChange} />
+      <CampaignStepEditor step={step} store={store} onChange={onChange} />
     )}
     {step.when && (
       <StepCondition
@@ -640,8 +655,9 @@ type CampaignStep = Extract<PresetStep, { kind: 'addToCampaign' }>;
  * keeps sending what's in this box even after that campaign ages out of
  * history.
  */
-function CampaignStepEditor({ step, onChange }: {
+function CampaignStepEditor({ step, store, onChange }: {
   step: CampaignStep;
+  store: Store;
   onChange: (next: PresetStep) => void;
 }) {
   const toggle = (key: 'skipIfUnread' | 'dryRun', on: boolean) => {
@@ -651,13 +667,27 @@ function CampaignStepEditor({ step, onChange }: {
 
   return (
     <Stack gap="xs" style={{ marginTop: space.xs, paddingLeft: space.sm, borderLeft: `2px solid ${color.border.subtle}` }}>
-      <RecentCampaignPicker onPick={(template) => onChange({ ...step, template })} />
-      <DraftTextarea
-        value={step.template}
-        aria-label="Campaign message"
-        onCommit={(template) => onChange({ ...step, template })}
-        placeholder="Hi {{firstName}}, just checking in…"
+      <LinkedTemplateSelect
+        store={store}
+        templateId={step.templateId}
+        onChange={(t) => {
+          const { templateId: _t, ...rest } = step;
+          // The text is copied too: it is what older builds send, and the
+          // fallback if the template is deleted.
+          onChange(t ? { ...rest, templateId: t.id, template: t.body } : rest);
+        }}
       />
+      {!step.templateId && (
+        <>
+          <RecentCampaignPicker onPick={(template) => onChange({ ...step, template })} />
+          <DraftTextarea
+            value={step.template}
+            aria-label="Campaign message"
+            onCommit={(template) => onChange({ ...step, template })}
+            placeholder="Hi {{firstName}}, just checking in…"
+          />
+        </>
+      )}
       <Text size="micro" tone="muted">
         {'{{firstName}}'} and {'{{name}}'} are filled in; {'{option a|option b}'} picks one at random per person.
         Pressed on a selection, everyone goes into one campaign, sent with your usual pacing. Anyone already

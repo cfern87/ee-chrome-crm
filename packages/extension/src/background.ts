@@ -119,6 +119,7 @@ import { MAX_READ_STATE_WRITES } from './mutations';
 import { e2eeVariantOf } from './threadUrl';
 import {
   readAutomations, resolveUnread, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable, automationChangesOf,
+  tagTriggerHits, withResolvedMessage,
   AUTOMATION_RUNS_KEY,
   type Automation, type AutomationRun, type AutomationRuns, type UnreadScanReport,
 } from './automations';
@@ -227,7 +228,7 @@ interface MutateResponse {
  * sidebar re-asserts a contact's chat URL on every repaint and almost never has
  * anything new to say.
  */
-async function mutateStore(mutations: Mutation[]): Promise<MutateResponse> {
+async function mutateStore(mutations: Mutation[], opts: { triggerDepth?: number } = {}): Promise<MutateResponse> {
   return withStoreLock(async () => {
     const store = await loadStore();
     const { store: next, changed, conversationId } = applyMutations(store, mutations);
@@ -237,8 +238,81 @@ async function mutateStore(mutations: Mutation[]): Promise<MutateResponse> {
     // takes ten seconds to answer must not hold the store lock for ten seconds
     // — every other tab's edits would queue behind it.
     void fireContactWebhooks(store, next);
+    fireTagTriggers(store, next, opts.triggerDepth ?? 0);
     return { success: true, changed: true, store: next, conversationId, result };
   });
+}
+
+// ---- tag-triggered automations ----
+//
+// "When a tag is added / removed" automations run on the contact the moment
+// this machine writes the change — from the panel, the dashboard, a quick
+// action, or another automation. Changes that arrive from other machines by
+// sync never come through here, so each change fires once, on the machine
+// where it was made.
+//
+// An automation's own edits can set off another tag trigger (that's how they
+// chain), but only MAX_TAG_TRIGGER_DEPTH deep, so two automations that add and
+// remove each other's tags can't loop forever.
+const MAX_TAG_TRIGGER_DEPTH = 3;
+const tagTriggerQueue = new Map<string, { ids: Set<string>; depth: number; source: string }>();
+const tagTriggerDraining = new Set<string>();
+
+function fireTagTriggers(prev: Store, next: Store, depth: number): void {
+  try {
+    if (depth >= MAX_TAG_TRIGGER_DEPTH) return;
+    const automations = readAutomations(next);
+    for (const hit of tagTriggerHits(prev, next, automations)) {
+      const a = automations.find((x) => x.id === hit.automationId)!;
+      const tag = a.triggerTagId ? next.tags[a.triggerTagId]?.name || 'tag' : 'tag';
+      const source = `“${tag}” ${a.triggerOn === 'removed' ? 'removed' : 'added'}`;
+      const q = tagTriggerQueue.get(hit.automationId) || { ids: new Set<string>(), depth: depth + 1, source };
+      hit.ids.forEach((id) => q.ids.add(id));
+      q.depth = Math.max(q.depth, depth + 1);
+      tagTriggerQueue.set(hit.automationId, q);
+      void drainTagTriggers(hit.automationId);
+    }
+  } catch (e) {
+    console.warn('[CRM] tag trigger check failed', e);
+  }
+}
+
+/**
+ * Run one tag-triggered automation on everyone queued for it, one run at a
+ * time. A bulk edit tags people in chunks, so contacts that arrive while a
+ * run is going wait and go in the next run rather than being dropped.
+ */
+async function drainTagTriggers(id: string): Promise<void> {
+  if (tagTriggerDraining.has(id)) return;
+  tagTriggerDraining.add(id);
+  try {
+    let busyRetries = 0;
+    while (tagTriggerQueue.has(id)) {
+      // Already running (Run now, or a run from before): wait for it.
+      if (runningSearchIds.has(id)) {
+        if (++busyRetries > 200) break;
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+      const q = tagTriggerQueue.get(id)!;
+      tagTriggerQueue.delete(id);
+      await new Promise<void>((resolve) => {
+        void startAutomation(id, 'tag', {
+          ids: [...q.ids],
+          triggerDepth: q.depth,
+          source: q.source,
+          onJob: (job) => { void job.finally(() => resolve()); },
+        }).then((res) => {
+          if (!res.success) {
+            console.info('[CRM] tag-triggered automation did not run:', res.error);
+            resolve();
+          }
+        }, () => resolve());
+      });
+    }
+  } finally {
+    tagTriggerDraining.delete(id);
+  }
 }
 
 // ---- webhooks ----
@@ -1197,6 +1271,9 @@ async function startReadScan(conversationIds: string[]): Promise<{ success: bool
 
     const store = await loadStore();
     const targets = new Map<string, string>(); // thread id -> conversation key
+    // Every id each contact answers to, asked-about id first, so a row under
+    // any of them counts (see scanReadStates).
+    const aliasGroups: string[][] = [];
     let unscannable = 0;
     for (const id of conversationIds) {
       const conv = store.conversations[id];
@@ -1204,6 +1281,7 @@ async function startReadScan(conversationIds: string[]): Promise<{ success: bool
       const threadId = scanThreadIdFor(conv);
       if (!threadId) { unscannable++; continue; }
       targets.set(threadId, id);
+      aliasGroups.push([threadId, ...threadAliases(conv).filter((a) => a !== threadId)]);
     }
 
     if (!targets.size) {
@@ -1225,7 +1303,7 @@ async function startReadScan(conversationIds: string[]): Promise<{ success: bool
     // message channel open for the whole scroll. From this point the JOB owns
     // the claim and releases it when it finishes.
     handedOff = true;
-    void runReadScan(Array.from(targets.keys())).finally(() => { scanning = false; });
+    void runReadScan(Array.from(targets.keys()), aliasGroups).finally(() => { scanning = false; });
     return { success: true };
   } catch (e) {
     return { success: false, error: String((e as Error)?.message || e) };
@@ -1236,7 +1314,7 @@ async function startReadScan(conversationIds: string[]): Promise<{ success: bool
   }
 }
 
-async function runReadScan(threadIds: string[]): Promise<void> {
+async function runReadScan(threadIds: string[], aliasGroups: string[][] = []): Promise<void> {
   const log: string[] = [];
   try {
     // The ordinary feed, NOT a Messenger URL.
@@ -1254,7 +1332,7 @@ async function runReadScan(threadIds: string[]): Promise<void> {
 
     const report = await sendViaPort<ScanReport>(
       tabId,
-      { type: 'CRM_SCAN_READ_STATES', payload: { threadIds, budgetMs: READ_SCAN_BUDGET_MS } },
+      { type: 'CRM_SCAN_READ_STATES', payload: { threadIds, aliasGroups, budgetMs: READ_SCAN_BUDGET_MS } },
       READ_SCAN_PORT_MS
     );
     if (!report) throw new Error('The Messenger window stopped responding.');
@@ -1267,7 +1345,7 @@ async function runReadScan(threadIds: string[]): Promise<void> {
       running: false,
       phase: undefined,
       finishedAt: Date.now(),
-      scanned: report.judged.length + report.seenNoAnswer.length,
+      scanned: report.judged.length + report.seenNoAnswer.length + (report.noUnread?.length ?? 0),
       rowsSeen: report.rowsSeen,
       source: report.source,
       tally: tally(report, wanted),
@@ -1400,6 +1478,8 @@ interface AutomationRunOptions {
   onJob?: (job: Promise<void>) => void;
   /** What started it, in the user's words (an incoming webhook's token label), for contact history. */
   source?: string;
+  /** How many tag triggers deep this run is (see fireTagTriggers). Absent = 0. */
+  triggerDepth?: number;
 }
 
 /** How a run is written into each touched contact's history (history.ts, 'a' events). */
@@ -1410,6 +1490,8 @@ interface RunLogContext {
   startedAt: number;
   /** Log these contacts even if nothing changed for them (contacts a webhook named, contacts the run added). */
   alwaysLog?: string[];
+  /** Passed to this run's writes, so tag triggers they set off know how deep they are. */
+  triggerDepth?: number;
 }
 
 async function startAutomation(id: string, trigger: AutomationRun['trigger'], opts: AutomationRunOptions = {}): Promise<{ success: boolean; error?: string }> {
@@ -1417,7 +1499,7 @@ async function startAutomation(id: string, trigger: AutomationRun['trigger'], op
   // neither needs nor takes the `scanning` claim, and can run alongside a
   // reply check or the send queue. Same for any run given explicit contacts.
   const peek = readAutomations(await loadStore()).find((a) => a.id === id);
-  if (peek?.kind === 'search' || opts.ids) return startSearchAutomation(id, trigger, opts);
+  if (peek?.kind === 'search' || peek?.kind === 'tagChange' || opts.ids) return startSearchAutomation(id, trigger, opts);
 
   if (scanning) {
     return { success: false, error: runningAutomationId ? 'Another automation is already running.' : 'A reply check is running. Try again when it finishes.' };
@@ -1495,18 +1577,25 @@ async function runSearchAutomationJob(id: string, trigger: AutomationRun['trigge
   try {
     const startedAt = Date.now();
     const store = await loadStore();
-    const stored = readAutomations(store).find((a) => a.id === id);
-    if (!stored) throw new Error('The automation was deleted while it was running.');
+    const found = readAutomations(store).find((a) => a.id === id);
+    if (!found) throw new Error('The automation was deleted while it was running.');
+    const stored = withResolvedMessage(found, store);
     const automation = opts.transform ? opts.transform(stored) : stored;
 
     let ids = opts.ids;
-    if (!ids) {
+    if (!ids && automation.kind === 'tagChange') {
+      // Run by hand: everyone who has the tag now. "When removed" has no one
+      // to run on until it is removed from someone.
+      if (automation.triggerOn === 'removed') throw new Error('It runs by itself when the tag is removed from someone.');
+      const tag = automation.triggerTagId;
+      ids = Object.values(store.conversations).filter((c) => !!tag && c.tags.includes(tag)).map((c) => c.id);
+    } else if (!ids) {
       const search = automation.savedSearchId ? store.savedSearches[automation.savedSearchId] : undefined;
       if (!search) throw new Error('Its saved search no longer exists.');
       ids = matchSavedSearch(search, store).map((c) => c.id);
     }
     const result = await applyAutomationActions(automation, ids, {
-      trigger, source: opts.source, startedAt,
+      trigger, source: opts.source, startedAt, triggerDepth: opts.triggerDepth,
       // Contacts a webhook named explicitly are logged even when nothing
       // changed, so "did my request reach them?" has an answer.
       ...(opts.ids ? { alwaysLog: ids } : {}),
@@ -1566,7 +1655,7 @@ async function applyAutomationActions(automation: Automation, ids: string[], ctx
   for (const id of ctx.alwaysLog || []) touch(id);
   let failed = false;
   try {
-    return await applyAutomationActionsInner(automation, ids, touch);
+    return await applyAutomationActionsInner(automation, ids, touch, ctx.triggerDepth ?? 0);
   } catch (e) {
     failed = true;
     throw e;
@@ -1597,6 +1686,7 @@ async function applyAutomationActionsInner(
   automation: Automation,
   ids: string[],
   touch: (id: string, changes?: AutomationChange[]) => void,
+  triggerDepth = 0,
 ): Promise<Partial<AutomationRun>> {
   const store = await loadStore();
   const plan = planActions(automation, ids, store);
@@ -1627,7 +1717,7 @@ async function applyAutomationActionsInner(
   // reason — see chunkDelayMs.
   const delay = chunkDelayMs(await isDriveEnabled());
   for (let i = 0; i < chunks.length; i++) {
-    const res = await mutateStore(chunks[i].mutations);
+    const res = await mutateStore(chunks[i].mutations, { triggerDepth });
     for (let g = chunks[i].start; g < Math.min(chunks[i].start + MAX_READ_STATE_WRITES, plan.groups.length); g++) {
       touch(plan.groupIds[g], automationChangesOf(plan.groups[g]));
     }
@@ -1720,8 +1810,9 @@ async function runAutomationJob(automation: Automation, trigger: AutomationRun['
     // can take minutes, and in that time the automation may have been edited or
     // deleted, or contacts tagged by hand.
     const store = await loadStore();
-    const stored = readAutomations(store).find((a) => a.id === id);
-    if (!stored) throw new Error('The automation was deleted while it was running.');
+    const found = readAutomations(store).find((a) => a.id === id);
+    if (!found) throw new Error('The automation was deleted while it was running.');
+    const stored = withResolvedMessage(found, store);
     const current = transform ? transform(stored) : stored;
     const resolved = resolveUnread(current, report.unread, store);
 
@@ -2989,6 +3080,9 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
             const before = await loadStore();
             const saved = await saveStore(incoming);
             void fireContactWebhooks(before, incoming);
+            // Against what was actually saved, not what the page sent: the
+            // save merges, and only real tag changes should start automations.
+            try { fireTagTriggers(before, await loadStore(), 0); } catch { /* best effort */ }
             return saved;
           });
           sendResponse({ success: true, result });

@@ -865,6 +865,7 @@ function describeRunHeader(run: AutomationRunInfo, names: Map<string, string>): 
   const name = names.get(run.automationId);
   const how = run.trigger === 'webhook'
     ? `incoming webhook${run.source ? `: ${run.source}` : ''}`
+    : run.trigger === 'tag' ? (run.source ? `tag ${run.source}` : 'tag change')
     : run.trigger === 'schedule' ? 'on its schedule' : 'run by hand';
   return (
     <>

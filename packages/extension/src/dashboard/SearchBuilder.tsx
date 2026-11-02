@@ -809,9 +809,11 @@ interface PresetBarProps {
   dirty: boolean;
   ctx: QueryContext;
   onApply: (preset: SavedSearch) => void;
-  onSaveNew: (name: string) => void;
+  onSaveNew: (name: string, description?: string) => void;
   onUpdateActive: () => void;
   onRename: (id: string, name: string) => void;
+  /** Set the search's note ('' clears it). Without it the description can't be edited. */
+  onDescribe?: (id: string, description: string) => void;
   onTogglePin: (id: string) => void;
   /** Show or hide this query as a count tile on the Dashboard. */
   onToggleDashboard: (id: string) => void;
@@ -825,11 +827,13 @@ interface PresetBarProps {
 
 function PresetBar({
   savedSearches, activeId, dirty, ctx,
-  onApply, onSaveNew, onUpdateActive, onRename, onTogglePin, onToggleDashboard, onCopy, onDelete, onReorder,
+  onApply, onSaveNew, onUpdateActive, onRename, onDescribe, onTogglePin, onToggleDashboard, onCopy, onDelete, onReorder,
   usedByTiles,
 }: PresetBarProps) {
   const [naming, setNaming] = useState(false);
   const [draftName, setDraftName] = useState('');
+  const [draftDescription, setDraftDescription] = useState('');
+  const [describeDraft, setDescribeDraft] = useState('');
   const [managing, setManaging] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
@@ -845,9 +849,19 @@ function PresetBar({
   const submitNew = () => {
     const name = draftName.trim();
     if (!name) return;
-    onSaveNew(name);
+    onSaveNew(name, draftDescription.trim() || undefined);
     setDraftName('');
+    setDraftDescription('');
     setNaming(false);
+  };
+  // Rename and describe are one edit row: both say what the search is.
+  const commitEdit = (p: SavedSearch) => {
+    const name = renameDraft.trim();
+    if (!name) return;
+    if (name !== p.name) onRename(p.id, name);
+    const description = describeDraft.trim();
+    if (onDescribe && description !== (p.description || '')) onDescribe(p.id, description);
+    setRenamingId(null);
   };
 
   return (
@@ -880,7 +894,7 @@ function PresetBar({
             <button
               key={p.id}
               onClick={() => onApply(p)}
-              title={describeQuery(p.query, ctx)}
+              title={searchTooltip(p, ctx)}
               style={{
                 display: 'inline-flex', alignItems: 'center', gap: 4,
                 padding: '4px 10px', borderRadius: 12, fontSize: 11, fontWeight: 600, cursor: 'pointer',
@@ -927,6 +941,14 @@ function PresetBar({
             placeholder="Name this search, e.g. “Warm leads not contacted in 30 days”"
             style={{ ...control, flex: 1 }}
           />
+          <input
+            value={draftDescription}
+            onChange={(e) => setDraftDescription(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') submitNew(); if (e.key === 'Escape') setNaming(false); }}
+            placeholder="Description (optional): what it's for"
+            aria-label="Description"
+            style={{ ...control, flex: 1 }}
+          />
           <button
             onClick={submitNew}
             disabled={!draftName.trim()}
@@ -952,13 +974,27 @@ function PresetBar({
                     value={renameDraft}
                     onChange={(e) => setRenameDraft(e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === 'Enter' && renameDraft.trim()) { onRename(p.id, renameDraft.trim()); setRenamingId(null); }
+                      if (e.key === 'Enter') commitEdit(p);
                       if (e.key === 'Escape') setRenamingId(null);
                     }}
+                    aria-label="Name"
                     style={{ ...control, flex: 1, minWidth: 140 }}
                   />
+                  {onDescribe && (
+                    <input
+                      value={describeDraft}
+                      onChange={(e) => setDescribeDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') commitEdit(p);
+                        if (e.key === 'Escape') setRenamingId(null);
+                      }}
+                      placeholder="Description (optional)"
+                      aria-label="Description"
+                      style={{ ...control, flex: 2, minWidth: 180 }}
+                    />
+                  )}
                   <button
-                    onClick={() => { if (renameDraft.trim()) { onRename(p.id, renameDraft.trim()); setRenamingId(null); } }}
+                    onClick={() => commitEdit(p)}
                     style={addBtn}
                   >
                     Save
@@ -968,8 +1004,13 @@ function PresetBar({
               ) : (
                 <>
                   <span style={{ fontSize: 12, fontWeight: 600, color: color.text.primary, minWidth: 110 }}>{p.name}</span>
-                  <span style={{ fontSize: 11, color: color.text.muted, flex: 1, minWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {describeQuery(p.query, ctx)}
+                  <span
+                    title={searchTooltip(p, ctx)}
+                    style={{ fontSize: 11, color: color.text.muted, flex: 1, minWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                  >
+                    {p.description
+                      ? <><span style={{ color: color.text.secondary }}>{p.description}</span> · {describeQuery(p.query, ctx)}</>
+                      : describeQuery(p.query, ctx)}
                   </span>
                   <button onClick={() => onReorder(p.id, -1)} disabled={i === 0} title="Move up" style={{ ...iconBtn, opacity: i === 0 ? 0.4 : 1 }}>↑</button>
                   <button onClick={() => onReorder(p.id, 1)} disabled={i === presets.length - 1} title="Move down" style={{ ...iconBtn, opacity: i === presets.length - 1 ? 0.4 : 1 }}>↓</button>
@@ -990,7 +1031,13 @@ function PresetBar({
                   >
                     {p.onDashboard ? '▦ On dashboard' : '▦ Dashboard'}
                   </button>
-                  <button onClick={() => { setRenamingId(p.id); setRenameDraft(p.name); }} style={iconBtn}>Rename</button>
+                  <button
+                    onClick={() => { setRenamingId(p.id); setRenameDraft(p.name); setDescribeDraft(p.description || ''); }}
+                    title={onDescribe ? 'Rename or describe this search' : 'Rename this search'}
+                    style={iconBtn}
+                  >
+                    {onDescribe ? 'Edit' : 'Rename'}
+                  </button>
                   <button
                     onClick={() => onCopy(p.id)}
                     title="Make a copy of this search to change without touching the original"
@@ -1042,6 +1089,12 @@ function DeleteTileWarning({ names }: { names: string[] }) {
   );
 }
 
+/** Hover text for a saved search: its description (when it has one), then what it matches. */
+function searchTooltip(p: SavedSearch, ctx: QueryContext): string {
+  const query = describeQuery(p.query, ctx);
+  return p.description ? `${p.description}\n\n${query}` : query;
+}
+
 /** The pinned presets, rendered as one-click chips outside the builder panel. */
 export function PinnedSearchChips({ savedSearches, activeId, onApply, onClear, ctx }: {
   savedSearches: Record<string, SavedSearch>;
@@ -1061,7 +1114,7 @@ export function PinnedSearchChips({ savedSearches, activeId, onApply, onClear, c
           <button
             key={p.id}
             onClick={() => (isActive ? onClear() : onApply(p))}
-            title={describeQuery(p.query, ctx)}
+            title={searchTooltip(p, ctx)}
             style={{
               padding: '4px 10px', borderRadius: 12, fontSize: 11, fontWeight: 600, cursor: 'pointer',
               border: `1px solid ${isActive ? color.warning.base : '#e0d5c0'}`,
@@ -1091,9 +1144,10 @@ export interface AdvancedSearchProps {
   matchCount: number;
   totalCount: number;
   onApplyPreset: (preset: SavedSearch) => void;
-  onSaveNewPreset: (name: string) => void;
+  onSaveNewPreset: (name: string, description?: string) => void;
   onUpdateActivePreset: () => void;
   onRenamePreset: (id: string, name: string) => void;
+  onDescribePreset?: (id: string, description: string) => void;
   onTogglePinPreset: (id: string) => void;
   onToggleDashboardPreset: (id: string) => void;
   onCopyPreset: (id: string) => void;
@@ -1138,6 +1192,7 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
           onSaveNew={props.onSaveNewPreset}
           onUpdateActive={props.onUpdateActivePreset}
           onRename={props.onRenamePreset}
+          onDescribe={props.onDescribePreset}
           onTogglePin={props.onTogglePinPreset}
           onToggleDashboard={props.onToggleDashboardPreset}
           onCopy={props.onCopyPreset}

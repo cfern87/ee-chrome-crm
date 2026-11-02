@@ -40,6 +40,7 @@ import {
 import { elevation } from '../ui/tokens';
 import { ICON_DASHBOARD, ICON_CONTACTS, ICON_TASKS, ICON_CAMPAIGNS, ICON_AUTOMATIONS, ICON_TAGS, ICON_SETTINGS } from '../ui/icons';
 import { AutomationsPanel } from './AutomationsPanel';
+import { MessageTemplatesPanel } from './MessageTemplates';
 import { readAutomations } from '../automations';
 import { newTask, nextDueAt, countOpenTasks } from '../tasks';
 import { TasksPanel, type TaskHandlers } from './TasksPanel';
@@ -52,11 +53,11 @@ import {
 } from '../presets';
 import { ensureHostPermission } from './WebhookSettings';
 import {
-  MessagingPanel, ActiveCampaignsView, HistoryPanel, NotificationsDrawer, holdOf, OnlineDot, QueuePreview,
+  MessagingPanel, ActiveCampaignsView, HistoryPanel, NotificationsDrawer, holdOf, OnlineDot, QueuePreview, emptyComposerDraft,
   type HistoryFocus, type ComposeSeed, type ComposerDraft,
 } from './Campaigns';
 import {
-  MachineView, sendBg, ensureSignedIn, downloadText, tsStamp, formatRelativeTime, previewTags, SubNav, ReadStateChip,
+  MachineView, sendBg, ensureSignedIn, downloadText, tsStamp, formatRelativeTime, previewTags, SubNav, ReadStateChip, readPace,
 } from './shared';
 import { SettingsPanel, type SettingsFocus, type SettingsView } from './SettingsPanel';
 import { DAILY_REPORT_SECTION_ID } from './DailyReportSettings';
@@ -99,7 +100,7 @@ import { PRODUCT_NAME, PRODUCT_SLUG } from '../product';
 type Route = 'dashboard' | 'contacts' | 'tasks' | 'campaigns' | 'automations' | 'tags' | 'settings';
 
 /** Sub-views inside Campaigns. */
-type CampaignView = 'compose' | 'active' | 'past';
+type CampaignView = 'compose' | 'active' | 'past' | 'templates';
 
 /** Sub-views inside Tags & fields. */
 type SchemaView = 'tags' | 'fields';
@@ -163,7 +164,9 @@ const PRESET_ORDER_WRITE_MS = 600;
  * collapse together. Only the first is evidence of anything:
  *
  *   replied      — the row carried an unread marker.
- *   no reply     — the row was read and carried no marker.
+ *   no reply     — the row was read and carried no marker, or the contact
+ *                  isn't on Messenger's Unread list, which was walked to its
+ *                  end (so nothing from them is waiting).
  *   not reached  — the scan never got to that conversation. The list is
  *                  ordered by recency, so these are contacts too far down to
  *                  reach inside the time budget; running it again gets further.
@@ -230,7 +233,7 @@ function ReadScanPanel({ scan, error, onCancel, onDismiss }: {
                 {t && (
                   <span style={{ fontWeight: 500, color: color.text.secondary }}>
                     {' '}· {t.responded} need a response
-                    {t.noAnswer > 0 ? ` · ${t.noAnswer} no reply` : ''}
+                    {t.noAnswer > 0 ? ` · ${t.noAnswer} no new reply` : ''}
                     {t.read > 0 ? ` · ${t.read} read` : ''}
                     {t.unread > 0 ? ` · ${t.unread} unread` : ''}
                     {t.unreached > 0 ? ` · ${t.unreached} not reached` : ''}
@@ -253,7 +256,7 @@ function ReadScanPanel({ scan, error, onCancel, onDismiss }: {
       )}
       {!scan.error && t && t.unreached > 0 && (
         <div style={{ marginTop: 6, fontSize: 11, color: color.text.secondary }}>
-          "Not reached" means the scan didn't scroll far enough down Messenger's list to find them — not that they haven't read. Run it again to get further.
+          "Not reached" means Messenger's Unread list couldn't be read to the end this time (it was stopped, or ran out of time), so these couldn't be ruled in or out — not that they haven't read. Run it again.
         </div>
       )}
     </div>
@@ -355,6 +358,24 @@ export default function DashboardApp() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkTagMenu, setBulkTagMenu] = useState<'assign' | 'remove' | null>(null);
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
+  // Which dropdown of the selection row is open. They float over the list, so
+  // opening one never pushes the contacts down under the pointer.
+  const [bulkMenu, setBulkMenu] = useState<null | 'tags' | 'presets' | 'more'>(null);
+  const bulkRowRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!bulkMenu) return;
+    const onDown = (e: MouseEvent) => {
+      if (bulkRowRef.current && !bulkRowRef.current.contains(e.target as Node)) {
+        setBulkMenu(null); setBulkDeleteConfirm(false); setBulkPresetArmed(null);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setBulkMenu(null); setBulkDeleteConfirm(false); setBulkPresetArmed(null); }
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey); };
+  }, [bulkMenu]);
   // A quick action that deletes, waiting for its confirming second click.
   const [bulkPresetArmed, setBulkPresetArmed] = useState<string | null>(null);
   // What the last bulk quick action did, shown under the buttons.
@@ -992,6 +1013,7 @@ export default function DashboardApp() {
   const firstSelectionKey = useRef(true);
   const clearBulkSelection = () => {
     setSelectedIds(new Set());
+    setBulkMenu(null);
     setBulkTagMenu(null);
     setBulkDeleteConfirm(false);
     setBulkPresetArmed(null);
@@ -1461,9 +1483,10 @@ export default function DashboardApp() {
     updatedAt: Date.now(),
   });
 
-  const saveNewPreset = async (name: string) => {
+  const saveNewPreset = async (name: string, description?: string) => {
     const order = Object.keys(store.savedSearches).length;
-    const preset = withViewSettings(newSavedSearch(name, query, order));
+    const base = newSavedSearch(name, query, order);
+    const preset = withViewSettings(description ? { ...base, description } : base);
     await updateStore({ ...store, savedSearches: { ...store.savedSearches, [preset.id]: preset } });
     setActivePresetId(preset.id);
     setPresetBaseline(currentSignature);
@@ -2177,223 +2200,241 @@ export default function DashboardApp() {
                 onDismiss={handleDismissReadScan}
               />
 
-              {/* Bulk actions bar */}
-              {selectedIds.size > 0 && (
-                // Paused while a save is in flight, so a second press of a bulk
-                // action can't fire against a selection the first is still writing.
-                <div
-                  aria-busy={savesInFlight > 0}
-                  style={{
-                    background: color.surface.selected, border: '1px solid #b3d9f2', borderRadius: 8, padding: '10px 12px', marginBottom: 12,
-                    ...(savesInFlight > 0 ? { pointerEvents: 'none', opacity: 0.6, cursor: 'progress' } : {}),
-                  }}
-                >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: color.accent.base }}>
-                      {selectedIds.size} selected
-                      {offPageSelected > 0 && (
-                        <span style={{ fontWeight: 500, color: color.text.secondary }}>
-                          {' '}· {offPageSelected} on other pages
-                        </span>
-                      )}
-                    </span>
-                    <button
-                      onClick={clearBulkSelection}
-                      style={{ background: 'none', color: color.text.secondary, border: 'none', fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline' }}
-                    >
-                      Clear
-                    </button>
-                  </div>
-
-                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                    <button
-                      onClick={handleOpenAll}
-                      style={{ background: color.accent.base, color: color.surface.raised, border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
-                    >
-                      Open All
-                    </button>
-                    <button
-                      onClick={() => { setComposeSeed({ threadIds: Array.from(selectedIds) }); go('campaigns', 'compose'); }}
-                      style={{ background: color.success.base, color: color.surface.raised, border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
-                    >
-                      💬 Message ({selectedIds.size})
-                    </button>
-                    <button
-                      onClick={handleCheckReadStatus}
-                      disabled={!!readScan?.running}
-                      title="Find which of these contacts have replied and are waiting on you, by reading Messenger's conversation list. Nothing is opened, so nothing gets marked as read. Messenger doesn't show read receipts on that list, so this can't tell you who has opened your message."
-                      style={{ background: color.surface.raised, color: color.accent.base, border: `1px solid ${color.accent.base}`, padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: readScan?.running ? 'not-allowed' : 'pointer', opacity: readScan?.running ? 0.55 : 1 }}
-                    >
-                      🔄 Check for replies ({selectedIds.size})
-                    </button>
-                    <button
-                      onClick={() => { setBulkTagMenu(bulkTagMenu === 'assign' ? null : 'assign'); setBulkDeleteConfirm(false); setBulkPresetArmed(null); }}
-                      style={{ background: bulkTagMenu === 'assign' ? color.accent.base : color.surface.raised, color: bulkTagMenu === 'assign' ? color.surface.raised : color.accent.base, border: `1px solid ${color.accent.base}`, padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
-                    >
-                      Assign Tag
-                    </button>
-                    <button
-                      onClick={() => { setBulkTagMenu(bulkTagMenu === 'remove' ? null : 'remove'); setBulkDeleteConfirm(false); setBulkPresetArmed(null); }}
-                      style={{ background: bulkTagMenu === 'remove' ? color.accent.base : color.surface.raised, color: bulkTagMenu === 'remove' ? color.surface.raised : color.accent.base, border: `1px solid ${color.accent.base}`, padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
-                    >
-                      Remove Tag
-                    </button>
-                    {selectedIds.size >= 2 && (
+              {/* Selection row. One fixed-height row above the list: "Select
+                  all" when nothing is ticked, the bulk actions once something is.
+                  It used to be a tall bar inserted above the list on the first
+                  tick, which pushed every contact down under the pointer. The
+                  pickers open as dropdowns OVER the list for the same reason. */}
+              {filtered.length > 0 && (() => {
+                const any = selectedIds.size > 0;
+                const busy = savesInFlight > 0;
+                const pill = (active = false): React.CSSProperties => ({
+                  background: active ? color.accent.base : color.surface.raised,
+                  color: active ? color.surface.raised : color.accent.base,
+                  border: `1px solid ${color.accent.base}`, padding: '3px 10px', borderRadius: 6,
+                  fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
+                });
+                const menuItem: React.CSSProperties = {
+                  display: 'block', width: '100%', textAlign: 'left', background: 'none', border: 'none',
+                  padding: '7px 12px', fontSize: 12, fontWeight: 600, color: color.text.primary, cursor: 'pointer',
+                };
+                const popover = (align: 'left' | 'right', width: number): React.CSSProperties => ({
+                  position: 'absolute', top: 'calc(100% + 4px)', [align]: 0, zIndex: 40, width, maxWidth: '90vw',
+                  background: color.surface.raised, border: `1px solid ${color.border.subtle}`, borderRadius: 8,
+                  boxShadow: '0 8px 24px rgba(0,0,0,0.16)', padding: 10,
+                });
+                const toggle = (m: 'tags' | 'presets' | 'more') => {
+                  setBulkMenu(bulkMenu === m ? null : m);
+                  setBulkDeleteConfirm(false);
+                  setBulkPresetArmed(null);
+                  if (m === 'tags' && !bulkTagMenu) setBulkTagMenu('assign');
+                };
+                return (
+                  <div
+                    ref={bulkRowRef}
+                    aria-busy={busy}
+                    style={{
+                      // Sticky, so the actions stay in reach while you tick your way down a long page.
+                      position: 'sticky', top: 0, zIndex: 30, display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', minHeight: 40, boxSizing: 'border-box',
+                      background: any ? color.surface.selected : color.surface.sunken,
+                      border: `1px solid ${any ? '#b3d9f2' : 'transparent'}`, borderRadius: 6, marginBottom: 6, fontSize: 12,
+                      ...(busy ? { pointerEvents: 'none', opacity: 0.6, cursor: 'progress' } : {}),
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      aria-label={pageCount > 1 ? 'Select this page' : 'Select all'}
+                      ref={(el) => {
+                        if (el) el.indeterminate = pageSelectedCount > 0 && pageSelectedCount < pageIds.length;
+                      }}
+                      checked={pageIds.length > 0 && pageSelectedCount === pageIds.length}
+                      onChange={handleSelectPage}
+                      style={{ cursor: 'pointer' }}
+                    />
+                    {any ? (
+                      <span style={{ fontWeight: 600, color: color.accent.base, whiteSpace: 'nowrap' }}>
+                        {selectedIds.size} selected
+                        {offPageSelected > 0 && (
+                          <span style={{ fontWeight: 500, color: color.text.secondary }}> · {offPageSelected} on other pages</span>
+                        )}
+                      </span>
+                    ) : (
+                      <label style={{ cursor: 'pointer', fontWeight: 500, color: color.text.secondary }} onClick={handleSelectPage}>
+                        {pageCount > 1 ? `Select this page (${pageIds.length})` : 'Select all'}
+                      </label>
+                    )}
+                    {pageCount > 1 && selectedIds.size < filtered.length && (
                       <button
-                        onClick={handleBulkMerge}
-                        title="Combine the selected contacts into one (unions tags, keeps the best identity/thread id)"
-                        style={{ background: color.special.base, color: color.surface.raised, border: 'none', padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                        onClick={handleSelectAllMatching}
+                        title="Select every contact matching the current filters, across all pages"
+                        style={{ background: 'none', border: 'none', color: color.accent.base, fontSize: 11, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', padding: 0, whiteSpace: 'nowrap' }}
                       >
-                        Merge ({selectedIds.size})
+                        Select all {filtered.length}
                       </button>
                     )}
-                    <button
-                      onClick={() => { setBulkDeleteConfirm(true); setBulkTagMenu(null); setBulkPresetArmed(null); }}
-                      style={{ background: color.danger.subtle, color: color.danger.base, border: `1px solid ${color.danger.base}`, padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
-                    >
-                      Delete
-                    </button>
-                  </div>
 
-                  {/* Quick actions — the same presets the Messenger panel shows,
-                      applied to every selected contact. */}
-                  {bulkPresets.length > 0 && (
-                    <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid #cfe2f5' }}>
-                      <div style={{ fontSize: 11, color: color.text.secondary, marginBottom: 6, fontWeight: 600 }}>
-                        Quick actions for all {selectedIds.size} selected:
+                    {any && (
+                      <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'nowrap', overflowX: 'auto' }}>
+                        <button
+                          onClick={() => { setComposeSeed({ threadIds: Array.from(selectedIds) }); go('campaigns', 'compose'); }}
+                          style={{ ...pill(), background: color.success.base, color: color.surface.raised, border: `1px solid ${color.success.base}` }}
+                        >
+                          💬 Message
+                        </button>
+                        <button onClick={() => toggle('tags')} aria-expanded={bulkMenu === 'tags'} style={pill(bulkMenu === 'tags')}>Tag ▾</button>
+                        {bulkPresets.length > 0 && (
+                          <button onClick={() => toggle('presets')} aria-expanded={bulkMenu === 'presets'} style={pill(bulkMenu === 'presets')}>Quick actions ▾</button>
+                        )}
+                        <button
+                          onClick={handleCheckReadStatus}
+                          disabled={!!readScan?.running}
+                          title="Find which of these contacts have replied and are waiting on you, by reading Messenger's conversation list. Nothing is opened, so nothing gets marked as read. Messenger doesn't show read receipts on that list, so this can't tell you who has opened your message."
+                          style={{ ...pill(), cursor: readScan?.running ? 'not-allowed' : 'pointer', opacity: readScan?.running ? 0.55 : 1 }}
+                        >
+                          🔄 Check replies
+                        </button>
+                        <button onClick={() => toggle('more')} aria-expanded={bulkMenu === 'more'} style={pill(bulkMenu === 'more')}>More ▾</button>
+                        <button
+                          onClick={clearBulkSelection}
+                          title="Clear the selection"
+                          style={{ background: 'none', color: color.text.secondary, border: 'none', fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', padding: '0 2px' }}
+                        >
+                          Clear
+                        </button>
                       </div>
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                        {bulkPresets.map((p) => {
-                          const destructive = isDestructive(p);
-                          const confirm = needsConfirm(p);
-                          const armed = bulkPresetArmed === p.id;
-                          const bg = armed || destructive ? color.danger.base : p.color || color.surface.raised;
-                          return (
-                            <button
-                              key={p.id}
-                              title={p.description || describePreset(p, store)}
-                              onClick={() => {
-                                setBulkTagMenu(null);
-                                setBulkDeleteConfirm(false);
-                                if (confirm && !armed) { setBulkPresetArmed(p.id); setBulkPresetResult(null); return; }
-                                void handleBulkPreset(p.id);
-                              }}
-                              style={{
-                                background: bg,
-                                color: armed || destructive || p.color ? onColor(bg) : color.text.primary,
-                                border: `1px solid ${armed || destructive ? color.danger.base : p.color || color.border.control}`,
-                                padding: '5px 11px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer',
-                              }}
-                            >
-                              {armed ? `Yes, “${p.label}” ${selectedIds.size} contacts` : p.label}
-                            </button>
-                          );
-                        })}
-                        {bulkPresetArmed && (
-                          <button
-                            onClick={() => setBulkPresetArmed(null)}
-                            style={{ background: color.surface.raised, color: color.text.secondary, border: `1px solid ${color.border.control}`, padding: '5px 11px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
-                          >
-                            Cancel
-                          </button>
+                    )}
+
+                    {/* Tag picker */}
+                    {any && bulkMenu === 'tags' && (
+                      <div role="dialog" aria-label="Tag the selected contacts" style={popover('right', 420)}>
+                        <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+                          <button onClick={() => setBulkTagMenu('assign')} style={pill(bulkTagMenu !== 'remove')}>Add tag</button>
+                          <button onClick={() => setBulkTagMenu('remove')} style={pill(bulkTagMenu === 'remove')}>Remove tag</button>
+                        </div>
+                        {tags.length === 0 ? (
+                          <div style={{ fontSize: 12, color: color.text.muted }}>No tags exist yet.</div>
+                        ) : (
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxHeight: 260, overflowY: 'auto' }}>
+                            {tags.map((tag) => (
+                              <button
+                                key={tag.id}
+                                onClick={() => bulkTagMenu === 'remove' ? handleBulkRemoveTag(tag.id) : handleBulkAssignTag(tag.id)}
+                                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: tag.color, color: onColor(tag.color), border: 'none', padding: '4px 10px', borderRadius: 12, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                              >
+                                {bulkTagMenu === 'remove' ? '−' : '+'} {tag.name}
+                              </button>
+                            ))}
+                          </div>
                         )}
                       </div>
-                      {bulkPresetArmed && (() => {
-                        const armedPreset = bulkPresets.find((p) => p.id === bulkPresetArmed);
-                        const deletes = !!armedPreset && isDestructive(armedPreset);
-                        return (
-                          <div style={{ fontSize: 12, color: color.danger.base, fontWeight: 600, marginTop: 6 }}>
-                            {deletes
-                              ? 'This quick action deletes contacts — click it again to confirm. This cannot be undone.'
-                              : `This quick action messages people: everyone selected goes into one campaign. Click it again to queue it.`}
-                          </div>
-                        );
-                      })()}
-                      {bulkPresetResult && !bulkPresetArmed && (
-                        <div role="status" style={{ fontSize: 12, color: bulkPresetWarn ? color.danger.base : color.success.base, marginTop: 6 }}>
-                          {bulkPresetWarn ? '⚠' : '✓'} {bulkPresetResult}
-                        </div>
-                      )}
-                    </div>
-                  )}
+                    )}
 
-                  {/* Tag picker for assign/remove */}
-                  {bulkTagMenu && (
-                    <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid #cfe2f5' }}>
-                      <div style={{ fontSize: 11, color: color.text.secondary, marginBottom: 6, fontWeight: 600 }}>
-                        {bulkTagMenu === 'assign' ? 'Add tag to selected:' : 'Remove tag from selected:'}
-                      </div>
-                      {tags.length === 0 ? (
-                        <div style={{ fontSize: 12, color: color.text.muted }}>No tags exist yet.</div>
-                      ) : (
+                    {/* Quick actions — the same presets the Messenger panel shows,
+                        applied to every selected contact. */}
+                    {any && bulkMenu === 'presets' && (
+                      <div role="dialog" aria-label="Quick actions for the selected contacts" style={popover('right', 420)}>
+                        <div style={{ fontSize: 11, color: color.text.secondary, marginBottom: 6, fontWeight: 600 }}>
+                          For all {selectedIds.size} selected:
+                        </div>
                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                          {tags.map((tag) => (
+                          {bulkPresets.map((p) => {
+                            const destructive = isDestructive(p);
+                            const confirm = needsConfirm(p);
+                            const armed = bulkPresetArmed === p.id;
+                            const bg = armed || destructive ? color.danger.base : p.color || color.surface.raised;
+                            return (
+                              <button
+                                key={p.id}
+                                title={p.description || describePreset(p, store)}
+                                onClick={() => {
+                                  if (confirm && !armed) { setBulkPresetArmed(p.id); setBulkPresetResult(null); return; }
+                                  void handleBulkPreset(p.id);
+                                }}
+                                style={{
+                                  background: bg,
+                                  color: armed || destructive || p.color ? onColor(bg) : color.text.primary,
+                                  border: `1px solid ${armed || destructive ? color.danger.base : p.color || color.border.control}`,
+                                  padding: '5px 11px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                                }}
+                              >
+                                {armed ? `Yes, “${p.label}” ${selectedIds.size} contacts` : p.label}
+                              </button>
+                            );
+                          })}
+                          {bulkPresetArmed && (
                             <button
-                              key={tag.id}
-                              onClick={() => bulkTagMenu === 'assign' ? handleBulkAssignTag(tag.id) : handleBulkRemoveTag(tag.id)}
-                              style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: tag.color, color: color.surface.raised, border: 'none', padding: '4px 10px', borderRadius: 12, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                              onClick={() => setBulkPresetArmed(null)}
+                              style={{ background: color.surface.raised, color: color.text.secondary, border: `1px solid ${color.border.control}`, padding: '5px 11px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
                             >
-                              {bulkTagMenu === 'assign' ? '+' : '−'} {tag.name}
+                              Cancel
                             </button>
-                          ))}
+                          )}
                         </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Delete confirmation */}
-                  {bulkDeleteConfirm && (
-                    <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid #cfe2f5' }}>
-                      <div style={{ fontSize: 13, color: color.danger.base, fontWeight: 600, marginBottom: 8 }}>
-                        Delete {selectedIds.size} contact{selectedIds.size !== 1 ? 's' : ''}? Their tags, custom fields and message history go too. This cannot be undone.
+                        {bulkPresetArmed && (() => {
+                          const armedPreset = bulkPresets.find((p) => p.id === bulkPresetArmed);
+                          const deletes = !!armedPreset && isDestructive(armedPreset);
+                          return (
+                            <div style={{ fontSize: 12, color: color.danger.base, fontWeight: 600, marginTop: 6 }}>
+                              {deletes
+                                ? 'This quick action deletes contacts — click it again to confirm. This cannot be undone.'
+                                : `This quick action messages people: everyone selected goes into one campaign. Click it again to queue it.`}
+                            </div>
+                          );
+                        })()}
+                        {bulkPresetResult && !bulkPresetArmed && (
+                          <div role="status" style={{ fontSize: 12, color: bulkPresetWarn ? color.danger.base : color.success.base, marginTop: 6 }}>
+                            {bulkPresetWarn ? '⚠' : '✓'} {bulkPresetResult}
+                          </div>
+                        )}
                       </div>
-                      <div style={{ display: 'flex', gap: 8 }}>
-                        <button
-                          onClick={handleBulkDelete}
-                          style={{ background: color.danger.base, color: color.surface.raised, border: 'none', padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
-                        >
-                          Yes, Delete {selectedIds.size}
-                        </button>
-                        <button
-                          onClick={() => setBulkDeleteConfirm(false)}
-                          style={{ background: color.surface.raised, color: color.text.secondary, border: `1px solid ${color.border.control}`, padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
+                    )}
 
-              {/* Select-this-page header */}
-              {filtered.length > 0 && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', background: color.surface.sunken, borderRadius: 6, marginBottom: 6, fontSize: 12 }}>
-                  <input
-                    type="checkbox"
-                    ref={(el) => {
-                      if (el) el.indeterminate = pageSelectedCount > 0 && pageSelectedCount < pageIds.length;
-                    }}
-                    checked={pageIds.length > 0 && pageSelectedCount === pageIds.length}
-                    onChange={handleSelectPage}
-                    style={{ cursor: 'pointer' }}
-                  />
-                  <label style={{ flex: 1, cursor: 'pointer', fontWeight: 500, color: color.text.secondary }} onClick={handleSelectPage}>
-                    {pageSelectedCount > 0
-                      ? `${pageSelectedCount} of ${pageIds.length} on this page selected`
-                      : pageCount > 1 ? `Select this page (${pageIds.length})` : 'Select all'}
-                  </label>
-                  {pageCount > 1 && selectedIds.size < filtered.length && (
-                    <button
-                      onClick={handleSelectAllMatching}
-                      title="Select every contact matching the current filters, across all pages"
-                      style={{ background: 'none', border: 'none', color: color.accent.base, fontSize: 11, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', padding: 0 }}
-                    >
-                      Select all {filtered.length}
-                    </button>
-                  )}
-                </div>
-              )}
+                    {/* More: the less frequent actions, and Delete with its confirmation. */}
+                    {any && bulkMenu === 'more' && (
+                      <div role="menu" style={{ ...popover('right', 260), padding: '4px 0' }}>
+                        {bulkDeleteConfirm ? (
+                          <div style={{ padding: '6px 12px' }}>
+                            <div style={{ fontSize: 12, color: color.danger.base, fontWeight: 600, marginBottom: 8 }}>
+                              Delete {selectedIds.size} contact{selectedIds.size !== 1 ? 's' : ''}? Their tags, custom fields and message history go too. This cannot be undone.
+                            </div>
+                            <div style={{ display: 'flex', gap: 8 }}>
+                              <button
+                                onClick={() => { setBulkMenu(null); handleBulkDelete(); }}
+                                style={{ background: color.danger.base, color: color.surface.raised, border: 'none', padding: '5px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                              >
+                                Yes, delete {selectedIds.size}
+                              </button>
+                              <button
+                                onClick={() => setBulkDeleteConfirm(false)}
+                                style={{ background: color.surface.raised, color: color.text.secondary, border: `1px solid ${color.border.control}`, padding: '5px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <button role="menuitem" onClick={() => { setBulkMenu(null); handleOpenAll(); }} style={menuItem}>Open all in Messenger</button>
+                            {selectedIds.size >= 2 && (
+                              <button
+                                role="menuitem"
+                                onClick={() => { setBulkMenu(null); handleBulkMerge(); }}
+                                title="Combine the selected contacts into one (unions tags, keeps the best identity/thread id)"
+                                style={menuItem}
+                              >
+                                Merge {selectedIds.size} into one
+                              </button>
+                            )}
+                            <button role="menuitem" onClick={() => setBulkDeleteConfirm(true)} style={{ ...menuItem, color: color.danger.base }}>
+                              Delete {selectedIds.size}…
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
               {/* List header with count + CSV export of the current view */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: space.sm, marginBottom: space.sm, paddingBottom: space.sm, borderBottom: `1px solid ${color.border.subtle}` }}>
@@ -2621,6 +2662,7 @@ export default function DashboardApp() {
                 onSaveNewPreset={saveNewPreset}
                 onUpdateActivePreset={updateActivePreset}
                 onRenamePreset={(id, name) => patchPreset(id, { name })}
+                onDescribePreset={(id, description) => patchPreset(id, { description: description || undefined })}
                 onTogglePinPreset={(id) => patchPreset(id, { pinned: !store.savedSearches[id]?.pinned })}
                 onToggleDashboardPreset={(id) => patchPreset(id, { onDashboard: !store.savedSearches[id]?.onDashboard })}
                 onCopyPreset={(id) => void copyPreset(id)}
@@ -2752,8 +2794,20 @@ export default function DashboardApp() {
                 // Archived campaigns are absent from the list by default, so
                 // counting them here would contradict what the tab opens.
                 { id: 'past', label: 'Past sends', count: campaigns.filter((c) => !c.archived).length || undefined },
+                { id: 'templates', label: 'Templates' },
               ]}
             />
+
+            {campaignView === 'templates' && (
+              <MessageTemplatesPanel
+                store={store}
+                updateStore={updateStore}
+                onUse={(body) => {
+                  setComposerDraft({ ...(composerDraft ?? emptyComposerDraft(readPace(store))), template: body });
+                  setCampaignView('compose');
+                }}
+              />
+            )}
 
             {campaignView === 'compose' && (
               <MessagingPanel
@@ -2770,6 +2824,7 @@ export default function DashboardApp() {
                 onChanged={refreshCampaigns}
                 onViewHistory={() => setCampaignView('past')}
                 showQueue={false}
+                updateStore={updateStore}
               />
             )}
 

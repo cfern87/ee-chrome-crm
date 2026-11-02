@@ -14,7 +14,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { Store, SaveResult } from '../storage';
 import {
   readAutomations, writeAutomations, newTagUnreadAutomation, newSearchAutomation, withLegacyFields,
-  whyNotRunnable, describeSchedule, describeRun, describeActions, matchSavedSearch,
+  whyNotRunnable, describeSchedule, describeRun, describeActions, matchSavedSearch, describeTagTrigger,
   AUTOMATION_RUNS_KEY, DEPTH_OPTIONS, SCHEDULE_OPTIONS, MAX_AUTOMATIONS, MESSAGE_CAP_OPTIONS, DEFAULT_MESSAGE_CAP,
   type Automation, type AutomationRuns, type AutomationRun, type AutomationMessage,
 } from '../automations';
@@ -27,6 +27,7 @@ import {
 import { sendBg, formatRelativeTime } from './shared';
 import { SendAsPicker, sendAsInvalid } from './SendAsPicker';
 import { StepListEditor, RecentCampaignPicker } from './PresetActionsSettings';
+import { LinkedTemplateSelect } from './MessageTemplates';
 import { useWorkspaces } from './TeamSettings';
 import { isTeamWorkspace } from '../team';
 
@@ -156,9 +157,10 @@ export function AutomationsPanel({ store, updateStore, onOpenTags, onOpenSearch 
           <div style={{ flex: 1, minWidth: 260 }}>
             <Text as="h2" size="strong" weight="bold" style={{ margin: 0 }}>Automations</Text>
             <Text as="p" size="small" tone="muted" leading="relaxed" style={{ margin: `${space.xs}px 0 0` }}>
-              Take a set of contacts — everyone a saved search matches, or everyone with an unread
-              conversation — and apply actions to them: tags, funnel stages, fields, follow-ups, and
-              optionally a message. Run one whenever you like, or put it on a schedule.
+              Take a set of contacts — everyone a saved search matches, everyone with an unread
+              conversation, or whoever just had a tag added or removed — and apply actions to them: tags,
+              funnel stages, fields, follow-ups, and optionally a message. Run one whenever you like, put it
+              on a schedule, or let a tag start it.
             </Text>
           </div>
           <Button variant="primary" onClick={startNew} disabled={!!draftNew || automations.length >= MAX_AUTOMATIONS}>
@@ -236,6 +238,7 @@ export function AutomationsPanel({ store, updateStore, onOpenTags, onOpenSearch 
 
 /** "Everyone in the saved search 'Hot leads'" / "Unread conversations among your 100 most recent". */
 function describeSource(a: Automation, store: Store): string {
+  if (a.kind === 'tagChange') return `${describeTagTrigger(a, store)} — runs on that contact straight away`;
   if (a.kind === 'search') {
     const s = a.savedSearchId ? store.savedSearches[a.savedSearchId] : undefined;
     return s ? `Everyone in the saved search “${s.name}”` : 'A saved search that no longer exists';
@@ -272,6 +275,7 @@ function AutomationCard({
   // was cut off — the browser closed, or the service worker restarted mid-run.
   const interrupted = !!run?.running && !isRunning;
   const scheduled = a.everyMinutes > 0;
+  const tagTriggered = a.kind === 'tagChange';
   const search = a.kind === 'search' && a.savedSearchId ? store.savedSearches[a.savedSearchId] : undefined;
   const stopping = stoppingLocal || !!run?.stopping;
   const shownRun = run && stopping ? { ...run, stopping: true } : run;
@@ -281,13 +285,15 @@ function AutomationCard({
       <Stack gap="sm">
         <Stack direction="row" gap="sm" align="center" wrap>
           <Text size="body" weight="semibold" style={{ flex: 1, minWidth: 180 }}>{a.name}</Text>
-          <Text size="small" tone={scheduled && a.enabled ? 'accent' : 'muted'}>
-            {scheduled ? (a.enabled ? describeSchedule(a.everyMinutes) : `${describeSchedule(a.everyMinutes)} (paused)`) : 'Manual'}
+          <Text size="small" tone={(scheduled || tagTriggered) && a.enabled ? 'accent' : 'muted'}>
+            {tagTriggered
+              ? (a.enabled ? 'On tag change' : 'On tag change (paused)')
+              : scheduled ? (a.enabled ? describeSchedule(a.everyMinutes) : `${describeSchedule(a.everyMinutes)} (paused)`) : 'Manual'}
             {scheduled && team && ` · on ${describeRunner(a.runOn, team)}`}
           </Text>
-          {scheduled && (
+          {(scheduled || tagTriggered) && (
             <Toggle
-              label={<span className="crm-sr-only">Run on schedule</span>}
+              label={<span className="crm-sr-only">{tagTriggered ? 'Run when the tag changes' : 'Run on schedule'}</span>}
               checked={a.enabled}
               onChange={(e) => onToggleEnabled(e.target.checked)}
             />
@@ -332,7 +338,7 @@ function AutomationCard({
           <Text size="small" tone={run.error || interrupted ? 'danger' : 'muted'}>
             {interrupted
               ? `Last run ${formatRelativeTime(run.startedAt)} was interrupted before it finished.`
-              : `Last run ${formatRelativeTime(run.finishedAt || run.startedAt)}${run.trigger === 'schedule' ? ' (scheduled)' : run.trigger === 'webhook' ? ' (webhook)' : ''}: ${describeRun(run)}`}
+              : `Last run ${formatRelativeTime(run.finishedAt || run.startedAt)}${run.trigger === 'schedule' ? ' (scheduled)' : run.trigger === 'webhook' ? ' (webhook)' : run.trigger === 'tag' ? ' (tag change)' : ''}: ${describeRun(run)}`}
           </Text>
         )}
         {!run && <Text size="small" tone="muted">Hasn’t run on this computer yet.</Text>}
@@ -342,10 +348,14 @@ function AutomationCard({
             size="sm"
             variant="primary"
             onClick={onRun}
-            disabled={isRunning || scanBusy || !!blocked}
-            title={scanBusy ? 'Another unread scan is using the Facebook window' : undefined}
+            disabled={isRunning || scanBusy || !!blocked || (tagTriggered && a.triggerOn === 'removed')}
+            title={scanBusy
+              ? 'Another unread scan is using the Facebook window'
+              : tagTriggered
+                ? (a.triggerOn === 'removed' ? 'Runs by itself when the tag is removed from someone' : 'Runs it now on everyone who has the tag')
+                : undefined}
           >
-            Run now
+            {tagTriggered && a.triggerOn !== 'removed' ? 'Run on everyone tagged' : 'Run now'}
           </Button>
           <Button size="sm" variant="secondary" onClick={onEdit} disabled={isRunning}>Edit</Button>
           <div style={{ marginLeft: 'auto', display: 'flex', gap: space.xs }}>
@@ -393,6 +403,7 @@ function AutomationEditor({ initial, store, team, isNew, onSave, onCancel, onOpe
     setDraft((d) => ({ ...d, message: { ...(d.message || blankMessage()), ...patch } }));
 
   const searches = sortSavedSearches(store.savedSearches);
+  const tagList = useMemo(() => Object.values(store.tags).sort((a, b) => a.name.localeCompare(b.name)), [store.tags]);
   const search = draft.kind === 'search' && draft.savedSearchId ? store.savedSearches[draft.savedSearchId] : undefined;
   const [showSearch, setShowSearch] = useState(false);
   const previewCtx: QueryContext = useMemo(
@@ -432,12 +443,15 @@ function AutomationEditor({ initial, store, team, isNew, onSave, onCancel, onOpe
                       const kind = e.target.value as Automation['kind'];
                       set(kind === 'search'
                         ? { kind, savedSearchId: draft.savedSearchId || searches[0]?.id }
-                        : { kind });
+                        : kind === 'tagChange'
+                          ? { kind, everyMinutes: 0, enabled: true, triggerOn: draft.triggerOn || 'added', triggerTagId: draft.triggerTagId || tagList[0]?.id }
+                          : { kind });
                     }}
                     style={{ width: 260 }}
                   >
                     <option value="search">A saved search</option>
                     <option value="tagUnread">Unread conversations in Messenger</option>
+                    <option value="tagChange">When a tag is added or removed</option>
                   </Select>
                 )}
               </FormField>
@@ -458,6 +472,37 @@ function AutomationEditor({ initial, store, team, isNew, onSave, onCancel, onOpe
                 </FormField>
               )}
 
+              {draft.kind === 'tagChange' && (
+                <>
+                  <FormField label="Tag">
+                    {(fp) => (
+                      <Select
+                        {...fp}
+                        value={draft.triggerTagId || ''}
+                        onChange={(e) => set({ triggerTagId: e.target.value || undefined })}
+                        style={{ width: 220 }}
+                      >
+                        {!(draft.triggerTagId && store.tags[draft.triggerTagId]) && <option value="">Choose a tag…</option>}
+                        {tagList.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+                      </Select>
+                    )}
+                  </FormField>
+                  <FormField label="When it is">
+                    {(fp) => (
+                      <Select
+                        {...fp}
+                        value={draft.triggerOn || 'added'}
+                        onChange={(e) => set({ triggerOn: e.target.value === 'removed' ? 'removed' : 'added' })}
+                        style={{ width: 200 }}
+                      >
+                        <option value="added">Added to a contact</option>
+                        <option value="removed">Removed from a contact</option>
+                      </Select>
+                    )}
+                  </FormField>
+                </>
+              )}
+
               {draft.kind === 'tagUnread' && (
                 <FormField label="Look through" hint="Messenger lists newest first, so unread conversations are nearly always near the top.">
                   {(fp) => (
@@ -471,6 +516,13 @@ function AutomationEditor({ initial, store, team, isNew, onSave, onCancel, onOpe
               )}
             </Stack>
 
+            {draft.kind === 'tagChange' && (
+              <Text size="small" tone="muted">
+                Runs on that one contact the moment the tag is {draft.triggerOn === 'removed' ? 'removed' : 'added'} on this
+                computer — from Messenger, the dashboard, a quick action or another automation. Use an action’s “If…” to
+                narrow it down further.
+              </Text>
+            )}
             {draft.kind === 'search' && searches.length === 0 && (
               <Banner tone="info">
                 You don’t have any saved searches yet. In Contacts, open Advanced search, build the search, and
@@ -541,20 +593,33 @@ function AutomationEditor({ initial, store, team, isNew, onSave, onCancel, onOpe
             />
             {draft.message && (
               <Stack gap="sm" style={{ paddingLeft: space.md, borderLeft: `2px solid ${color.border.subtle}` }}>
-                {/* Copies the message in; it can still be edited below. */}
-                <RecentCampaignPicker onPick={(template) => setMessage({ template })} />
-                <FormField label="Message" hint="Queued as a campaign each run, sent with your usual pacing. {{firstName}} and {{name}} are filled in; {option a|option b} picks one at random per person.">
-                  {(fp) => (
-                    <Textarea
-                      {...fp}
-                      rows={4}
-                      value={draft.message!.template}
-                      onChange={(e) => setMessage({ template: e.target.value })}
-                      placeholder="Hi {{firstName}}, just checking in…"
-                      style={{ maxWidth: 520 }}
-                    />
-                  )}
-                </FormField>
+                <LinkedTemplateSelect
+                  store={store}
+                  templateId={draft.message.templateId}
+                  onChange={(t) => setDraft((d) => {
+                    const { templateId: _t, ...rest } = d.message || blankMessage();
+                    // The text is copied too: the fallback if the template is deleted.
+                    return { ...d, message: t ? { ...rest, templateId: t.id, template: t.body } : rest };
+                  })}
+                />
+                {!draft.message.templateId && (
+                  <>
+                    {/* Copies the message in; it can still be edited below. */}
+                    <RecentCampaignPicker onPick={(template) => setMessage({ template })} />
+                    <FormField label="Message" hint="Queued as a campaign each run, sent with your usual pacing. {{firstName}} and {{name}} are filled in; {option a|option b} picks one at random per person.">
+                      {(fp) => (
+                        <Textarea
+                          {...fp}
+                          rows={4}
+                          value={draft.message!.template}
+                          onChange={(e) => setMessage({ template: e.target.value })}
+                          placeholder="Hi {{firstName}}, just checking in…"
+                          style={{ maxWidth: 520 }}
+                        />
+                      )}
+                    </FormField>
+                  </>
+                )}
                 <Stack direction="row" gap="md" wrap align="center">
                   <Toggle
                     labelFirst={false}
@@ -596,6 +661,9 @@ function AutomationEditor({ initial, store, team, isNew, onSave, onCancel, onOpe
 
           {/* 3. When */}
           <Section title="3. When">
+            {draft.kind === 'tagChange' ? (
+              <Text size="small" tone="muted">Whenever the tag changes (see above). Turn it off with the switch on its card.</Text>
+            ) : (
             <FormField label="Run automatically" hint="Scheduled runs happen on the computer that sends your campaigns, while its browser is open.">
               {(fp) => (
                 <Select
@@ -613,7 +681,8 @@ function AutomationEditor({ initial, store, team, isNew, onSave, onCancel, onOpe
                 </Select>
               )}
             </FormField>
-            {team && (
+            )}
+            {team && draft.kind !== 'tagChange' && (
               <FormField
                 label="Runs on"
                 hint="This is a team workspace, so one member's computer runs the schedule for everyone. Unread scans read that member's Messenger, and messages go out from their Facebook account. Run now always runs on your own computer."

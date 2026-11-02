@@ -48,9 +48,17 @@ import { normalizeSteps, stepsFor, describePreset, type PresetStep } from './pre
 import { filterByQuery, normalizeQuery, type SavedSearch } from './search';
 import { writeCollection, type SettingsBag, type SettingsCollection } from './settingsMerge';
 import type { SendAsMode } from './campaigns';
+import { resolveMessage, templateName } from './templates';
 
-/** Where the contacts come from. 'tagUnread' = unread conversations; 'search' = a saved search. */
-export type AutomationKind = 'tagUnread' | 'search';
+/**
+ * Where the contacts come from. 'tagUnread' = unread conversations; 'search' =
+ * a saved search; 'tagChange' = whoever just had a tag added or removed (it
+ * runs on that contact the moment it happens, not on a schedule).
+ */
+export type AutomationKind = 'tagUnread' | 'search' | 'tagChange';
+
+/** Which edit a 'tagChange' automation reacts to. */
+export type TagTriggerOn = 'added' | 'removed';
 
 /**
  * "Send a message" as an automation action: each run queues ONE campaign to
@@ -60,6 +68,11 @@ export type AutomationKind = 'tagUnread' | 'search';
  */
 export interface AutomationMessage {
   template: string;
+  /**
+   * A saved message template (templates.ts). When set, its CURRENT text is
+   * sent; `template` holds a copy as the fallback and for older builds.
+   */
+  templateId?: string;
   /** Skip anyone who hasn't read your last message (Campaign.skipIfUnread). */
   skipIfUnread: boolean;
   /** Type but never send - for trying an automation out. */
@@ -95,6 +108,10 @@ export interface Automation {
   tagIds: string[];
   /** 'search' source: the saved search whose matches are acted on. */
   savedSearchId?: string;
+  /** 'tagChange' source: the tag whose adding (or removing) starts a run for that contact. */
+  triggerTagId?: string;
+  /** 'tagChange' source: react to the tag being added (default) or removed. */
+  triggerOn?: TagTriggerOn;
   /** 'tagUnread' source: also add people who aren't in the CRM yet, instead of skipping them. */
   createContacts: boolean;
   /** 'tagUnread' source: how many of the most recent conversations to look through. */
@@ -170,11 +187,12 @@ export function normalizeAutomation(raw: unknown): Automation | null {
   if (!raw || typeof raw !== 'object') return null;
   const o = raw as Record<string, unknown>;
   if (typeof o.id !== 'string' || !o.id) return null;
-  if (o.kind !== 'tagUnread' && o.kind !== 'search') return null;
+  if (o.kind !== 'tagUnread' && o.kind !== 'search' && o.kind !== 'tagChange') return null;
   const depth = typeof o.depth === 'number' && Number.isFinite(o.depth) && o.depth > 0
     ? Math.min(Math.round(o.depth), DEPTH_OPTIONS[DEPTH_OPTIONS.length - 1])
     : DEFAULT_DEPTH;
-  const every = typeof o.everyMinutes === 'number' && Number.isFinite(o.everyMinutes) && o.everyMinutes > 0
+  // A tag trigger runs when the tag changes, never on a schedule.
+  const every = o.kind !== 'tagChange' && typeof o.everyMinutes === 'number' && Number.isFinite(o.everyMinutes) && o.everyMinutes > 0
     ? Math.max(MIN_EVERY_MINUTES, Math.round(o.everyMinutes))
     : 0;
   const tagIds = Array.isArray(o.tagIds) ? o.tagIds.filter((t): t is string => typeof t === 'string' && !!t) : [];
@@ -192,6 +210,8 @@ export function normalizeAutomation(raw: unknown): Automation | null {
     ...(message ? { message } : {}),
     tagIds: legacyTagIds(steps),
     ...(o.kind === 'search' && typeof o.savedSearchId === 'string' && o.savedSearchId ? { savedSearchId: o.savedSearchId } : {}),
+    ...(o.kind === 'tagChange' && typeof o.triggerTagId === 'string' && o.triggerTagId ? { triggerTagId: o.triggerTagId } : {}),
+    ...(o.kind === 'tagChange' ? { triggerOn: o.triggerOn === 'removed' ? 'removed' as const : 'added' as const } : {}),
     createContacts: o.createContacts === true,
     depth,
     everyMinutes: every,
@@ -211,6 +231,7 @@ function normalizeMessage(raw: unknown): AutomationMessage | null {
     : DEFAULT_MESSAGE_CAP;
   return {
     template: o.template,
+    ...(typeof o.templateId === 'string' && o.templateId ? { templateId: o.templateId } : {}),
     skipIfUnread: o.skipIfUnread === true,
     dryRun: o.dryRun === true,
     oncePerContact: o.oncePerContact !== false,
@@ -276,6 +297,26 @@ export function newSearchAutomation(order: number, savedSearchId: string | undef
   };
 }
 
+export function newTagTriggerAutomation(order: number, triggerTagId: string | undefined, now = Date.now()): Automation {
+  return {
+    ...newTagUnreadAutomation(order, now),
+    name: 'When a tag is added',
+    kind: 'tagChange',
+    triggerOn: 'added',
+    ...(triggerTagId ? { triggerTagId } : {}),
+  };
+}
+
+/**
+ * The automation with its message's linked template resolved to the text it
+ * sends right now. Applied when a run starts, before anything else reads
+ * `message.template` (an incoming webhook's variables included).
+ */
+export function withResolvedMessage(a: Automation, store: Pick<Store, 'settings'>): Automation {
+  if (!a.message?.templateId) return a;
+  return { ...a, message: { ...a.message, template: resolveMessage(store, a.message.templateId, a.message.template) } };
+}
+
 /** Keep the legacy tag mirror in step with the steps - the only way automations should be saved. */
 export function withLegacyFields(a: Automation): Automation {
   return { ...a, tagIds: legacyTagIds(a.steps) };
@@ -291,7 +332,10 @@ export function whyNotRunnable(automation: Automation, store: Pick<Store, 'tags'
   if (automation.kind === 'search' && !(automation.savedSearchId && store.savedSearches?.[automation.savedSearchId])) {
     return 'Choose the saved search whose contacts it should act on.';
   }
-  const hasMessage = !!automation.message?.template.trim();
+  if (automation.kind === 'tagChange' && !(automation.triggerTagId && store.tags?.[automation.triggerTagId])) {
+    return 'Choose the tag that starts it.';
+  }
+  const hasMessage = !!automation.message?.template.trim() || !!automation.message?.templateId;
   if (automation.message && !hasMessage) return 'Write the message, or remove the \u201csend a message\u201d action.';
   if (!automation.steps.length && !hasMessage) return 'Add at least one action.';
   return null;
@@ -304,11 +348,58 @@ export function describeActions(automation: Automation, store: Store): string {
     parts.push(describePreset({ id: '', label: '', order: 0, createdAt: 0, steps: automation.steps }, store));
   }
   const m = automation.message;
-  if (m && m.template.trim()) {
+  const linked = templateName(store, m?.templateId);
+  if (m && linked) {
+    parts.push(`message${m.dryRun ? ' (dry run)' : ''}: template "${linked}"`);
+  } else if (m && m.template.trim()) {
     const first = m.template.split('\n')[0];
     parts.push(`message${m.dryRun ? ' (dry run)' : ''}: "${first.slice(0, 40)}${first.length > 40 ? '...' : ''}"`);
   }
   return parts.join(' \u00b7 ') || 'No actions yet';
+}
+
+// ---------------------------------------------------------------------------
+// Tag triggers
+// ---------------------------------------------------------------------------
+
+/** One tag-triggered automation that should run, and the contacts it runs on. */
+export interface TagTriggerHit {
+  automationId: string;
+  ids: string[];
+}
+
+/**
+ * Which tag-triggered automations a write sets off: compares each contact's
+ * tags before and after. A contact that is new in `next` and already carries
+ * the tag counts as "added"; a contact that was deleted counts as nothing
+ * (there's no one left to act on). Paused automations never fire.
+ */
+export function tagTriggerHits(prev: Store, next: Store, automations: Automation[]): TagTriggerHit[] {
+  const triggers = automations.filter((a) => a.kind === 'tagChange' && a.enabled && a.triggerTagId);
+  if (!triggers.length) return [];
+  const byId = new Map<string, Set<string>>();
+  for (const [id, conv] of Object.entries(next.conversations)) {
+    const before = prev.conversations[id]?.tags;
+    const after = conv.tags;
+    if (before === after) continue;
+    const had = new Set(before || []);
+    const has = new Set(after);
+    for (const a of triggers) {
+      const tag = a.triggerTagId!;
+      const fired = a.triggerOn === 'removed' ? had.has(tag) && !has.has(tag) : !had.has(tag) && has.has(tag);
+      if (!fired) continue;
+      let s = byId.get(a.id);
+      if (!s) byId.set(a.id, (s = new Set()));
+      s.add(id);
+    }
+  }
+  return [...byId].map(([automationId, ids]) => ({ automationId, ids: [...ids] }));
+}
+
+/** "When Lead is added" — for the card and the run's history entry. */
+export function describeTagTrigger(a: Pick<Automation, 'triggerTagId' | 'triggerOn'>, store: Pick<Store, 'tags'>): string {
+  const name = a.triggerTagId ? store.tags[a.triggerTagId]?.name : undefined;
+  return `When ${name ? `“${name}”` : 'a deleted tag'} is ${a.triggerOn === 'removed' ? 'removed from' : 'added to'} a contact`;
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +416,7 @@ export function describeActions(automation: Automation, store: Store): string {
  * fires a few seconds early.
  */
 export function isDue(automation: Automation, lastRunAt: number | undefined, now: number): boolean {
-  if (!automation.enabled || automation.everyMinutes <= 0) return false;
+  if (!automation.enabled || automation.everyMinutes <= 0 || automation.kind === 'tagChange') return false;
   if (!lastRunAt) return true;
   return now - lastRunAt >= automation.everyMinutes * 60_000 - 60_000;
 }
@@ -530,8 +621,8 @@ export interface AutomationRun {
   phase?: 'scanning' | 'saving';
   /** Stop was pressed; the scan is winding down and will keep what it found. */
   stopping?: boolean;
-  /** 'webhook' = started by an incoming webhook (inbound.ts). */
-  trigger: 'manual' | 'schedule' | 'webhook';
+  /** 'webhook' = started by an incoming webhook (inbound.ts); 'tag' = a tag was added or removed. */
+  trigger: 'manual' | 'schedule' | 'webhook' | 'tag';
   startedAt: number;
   finishedAt?: number;
   rowsSeen: number;
@@ -570,9 +661,11 @@ export function describeRun(run: AutomationRun): string {
       : `Looking through conversations — ${run.rowsSeen} checked`;
   }
   if (run.error) return `Stopped: ${run.error}`;
-  const parts = run.matched !== undefined
-    ? [`${run.matched} matched the search`]
-    : [`${run.unreadFound ?? 0} unread found`];
+  const parts = run.trigger === 'tag'
+    ? [`ran on ${run.matched ?? 0} contact${run.matched === 1 ? '' : 's'}`]
+    : run.matched !== undefined
+      ? [`${run.matched} matched the search`]
+      : [`${run.unreadFound ?? 0} unread found`];
   parts.push(`${run.tagged ?? 0} updated`);
   if (run.alreadyTagged) parts.push(`${run.alreadyTagged} unchanged`);
   if (run.created) parts.push(`${run.created} added to CRM`);

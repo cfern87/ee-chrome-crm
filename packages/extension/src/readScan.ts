@@ -84,6 +84,14 @@ export interface ScanReport {
   observations: ReadStateObservation[];
   judged: string[];
   seenNoAnswer: string[];
+  /**
+   * Not on any row the scan saw, BUT Messenger's Unread list was walked to its
+   * end — so these have no unread message from the contact. That is an answer
+   * ("no new reply") even though their row was never drawn: the All list in the
+   * chat dropdown stops at ~16 rows, so for most of a large selection this is
+   * the only answer the list can give. Like seenNoAnswer, it writes nothing.
+   */
+  noUnread?: string[];
   unreached: string[];
   /** Conversation rows looked at, including ones nobody asked about. */
   rowsSeen: number;
@@ -133,6 +141,8 @@ export function buildReport(opts: {
   exhausted: boolean;
   source: ScanSource;
   at: number;
+  /** The Unread filter was walked to its end — see ScanReport.noUnread. */
+  unreadComplete?: boolean;
 }): ScanReport {
   const { wanted, states, seenThreadIds, rowsSeen, exhausted, source, at } = opts;
 
@@ -141,14 +151,16 @@ export function buildReport(opts: {
 
   const judged: string[] = [];
   const seenNoAnswer: string[] = [];
+  const noUnread: string[] = [];
   const unreached: string[] = [];
   for (const id of wanted) {
     if (states.has(id)) judged.push(id);
     else if (seenThreadIds.has(id)) seenNoAnswer.push(id);
+    else if (opts.unreadComplete) noUnread.push(id);
     else unreached.push(id);
   }
 
-  return { observations, judged, seenNoAnswer, unreached, rowsSeen, exhausted, source };
+  return { observations, judged, seenNoAnswer, noUnread, unreached, rowsSeen, exhausted, source };
 }
 
 /** Per-state counts for the summary line the dashboard shows. */
@@ -156,7 +168,7 @@ export interface ScanTally {
   read: number;
   unread: number;
   responded: number;
-  /** Rows read that had nothing to say. */
+  /** Rows read that had nothing to say, plus contacts not on the (fully walked) Unread list. */
   noAnswer: number;
   /** Contacts the scan never got to. */
   unreached: number;
@@ -170,7 +182,11 @@ export interface ScanTally {
  * make the summary describe the user's Messenger rather than their selection.
  */
 export function tally(report: ScanReport, wanted: Set<string>): ScanTally {
-  const out: ScanTally = { read: 0, unread: 0, responded: 0, noAnswer: report.seenNoAnswer.length, unreached: report.unreached.length };
+  const out: ScanTally = {
+    read: 0, unread: 0, responded: 0,
+    noAnswer: report.seenNoAnswer.length + (report.noUnread?.length ?? 0),
+    unreached: report.unreached.length,
+  };
   for (const ob of report.observations) {
     if (!wanted.has(ob.threadId)) continue;
     if (ob.state === 'read') out.read++;

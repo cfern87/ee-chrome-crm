@@ -9,7 +9,7 @@
 // both campaign state, and both surface in the shell's drawer.
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type { Store, Tag, Conversation } from '../storage';
+import type { Store, Tag, Conversation, SaveResult } from '../storage';
 import {
   Campaign, CampaignRecipient, RecipientStatus, summarize, renderTemplate, DEFAULTS,
   FailedSend, failureKey,
@@ -34,6 +34,7 @@ import { bucketTags, showsGroupLabels } from '../tagGrouping';
 import { useSearchTagGrouping } from './SearchBuilder';
 import { SendAsPicker, sendAsInvalid, type SendAsValue } from './SendAsPicker';
 import type { SendAsMode } from '../campaigns';
+import { TemplateInsertPicker, SaveAsTemplate } from './MessageTemplates';
 
 // Inline code sample in the composer's help text.
 const codeStyle: React.CSSProperties = { background: color.surface.sunken, padding: '1px 5px', borderRadius: 4 };
@@ -213,9 +214,11 @@ export interface MessagingPanelProps {
   /** Draw the queue and in-flight campaign cards above the composer. False
    *  now that Campaigns has an Active sub-view that owns them. */
   showQueue?: boolean;
+  /** Saves the store — enables "Save as template". */
+  updateStore?: (s: Store) => Promise<SaveResult>;
 }
 
-export function MessagingPanel({ conversations, tags, store, campaigns, queue, machines, seed, onConsumeSeed, draft: draftProp, onDraftChange, onChanged, onViewHistory, showQueue = true }: MessagingPanelProps) {
+export function MessagingPanel({ conversations, tags, store, campaigns, queue, machines, seed, onConsumeSeed, draft: draftProp, onDraftChange, onChanged, onViewHistory, showQueue = true, updateStore }: MessagingPanelProps) {
   // Everything typed into the composer lives in `draft`, which the DASHBOARD
   // owns — see ComposerDraft. Held there because this panel unmounts the moment
   // you switch to Active or Past sends, and a half-written message should
@@ -419,6 +422,13 @@ export function MessagingPanel({ conversations, tags, store, campaigns, queue, m
             the options at random, and they nest:{' '}
             <code style={codeStyle}>{'{Hope you\'re {well|good}|How are you}'}</code>.
           </p>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 8 }}>
+            <TemplateInsertPicker
+              store={store}
+              onPick={(body) => patch({ template: template.trim() ? `${template.replace(/\s+$/, '')}\n\n${body}` : body })}
+            />
+            {updateStore && <SaveAsTemplate store={store} updateStore={updateStore} body={template} />}
+          </div>
           <textarea
             value={template}
             onChange={(e) => patch({ template: e.target.value })}

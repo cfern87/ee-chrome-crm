@@ -83,6 +83,9 @@ export type Mutation =
   | { op: 'setPinned'; conversationId: string; pinned: boolean }
   // Hide or show one funnel bar in this contact's panel (Conversation.hiddenFunnels).
   | { op: 'setFunnelHidden'; conversationId: string; groupId: string; hidden: boolean }
+  // Forget any hide/show choice made for this funnel on this contact, so it
+  // follows the group's "hidden by default" setting again.
+  | { op: 'resetFunnelVisibility'; conversationId: string; groupId: string }
   | { op: 'deleteContact'; conversationId: string }
   // `message` is the exact text a campaign sent, logged with the history event;
   // manual sends leave it out.
@@ -538,6 +541,24 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
       const hidden = m.hidden ? added : taken;
       const shown = m.hidden ? taken : added;
       const nextConv = { ...conv, updatedAt: now };
+      if (hidden.length) nextConv.hiddenFunnels = hidden;
+      else delete nextConv.hiddenFunnels;
+      if (shown.length) nextConv.shownFunnels = shown;
+      else delete nextConv.shownFunnels;
+      const next = copy(store);
+      next.conversations[m.conversationId] = nextConv;
+      return { store: next, changed: true, conversationId: m.conversationId };
+    }
+
+    case 'resetFunnelVisibility': {
+      const conv = store.conversations[m.conversationId];
+      if (!conv) return { store, changed: false };
+      const inHidden = !!conv.hiddenFunnels?.includes(m.groupId);
+      const inShown = !!conv.shownFunnels?.includes(m.groupId);
+      if (!inHidden && !inShown) return { store, changed: false, conversationId: m.conversationId };
+      const nextConv = { ...conv, updatedAt: now };
+      const hidden = (conv.hiddenFunnels || []).filter((id) => id !== m.groupId);
+      const shown = (conv.shownFunnels || []).filter((id) => id !== m.groupId);
       if (hidden.length) nextConv.hiddenFunnels = hidden;
       else delete nextConv.hiddenFunnels;
       if (shown.length) nextConv.shownFunnels = shown;

@@ -42,6 +42,7 @@ import { CLEARED_FAILURES_COLLECTION, FAILED_NOTICE_ACK_KEY } from './campaigns'
 import { AUTOMATION_COLLECTION } from './automations';
 import { DASHBOARD_TILE_ORDER_KEY } from './dashboardTiles';
 import { RATIO_TILE_COLLECTION } from './ratioTiles';
+import { TEMPLATE_COLLECTION } from './templates';
 import { DAILY_REPORT_KEY, DAILY_REPORT_LOG_KEY } from './dailyReport';
 
 /** The `settings` bag. Untyped by design — it holds every feature's keys. */
@@ -98,6 +99,7 @@ export interface SettingsCollection<T> {
 function collections(): SettingsCollection<never>[] {
   return [
     PRESET_COLLECTION, WEBHOOK_COLLECTION, CLEARED_FAILURES_COLLECTION, AUTOMATION_COLLECTION, RATIO_TILE_COLLECTION,
+    TEMPLATE_COLLECTION,
   ] as unknown as SettingsCollection<never>[];
 }
 
