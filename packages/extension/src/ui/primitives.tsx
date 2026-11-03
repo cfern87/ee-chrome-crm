@@ -419,7 +419,11 @@ export function Banner({ tone = 'info', live, className, children, ...rest }: Ba
       role={live ? (tone === 'danger' ? 'alert' : 'status') : undefined}
       {...rest}
     >
-      {children}
+      {/* One wrapper, so the text flows as a paragraph. The banner is a flex
+          row, and without this every text run and <strong> in the message
+          became its own squeezed column (the team-workspace notice read as
+          broken fragments with no line breaks). */}
+      <div style={{ flex: 1, minWidth: 0 }}>{children}</div>
     </div>
   );
 }

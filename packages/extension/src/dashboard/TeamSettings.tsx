@@ -5,8 +5,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { PLATFORM_URL } from '../license';
 import {
-  ACTIVE_WORKSPACE_KEY, PERSONAL_WORKSPACE, WORKSPACES_CACHE_KEY, isTeamWorkspace,
-  type TeamMember, type WorkspaceInfo,
+  ACTIVE_WORKSPACE_KEY, PERSONAL_WORKSPACE, WORKSPACES_CACHE_KEY, WORKSPACE_NOTICE_KEY, isTeamWorkspace,
+  localGet, localSet, type TeamMember, type WorkspaceInfo, type WorkspaceNotice,
 } from '../team';
 import type { WorkspacesView } from '../teamService';
 import type { TeamSeed } from '../workspaceTransfer';
@@ -36,6 +36,35 @@ export function useWorkspaces(): { view: WorkspacesView | null; reload: (refresh
 }
 
 const joined = (list: WorkspaceInfo[]) => list.filter((w) => w.status === 'active');
+
+/**
+ * A workspace change the user didn't make ("you were moved to Personal
+ * because…"). Shown until dismissed — after one, every save lands somewhere
+ * else, so it must not go unnoticed. The Messenger panel shows the same notice.
+ */
+export function WorkspaceNoticeBanner() {
+  const [notice, setNotice] = useState<WorkspaceNotice | null>(null);
+  useEffect(() => {
+    const load = () => { void localGet<WorkspaceNotice>(WORKSPACE_NOTICE_KEY).then((n) => setNotice(n?.text ? n : null)); };
+    load();
+    try {
+      const handler = (changes: Record<string, unknown>, area: string) => {
+        if (area === 'local' && WORKSPACE_NOTICE_KEY in changes) load();
+      };
+      chrome.storage.onChanged.addListener(handler);
+      return () => chrome.storage.onChanged.removeListener(handler);
+    } catch { return undefined; }
+  }, []);
+  if (!notice) return null;
+  return (
+    <div style={{ padding: `${space.sm}px ${space.md}px 0` }}>
+      <Banner tone="warning" live>
+        {notice.text}{' '}
+        <Button variant="link" size="sm" onClick={() => { void localSet(WORKSPACE_NOTICE_KEY, null); setNotice(null); }}>Dismiss</Button>
+      </Banner>
+    </div>
+  );
+}
 
 /**
  * Top-bar switcher. Only rendered once the user is in at least one team, so
@@ -133,7 +162,7 @@ export function TeamPanel() {
           <Text as="div" size="small"><strong>{w.ownerEmail || 'Someone'}</strong> invited you to <strong>{w.name}</strong>.</Text>
           <Stack direction="row" gap="sm" style={{ marginTop: space.sm }}>
             <Button variant="primary" size="sm" disabled={busy}
-              onClick={() => void run({ type: 'TEAM_ACCEPT', payload: { teamId: w.id } }, `You joined ${w.name}. Pick it in the workspace switcher at the top.`)}>
+              onClick={() => void run({ type: 'TEAM_ACCEPT', payload: { teamId: w.id } }, `You joined ${w.name} and it's open now. Switch back to Personal any time from the switcher at the top.`)}>
               Accept
             </Button>
             <Button variant="ghost" size="sm" disabled={busy}

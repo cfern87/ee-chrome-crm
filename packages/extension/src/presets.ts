@@ -36,7 +36,7 @@ import type { Mutation } from './mutations';
 import { writeCollection, type SettingsBag, type SettingsCollection } from './settingsMerge';
 import { newTask, dueFromOffset, type TaskPriority } from './tasks';
 import { matchesQuery, normalizeQuery, isQueryEmpty, describeQuery, type QueryGroup, type QueryContext } from './search';
-import { isExclusiveFunnel } from './funnel';
+import { isExclusiveFunnel, isFunnelHiddenFor } from './funnel';
 import { tagDisplayOrder } from './tagGrouping';
 import { resolveMessage, templateName } from './templates';
 import type { SendAsMode } from './campaigns';
@@ -536,6 +536,17 @@ export function stepsFor(preset: PresetAction, conv: Conversation, store: Store,
   }
 
   flushTags();
+  // A stage just added in a funnel that's hidden for this contact: show the
+  // funnel, so the panel shows where they now are. (The mirror of "Remove from
+  // funnel" re-hiding one that's hidden by default.)
+  const shown = new Set<string>();
+  for (const tagId of held) {
+    if (conv.tags.includes(tagId)) continue;
+    const group = store.tags[tagId]?.groupId ? store.tagGroups[store.tags[tagId].groupId!] : undefined;
+    if (!group?.funnel || shown.has(group.id) || !isFunnelHiddenFor(conv, group)) continue;
+    shown.add(group.id);
+    out.push({ op: 'setFunnelHidden', conversationId: id, groupId: group.id, hidden: false });
+  }
   // After the tag steps, so a preset that both renames and tags reads in the
   // panel the way it was written.
   if (nameChanged && name && name !== conv.participantName) {

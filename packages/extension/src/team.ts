@@ -45,6 +45,35 @@ export interface WorkspacesCache {
   list: WorkspaceInfo[];
   checkedAt: number;
   error?: string;
+  /**
+   * When the server first answered "team workspaces aren't set up". A single
+   * such answer is normal while the database is being updated (a function is
+   * briefly missing during a migration), so the list is only given up once it
+   * has said so continuously for SETUP_GONE_MS.
+   */
+  setupPendingSince?: number;
+}
+
+/** How long "not set up" must persist before teams are treated as gone. */
+export const SETUP_GONE_MS = 30 * 60_000;
+
+/**
+ * chrome.storage.local key: a one-off message about a workspace change the
+ * user didn't make themselves ("you were moved to Personal because…"). The
+ * dashboard and the Messenger panel show it until dismissed.
+ */
+export const WORKSPACE_NOTICE_KEY = 'crm_workspace_notice';
+
+/**
+ * chrome.storage.local key: which workspace contacts first saved from
+ * Messenger or a profile page go to. Absent / '' = whichever is open (the
+ * default). Per browser — it's how this person works on this computer.
+ */
+export const NEW_CONTACT_TARGET_KEY = 'crm_new_contact_workspace';
+
+export interface WorkspaceNotice {
+  at: number;
+  text: string;
 }
 
 export interface TeamMember {

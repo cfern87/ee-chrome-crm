@@ -57,6 +57,10 @@ import { noteState, buildReport, emptyReport, type ScanReport } from './readScan
 import { readActionButtons, type UnreadScanReport, type UnreadThread } from './automations';
 import type { SendFailureKind } from './campaigns';
 import { isE2eeThreadUrl, threadChatUrl } from './threadUrl';
+import {
+  getActiveWorkspaceId, getCachedWorkspaces, localGet, localSet,
+  NEW_CONTACT_TARGET_KEY, WORKSPACE_NOTICE_KEY, type WorkspaceNotice,
+} from './team';
 import { isPlaceholderThreadText, profileOwnerIdFromHtml, staysPlaceholder } from './profileOwner';
 import { checkSender, detectSenderIdentity, type SenderIdentity, type SenderRequirement } from './senderIdentity';
 
@@ -302,8 +306,30 @@ interface MutateResponse {
   success?: boolean;
   changed?: boolean;
   store?: Store;
-  result?: { planLimitReached?: boolean; signedOut?: boolean };
+  result?: { ok?: boolean; planLimitReached?: boolean; signedOut?: boolean; reason?: string };
+  /** A new contact went to another workspace (NEW_CONTACT_TARGET_KEY), not the open one. */
+  savedTo?: SavedTo;
 }
+
+/** A workspace a new contact was saved into instead of the open one. */
+interface SavedTo { workspaceId: string; name: string }
+
+// Set by mutate() when the background put a NEW contact into another
+// workspace; read once by the caller that asked for the contact.
+let lastSavedTo: SavedTo | null = null;
+// Why the last write was refused, when the background said (a read-only team
+// workspace, say). Shown by the panel instead of a generic "couldn't load".
+let lastSaveRefusal: string | null = null;
+// Threads (and 'profile:<key>' profiles) whose contact was saved into another
+// workspace this session, so the panel says where they went instead of
+// re-saving them on every repaint. Cleared on a workspace switch.
+const routedThreads = new Map<string, SavedTo>();
+// "Is this contact also in another workspace?" answers, per open workspace and
+// thread, for a short while — the lookup reads other workspaces' local copies.
+const elsewhereCache = new Map<string, { at: number; list: SavedTo[] }>();
+const ELSEWHERE_TTL_MS = 30_000;
+// The workspace the panel last rendered, to notice a switch.
+let panelWorkspace: string | undefined;
 
 // ---- Panel busy state ----
 //
@@ -354,7 +380,8 @@ window.addEventListener('beforeunload', (e) => {
   e.returnValue = '';
 });
 
-async function mutate(mutations: Mutation[]): Promise<Store> {
+async function mutate(mutations: Mutation[], opts: { here?: boolean } = {}): Promise<Store> {
+  lastSavedTo = null;
   if (!mutations.length) return getStore();
 
   // Locked without an account. The background refuses these writes anyway; this
@@ -375,7 +402,7 @@ async function mutate(mutations: Mutation[]): Promise<Store> {
   invalidateThreadIndex();
 
   const send = (timeoutMs: number) =>
-    sendBg<MutateResponse>({ type: 'MUTATE_STORE', payload: { mutations } }, timeoutMs);
+    sendBg<MutateResponse>({ type: 'MUTATE_STORE', payload: { mutations, ...(opts.here ? { here: true } : {}) } }, timeoutMs);
 
   // A null response means the worker didn't answer in time — it was asleep, or
   // busy with a campaign send. Give it one more, longer go before giving up:
@@ -389,6 +416,10 @@ async function mutate(mutations: Mutation[]): Promise<Store> {
   else if (res?.result?.planLimitReached) showPlanLimitNotice();
 
   invalidateThreadIndex();
+  lastSavedTo = res?.savedTo || null;
+  lastSaveRefusal = res?.result && res.result.ok === false && !res.result.signedOut && !res.result.planLimitReached
+    ? res.result.reason || null
+    : null;
   if (res?.store) {
     storeCache = res.store;
     // Cover the window until chrome.storage fires onChanged for this write.
@@ -606,7 +637,7 @@ function nameCandidates(threadId: string | null, link?: HTMLAnchorElement): Reco
   return out;
 }
 
-async function ensureConversation(threadId: string, link?: HTMLAnchorElement): Promise<Conversation | null> {
+async function ensureConversation(threadId: string, link?: HTMLAnchorElement, opts: { here?: boolean } = {}): Promise<Conversation | null> {
   // Only assembled when this could be a FIRST capture — an already-saved
   // contact re-asserting its chat URL on the sidebar's 2s pass is the common
   // case by a wide margin, and building a diagnostic for it every time would
@@ -641,7 +672,13 @@ async function ensureConversation(threadId: string, link?: HTMLAnchorElement): P
         },
       }),
     },
-  ]);
+  ], opts);
+  if (lastSavedTo) {
+    // Saved into the workspace new contacts go to, not the open one.
+    routedThreads.set(threadId.toLowerCase(), lastSavedTo);
+    lastSavedTo = null;
+    return null;
+  }
   return findConversationForThread(next, threadId);
 }
 
@@ -676,7 +713,7 @@ function findConversationForProfile(store: Store, profileUrl: string): Conversat
 // Create a new contact directly from a profile page (no Messenger thread
 // required yet). Mirrors the CSV-import identity resolution so the contact
 // lines up with any Messenger-captured or imported copy of the same person.
-async function addProfileContact(profileUrl: string, name: string): Promise<Conversation | null> {
+async function addProfileContact(profileUrl: string, name: string, opts: { here?: boolean } = {}): Promise<Conversation | null> {
   const norm = normalizeProfileUrl(profileUrl) || profileUrl;
   const thread = extractThreadFromProfileUrl(profileUrl);
   // The numeric fbid read off the page. This is the id the Messenger sidebar
@@ -708,7 +745,12 @@ async function addProfileContact(profileUrl: string, name: string): Promise<Conv
         ],
       },
     },
-  ]);
+  ], opts);
+  if (lastSavedTo) {
+    routedThreads.set(`profile:${profileKey(norm) || norm}`, lastSavedTo);
+    lastSavedTo = null;
+    return null;
+  }
   return findConversationForProfile(next, profileUrl);
 }
 
@@ -1452,6 +1494,7 @@ function funnelBarsHtml(allViews: FunnelView[], hiddenIds: string[]): string {
       <div class="fb-crm-section-title-row fb-crm-funnel__row--hidden">
         ${title}
         <span class="fb-crm-funnel__meta">
+          ${view.currentIndex >= 0 ? `<span class="fb-crm-funnel__pos" title="${escapeHtml(describeStage(view))}">${escapeHtml(stagePosition(view))}</span>` : ''}
           <button class="fb-crm-funnel__link" data-funnel-unhide="${groupId}" title="Show ${groupName} for this contact again">Unhide</button>
         </span>
       </div>`;
@@ -1471,10 +1514,14 @@ function funnelBarsHtml(allViews: FunnelView[], hiddenIds: string[]): string {
     const completed = view.currentIndex === view.stages.length - 1;
     const expanded = expandedFunnels.has(view.group.id);
 
+    // No stage readout on a visible funnel's title row: the bar right below
+    // already highlights the stage, and the readout squeezed longer funnel
+    // names ("Falloff funnel") onto two lines. Hidden funnels show it, since
+    // they have no bar.
     const status = completed
       ? `<button class="fb-crm-funnel__done" data-funnel-expand="${groupId}" aria-expanded="${expanded}"
            title="${escapeHtml(describeStage(view))} — ${expanded ? 'hide' : 'show'} the pipeline">✓ Completed ${expanded ? '▴' : '▾'}</button>`
-      : `<span class="fb-crm-funnel__pos">${escapeHtml(stagePosition(view))}</span>`;
+      : '';
 
     const header = `
       <div class="fb-crm-section-title-row">
@@ -1786,6 +1833,121 @@ async function togglePanel() {
  * has to clamp against isn't known until the content is in the DOM — and it
  * changes on every render (a tag added, the delete confirmation opening).
  */
+// ---- Workspace strip ----
+//
+// Only for people in a team. One line at the top of the panel: which workspace
+// is open (and a switcher), where contacts first saved from here go, any notice
+// about a workspace change the user didn't make, and whether this contact also
+// exists in another workspace. Without it the panel gave no hint which
+// workspace it was reading or writing.
+
+interface StripData {
+  active: string;
+  teams: Array<{ id: string; name: string; writable: boolean }>;
+  target: string;
+  notice: WorkspaceNotice | null;
+  elsewhere: SavedTo[];
+}
+
+async function workspaceStripData(threadId: string | null): Promise<StripData | null> {
+  const [cache, active, target, notice] = await Promise.all([
+    getCachedWorkspaces(), getActiveWorkspaceId(),
+    localGet<string>(NEW_CONTACT_TARGET_KEY), localGet<WorkspaceNotice>(WORKSPACE_NOTICE_KEY),
+  ]);
+  const teams = cache.list.filter((w) => w.status === 'active').map((w) => ({ id: w.id, name: w.name, writable: w.active }));
+  if (!teams.length && !notice) return null;
+  let elsewhere: SavedTo[] = [];
+  if (teams.length && threadId) {
+    const key = `${active}:${threadId.toLowerCase()}`;
+    const hit = elsewhereCache.get(key);
+    if (hit && Date.now() - hit.at < ELSEWHERE_TTL_MS) elsewhere = hit.list;
+    else {
+      const res = await sendBg<{ workspaces?: SavedTo[] }>({ type: 'CONTACT_ELSEWHERE', payload: { threadId } });
+      elsewhere = res?.workspaces || [];
+      elsewhereCache.set(key, { at: Date.now(), list: elsewhere });
+    }
+  }
+  return { active, teams, target: target || '', notice: notice?.text ? notice : null, elsewhere };
+}
+
+function workspaceStripHtml(d: StripData | null): string {
+  if (!d) return '';
+  const notice = d.notice
+    ? `<div class="fb-crm-ws-notice" role="status">${escapeHtml(d.notice.text)}
+         <button class="fb-crm-ws-notice-x" data-ws-notice-dismiss="1" aria-label="Dismiss">✕</button></div>`
+    : '';
+  if (!d.teams.length) return notice;
+  const all = [{ id: 'personal', name: 'Personal', writable: true }, ...d.teams];
+  const options = all.map((w) =>
+    `<option value="${escapeHtml(w.id)}"${w.id === d.active ? ' selected' : ''}>${escapeHtml(w.name)}${w.writable ? '' : ' (read-only)'}</option>`).join('');
+  const targetValid = !d.target || all.some((w) => w.id === d.target && w.writable);
+  const targets = `<option value="">The open workspace</option>` + all.filter((w) => w.writable).map((w) =>
+    `<option value="${escapeHtml(w.id)}"${targetValid && w.id === d.target ? ' selected' : ''}>${escapeHtml(w.name)}</option>`).join('');
+  const elsewhere = d.elsewhere.length
+    ? `<div class="fb-crm-ws-elsewhere">Also in ${d.elsewhere.map((w) =>
+        `<button class="fb-crm-ws-link" data-ws-switch="${escapeHtml(w.workspaceId)}" title="Switch to ${escapeHtml(w.name)}">${escapeHtml(w.name)}</button>`).join(', ')}</div>`
+    : '';
+  return `${notice}
+    <div class="fb-crm-ws" role="group" aria-label="Workspace">
+      <label class="fb-crm-ws-field">Workspace
+        <select id="fb-crm-ws-select" aria-label="Open workspace">${options}</select>
+      </label>
+      <label class="fb-crm-ws-field" title="Where a contact goes the first time it's saved from Messenger or a profile page">New contacts to
+        <select id="fb-crm-ws-target" aria-label="Save new contacts to">${targets}</select>
+      </label>
+    </div>
+    ${elsewhere}`;
+}
+
+function wireWorkspaceStrip(): void {
+  if (!panelEl) return;
+  const switchTo = (id: string) => void panelAction(async () => {
+    const res = await sendBg<{ ok?: boolean; error?: string }>({ type: 'TEAM_SWITCH', payload: { id } }, 60_000);
+    if (!res?.ok) { presetNotice = { text: res?.error || 'Could not switch workspace.', error: true }; }
+    storeCache = null;
+    await renderPanel();
+    await injectSidebarTags();
+  });
+  panelEl.querySelector<HTMLSelectElement>('#fb-crm-ws-select')?.addEventListener('change', (e) => {
+    switchTo((e.target as HTMLSelectElement).value);
+  });
+  panelEl.querySelectorAll<HTMLElement>('[data-ws-switch]').forEach((b) => {
+    b.addEventListener('click', () => switchTo(b.dataset.wsSwitch!));
+  });
+  panelEl.querySelector<HTMLSelectElement>('#fb-crm-ws-target')?.addEventListener('change', (e) => {
+    const v = (e.target as HTMLSelectElement).value;
+    void (async () => {
+      await localSet(NEW_CONTACT_TARGET_KEY, v || null);
+      await renderPanel();
+    })();
+  });
+  panelEl.querySelector('[data-ws-notice-dismiss]')?.addEventListener('click', () => {
+    void (async () => { await localSet(WORKSPACE_NOTICE_KEY, null); await renderPanel(); })();
+  });
+}
+
+/** The panel for a contact that was saved into another workspace than the open one. */
+function renderSavedElsewhere(name: string, to: SavedTo, strip: string, saveHere: () => Promise<void>): void {
+  if (!panelEl) return;
+  panelEl.innerHTML = `
+    <div class="fb-crm-header">
+      <span>${PRODUCT_NAME}</span>
+      <button class="fb-crm-close">✕</button>
+    </div>
+    <div class="fb-crm-body">
+      ${strip}
+      <div class="fb-crm-name-row"><div class="fb-crm-name">${escapeHtml(name || 'This contact')}</div></div>
+      <div class="fb-crm-muted" style="margin:6px 0 12px">
+        Saved to <strong>${escapeHtml(to.name)}</strong> — that's where new contacts go. Switch to it to tag or edit them.
+      </div>
+      <button class="fb-crm-pick-btn" data-ws-switch="${escapeHtml(to.workspaceId)}">Switch to ${escapeHtml(to.name)}</button>
+      <button class="fb-crm-pick-btn" id="fb-crm-save-here" style="margin-top:6px">➕ Also save in this workspace</button>
+    </div>`;
+  wireClose();
+  wireWorkspaceStrip();
+  panelEl.querySelector('#fb-crm-save-here')?.addEventListener('click', () => void panelAction(saveHere));
+}
+
 async function renderPanel(): Promise<void> {
   await renderPanelContent();
   restorePanelScroll();
@@ -1824,6 +1986,16 @@ async function renderPanelContent() {
     renderSignInPanel();
     return;
   }
+
+  // A workspace switch (here, in the dashboard, or forced) leaves nothing from
+  // the old workspace behind: drafts, armed buttons, "saved elsewhere" notes.
+  const wsNow = (await getStore()).workspace || 'personal';
+  if (panelWorkspace !== undefined && wsNow !== panelWorkspace) {
+    lastRenderedThread = null;
+    routedThreads.clear();
+    elsewhereCache.clear();
+  }
+  panelWorkspace = wsNow;
 
   let threadId = currentPanelThreadId || getActiveThreadId();
 
@@ -1869,6 +2041,17 @@ async function renderPanelContent() {
     if (isProfilePage()) {
       const profileUrl = normalizeProfileUrl(window.location.href) || window.location.href;
       const guessName = getProfilePageName();
+      const routedProfile = routedThreads.get(`profile:${profileKey(profileUrl) || profileUrl}`);
+      if (routedProfile) {
+        renderSavedElsewhere(guessName, routedProfile, workspaceStripHtml(await workspaceStripData(null)), async () => {
+          routedThreads.delete(`profile:${profileKey(profileUrl) || profileUrl}`);
+          const name = await establishProfileName();
+          const conv = await addProfileContact(profileUrl, name || 'Unknown', { here: true });
+          if (conv) currentPanelThreadId = conv.id;
+          await renderPanel();
+        });
+        return;
+      }
       panelEl.innerHTML = `
         <div class="fb-crm-header">
           <span>${PRODUCT_NAME}</span>
@@ -1930,6 +2113,18 @@ async function renderPanelContent() {
   const preStore = await getStore();
   const autoCapture = (preStore.settings as Record<string, unknown>)?.autoCapture !== false;
   const wasRemoved = removedThreads.has(threadId);
+  const strip = workspaceStripHtml(await workspaceStripData(threadId));
+  const routed = routedThreads.get(threadId.toLowerCase());
+  if (routed && !findConversationForThread(preStore, threadId)) {
+    const tid = threadId;
+    renderSavedElsewhere(pageOfferedName(threadId), routed, strip, async () => {
+      routedThreads.delete(tid.toLowerCase());
+      await ensureConversation(tid, undefined, { here: true });
+      await renderPanel();
+      await injectSidebarTags();
+    });
+    return;
+  }
   if ((!autoCapture || wasRemoved) && !preStore.conversations[threadId]) {
     // Read through the same resolver the save below will use, so this screen
     // can't show one person's name and store another's.
@@ -1940,11 +2135,13 @@ async function renderPanelContent() {
         <button class="fb-crm-close">✕</button>
       </div>
       <div class="fb-crm-body">
+        ${strip}
         <div class="fb-crm-name-row"><div class="fb-crm-name">${escapeHtml(guessName)}</div></div>
         <div class="fb-crm-muted" style="margin:6px 0 12px">${wasRemoved ? 'Removed from your CRM.' : 'Not saved yet · auto-capture is off.'}</div>
         <button class="fb-crm-pick-btn" id="fb-crm-save-contact">➕ ${wasRemoved ? 'Add back to CRM' : 'Save this contact'}</button>
       </div>`;
     wireClose();
+    wireWorkspaceStrip();
     panelEl.querySelector('#fb-crm-save-contact')?.addEventListener('click', () => void panelAction(async () => {
       removedThreads.delete(threadId);
       await ensureConversation(threadId);
@@ -1955,6 +2152,11 @@ async function renderPanelContent() {
   }
 
   const conv = await ensureConversation(threadId);
+  if (!conv && routedThreads.has(threadId.toLowerCase())) {
+    // Just saved into another workspace — say where.
+    await renderPanel();
+    return;
+  }
   if (!conv) {
     // The contact couldn't be created or read back — the background is
     // unreachable, or the save was refused (signed out, free plan full; both
@@ -1966,9 +2168,11 @@ async function renderPanelContent() {
         <button class="fb-crm-close">✕</button>
       </div>
       <div class="fb-crm-body">
-        <div class="fb-crm-empty">Couldn't load this contact. Check your connection and try again.</div>
+        ${strip}
+        <div class="fb-crm-empty">${escapeHtml(lastSaveRefusal || "Couldn't load this contact. Check your connection and try again.")}</div>
       </div>`;
     wireClose();
+    wireWorkspaceStrip();
     return;
   }
   const store = await getStore();
@@ -1998,6 +2202,7 @@ async function renderPanelContent() {
       <button class="fb-crm-close">✕</button>
     </div>
     <div class="fb-crm-body">
+      ${strip}
       ${nameRowHtml(conv.participantName, !isProfilePage())}
       <div class="fb-crm-meta">📨 Last contacted: <strong>${formatRelative(conv.lastContactedAt)}</strong></div>
 
@@ -2070,6 +2275,7 @@ async function renderPanelContent() {
   wirePanelActions(conv.id);
   wirePanelFields(conv.id, conv, panelFields);
   wirePanelTasks(conv);
+  wireWorkspaceStrip();
 
   // If the user was typing a tag name when a re-render happened, restore focus
   // and place the caret at the end so their typing isn't interrupted.

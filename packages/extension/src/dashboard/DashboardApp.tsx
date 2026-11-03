@@ -30,7 +30,7 @@ import { isDriveConfigured, getDriveStatus, getDriveAuthState, connectDrive, dis
 import { isOnline as isDeviceOnline, LEASE_TTL_MS, type DeviceInfo, type DeviceOverview } from '../devices';
 import { isDisconnected, type SyncStatusView, type SendHoldReason } from '../syncHealth';
 import { AppShell, type NavItem } from '../ui/AppShell';
-import { WorkspaceSwitcher } from './TeamSettings';
+import { WorkspaceSwitcher, WorkspaceNoticeBanner } from './TeamSettings';
 import {
   Banner, Button, Card, Chip, EmptyState, Input, Option, Pager, SectionTitle, Select, Stack, Text, Toggle,
   // `Field` is already taken in this file by the CSV mapping type.
@@ -279,6 +279,11 @@ export default function DashboardApp() {
   const presetOrderTimerRef = useRef<number | null>(null);
   // Same, for the Dashboard's tile order: the stamped value not yet written.
   const pendingTileOrderRef = useRef<TileOrder | null>(null);
+  // The workspace the last read came from. When it changes, every "re-apply
+  // my recent edit" record above belongs to the OTHER workspace and must go:
+  // overlaying them is how a contact saved in Personal showed up in the team
+  // after switching, and the next whole-store save then wrote it there.
+  const workspaceRef = useRef<string | undefined>(undefined);
   const tileOrderTimerRef = useRef<number | null>(null);
   // Contacts written here that a read hasn't confirmed yet. See pendingEdits.ts.
   const pendingEditsRef = useRef<PendingEdits>(new Map());
@@ -356,6 +361,23 @@ export default function DashboardApp() {
   const [sortBy, setSortBy] = useState<SortBy>('recent');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // Switching workspace: nothing selected or open in the old one carries over.
+  // An open contact from the other workspace would otherwise stay on screen,
+  // and editing it would write a copy of it into this one.
+  const shownWorkspace = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const ws = store.workspace;
+    if (shownWorkspace.current !== undefined && ws !== shownWorkspace.current) {
+      setSelectedConv(null);
+      setSelectedIds(new Set());
+      setDeleteConfirm(null);
+      setActivePresetId(null);
+      setComposeSeed(null);
+      setComposerDraft(null);
+      setHistoryFocus(null);
+    }
+    shownWorkspace.current = ws;
+  }, [store.workspace]);
   const [bulkTagMenu, setBulkTagMenu] = useState<'assign' | 'remove' | null>(null);
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
   // A quick action that deletes, waiting for its confirming second click.
@@ -518,8 +540,9 @@ export default function DashboardApp() {
   );
 
   const unseenFailures: FailedSend[] = useMemo(
-    () => (failedAck === null ? [] : collectUnseenFailures(campaigns, failedAck, new Set(clearedFailures))),
-    [campaigns, failedAck, clearedFailures]
+    // Only this workspace's campaigns: the dismissals above are this workspace's.
+    () => (failedAck === null ? [] : collectUnseenFailures(campaigns, failedAck, new Set(clearedFailures), store.workspace || 'personal')),
+    [campaigns, failedAck, clearedFailures, store.workspace]
   );
 
   /**
@@ -580,6 +603,12 @@ export default function DashboardApp() {
     const s = await loadStore(fresh ? { maxAgeMs: 0 } : {});
     setLoading(false);
     if (seq !== storeSeqRef.current) return; // superseded while in flight
+    if (workspaceRef.current !== undefined && s.workspace !== workspaceRef.current) {
+      pendingEditsRef.current.clear();
+      pendingPresetOrderRef.current = null;
+      pendingTileOrderRef.current = null;
+    }
+    workspaceRef.current = s.workspace;
     // An unwritten reorder is re-applied on top of whatever arrives, so a store
     // that predates it can't put the old order back under the cursor. The
     // ticket above can't cover this: the read may be legitimately newer than
@@ -2007,6 +2036,7 @@ export default function DashboardApp() {
       }
     >
       <SavingPill active={savesInFlight > 0} />
+      <WorkspaceNoticeBanner />
       {/* Contacts owns the full viewport and scrolls its two columns
           independently. Every other route is a document, so it keeps the
           centred, page-scrolling wrapper. */}
@@ -2467,7 +2497,14 @@ export default function DashboardApp() {
               aria-label="Advanced search"
               style={{
                 position: 'absolute', top: space.md, left: space.md, zIndex: layer.overlay,
-                width: `min(680px, calc(100% - ${space.xxl}px))`,
+                // As wide as its widest condition row (fit-content = one line
+                // per row when there is room), from 680px up to the screen
+                // edge. A fixed 680px wrapped longer conditions such as
+                // "Last activity / not in the last / 30 / days" onto a second
+                // line each, and the panel grew tall fast.
+                width: 'fit-content',
+                minWidth: `min(680px, calc(100% - ${space.xxl}px))`,
+                maxWidth: `calc(100% - ${space.xxl}px)`,
                 maxHeight: `calc(100% - ${space.xxl}px)`, overflowY: 'auto',
                 background: color.surface.raised,
                 border: `1px solid ${color.border.subtle}`,

@@ -135,6 +135,24 @@ describe('collectUnseenFailures with archiving', () => {
   });
 });
 
+describe('collectUnseenFailures per workspace', () => {
+  const failing = campaign({
+    recipients: [recipient('Kai Burns', { status: 'error', error: 'no composer', failedAt: 9_000 })],
+  });
+
+  it('shows a workspace only the failures of campaigns started in it', () => {
+    const team = { ...failing, id: 'c-team', workspace: 'team-1' };
+    expect(collectUnseenFailures([team], 0, new Set(), 'team-1')).toHaveLength(1);
+    expect(collectUnseenFailures([team], 0, new Set(), 'team-2')).toHaveLength(0);
+    expect(collectUnseenFailures([team], 0, new Set(), 'personal')).toHaveLength(0);
+  });
+
+  it('counts campaigns from before workspaces were recorded as Personal', () => {
+    expect(collectUnseenFailures([failing], 0, new Set(), 'personal')).toHaveLength(1);
+    expect(collectUnseenFailures([failing], 0, new Set(), 'team-1')).toHaveLength(0);
+  });
+});
+
 describe('failureReport', () => {
   const failing = (name: string, first: string | null, error: string) => recipient(name, {
     status: 'error',

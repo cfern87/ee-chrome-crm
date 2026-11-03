@@ -1182,7 +1182,12 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
 
   return (
     <div style={{ background: color.surface.raised, border: `1px solid ${color.border.subtle}`, borderRadius: 8, padding: 12, marginBottom: 12 }}>
+      {/* width 0 + min-width 100%: these fill the panel but never WIDEN it —
+          the condition rows decide how wide Advanced search grows (it sizes
+          to fit them), not a long row of saved-search chips or the one-line
+          summary below. */}
       {!props.hidePresetBar && (
+        <div style={{ width: 0, minWidth: '100%' }}>
         <PresetBar
           savedSearches={props.savedSearches}
           activeId={props.activePresetId}
@@ -1200,6 +1205,7 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
           onReorder={props.onReorderPreset}
           usedByTiles={props.usedByTiles}
         />
+        </div>
       )}
 
       <QueryDndRoot query={query} onChange={onQueryChange}>
@@ -1213,7 +1219,7 @@ export default function AdvancedSearch(props: AdvancedSearchProps) {
         />
       </QueryDndRoot>
 
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10, flexWrap: 'wrap', width: 0, minWidth: '100%' }}>
         <span style={{ fontSize: 12, fontWeight: 700, color: empty ? color.text.muted : color.accent.base }}>
           {matchCount} of {totalCount} contacts match
         </span>

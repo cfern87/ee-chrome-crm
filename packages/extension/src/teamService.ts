@@ -13,6 +13,7 @@ import { normalizeStoreShape } from './drive';
 import {
   PERSONAL_WORKSPACE, WORKSPACES_CACHE_KEY, getActiveWorkspaceId, getCachedWorkspaces,
   isNotMemberError, isTeamWorkspace, localSet, patchTeamSyncMeta, getTeamSyncMeta,
+  SETUP_GONE_MS, WORKSPACE_NOTICE_KEY, type WorkspaceNotice,
   type TeamClient, type TeamSyncMeta, type WorkspaceInfo, type WorkspacesCache,
 } from './team';
 import { syncTeamOnce, type TeamSyncResult } from './teamSync';
@@ -59,31 +60,52 @@ export function makeTeamService(deps: TeamServiceDeps) {
   const { client } = deps;
 
   async function refreshWorkspaces(): Promise<WorkspacesCache & { setupPending?: boolean }> {
+    const prev = await getCachedWorkspaces();
     const r = await client.myWorkspaces();
     if (!r.ok) {
       const fail = r as { error: string; setupPending?: boolean };
-      const prev = await getCachedWorkspaces();
-      // A missing server leaves nobody in a team; a network blip changes nothing.
-      const next: WorkspacesCache = fail.setupPending
-        ? { list: [], checkedAt: Date.now(), error: fail.error }
-        : { ...prev, error: fail.error };
+      if (!fail.setupPending) {
+        // A network blip changes nothing.
+        const next: WorkspacesCache = { ...prev, error: fail.error };
+        await localSet(WORKSPACES_CACHE_KEY, next);
+        return next;
+      }
+      // "Not set up" is ALSO what the server says for a moment while its
+      // database is being updated. Only a long, unbroken run of it means the
+      // feature really is gone; until then keep the teams we know about, so a
+      // migration can't bounce everyone to Personal (where their next saves
+      // would land) and delete this computer's unsynced team edits.
+      const since = prev.setupPendingSince ?? Date.now();
+      const gone = !prev.list.length || Date.now() - since >= SETUP_GONE_MS;
+      const next: WorkspacesCache = gone
+        ? { list: [], checkedAt: Date.now(), error: fail.error, setupPendingSince: since }
+        : { ...prev, error: fail.error, setupPendingSince: since };
       await localSet(WORKSPACES_CACHE_KEY, next);
-      if (fail.setupPending) await leaveActiveTeamIfGone(next.list);
-      return { ...next, setupPending: fail.setupPending };
+      if (gone) await leaveActiveTeamIfGone(next.list, prev.list, 'the team server is not available');
+      return { ...next, setupPending: gone };
     }
     const next: WorkspacesCache = { list: (r as { list: WorkspaceInfo[] }).list, checkedAt: Date.now() };
     await localSet(WORKSPACES_CACHE_KEY, next);
-    await leaveActiveTeamIfGone(next.list);
+    await leaveActiveTeamIfGone(next.list, prev.list, 'you are no longer a member of it');
     return next;
   }
 
-  /** Back to Personal when the active team is no longer one we're in. */
-  async function leaveActiveTeamIfGone(list: WorkspaceInfo[]): Promise<void> {
+  /**
+   * Back to Personal when the active team is no longer one we're in — and say
+   * so, because every save after this lands in Personal. The local copy is
+   * kept if it holds edits the server never got, so nothing typed is lost.
+   */
+  async function leaveActiveTeamIfGone(list: WorkspaceInfo[], before: WorkspaceInfo[], why: string): Promise<void> {
     const active = await getActiveWorkspaceId();
     if (!isTeamWorkspace(active)) return;
     if (list.some((w) => w.id === active && w.status === 'active')) return;
+    const name = before.find((w) => w.id === active)?.name;
     await switchWorkspace(PERSONAL_WORKSPACE);
-    await forgetTeamCache(active);
+    await localSet(WORKSPACE_NOTICE_KEY, {
+      at: Date.now(),
+      text: `You were moved to your Personal workspace because ${why}${name ? ` (“${name}”)` : ''}. New contacts now save to Personal.`,
+    } satisfies WorkspaceNotice);
+    if (!(await isTeamDirty(active))) await forgetTeamCache(active);
   }
 
   async function getWorkspaces(refresh = false): Promise<WorkspacesView> {
@@ -281,10 +303,13 @@ export function makeTeamService(deps: TeamServiceDeps) {
     return r as Ok | Err;
   }
 
+  /** Accept an invite and open the team straight away — that is why it was accepted. */
   async function accept(teamId: string): Promise<Ok | Err> {
     const r = await client.accept(teamId);
-    if (r.ok) await refreshWorkspaces();
-    return r as Ok | Err;
+    if (!r.ok) return r as Err;
+    await refreshWorkspaces();
+    const sw = await switchTo(teamId);
+    return sw.ok ? { ok: true } : sw as Err;
   }
 
   /** Decline an invite or leave a team. */
@@ -347,6 +372,8 @@ export function makeTeamService(deps: TeamServiceDeps) {
     getWorkspaces, refreshWorkspaces, syncActiveTeam, onStoreChanged, onAlarm, switchTo,
     createTeam, invite, removeMember, accept, leave, deleteTeam, mayRunScheduledAutomations, mergeTargets,
     members: (teamId: string) => client.members(teamId),
+    /** Push/pull one team now, open or not (after a write into a team that isn't open). */
+    syncTeam: (teamId: string) => syncOnce(teamId),
   };
 }
 

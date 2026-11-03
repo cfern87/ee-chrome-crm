@@ -29,9 +29,41 @@
 
 import type { Conversation, Store } from './storage';
 
-export type HistoryOp = 'c' | '+' | '-' | 'm' | 'q' | 'w' | 'x' | 'a';
+export type HistoryOp = 'c' | '+' | '-' | 'm' | 'q' | 'w' | 'x' | 'a' | 'f' | 'n' | 'r' | 'u' | 'k' | 't';
 
-const OPS = 'c+-mqwxa';
+// 'f' custom field changed (arg: field id), 'n' renamed, 'r' archived,
+// 'u' unarchived, 'k' follow-up task added (arg: its title, URI-encoded),
+// 't' follow-up task completed (arg: its title). Added 2026-11 so a team can
+// see who did what; older builds skip ops they don't know.
+const OPS = 'c+-mqwxafnrukt';
+
+// ---- who did it (team workspaces) ----
+//
+// In a team workspace each event carries the member who made it, as a suffix:
+// `<time><op><arg>^<actor>`. `actor` is a short key for the member's email
+// (actorKey); the email itself is kept once per member in settings, under
+// ACTOR_SETTING_PREFIX + key (one key per member, so per-key merging never
+// loses one). '^' never appears in an arg: ids are base36, messages and run
+// args are URI-encoded. Older builds read the suffix as part of the arg.
+
+export const ACTOR_SETTING_PREFIX = 'historyActor:';
+
+/** Short, stable key for a member's email (6 base36 chars). */
+export function actorKey(email: string): string {
+  let h = 0x811c9dc5;
+  for (const ch of email.trim().toLowerCase()) {
+    h ^= ch.charCodeAt(0);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(36).padStart(6, '0').slice(-6);
+}
+
+/** The email behind an actor key, from the store's settings. */
+export function actorEmail(settings: Record<string, unknown> | undefined, key: string | undefined): string | undefined {
+  if (!key) return undefined;
+  const v = settings?.[ACTOR_SETTING_PREFIX + key];
+  return typeof v === 'string' ? v : undefined;
+}
 
 // ---- automation runs ('a') ----
 //
@@ -106,7 +138,7 @@ export function parseAutomationRunArg(arg: string | undefined): AutomationRunInf
 }
 
 /** Ops that can belong to an automation run in the details pane. */
-const RUN_CHILD_OPS: HistoryOp[] = ['c', '+', '-', 'w', 'x', 'q'];
+const RUN_CHILD_OPS: HistoryOp[] = ['c', '+', '-', 'w', 'x', 'q', 'f', 'n', 'r', 'u', 'k', 't'];
 
 export type HistoryItem =
   | { kind: 'event'; event: HistoryEvent }
@@ -178,6 +210,8 @@ export interface HistoryEvent {
   op: HistoryOp;
   /** Tag id for '+' / '-'; HTTP status for 'w'; reason for 'x'; message (messageArg) for 'q' / 'm'. */
   arg?: string;
+  /** Team workspaces: the member who did it (actorKey of their email). */
+  by?: string;
 }
 
 /**
@@ -212,7 +246,7 @@ function encodeTime(ms: number): string {
 export function encodeEvent(e: HistoryEvent): string {
   // Commas are the separator; ids never contain one, but a stray one must not
   // split an event in two.
-  return encodeTime(e.at) + e.op + (e.arg ? e.arg.replace(/,/g, '') : '');
+  return encodeTime(e.at) + e.op + (e.arg ? e.arg.replace(/[,^]/g, '') : '') + (e.by ? `^${e.by}` : '');
 }
 
 function decodeToken(tok: string): HistoryEvent | null {
@@ -220,9 +254,17 @@ function decodeToken(tok: string): HistoryEvent | null {
   const secs = parseInt(tok.slice(0, TIME_WIDTH), 36);
   const op = tok[TIME_WIDTH] as HistoryOp;
   if (!Number.isFinite(secs) || !OPS.includes(op)) return null;
-  const arg = tok.slice(TIME_WIDTH + 1);
+  let arg = tok.slice(TIME_WIDTH + 1);
+  let by: string | undefined;
+  const caret = arg.lastIndexOf('^');
+  if (caret >= 0) { by = arg.slice(caret + 1) || undefined; arg = arg.slice(0, caret); }
   const at = (secs + EPOCH_S) * 1000;
-  return arg ? { at, op, arg } : { at, op };
+  return { at, op, ...(arg ? { arg } : {}), ...(by ? { by } : {}) };
+}
+
+/** Stamp an encoded token with who made it, unless it already says. */
+function withActor(tok: string, actor: string): string {
+  return tok.includes('^') ? tok : `${tok}^${actor}`;
 }
 
 function tokensOf(s: string | undefined): string[] {
@@ -295,12 +337,33 @@ function eventsFor(prev: Conversation | undefined, next: Conversation, now: numb
     for (const id of next.tags) out.push({ at: next.tagAddedAt?.[id] || at, op: '+', arg: id });
     return out;
   }
-  if (prev.tags === next.tags) return [];
-  const before = new Set(prev.tags);
-  const after = new Set(next.tags);
   const out: HistoryEvent[] = [];
-  for (const id of prev.tags) if (!after.has(id)) out.push({ at: now, op: '-', arg: id });
-  for (const id of next.tags) if (!before.has(id)) out.push({ at: next.tagAddedAt?.[id] || now, op: '+', arg: id });
+  if (prev.tags !== next.tags) {
+    const before = new Set(prev.tags);
+    const after = new Set(next.tags);
+    for (const id of prev.tags) if (!after.has(id)) out.push({ at: now, op: '-', arg: id });
+    for (const id of next.tags) if (!before.has(id)) out.push({ at: next.tagAddedAt?.[id] || now, op: '+', arg: id });
+  }
+  // The other edits worth a line in a shared contact's log.
+  if (prev.customFields !== next.customFields) {
+    const a = prev.customFields || {};
+    const b = next.customFields || {};
+    for (const id of new Set([...Object.keys(a), ...Object.keys(b)])) {
+      if ((a[id] || '') !== (b[id] || '')) out.push({ at: now, op: 'f', arg: id });
+    }
+  }
+  if (prev.participantName !== next.participantName && prev.participantName && next.nameManual) {
+    out.push({ at: now, op: 'n' });
+  }
+  if (!!prev.archived !== !!next.archived) out.push({ at: now, op: next.archived ? 'r' : 'u' });
+  if (prev.tasks !== next.tasks) {
+    const before = new Map((prev.tasks || []).map((t) => [t.id, t]));
+    for (const t of next.tasks || []) {
+      const old = before.get(t.id);
+      if (!old) out.push({ at: now, op: 'k', arg: encodeURIComponent(t.title) });
+      else if (!old.done && t.done) out.push({ at: now, op: 't', arg: encodeURIComponent(t.title) });
+    }
+  }
   return out;
 }
 
@@ -319,7 +382,7 @@ function eventsFor(prev: Conversation | undefined, next: Conversation, now: numb
  *   * drops history for contacts that no longer exist, so a deleted contact
  *     doesn't keep costing space.
  */
-export function recordHistory(previous: Store | null, next: Store, now = Date.now()): Store {
+export function recordHistory(previous: Store | null, next: Store, now = Date.now(), actor?: string): Store {
   const history: Record<string, string> = {};
   const prevConvs = previous?.conversations || {};
   const prevHist = previous?.history || {};
@@ -330,6 +393,12 @@ export function recordHistory(previous: Store | null, next: Store, now = Date.no
     // No previous store at all (first save on this machine) is not "every
     // contact was just created" — only diff when there is something to diff.
     if (previous) s = appendHistory(s, eventsFor(prevConvs[id], conv, now));
+    // In a team: everything new in this save — the diff above, and events the
+    // log mutations wrote (messages queued, automation runs) — is this member's.
+    if (actor && s) {
+      const had = new Set(tokensOf(prevHist[id]));
+      s = tokensOf(s).map((t) => (had.has(t) ? t : withActor(t, actor))).join(',');
+    }
     if (s) history[id] = s;
   }
   return { ...next, history };

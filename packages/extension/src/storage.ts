@@ -21,10 +21,10 @@
 //     (changed/removed shards) versus the last synced snapshot, so tagging one
 //     person costs a single write.
 
-import { recordHistory } from './history';
+import { recordHistory, actorKey, ACTOR_SETTING_PREFIX } from './history';
 import { readStore as driveReadStore, writeStore as driveWriteStore, mergeStores } from './drive';
 import { mergeSettingsWithBase, reconcileCollections, type SettingsBag } from './settingsMerge';
-import { getEntitlement, isSignedIn, FREE_CONTACT_LIMIT } from './license';
+import { getEntitlement, isSignedIn, getStoredSession, FREE_CONTACT_LIMIT } from './license';
 import type { SavedSearch } from './search';
 import type { FollowUpTask } from './tasks';
 import {
@@ -1465,7 +1465,7 @@ export async function switchWorkspace(id: string): Promise<void> {
   });
 }
 
-async function saveStoreTeam(input: Store, teamId: string): Promise<SaveResult> {
+async function saveStoreTeam(input: Store, teamId: string, isActive = true): Promise<SaveResult> {
   const info = await getWorkspaceInfo(teamId);
   if (info && !info.active) {
     return {
@@ -1482,13 +1482,23 @@ async function saveStoreTeam(input: Store, teamId: string): Promise<SaveResult> 
   const guarded = previous
     ? guardStaleWrite(previous, normalize(input), arrivals, input.workspaceReadAt || 0)
     : normalize(input);
+  // Who is saving: every new history event is stamped with them, so teammates
+  // can see who did what (history.ts, "who did it").
+  const email = (await getStoredSession().catch(() => null))?.email?.trim().toLowerCase();
+  const actor = email ? actorKey(email) : undefined;
+  const withActorDir = actor && guarded.settings?.[ACTOR_SETTING_PREFIX + actor] !== email
+    ? { ...guarded, settings: { ...guarded.settings, [ACTOR_SETTING_PREFIX + actor]: email } }
+    : guarded;
   const store = recordHistory(previous, pruneDiagnostics(previous
-    ? tombstone(guarded, removedConversationIds(previous, guarded))
-    : pruneTombstones(guarded)));
+    ? tombstone(withActorDir, removedConversationIds(previous, withActorDir))
+    : pruneTombstones(withActorDir)), Date.now(), actor);
 
   await Promise.all([chromeLocalSet(store, key), idbSet(store, teamIdbKey(teamId))]);
-  loadedStore = { ...store, workspace: teamId, workspaceReadAt: Date.now() };
-  loadedAt = Date.now();
+  // Only the open workspace is this context's cached view.
+  if (isActive) {
+    loadedStore = { ...store, workspace: teamId, workspaceReadAt: Date.now() };
+    loadedAt = Date.now();
+  }
   await setTeamDirty(teamId, true);
   // The background worker listens for this and pushes shortly after.
   await bumpStoreRev();
@@ -1600,6 +1610,27 @@ async function applyContactLimit(store: Store): Promise<{ store: Store; blocked:
  * the sharded delta write to chrome.storage.sync in legacy mode.
  */
 export async function saveStore(input: Store): Promise<SaveResult> {
+  return saveStoreIn(await getActiveWorkspaceId(), input);
+}
+
+/**
+ * Load one workspace's store, whether or not it is the open one. The open one
+ * goes through loadStore (and its cache); any other is read straight from its
+ * local copy, stamped with its own id so it can only be saved back there.
+ */
+export async function loadStoreIn(ws: string): Promise<Store> {
+  const target = ws || PERSONAL_WORKSPACE;
+  if (target === await getActiveWorkspaceId()) return loadStore();
+  const s = isTeamWorkspace(target) ? await loadStoreTeam(target) : await loadStoreUncached();
+  return { ...s, workspace: target, workspaceReadAt: Date.now() };
+}
+
+/**
+ * Save into workspace `ws` — the open one (what saveStore does) or another,
+ * e.g. a new contact sent to Personal while a team is open. A store loaded in a
+ * different workspace is refused, whichever is open.
+ */
+export async function saveStoreIn(ws: string, input: Store): Promise<SaveResult> {
   // An account is required for every plan, free included: without one we can't
   // tell which entitlements apply, so nothing is written at all.
   if (!(await isSignedIn())) {
@@ -1612,14 +1643,14 @@ export async function saveStore(input: Store): Promise<SaveResult> {
     };
   }
 
-  const ws = await getActiveWorkspaceId();
   if (input.workspace && input.workspace !== ws) {
     return {
       ok: false, pending: 0, itemLimitReached: false,
       reason: 'You switched workspace since this was loaded, so nothing was saved. Reload and try again.',
     };
   }
-  if (isTeamWorkspace(ws)) return saveStoreTeam(input, ws);
+  const isActive = ws === await getActiveWorkspaceId();
+  if (isTeamWorkspace(ws)) return saveStoreTeam(input, ws, isActive);
 
   // Auto-tombstone whatever this write dropped. The dashboard and popup still
   // write the store wholesale, so without this a delete made there would carry
@@ -1648,8 +1679,10 @@ export async function saveStore(input: Store): Promise<SaveResult> {
   await Promise.all([chromeLocalSet(store), idbSet(store)]);
   // This context's own view is now authoritative; serve it to callers inside
   // the freshness window rather than re-reading what we just wrote.
-  loadedStore = { ...store, workspace: PERSONAL_WORKSPACE, workspaceReadAt: Date.now() };
-  loadedAt = Date.now();
+  if (isActive) {
+    loadedStore = { ...store, workspace: PERSONAL_WORKSPACE, workspaceReadAt: Date.now() };
+    loadedAt = Date.now();
+  }
 
   if (driveMode) {
     // Mark dirty up front; queueDriveWrite clears it once the upload lands.

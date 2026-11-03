@@ -21,7 +21,7 @@ import {
 import { funnelsFor, describeStage, stagePosition, stageTitle, type FunnelView } from '../funnel';
 import { ContactTasks, type TaskHandlers } from './TasksPanel';
 import {
-  displayHistory, groupHistory, messageFromArg,
+  displayHistory, groupHistory, messageFromArg, actorEmail,
   type AutomationChange, type AutomationRunInfo, type HistoryEvent,
 } from '../history';
 import { readActions } from '../automations';
@@ -793,12 +793,12 @@ function ContactHistory({ conv, store }: { conv: Conversation; store: Store }) {
             return (
               <li key={key} style={historyRow}>
                 <HistoryTime at={e.at} />
-                <span style={{ minWidth: 0 }}>{describeHistoryEvent(e, store)}</span>
+                <span style={{ minWidth: 0 }}>{describeHistoryEvent(e, store)}<ByLine e={e} store={store} /></span>
               </li>
             );
           }
           const open = openRuns.has(key);
-          const lines = runDetailLines(item.run);
+          const lines = runDetailLines(item.run, item.children);
           const count = item.children.length + lines.length;
           return (
             <li key={key} style={{ ...historyRow, flexDirection: 'column', alignItems: 'stretch', gap: 4 }}>
@@ -806,6 +806,7 @@ function ContactHistory({ conv, store }: { conv: Conversation; store: Store }) {
                 <HistoryTime at={e.at} />
                 <span style={{ minWidth: 0 }}>
                   {describeRunHeader(item.run, automationNames)}
+                  <ByLine e={e} store={store} />
                   {' '}
                   <button
                     onClick={() => toggleRun(key)}
@@ -820,7 +821,7 @@ function ContactHistory({ conv, store }: { conv: Conversation; store: Store }) {
                 <ol style={{ listStyle: 'none', margin: '0 0 0 142px', padding: '0 0 0 10px', borderLeft: `2px solid ${color.border.subtle}`, display: 'flex', flexDirection: 'column', gap: 4 }}>
                   {item.children.map((c, j) => (
                     <li key={`${c.at}-${c.op}-${c.arg ?? ''}-${j}`} style={{ fontSize: 13, color: color.text.secondary }}>
-                      {describeHistoryEvent(c, store)}
+                      {describeHistoryEvent(c, store)}<ByLine e={c} store={store} />
                     </li>
                   ))}
                   {lines.map((l) => (
@@ -845,6 +846,17 @@ function ContactHistory({ conv, store }: { conv: Conversation; store: Store }) {
         </button>
       )}
     </div>
+  );
+}
+
+/** " · by sam@acme.com" on an event a team member made (history.ts, "who did it"). */
+function ByLine({ e, store }: { e: HistoryEvent; store: Store }) {
+  if (!e.by) return null;
+  const email = actorEmail(store.settings as Record<string, unknown>, e.by);
+  return (
+    <span style={{ color: color.text.muted, fontSize: 12 }} title={email ? `Done by ${email}` : 'Done by a team member'}>
+      {' '}· by {email || 'a team member'}
+    </span>
   );
 }
 
@@ -877,7 +889,13 @@ function describeRunHeader(run: AutomationRunInfo, names: Map<string, string>): 
 }
 
 /** The changes history has no event of its own for (see history.ts). */
-function runDetailLines(run: AutomationRunInfo): string[] {
+function runDetailLines(run: AutomationRunInfo, children: HistoryEvent[] = []): string[] {
+  // Newer builds log these as events of their own (listed as children); only
+  // fall back to the run's one-word summary when there's no such event.
+  const op: Record<AutomationChange, HistoryEvent['op']> = {
+    field: 'f', task: 'k', tasksDone: 't', archived: 'r', unarchived: 'u', renamed: 'n',
+  };
+  const logged = new Set(children.map((c) => c.op));
   const words: Record<AutomationChange, string> = {
     field: 'Custom field updated',
     task: 'Task added',
@@ -886,7 +904,7 @@ function runDetailLines(run: AutomationRunInfo): string[] {
     unarchived: 'Unarchived',
     renamed: 'Name changed',
   };
-  return (run.changes || []).map((c) => words[c]);
+  return (run.changes || []).filter((c) => !logged.has(op[c])).map((c) => words[c]);
 }
 
 function describeHistoryEvent(e: HistoryEvent, store: Store): React.ReactNode {
@@ -910,6 +928,16 @@ function describeHistoryEvent(e: HistoryEvent, store: Store): React.ReactNode {
       );
     }
     case 'w': return `Sent to webhook${e.arg ? ` (HTTP ${e.arg})` : ''}`;
+    case 'f': return `Field changed: ${(e.arg && store.fieldDefs[e.arg]?.name) || 'a deleted field'}`;
+    case 'n': return 'Name changed';
+    case 'r': return 'Archived';
+    case 'u': return 'Unarchived';
+    case 'k':
+    case 't': {
+      let title = '';
+      try { title = e.arg ? decodeURIComponent(e.arg) : ''; } catch { title = e.arg || ''; }
+      return `${e.op === 'k' ? 'Follow-up added' : 'Follow-up done'}${title ? `: ${title}` : ''}`;
+    }
     case 'x': return <span style={{ color: color.danger.base }}>Webhook failed{e.arg ? `: ${e.arg}` : ''}</span>;
     // Only reached for an 'a' groupHistory couldn't read; readable ones render as a group.
     case 'a': return 'An automation ran';

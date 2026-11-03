@@ -86,6 +86,37 @@ describe('remove from funnel re-hides a hidden-by-default funnel', () => {
   });
 });
 
+describe('a quick action that tags into a hidden funnel shows it', () => {
+  const groups = [group('stage', { funnelHiddenByDefault: true }), group('pipe')];
+
+  it('shows a funnel that is hidden by default once a stage is added', () => {
+    const c = conv('c', []);
+    const store = storeWith([c], groups);
+    const after = press([{ kind: 'addTag', tagId: 's1' }], c, store);
+    expect(after.tags).toEqual(['s1']);
+    expect(isFunnelHiddenFor(after, store.tagGroups.stage)).toBe(false);
+  });
+
+  it('shows a funnel hidden by hand for this contact', () => {
+    const c = conv('c', [], { hiddenFunnels: ['pipe'] });
+    const store = storeWith([c], groups);
+    const after = press([{ kind: 'setFunnelStage', groupId: 'pipe', tagId: 'p2' }], c, store);
+    expect(isFunnelHiddenFor(after, store.tagGroups.pipe)).toBe(false);
+  });
+
+  it('leaves visibility alone when the stage was already held', () => {
+    const c = conv('c', ['s1']);
+    const store = storeWith([c], groups);
+    expect(stepsFor(preset([{ kind: 'addTag', tagId: 's1' }]), c, store)).toEqual([]);
+  });
+
+  it('does not touch tags outside a funnel', () => {
+    const c = conv('c', []);
+    const ms = stepsFor(preset([{ kind: 'addTag', tagId: 'lead' }]), c, storeWith([c], groups));
+    expect(ms.some((m) => m.op === 'setFunnelHidden')).toBe(false);
+  });
+});
+
 describe('tag-triggered automations', () => {
   const trig = (patch: Partial<Automation> = {}): Automation =>
     ({ ...newTagTriggerAutomation(0, 'lead', 1_000), id: 't1', steps: [{ kind: 'addTag', tagId: 's1' }], ...patch });

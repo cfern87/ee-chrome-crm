@@ -193,6 +193,12 @@ export interface Campaign {
   // automation's "message each contact once" knows, on every machine, who it
   // has already messaged.
   automationId?: string;
+  // The workspace (team.ts: 'personal' or a team id) that was open when the
+  // campaign was started. Campaigns themselves are per person, but the
+  // dismissals of their failure alerts live in each workspace's settings, so a
+  // workspace only reports failures from its own campaigns. Absent on older
+  // campaigns, which count as Personal.
+  workspace?: string;
   // Which Facebook identity this campaign may send as. Chosen when the
   // campaign is made and never changed. Every send checks it before typing
   // (see senderIdentity.ts); a mismatch pauses all running campaigns. Absent
@@ -263,6 +269,8 @@ export interface NewCampaignInput {
   dryRun?: boolean;
   skipIfUnread?: boolean;
   automationId?: string;
+  /** Workspace open when it was started (Campaign.workspace). */
+  workspace?: string;
   // Sender identity; omitted means the personal profile. See Campaign.sendAs.
   sendAs?: SendAsMode;
   sendAsPageId?: string;
@@ -295,6 +303,7 @@ export function createCampaign(input: NewCampaignInput): Campaign {
     dryRun: !!input.dryRun,
     skipIfUnread: !!input.skipIfUnread,
     ...(input.automationId ? { automationId: input.automationId } : {}),
+    ...(input.workspace ? { workspace: input.workspace } : {}),
     ...campaignSendAsFields(input),
     createdAt: now,
     status: 'running',
@@ -1193,9 +1202,20 @@ export async function clearLegacyNoticeState(): Promise<void> {
 // failed before `failedAt` was recorded have no timestamp and count as already
 // seen, so upgrading the extension doesn't resurface old campaign history.
 // `cleared` holds keys the user dismissed one-by-one (see failureKey).
-export function collectUnseenFailures(campaigns: Campaign[], ackAt: number, cleared: Set<string> = new Set()): FailedSend[] {
+/** The workspace a campaign belongs to — Personal for campaigns made before workspaces were recorded. */
+export function campaignWorkspace(c: Pick<Campaign, 'workspace'>): string {
+  return c.workspace || 'personal';
+}
+
+/**
+ * Failures not yet dismissed. With `workspace`, only from campaigns started in
+ * that workspace: the dismissals being compared against are that workspace's,
+ * so another workspace's failures would always look undismissed here.
+ */
+export function collectUnseenFailures(campaigns: Campaign[], ackAt: number, cleared: Set<string> = new Set(), workspace?: string): FailedSend[] {
   const out: FailedSend[] = [];
   for (const c of campaigns) {
+    if (workspace && campaignWorkspace(c) !== workspace) continue;
     // Archiving a campaign is the user saying they're done with it, which
     // includes its failures — otherwise filing one away would leave its
     // banner on screen and there'd be no way to make it stop.

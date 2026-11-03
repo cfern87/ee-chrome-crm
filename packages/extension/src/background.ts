@@ -25,7 +25,7 @@
 // periodic watchdog alarm self-heals any stall (e.g. if the worker was killed
 // mid-step).
 
-import { loadStore, saveStore, flushDriveIfDirty, syncDriveNow, isDriveEnabled, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, removeTagsFrom, isStoreChangeKey } from './storage';
+import { loadStore, saveStore, flushDriveIfDirty, syncDriveNow, isDriveEnabled, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, removeTagsFrom, isStoreChangeKey, loadStoreIn, saveStoreIn, readPersonalCache, readTeamCache } from './storage';
 import type { Store, SaveResult, Conversation } from './storage';
 import { applyMutations } from './mutations';
 import type { Mutation } from './mutations';
@@ -52,7 +52,10 @@ import {
   type DailyReportConfig, type ReportDelivery,
 } from './dailyReport';
 import { makeInboundClient, inboundEndpointUrl } from './inboundClient';
-import { makeTeamClient, TEAM_SYNC_ALARM, TEAM_SYNC_PERIOD_MINUTES } from './team';
+import {
+  makeTeamClient, getActiveWorkspaceId, getCachedWorkspaces, getWorkspaceInfo, isTeamWorkspace, localGet,
+  NEW_CONTACT_TARGET_KEY, PERSONAL_WORKSPACE, TEAM_SYNC_ALARM, TEAM_SYNC_PERIOD_MINUTES,
+} from './team';
 import { makeTeamService } from './teamService';
 import { parseTeamSeed } from './workspaceTransfer';
 import type { SenderRequirement } from './senderIdentity';
@@ -105,7 +108,7 @@ import {
   type SendHoldReason,
 } from './syncHealth';
 import { ensureFreshToken } from './drive';
-import { threadAliases } from './contacts';
+import { threadAliases, buildThreadIndex } from './contacts';
 import {
   chunkObservations,
   chunkDelayMs,
@@ -241,6 +244,66 @@ async function mutateStore(mutations: Mutation[], opts: { triggerDepth?: number 
     fireTagTriggers(store, next, opts.triggerDepth ?? 0);
     return { success: true, changed: true, store: next, conversationId, result };
   });
+}
+
+// ---- edits from Messenger / profile pages: where new contacts go ----
+//
+// Someone in a team may want contacts they meet on Messenger to land in a
+// particular workspace (Personal, or one team) whichever one is open in the
+// switcher (NEW_CONTACT_TARGET_KEY; absent = the open one). Only a write that
+// would CREATE a contact is redirected — edits to someone already in the open
+// workspace stay there. The answer says where it went, so the panel can say so.
+
+interface SavedTo { workspaceId: string; name: string }
+
+async function newContactTarget(active: string): Promise<SavedTo | null> {
+  const pref = await localGet<string>(NEW_CONTACT_TARGET_KEY);
+  if (!pref || pref === active) return null;
+  if (pref === PERSONAL_WORKSPACE) return { workspaceId: pref, name: 'Personal' };
+  const info = await getWorkspaceInfo(pref);
+  // A team we've left, or one that's read-only: fall back to the open workspace.
+  if (!info || info.status !== 'active' || !info.active) return null;
+  return { workspaceId: pref, name: info.name };
+}
+
+async function mutateFromPage(mutations: Mutation[]): Promise<MutateResponse & { savedTo?: SavedTo }> {
+  const creates = mutations.length === 1 && (
+    (mutations[0].op === 'upsertContact' && mutations[0].allowCreate) || mutations[0].op === 'addProfileContact');
+  if (!creates) return mutateStore(mutations);
+  const target = await newContactTarget(await getActiveWorkspaceId());
+  if (!target) return mutateStore(mutations);
+  // Would this create someone in the open workspace? If not it's an update
+  // to a contact that already lives here, and stays here.
+  const current = await loadStore();
+  const trial = applyMutations(current, mutations);
+  if (!Object.keys(trial.store.conversations).some((id) => !current.conversations[id])) return mutateStore(mutations);
+
+  const result = await withStoreLock(async () => {
+    const other = await loadStoreIn(target.workspaceId);
+    const { store: next, changed } = applyMutations(other, mutations);
+    return changed ? saveStoreIn(target.workspaceId, next) : { ok: true, pending: 0, itemLimitReached: false } as SaveResult;
+  });
+  if (isTeamWorkspace(target.workspaceId)) void teamService.syncTeam(target.workspaceId);
+  const saved = result.ok || result.pending > 0;
+  return { success: saved, changed: false, store: current, result, ...(saved ? { savedTo: target } : { error: result.reason }) };
+}
+
+/** Which OTHER workspaces this computer has a copy of `threadId` in (from their local copies). */
+async function contactElsewhere(threadId: string): Promise<SavedTo[]> {
+  const active = await getActiveWorkspaceId();
+  const teams = (await getCachedWorkspaces()).list.filter((w) => w.status === 'active');
+  const candidates: Array<{ id: string; name: string }> = [
+    { id: PERSONAL_WORKSPACE, name: 'Personal' },
+    ...teams.map((w) => ({ id: w.id, name: w.name })),
+  ].filter((w) => w.id !== active);
+  const key = threadId.toLowerCase();
+  const out: SavedTo[] = [];
+  for (const w of candidates) {
+    const s = w.id === PERSONAL_WORKSPACE ? await readPersonalCache() : await readTeamCache(w.id);
+    if (!s?.conversations) continue;
+    if (s.conversations[threadId] || buildThreadIndex(s as Store).has(key)) out.push({ workspaceId: w.id, name: w.name });
+  }
+  return out;
 }
 
 // ---- tag-triggered automations ----
@@ -2556,7 +2619,8 @@ async function startCampaign(
     input = { ...input, recipients: fresh };
   }
 
-  const camp = createCampaign(input);
+  // Recorded so its failure alerts show only in this workspace (Campaign.workspace).
+  const camp = createCampaign({ ...input, workspace: input.workspace || await getActiveWorkspaceId() });
   camp.startedAt = Date.now();
   await upsertCampaign(camp);
   // The exact message each recipient will get (variations already rolled),
@@ -3029,7 +3093,13 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
             sendResponse({ success: false, changed: false, error: 'Signed out', result: { ok: false, pending: 0, itemLimitReached: false, signedOut: true, reason: 'Sign in to save contacts.' } });
             break;
           }
-          sendResponse(await mutateStore((request.payload?.mutations || []) as Mutation[]));
+          // `here`: the user asked to save in the open workspace regardless.
+          const pageMutations = (request.payload?.mutations || []) as Mutation[];
+          sendResponse(request.payload?.here ? await mutateStore(pageMutations) : await mutateFromPage(pageMutations));
+          break;
+        }
+        case 'CONTACT_ELSEWHERE': {
+          sendResponse({ workspaces: await contactElsewhere(String(request.payload?.threadId || '')) });
           break;
         }
         case 'ADVANCE_FUNNEL': {
@@ -3164,7 +3234,7 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           // queueDepth counts running and paused campaigns only — the same
           // rule the dashboard's queue card uses.
           const depth = queueDepth(campaigns);
-          const unseen = collectUnseenFailures(campaigns, ackAt, cleared);
+          const unseen = collectUnseenFailures(campaigns, ackAt, cleared, store.workspace || 'personal');
           sendResponse({
             queued: depth.pending,
             queuedCampaigns: depth.campaigns,

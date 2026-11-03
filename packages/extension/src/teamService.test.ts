@@ -193,6 +193,79 @@ describe('more than one team per owner', () => {
   });
 });
 
+describe('switching edge cases', () => {
+  const setupPending = { ok: false as const, error: 'not set up', setupPending: true };
+
+  async function inTeam() {
+    const fake = makeServer();
+    const svc = service(fake.client);
+    expect((await svc.createTeam('Acme', 'empty')).ok).toBe(true);
+    expect(await S.loadStore({ maxAgeMs: 0 }).then((s) => s.workspace)).toBe('t1');
+    return { ...fake, svc };
+  }
+
+  it('a brief "not set up" (the server mid-update) keeps you in the team', async () => {
+    const { client, svc } = await inTeam();
+    (client as unknown as { myWorkspaces: () => Promise<unknown> }).myWorkspaces = async () => setupPending;
+    await svc.refreshWorkspaces();
+    expect(await S.loadStore({ maxAgeMs: 0 }).then((s) => s.workspace)).toBe('t1');
+    expect(local.crm_workspace_notice).toBeUndefined();
+  });
+
+  it('a long run of "not set up" moves you to Personal, says so, and keeps unsynced team edits', async () => {
+    const { client, svc } = await inTeam();
+    await S.setTeamDirty('t1', true);
+    (client as unknown as { myWorkspaces: () => Promise<unknown> }).myWorkspaces = async () => setupPending;
+    await svc.refreshWorkspaces(); // starts the clock
+    const cache = local.crm_workspaces as { setupPendingSince: number };
+    local.crm_workspaces = { ...cache, setupPendingSince: Date.now() - 31 * 60_000 };
+    await svc.refreshWorkspaces();
+    expect(await S.loadStore({ maxAgeMs: 0 }).then((s) => s.workspace)).toBe('personal');
+    expect((local.crm_workspace_notice as { text: string }).text).toMatch(/moved to your Personal workspace/);
+    expect(await S.isTeamDirty('t1')).toBe(true); // the local copy was not deleted
+  });
+
+  it('removal from a team moves you to Personal with a notice naming the team', async () => {
+    const { teams, svc } = await inTeam();
+    teams.delete('t1');
+    await svc.refreshWorkspaces();
+    expect(await S.loadStore({ maxAgeMs: 0 }).then((s) => s.workspace)).toBe('personal');
+    expect((local.crm_workspace_notice as { text: string }).text).toMatch(/no longer a member.*Acme/);
+  });
+
+  it('accepting an invite opens the team', async () => {
+    const fake = makeServer();
+    fake.teams.set('t9', { info: fake.info('t9', 'Invited', { role: 'member', status: 'active' }), version: 0, data: null });
+    const svc = service(fake.client);
+    expect((await svc.accept('t9')).ok).toBe(true);
+    expect(await S.loadStore({ maxAgeMs: 0 }).then((s) => s.workspace)).toBe('t9');
+  });
+});
+
+describe('saving into a workspace that is not open', () => {
+  it('a contact saved to Personal while a team is open lands in Personal only', async () => {
+    const fake = makeServer();
+    const svc = service(fake.client);
+    expect((await svc.createTeam('Acme', 'empty')).ok).toBe(true);
+    const personal = await S.loadStoreIn('personal');
+    expect(personal.workspace).toBe('personal');
+    const res = await S.saveStoreIn('personal', { ...personal, conversations: { ...personal.conversations, p1: conv('p1') } });
+    expect(res.ok).toBe(true);
+    expect(Object.keys((await S.readPersonalCache())!.conversations)).toContain('p1');
+    const team = await S.loadStore({ maxAgeMs: 0 });
+    expect(team.workspace).toBe('t1');
+    expect(team.conversations.p1).toBeUndefined();
+  });
+
+  it('refuses a copy loaded from another workspace', async () => {
+    const fake = makeServer();
+    expect((await service(fake.client).createTeam('Acme', 'empty')).ok).toBe(true);
+    const team = await S.loadStore({ maxAgeMs: 0 });
+    const res = await S.saveStoreIn('personal', team);
+    expect(res.ok).toBe(false);
+  });
+});
+
 describe('delete a team after merging it', () => {
   async function teamWith(ids: string[], jobIds: string[]) {
     const fake = makeServer();

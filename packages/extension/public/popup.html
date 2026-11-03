@@ -286,14 +286,16 @@
     </div>
 
     <div class="pop-account">
-      <div class="pop-section-label">Account</div>
+      <div class="pop-section-label" style="display:flex;justify-content:space-between;align-items:baseline">
+        <span>Account</span>
+        <span id="popVersion" title="Extension version" style="font-weight:400;text-transform:none;letter-spacing:0;opacity:.55"></span>
+      </div>
       <div style="font-size:var(--crm-text-small);font-weight:var(--crm-weight-semibold)" id="acctEmailLabel"></div>
       <div class="pop-hint" id="acctPlanLabel"></div>
       <div class="pop-row" style="margin-top:var(--crm-space-xs)">
         <button class="crm-btn crm-btn--secondary crm-btn--sm" id="acctUpgradeBtn">Upgrade</button>
         <button class="crm-btn crm-btn--ghost crm-btn--sm" id="acctSignOutBtn">Sign out</button>
       </div>
-      <div class="pop-hint" id="popVersion" style="text-align:right;opacity:.7"></div>
     </div>
   </div>
 

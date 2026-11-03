@@ -502,6 +502,52 @@
 }
 .fb-crm-group-toggle:hover { text-decoration: underline; }
 
+/* Workspace strip (team members only): which workspace is open, where new
+   contacts go, and whether this contact is also somewhere else. */
+.fb-crm-ws {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+  margin: -4px 0 8px;
+  padding: 6px 8px;
+  background: #f0f2f5;
+  border-radius: 6px;
+  font-size: 11px;
+  color: #65676b;
+}
+.fb-crm-ws-field { display: inline-flex; align-items: center; gap: 4px; font-weight: 600; }
+.fb-crm-ws-field select {
+  font: inherit;
+  font-weight: 600;
+  color: #050505;
+  max-width: 130px;
+  padding: 1px 2px;
+  border: 1px solid #ccd0d5;
+  border-radius: 4px;
+  background: #fff;
+}
+.fb-crm-ws-elsewhere { margin: -4px 0 8px; font-size: 11px; color: #65676b; }
+.fb-crm-ws-link {
+  background: none; border: none; padding: 0; font: inherit; font-weight: 700;
+  color: #065fd4; cursor: pointer; text-decoration: underline;
+}
+.fb-crm-ws-notice {
+  position: relative;
+  margin: -4px 0 8px;
+  padding: 7px 26px 7px 9px;
+  background: #fff4e5;
+  border: 1px solid #f0b54a;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #7a4a00;
+}
+.fb-crm-ws-notice-x {
+  position: absolute; top: 4px; right: 4px;
+  background: none; border: none; cursor: pointer; color: inherit; font-size: 11px;
+}
+
 /* A collapsible section title: the whole title is the button. */
 .fb-crm-section-toggle {
   display: inline-flex;
