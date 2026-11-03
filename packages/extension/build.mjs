@@ -42,7 +42,8 @@ function git(args) {
  * Bump the revision once per build, before anything reads the manifest, so the
  * bundle, dist/manifest.json and the zip all carry the new number. Skipped for
  * --watch rebuilds (writing public/manifest.json would retrigger the watcher)
- * and when SKIP_VERSION_BUMP is set (the git hooks' automatic rebuilds).
+ * and when SKIP_VERSION_BUMP is set (the post-merge hook's rebuild after a
+ * pull, which only catches dist/ up with source and isn't a new build).
  * BUMP=minor|major passes through to scripts/bump-version.js.
  */
 function bumpVersion() {

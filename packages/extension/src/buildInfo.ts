@@ -15,7 +15,7 @@
 declare const __BUILD_INFO__: string | undefined;
 
 export interface BuildInfo {
-  version: string;     // extension version, bumped by the pre-commit hook
+  version: string;     // extension version, bumped on every build (scripts/bump-version.js)
   commit: string;      // short SHA of HEAD when the bundle was built
   commitDate: string;  // ISO timestamp of that commit ('' if unknown)
   dirty: boolean;      // uncommitted changes were present at build time

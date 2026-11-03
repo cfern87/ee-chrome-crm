@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-# The version is bumped by the extension build (packages/extension/build.mjs,
-# via scripts/bump-version.js), not on commit. Nothing to do here.
-exit 0

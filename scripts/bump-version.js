@@ -43,9 +43,8 @@ function setVersion(relPath, { required }) {
 }
 
 // The built manifest is what chrome.runtime.getManifest() reports, so patching
-// it here keeps Settings → About showing the same number as source. The bundle
-// itself is still the old one until the post-commit hook rebuilds — and that is
-// precisely the gap the About panel's staleness banner exists to announce.
+// it here keeps Settings → About showing the same number as source while the
+// build that called this script finishes.
 // Absent on a machine that has never built; not an error.
 setVersion(path.join('packages', 'extension', 'dist', 'manifest.json'), { required: false });
 

@@ -134,20 +134,20 @@ then hit **Reload** on the extension at `chrome://extensions/`.
 
 Three safeguards make this hard to get wrong:
 
+- **Every `npm run build` bumps the version** (`scripts/bump-version.js`, run
+  from `packages/extension/build.mjs`) — once per build, never on commit.
+  `BUMP=minor` or `BUMP=major` for a bigger step; `npm run watch` rebuilds
+  don't bump.
 - **`.githooks/post-merge`** rebuilds the extension automatically whenever a pull
-  touches `packages/extension` or `packages/shared`.
-- **`.githooks/post-commit`** does the same after a commit. This matters because
-  `.githooks/pre-commit` bumps the version *during* the commit — without a
-  rebuild, `dist/` would permanently trail source by one version and Settings →
-  About would report the previous number.
-
-  Both hooks only run once `npm install` has pointed git at the hooks directory
-  (the root `prepare` script does `git config core.hooksPath .githooks`).
+  touches `packages/extension` or `packages/shared` (without bumping — it only
+  catches `dist/` up with the pulled source). It only runs once `npm install`
+  has pointed git at the hooks directory (the root `prepare` script does
+  `git config core.hooksPath .githooks`). Commits run no hooks.
 - **Settings → About this build** shows the version, the commit the loaded
   bundle was built from, and when it was built. A red banner appears if the
   loaded manifest and the bundle disagree, which is what a skipped or failed
-  rebuild looks like. If the commit shown doesn't match `git log -1 --format=%h`
-  and no banner is showing, the hooks aren't installed — run `npm install`.
+  rebuild looks like. If the commit shown doesn't match `git log -1 --format=%h`,
+  the loaded build predates your latest commits — run `npm run build`.
 
 The version lives in `packages/extension/public/manifest.json` and is bumped by
 `scripts/bump-version.js` on every commit to `main`. That script also mirrors the

@@ -484,9 +484,9 @@ export function SendingPaceSettings({ store, updateStore }: { store: Store; upda
 // is invisible (the feature simply "isn't there"), so the exact build is
 // surfaced here: version, the commit it was built from, and when.
 //
-// The .githooks post-commit and post-merge hooks now rebuild automatically, so
-// these values stay current on their own. The banner below covers the remaining
-// cases — hooks not installed, or a build that failed.
+// Every build bumps the version (build.mjs), and the post-merge hook rebuilds
+// after a pull. The banner below covers the remaining cases — a build that
+// failed, or source changed since the last build.
 //
 // All of that is a developer's problem, and none of it is actionable for
 // someone who installed this from the Web Store: the rebuild advice, the hook
@@ -564,11 +564,11 @@ export function AboutPanel() {
 
       {IS_UNPACKED ? (
         <p style={{ margin: '10px 0 0', fontSize: 11, color: color.text.muted, lineHeight: 1.6 }}>
-          The version bumps on every commit to <code>main</code>, and the <code>post-commit</code> and <code>post-merge</code> hooks rebuild
-          {' '}<code>packages/extension/dist/</code> for you — so these values keep themselves current. You still have to reload at
+          The version bumps on every <code>npm run build</code>, and the <code>post-merge</code> hook rebuilds
+          {' '}<code>packages/extension/dist/</code> after a pull. You still have to reload at
           {' '}<code>chrome://extensions</code> for a new build to take effect. While actively editing, <code>npm run watch</code> rebuilds
-          on every save. If the commit above doesn't match <code>git log -1 --format=%h</code> and no banner is showing, the hooks aren't
-          installed: run <code>npm install</code>.
+          on every save. If the commit above doesn't match <code>git log -1 --format=%h</code>, the loaded build predates your latest
+          commits: run <code>npm run build</code>.
         </p>
       ) : (
         <p style={{ margin: '10px 0 0', fontSize: 11, color: color.text.muted, lineHeight: 1.6 }}>

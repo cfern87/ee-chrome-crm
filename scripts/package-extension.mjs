@@ -2,10 +2,9 @@
 // Release step: build the extension, then produce the Chrome Web Store upload
 // zip at <repo>/dist/<name>-<version>.zip.
 //
-// Run it deliberately before a submission — NOT from a git hook. The pre-commit
-// hook bumps the patch version on every commit to main, so a zip built before
-// committing is stale the instant you commit. Building here, on demand, means
-// the filename always reflects the manifest that actually went into the archive.
+// Run it deliberately before a submission — NOT from a git hook. Every build
+// bumps the version, so building here, on demand, means the filename always
+// reflects the manifest that actually went into the archive.
 //
 // Two things this script exists to get right, both of which are easy to botch
 // by hand and invisible until the Web Store rejects the upload:

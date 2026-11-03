@@ -5,7 +5,7 @@
 // what to run when the loaded build is stale. Shipped to a customer those are
 // noise at best and alarming at worst: nobody who installed this from the Web
 // Store can paste a client id into manifest.json, and a paragraph about
-// post-commit hooks makes a finished product read like somebody's checkout.
+// git hooks makes a finished product read like somebody's checkout.
 //
 // Chrome adds `update_url` to the manifest it hands back for anything installed
 // from a store; a folder loaded through "Load unpacked" has none, and none is
