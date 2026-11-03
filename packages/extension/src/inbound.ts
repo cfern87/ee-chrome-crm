@@ -24,7 +24,7 @@
 // chrome or the network.
 
 import type { Store } from './storage';
-import { readAutomations, whyNotRunnable, type Automation, type AutomationRun } from './automations';
+import { readActions, whyNotRunnable, type Automation, type AutomationRun } from './automations';
 import { buildThreadIndex } from './contacts';
 import { extractThreadFromProfileUrl, profileKey } from './csv';
 import type { SettingsBag } from './settingsMerge';
@@ -170,7 +170,7 @@ export function parseInboundCommand(row: InboundCommandRow): ParsedCommand {
 // ---------------------------------------------------------------------------
 
 export function findInboundAutomation(store: Store, ref: string): { automation: Automation } | { error: string } {
-  const all = readAutomations(store);
+  const all = readActions(store);
   const byId = all.find((a) => a.id === ref);
   let hit = byId;
   if (!hit) {

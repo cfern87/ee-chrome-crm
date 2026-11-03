@@ -4,7 +4,7 @@
 // 1100px, left the detail pane about 766px no matter how big the monitor was.
 
 import React, { useCallback, useEffect, useRef } from 'react';
-import { color, motion } from './tokens';
+import { color, motion, layer } from './tokens';
 
 export interface ResizerProps {
   /** Current width of the pane to the left, in px. */
@@ -100,7 +100,7 @@ export function Resizer({ width, onResize, onCommit, min, max, label }: ResizerP
         margin: '0 -4px',       // straddles the border without taking layout space
         cursor: 'col-resize',
         position: 'relative',
-        zIndex: 1,
+        zIndex: layer.raised,
         background: 'transparent',
         transition: `background ${motion.fast}`,
       }}

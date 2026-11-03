@@ -18,6 +18,10 @@ import {
 import { syncTeamOnce, type TeamSyncResult } from './teamSync';
 import { foldWorkspaceInto, personalAfterMove, teamSeedFrom, type TeamSeed } from './workspaceTransfer';
 
+/** createTeam's error when the server only allows one team per owner (docs/TEAM_WORKSPACES_LOVABLE.md §6). */
+export const SINGLE_TEAM_SERVER_ERROR =
+  'You already own a team, and the server only allows one per owner. The server needs the "multiple teams" update (docs/TEAM_WORKSPACES_LOVABLE.md, section 6) before you can create another.';
+
 export interface TeamServiceDeps {
   client: TeamClient;
   /** Serialize with every other store read-modify-write in the worker. */
@@ -186,13 +190,20 @@ export function makeTeamService(deps: TeamServiceDeps) {
   async function createTeam(name: string, seed: TeamSeed): Promise<Ok<{ id: string; moved?: boolean; warning?: string }> | Err> {
     if (!(await deps.isPro())) return { ok: false, error: 'Team workspaces are part of Pro. Upgrade to create one.' };
     const before = await client.myWorkspaces();
-    const existed = before.ok && (before as { list: WorkspaceInfo[] }).list.some((w) => w.role === 'owner');
+    const ownedBefore = before.ok
+      ? (before as { list: WorkspaceInfo[] }).list.filter((w) => w.role === 'owner').map((w) => w.id)
+      : [];
     const r = await client.createTeam(name);
     if (!r.ok) return r as Err;
     const id = (r as { id: string }).id;
+    // A server still on the one-team-per-owner rule hands back the team you
+    // already own instead of making a new one. Say so, rather than "created".
+    if (ownedBefore.includes(id)) {
+      return { ok: false, error: SINGLE_TEAM_SERVER_ERROR };
+    }
     let moved = false;
     let warning: string | undefined;
-    if (!existed && seed !== 'empty') {
+    if (seed !== 'empty') {
       // Personal's latest, read under the lock so a save in flight lands first.
       const personal = await deps.withStoreLock(() => readPersonalCache());
       const start = personal ? teamSeedFrom(personal, seed) : null;

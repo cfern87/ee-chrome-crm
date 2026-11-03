@@ -139,6 +139,32 @@ export const elevation = {
 } as const;
 
 /**
+ * Stacking order for the dashboard — the ONLY z-index values it may use
+ * (ui/layers.test.ts fails on a bare number anywhere in dashboard/ or ui/).
+ * Lowest first. Each layer must clear everything below it:
+ *
+ *   raised   — a handle that just needs to sit over its neighbours (split-pane grip)
+ *   sticky   — rows that stick while the page scrolls (the selection row)
+ *   popover  — dropdowns opened from something in the page
+ *   overlay  — panels that open OVER the workspace (Advanced search)
+ *   scrim    — the dimmed backdrop behind a modal drawer
+ *   drawer   — the modal drawer itself
+ *   toast    — status pills that must never be covered
+ *
+ * Sticky sits BELOW overlay on purpose: a sticky row painted over the open
+ * Advanced search dialog is the bug this scale exists to prevent.
+ */
+export const layer = {
+  raised: 1,
+  sticky: 10,
+  popover: 20,
+  overlay: 50,
+  scrim: 60,
+  drawer: 61,
+  toast: 1000,
+} as const;
+
+/**
  * Minimum interactive size. WCAG 2.2 puts the AA floor at 24x24 (2.5.8); the
  * old chip remove buttons were 16x16 and the pager keys ~26x24. `comfortable`
  * is what anything in a form or toolbar should use.

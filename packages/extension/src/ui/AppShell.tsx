@@ -15,7 +15,7 @@
 // to make those columns fluid.
 
 import React, { useCallback, useEffect, useRef } from 'react';
-import { color, fontSize, fontWeight, radius, space, elevation } from './tokens';
+import { color, fontSize, fontWeight, radius, space, elevation, layer } from './tokens';
 import { Icon, Text, IconButton } from './primitives';
 import { ICON_BELL, ICON_CHEVRON, ICON_CLOSE } from './icons';
 import { PRODUCT_NAME } from '../product';
@@ -414,7 +414,7 @@ function Drawer({
     <>
       <div
         onClick={close}
-        style={{ position: 'fixed', inset: 0, background: 'rgba(16,24,40,0.32)', zIndex: 40 }}
+        style={{ position: 'fixed', inset: 0, background: 'rgba(16,24,40,0.32)', zIndex: layer.scrim }}
       />
       <div
         ref={panelRef}
@@ -429,7 +429,7 @@ function Drawer({
           background: color.surface.page,
           borderLeft: `1px solid ${color.border.subtle}`,
           boxShadow: elevation.lg,
-          zIndex: 41,
+          zIndex: layer.drawer,
         }}
       >
         <div

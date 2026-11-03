@@ -118,7 +118,7 @@ import {
 import { MAX_READ_STATE_WRITES } from './mutations';
 import { e2eeVariantOf } from './threadUrl';
 import {
-  readAutomations, resolveUnread, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable, automationChangesOf,
+  readActions, shortTagTrigger, resolveUnread, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable, automationChangesOf,
   tagTriggerHits, withResolvedMessage,
   AUTOMATION_RUNS_KEY,
   type Automation, type AutomationRun, type AutomationRuns, type UnreadScanReport,
@@ -261,11 +261,9 @@ const tagTriggerDraining = new Set<string>();
 function fireTagTriggers(prev: Store, next: Store, depth: number): void {
   try {
     if (depth >= MAX_TAG_TRIGGER_DEPTH) return;
-    const automations = readAutomations(next);
+    const automations = readActions(next);
     for (const hit of tagTriggerHits(prev, next, automations)) {
-      const a = automations.find((x) => x.id === hit.automationId)!;
-      const tag = a.triggerTagId ? next.tags[a.triggerTagId]?.name || 'tag' : 'tag';
-      const source = `“${tag}” ${a.triggerOn === 'removed' ? 'removed' : 'added'}`;
+      const source = hit.fired.map((t) => shortTagTrigger(t, next)).join(', ');
       const q = tagTriggerQueue.get(hit.automationId) || { ids: new Set<string>(), depth: depth + 1, source };
       hit.ids.forEach((id) => q.ids.add(id));
       q.depth = Math.max(q.depth, depth + 1);
@@ -1498,8 +1496,8 @@ async function startAutomation(id: string, trigger: AutomationRun['trigger'], op
   // A saved-search automation is pure CRM work: no Facebook window, so it
   // neither needs nor takes the `scanning` claim, and can run alongside a
   // reply check or the send queue. Same for any run given explicit contacts.
-  const peek = readAutomations(await loadStore()).find((a) => a.id === id);
-  if (peek?.kind === 'search' || peek?.kind === 'tagChange' || opts.ids) return startSearchAutomation(id, trigger, opts);
+  const peek = readActions(await loadStore()).find((a) => a.id === id);
+  if (peek?.kind === 'search' || opts.ids) return startSearchAutomation(id, trigger, opts);
 
   if (scanning) {
     return { success: false, error: runningAutomationId ? 'Another automation is already running.' : 'A reply check is running. Try again when it finishes.' };
@@ -1514,7 +1512,7 @@ async function startAutomation(id: string, trigger: AutomationRun['trigger'], op
     if (busy) return { success: false, error: busy };
 
     const store = await loadStore();
-    const automation = readAutomations(store).find((a) => a.id === id);
+    const automation = readActions(store).find((a) => a.id === id);
     if (!automation) return { success: false, error: 'That automation no longer exists.' };
     const why = whyNotRunnable(automation, store);
     if (why) return { success: false, error: why };
@@ -1553,7 +1551,7 @@ async function startSearchAutomation(id: string, trigger: AutomationRun['trigger
   try {
     if (!(await isSignedIn())) return { success: false, error: 'Sign in to run automations.' };
     const store = await loadStore();
-    const automation = readAutomations(store).find((a) => a.id === id);
+    const automation = readActions(store).find((a) => a.id === id);
     if (!automation) return { success: false, error: 'That automation no longer exists.' };
     const why = whyNotRunnable(automation, store);
     if (why) return { success: false, error: why };
@@ -1577,21 +1575,15 @@ async function runSearchAutomationJob(id: string, trigger: AutomationRun['trigge
   try {
     const startedAt = Date.now();
     const store = await loadStore();
-    const found = readAutomations(store).find((a) => a.id === id);
+    const found = readActions(store).find((a) => a.id === id);
     if (!found) throw new Error('The automation was deleted while it was running.');
     const stored = withResolvedMessage(found, store);
     const automation = opts.transform ? opts.transform(stored) : stored;
 
     let ids = opts.ids;
-    if (!ids && automation.kind === 'tagChange') {
-      // Run by hand: everyone who has the tag now. "When removed" has no one
-      // to run on until it is removed from someone.
-      if (automation.triggerOn === 'removed') throw new Error('It runs by itself when the tag is removed from someone.');
-      const tag = automation.triggerTagId;
-      ids = Object.values(store.conversations).filter((c) => !!tag && c.tags.includes(tag)).map((c) => c.id);
-    } else if (!ids) {
+    if (!ids) {
       const search = automation.savedSearchId ? store.savedSearches[automation.savedSearchId] : undefined;
-      if (!search) throw new Error('Its saved search no longer exists.');
+      if (!search) throw new Error('It has no saved search to run on. Use “Run on…” to choose who.');
       ids = matchSavedSearch(search, store).map((c) => c.id);
     }
     const result = await applyAutomationActions(automation, ids, {
@@ -1810,7 +1802,7 @@ async function runAutomationJob(automation: Automation, trigger: AutomationRun['
     // can take minutes, and in that time the automation may have been edited or
     // deleted, or contacts tagged by hand.
     const store = await loadStore();
-    const found = readAutomations(store).find((a) => a.id === id);
+    const found = readActions(store).find((a) => a.id === id);
     if (!found) throw new Error('The automation was deleted while it was running.');
     const stored = withResolvedMessage(found, store);
     const current = transform ? transform(stored) : stored;
@@ -1878,7 +1870,7 @@ async function runDueAutomations(): Promise<void> {
     const store = await loadStore();
     const runs = await getAutomationRuns();
     const now = Date.now();
-    const candidates = readAutomations(store).filter((a) => isDue(a, runs[a.id]?.startedAt, now) && !whyNotRunnable(a, store));
+    const candidates = readActions(store).filter((a) => isDue(a, runs[a.id]?.startedAt, now) && !whyNotRunnable(a, store));
     // In a team workspace each job runs on one member's computer only (its
     // "Runs on" choice; the owner's by default).
     const due: typeof candidates = [];
@@ -3381,7 +3373,9 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         }
 
         case 'RUN_AUTOMATION': {
-          sendResponse(await startAutomation(String(request.payload?.automationId || ''), 'manual'));
+          // `ids`: "Run on…" from the Actions page, or a button pressed for a selection.
+          const runIds = Array.isArray(request.payload?.ids) ? (request.payload.ids as unknown[]).map(String) : undefined;
+          sendResponse(await startAutomation(String(request.payload?.automationId || ''), 'manual', runIds ? { ids: runIds } : {}));
           break;
         }
         case 'CANCEL_AUTOMATION': {

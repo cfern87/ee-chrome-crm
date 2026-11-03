@@ -117,8 +117,8 @@ describe('saved-search source', () => {
     expect(next.conversations['2'].archived).toBe(false);
   });
 
-  it('refuses to run without its saved search', () => {
-    const a = automation({ kind: 'search', savedSearchId: 'gone' });
+  it('refuses to run its schedule without its saved search', () => {
+    const a = automation({ kind: 'search', savedSearchId: 'gone', everyMinutes: 60 });
     expect(whyNotRunnable(a, store())).toMatch(/saved search/);
   });
 });

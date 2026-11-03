@@ -23,6 +23,7 @@
 // Everything here is pure: no chrome, no DOM, no I/O. The background owns the
 // load/save around it.
 
+import { readCollapsedSections, withSectionCollapsed, PANEL_COLLAPSED_KEY, type PanelSection } from './panelSections';
 import { appendHistory, automationRunArg, messageArg, type AutomationChange, type AutomationRunInfo } from './history';
 import type { Store, Conversation, Tag, NameDiag } from './storage';
 import {
@@ -81,6 +82,8 @@ export type Mutation =
   // the popup's snapshot of the store is up to 5s stale (it polls) — writing
   // that back wholesale is exactly the clobber mutations.ts exists to stop.
   | { op: 'setPinned'; conversationId: string; pinned: boolean }
+  // Collapse or expand one Messenger-panel section for the whole account (panelSections.ts).
+  | { op: 'setPanelSectionCollapsed'; section: PanelSection; collapsed: boolean }
   // Hide or show one funnel bar in this contact's panel (Conversation.hiddenFunnels).
   | { op: 'setFunnelHidden'; conversationId: string; groupId: string; hidden: boolean }
   // Forget any hide/show choice made for this funnel on this contact, so it
@@ -566,6 +569,14 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
       const next = copy(store);
       next.conversations[m.conversationId] = nextConv;
       return { store: next, changed: true, conversationId: m.conversationId };
+    }
+
+    case 'setPanelSectionCollapsed': {
+      const before = readCollapsedSections(store);
+      if (before.has(m.section) === m.collapsed) return { store, changed: false };
+      const out = copy(store);
+      out.settings = { ...out.settings, [PANEL_COLLAPSED_KEY]: withSectionCollapsed(store, m.section, m.collapsed) };
+      return { store: out, changed: true };
     }
 
     case 'setPinned': {

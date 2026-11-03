@@ -93,29 +93,35 @@ describe('tag-triggered automations', () => {
   it('fires for contacts that just got the tag, and only them', () => {
     const before = storeWith([conv('a', []), conv('b', ['lead']), conv('c', [])]);
     const after = storeWith([conv('a', ['lead']), conv('b', ['lead']), conv('c', ['s1'])]);
-    expect(tagTriggerHits(before, after, [trig()])).toEqual([{ automationId: 't1', ids: ['a'] }]);
+    expect(tagTriggerHits(before, after, [trig()])).toEqual([{ automationId: 't1', ids: ['a'], fired: [{ tagId: 'lead', on: 'added' }] }]);
   });
 
   it('fires on removal when set to', () => {
     const before = storeWith([conv('a', ['lead'])]);
     const after = storeWith([conv('a', [])]);
-    expect(tagTriggerHits(before, after, [trig({ triggerOn: 'removed' })])).toEqual([{ automationId: 't1', ids: ['a'] }]);
+    expect(tagTriggerHits(before, after, [trig({ tagTriggers: [{ tagId: 'lead', on: 'removed' }] })]))
+      .toEqual([{ automationId: 't1', ids: ['a'], fired: [{ tagId: 'lead', on: 'removed' }] }]);
     expect(tagTriggerHits(before, after, [trig()])).toEqual([]);
   });
 
   it('counts a brand-new contact that arrives tagged', () => {
-    expect(tagTriggerHits(storeWith([]), storeWith([conv('n', ['lead'])]), [trig()])).toEqual([{ automationId: 't1', ids: ['n'] }]);
+    expect(tagTriggerHits(storeWith([]), storeWith([conv('n', ['lead'])]), [trig()])).toEqual([{ automationId: 't1', ids: ['n'], fired: [{ tagId: 'lead', on: 'added' }] }]);
   });
 
   it('never fires when paused', () => {
     expect(tagTriggerHits(storeWith([conv('a', [])]), storeWith([conv('a', ['lead'])]), [trig({ enabled: false })])).toEqual([]);
   });
 
-  it('is never scheduled, and needs its tag to exist', () => {
-    const a = normalizeAutomation({ ...trig(), everyMinutes: 60 })!;
+  it('reads the first build’s single tag trigger as a tagTriggers entry, never scheduled', () => {
+    const a = normalizeAutomation({ ...trig(), tagTriggers: undefined, kind: 'tagChange', triggerTagId: 'lead', triggerOn: 'removed', everyMinutes: 60 })!;
+    expect(a.kind).toBe('search');
+    expect(a.tagTriggers).toEqual([{ tagId: 'lead', on: 'removed' }]);
     expect(a.everyMinutes).toBe(0);
     expect(isDue(a, undefined, Date.now())).toBe(false);
-    expect(whyNotRunnable(trig({ triggerTagId: 'gone' }), storeWith([]))).toMatch(/tag/);
+  });
+
+  it('needs its tags to exist', () => {
+    expect(whyNotRunnable(trig({ tagTriggers: [{ tagId: 'gone', on: 'added' }] }), storeWith([]))).toMatch(/tag/);
     expect(whyNotRunnable(trig(), storeWith([]))).toBeNull();
   });
 });

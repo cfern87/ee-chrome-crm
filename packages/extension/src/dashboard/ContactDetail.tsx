@@ -12,6 +12,7 @@ import {
   Button, Card, Chip, Input, SectionTitle, Select, Stack, Text,
   color, fontSize, fontWeight, radius, space,
 } from '../ui/primitives';
+import { layer } from '../ui/tokens';
 import { tint, onColor } from '../ui/contrast';
 import { useLocalPref } from '../ui/prefs';
 import {
@@ -23,7 +24,7 @@ import {
   displayHistory, groupHistory, messageFromArg,
   type AutomationChange, type AutomationRunInfo, type HistoryEvent,
 } from '../history';
-import { readAutomations } from '../automations';
+import { readActions } from '../automations';
 
 export const TAG_FILTER_VISIBLE = 12;
 
@@ -677,7 +678,7 @@ export function ConvDetail({ conv, store, tags, fieldDefs, deleteConfirm, delete
             {addingTag && (
               // Grouped the same way as the chips above, so picking a tag means
               // looking in the same place you'd expect to find it.
-              <div style={{ position: 'absolute', top: '100%', left: 0, zIndex: 100, background: color.surface.raised, border: `1px solid ${color.border.subtle}`, borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.12)', padding: 8, minWidth: 180, maxHeight: 320, overflowY: 'auto', marginTop: 4 }}>
+              <div style={{ position: 'absolute', top: '100%', left: 0, zIndex: layer.popover, background: color.surface.raised, border: `1px solid ${color.border.subtle}`, borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.12)', padding: 8, minWidth: 180, maxHeight: 320, overflowY: 'auto', marginTop: 4 }}>
                 {availableBuckets.map((bucket) => (
                   <div key={bucket.key}>
                     {showAvailableLabels && (
@@ -772,7 +773,7 @@ function ContactHistory({ conv, store }: { conv: Conversation; store: Store }) {
   const [openRuns, setOpenRuns] = useState<Set<string>>(() => new Set());
   useEffect(() => { setShowAll(false); setOpenRuns(new Set()); }, [conv.id]);
   const items = useMemo(() => groupHistory(displayHistory(conv, store.history?.[conv.id])), [conv, store.history]);
-  const automationNames = useMemo(() => new Map(readAutomations(store).map((a) => [a.id, a.name])), [store]);
+  const automationNames = useMemo(() => new Map(readActions(store).map((a) => [a.id, a.name])), [store]);
   if (items.length === 0) return null;
   const shown = showAll ? items : items.slice(0, HISTORY_PREVIEW);
   const toggleRun = (key: string) => setOpenRuns((prev) => {

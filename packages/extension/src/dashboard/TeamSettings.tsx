@@ -107,7 +107,7 @@ export function TeamPanel() {
     );
   }
 
-  const owned = view.list.find((w) => w.role === 'owner' && w.status === 'active');
+  const owned = view.list.filter((w) => w.role === 'owner' && w.status === 'active');
   const invites = view.list.filter((w) => w.status === 'invited');
   const memberOf = view.list.filter((w) => w.role === 'member' && w.status === 'active');
   const setupPending = !!view.setupPending;
@@ -149,10 +149,15 @@ export function TeamPanel() {
           onLeave={() => void run({ type: 'TEAM_LEAVE', payload: { teamId: w.id } }, `You left ${w.name}.`)} />
       ))}
 
-      {owned ? (
-        <OwnerTeam team={owned} view={view} busy={busy} run={run} />
-      ) : !setupPending && (
-        view.isPro ? <CreateTeam busy={busy} run={run} /> : <ProGate />
+      {owned.map((team, i) => (
+        <div key={team.id} style={i > 0 ? { marginTop: space.lg, paddingTop: space.lg, borderTop: `1px solid ${color.border.subtle}` } : undefined}>
+          <OwnerTeam team={team} view={view} busy={busy} run={run} />
+        </div>
+      ))}
+      {!setupPending && (
+        view.isPro
+          ? <NewTeam busy={busy} run={run} ownsOne={owned.length > 0} />
+          : owned.length === 0 && <ProGate />
       )}
     </Card>
   );
@@ -188,6 +193,31 @@ const SEED_CHOICES: { id: TeamSeed; label: string; hint: string }[] = [
   },
   { id: 'empty', label: 'Start empty', hint: 'Personal is untouched.' },
 ];
+
+/**
+ * Create a team workspace. Shown in full while you own none; once you own one,
+ * it folds behind "+ New team workspace" so the card leads with your teams —
+ * but another can always be made.
+ */
+function NewTeam({ busy, run, ownsOne }: { busy: boolean; run: Run; ownsOne: boolean }) {
+  const [open, setOpen] = useState(false);
+  if (!ownsOne) return <CreateTeam busy={busy} run={run} />;
+  return (
+    <div style={{ marginTop: space.lg, paddingTop: space.lg, borderTop: `1px solid ${color.border.subtle}` }}>
+      {open ? (
+        <Stack gap="sm">
+          <Stack direction="row" align="center" justify="space-between">
+            <Text size="small" weight="semibold">New team workspace</Text>
+            <Button variant="link" size="sm" onClick={() => setOpen(false)}>Cancel</Button>
+          </Stack>
+          <CreateTeam busy={busy} run={async (m, s, t) => { const ok = await run(m, s, t); if (ok) setOpen(false); return ok; }} />
+        </Stack>
+      ) : (
+        <Button variant="secondary" size="sm" disabled={busy} onClick={() => setOpen(true)}>+ New team workspace</Button>
+      )}
+    </div>
+  );
+}
 
 function CreateTeam({ busy, run }: { busy: boolean; run: Run }) {
   const [name, setName] = useState('');

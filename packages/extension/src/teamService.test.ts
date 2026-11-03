@@ -165,6 +165,34 @@ describe('create a team by moving Personal into it', () => {
   });
 });
 
+describe('more than one team per owner', () => {
+  it('a second team is created, seeded and opened', async () => {
+    await seedPersonal(['a'], []);
+    const { client, teams } = makeServer();
+    const svc = service(client);
+    expect((await svc.createTeam('Acme', 'empty')).ok).toBe(true);
+    const r = await svc.createTeam('Beta', 'copy');
+    expect(r).toMatchObject({ ok: true, id: 't2' });
+    expect(teams.size).toBe(2);
+    // Seeded even though the owner already had a team (v1 skipped this).
+    expect(Object.keys(teams.get('t2')!.data!.conversations)).toEqual(['a']);
+    expect(await S.loadStore({ maxAgeMs: 0 }).then((s) => s.workspace)).toBe('t2');
+  });
+
+  it('says the server needs updating when it hands back the team you already own', async () => {
+    await seedPersonal(['a'], []);
+    const fake = makeServer();
+    const svc = service(fake.client);
+    expect((await svc.createTeam('Acme', 'empty')).ok).toBe(true);
+    // A server still on one-team-per-owner: create returns the existing team.
+    (fake.client as unknown as { createTeam: () => Promise<unknown> }).createTeam = async () => ({ ok: true, id: 't1' });
+    const r = await svc.createTeam('Beta', 'move');
+    expect(r).toEqual({ ok: false, error: T.SINGLE_TEAM_SERVER_ERROR });
+    // Nothing was moved out of Personal.
+    expect(Object.keys((await S.readPersonalCache())!.conversations)).toEqual(['a']);
+  });
+});
+
 describe('delete a team after merging it', () => {
   async function teamWith(ids: string[], jobIds: string[]) {
     const fake = makeServer();

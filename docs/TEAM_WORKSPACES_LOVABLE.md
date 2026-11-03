@@ -27,7 +27,7 @@ any existing tables, functions or auth settings.
 ```sql
 create table public.crm_teams (
   id          uuid primary key default gen_random_uuid(),
-  owner_id    uuid not null unique,               -- one team per owner (v1)
+  owner_id    uuid not null unique,               -- one team per owner (v1; §6 lifts this)
   name        text not null,
   seat_limit  int  not null default 10,           -- members incl. owner and pending invites
   created_at  timestamptz not null default now()
@@ -318,3 +318,89 @@ drop table if exists public.crm_teams;
 
 With the server side gone, the extension's Team card shows "the server side is
 not set up yet"; anyone who was in a team workspace is moved back to Personal.
+
+---
+
+## 6. Update: more than one team per owner (paste into Lovable after §1–§2)
+
+Apply this on top of the migration above. It only changes `crm_teams`'s
+one-team-per-owner rule and `crm_create_team`; every other function already
+works per team id.
+
+### Prompt for Lovable
+
+Owners of Not Another Social CRM team workspaces need to be able to create
+**more than one** team. Please apply exactly this migration and run the checks
+below. Do not change anything else.
+
+```sql
+-- 1. Drop the one-team-per-owner rule (looked up by definition, not by name).
+do $$
+declare c text;
+begin
+  select con.conname into c
+    from pg_constraint con
+    join pg_class rel on rel.oid = con.conrelid
+   where rel.relname = 'crm_teams' and con.contype = 'u'
+     and con.conkey = array[(select attnum from pg_attribute
+                              where attrelid = rel.oid and attname = 'owner_id')]::smallint[];
+  if c is not null then execute format('alter table public.crm_teams drop constraint %I', c); end if;
+end $$;
+create index if not exists crm_teams_owner_idx on public.crm_teams (owner_id);
+
+-- 2. Create a NEW team every call. Two guards instead of the old idempotency:
+--    * a retry (same owner, same name, within 60 seconds) returns that team
+--      rather than making a duplicate;
+--    * at most 10 teams per owner.
+create or replace function public.crm_create_team(p_name text)
+returns uuid
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_uid  uuid := auth.uid();
+  v_name text;
+  v_id   uuid;
+begin
+  if v_uid is null then raise exception 'not signed in'; end if;
+  if not crm_team_owner_is_pro(v_uid) then raise exception 'Team workspaces need an active Pro plan.'; end if;
+  v_name := coalesce(nullif(left(trim(p_name), 60), ''), 'Team');
+
+  select id into v_id from crm_teams
+   where owner_id = v_uid and name = v_name and created_at > now() - interval '60 seconds'
+   order by created_at desc limit 1;
+  if v_id is not null then return v_id; end if;
+
+  if (select count(*) from crm_teams where owner_id = v_uid) >= 10 then
+    raise exception 'You can own up to 10 team workspaces.';
+  end if;
+
+  insert into crm_teams (owner_id, name) values (v_uid, v_name) returning id into v_id;
+  insert into crm_team_members (team_id, email, user_id, role, status, joined_at)
+  values (v_id, crm_jwt_email(), v_uid, 'owner', 'active', now());
+  return v_id;
+end $$;
+
+revoke all on function public.crm_create_team(text) from public, anon;
+grant execute on function public.crm_create_team(text) to authenticated;
+```
+
+### Acceptance checks
+
+With user **A** on Pro:
+
+1. `select crm_create_team('Acme')` returns uuid X. `select crm_create_team('Acme')`
+   again within a minute returns X (retry guard).
+2. `select crm_create_team('Beta')` returns a different uuid Y.
+3. `crm_my_workspaces()` lists both Acme and Beta with `role = 'owner'`.
+4. Inviting, `crm_team_store_put` and `crm_delete_team` on Y leave X untouched.
+5. Creating teams until A owns 10, the 11th fails with "You can own up to 10 team workspaces."
+6. A free user still gets the Pro message from `crm_create_team`.
+
+### Rollback of §6
+
+Only possible while every owner has at most one team:
+
+```sql
+alter table public.crm_teams add constraint crm_teams_owner_id_key unique (owner_id);
+```
+then re-run the original `crm_create_team` from §2.

@@ -11,6 +11,7 @@
 // Pick mode: lets the user click any sidebar item to register it as the
 //   "current" conversation for the panel when the URL-based detection fails.
 
+import { readCollapsedSections, type PanelSection } from './panelSections';
 import {
   isCrmSyncKey,
   isStoreChangeKey,
@@ -21,7 +22,7 @@ import type { Store, Tag, Conversation, CustomFieldDef, TagGroup } from './stora
 import { bucketTags, showsGroupLabels, tagDisplayOrder, type TagBucket } from './tagGrouping';
 import { funnelsFor, hiddenFunnelIds, stageEditsFor, isNoOpStageEdit, describeStage, stagePosition, stageTitle, type FunnelView } from './funnel';
 import {
-  readPresetActions, stepsFor, describePreset, isDestructive, needsConfirm, campaignSendsFor, webhookSendsFor,
+  stepsFor, describePreset, isDestructive, needsConfirm, campaignSendsFor, webhookSendsFor,
   type PresetAction, type PresetCampaignSend, type PresetWebhookSend,
 } from './presets';
 import {
@@ -53,7 +54,7 @@ import {
 import type { ReadState } from './messageStatus';
 import type { ReadStateObservation } from './mutations';
 import { noteState, buildReport, emptyReport, type ScanReport } from './readScan';
-import type { UnreadScanReport, UnreadThread } from './automations';
+import { readActionButtons, type UnreadScanReport, type UnreadThread } from './automations';
 import type { SendFailureKind } from './campaigns';
 import { isE2eeThreadUrl, threadChatUrl } from './threadUrl';
 import { isPlaceholderThreadText, profileOwnerIdFromHtml, staysPlaceholder } from './profileOwner';
@@ -1299,6 +1300,27 @@ const PANEL_TASKS_VISIBLE = 5;
 // shouldn't sync across machines or cost a Drive write.
 const PANEL_PREF_PREFIX = 'fb_crm_panel_';
 
+// Collapsed panel sections, account-wide (panelSections.ts). Read from the
+// store at the top of each contact render; the section helpers below look here.
+let collapsedSections = new Set<PanelSection>();
+
+/**
+ * A section's title row with a ▾/▸ toggle that collapses it for every contact.
+ * `extra` is whatever else the row carries (a Group toggle, a count).
+ */
+function sectionTitleRow(section: PanelSection, title: string, extra = '', keepExtraWhenCollapsed = false): string {
+  const collapsed = collapsedSections.has(section);
+  return `
+    <div class="fb-crm-section-title-row">
+      <button class="fb-crm-section-toggle" data-section-toggle="${section}" aria-expanded="${!collapsed}"
+        title="${collapsed ? 'Show' : 'Hide'} this section for every contact">
+        <span class="fb-crm-section-caret" aria-hidden="true">${collapsed ? '▸' : '▾'}</span>
+        <span class="fb-crm-section-title">${title}</span>
+      </button>
+      ${collapsed && !keepExtraWhenCollapsed ? '' : extra}
+    </div>`;
+}
+
 function readPanelPref(key: string, fallback: boolean): Promise<boolean> {
   return new Promise((resolve) => {
     try {
@@ -1342,8 +1364,11 @@ function tagSectionHtml(opts: {
   toggleKey: string;
   chip: (t: Tag) => string;
   emptyHtml?: string;
+  /** Collapsible (account-wide) under this id. */
+  section?: PanelSection;
 }): string {
-  const { title, tags, groups, grouped, toggleKey, chip, emptyHtml } = opts;
+  const { title, tags, groups, grouped, toggleKey, chip, emptyHtml, section } = opts;
+  if (section && collapsedSections.has(section)) return sectionTitleRow(section, title);
   // The toggle is only worth showing when it would actually change anything.
   // That's true the moment ANY tag here belongs to a real group — even just
   // one tag in one group gets a heading when grouped and none when flat, so
@@ -1370,11 +1395,14 @@ function tagSectionHtml(opts: {
     `).join('');
   }
 
-  return `
+  const head = section
+    ? sectionTitleRow(section, title, toggle)
+    : `
     <div class="fb-crm-section-title-row">
       <div class="fb-crm-section-title">${title}</div>
       ${toggle}
-    </div>
+    </div>`;
+  return `${head}
     ${body}`;
 }
 
@@ -1550,10 +1578,9 @@ function presetActionsHtml(presets: PresetAction[], store: Store, armedId: strin
     return `<button class="fb-crm-preset-btn${destructive ? ' fb-crm-preset-danger' : ''}" data-preset="${p.id}"${style} title="${title}">${escapeHtml(p.label)}</button>`;
   }).join('');
 
+  if (collapsedSections.has('quickActions')) return sectionTitleRow('quickActions', 'Actions');
   return `
-    <div class="fb-crm-section-title-row">
-      <div class="fb-crm-section-title">Quick actions</div>
-    </div>
+    ${sectionTitleRow('quickActions', 'Actions')}
     <div class="fb-crm-presets">${buttons}</div>
     ${presetNotice ? `<div class="fb-crm-preset-notice${presetNotice.error ? ' fb-crm-preset-notice--error' : ''}" role="status">${escapeHtml(presetNotice.text)}</div>` : ''}`;
 }
@@ -1645,11 +1672,13 @@ function tasksSectionHtml(conv: Conversation): string {
          min="${dateInputValue(Date.now())}" max="${dateInputValue(Date.now() + 5 * 366 * 86_400_000)}" value="${escapeAttr(taskDraft.date)}" />`
     : '';
 
+  const count = open.length ? `<span class="fb-crm-task-count${overdue ? ' fb-crm-task-count--overdue' : ''}">${open.length} open${overdue ? ` · ${overdue} overdue` : ''}</span>` : '';
+  if (collapsedSections.has('followUps')) {
+    // Still says how many are open (and overdue) while collapsed.
+    return sectionTitleRow('followUps', 'Follow-ups', count, true);
+  }
   return `
-    <div class="fb-crm-section-title-row">
-      <div class="fb-crm-section-title">Follow-ups</div>
-      ${open.length ? `<span class="fb-crm-task-count${overdue ? ' fb-crm-task-count--overdue' : ''}">${open.length} open${overdue ? ` · ${overdue} overdue` : ''}</span>` : ''}
-    </div>
+    ${sectionTitleRow('followUps', 'Follow-ups', count)}
     ${rows ? `<div class="fb-crm-tasks">${rows}</div>${more}` : ''}
     <div class="fb-crm-task-new">
       <input type="text" id="fb-crm-task-title" maxlength="${TASK_TITLE_MAX}" placeholder="Add a follow-up…" aria-label="New follow-up" />
@@ -1960,7 +1989,8 @@ async function renderPanelContent() {
     readPanelPref('addTagGrouped', true),
   ]);
 
-  const presets = readPresetActions(store);
+  const presets = readActionButtons(store);
+  collapsedSections = readCollapsedSections(store);
 
   panelEl.innerHTML = `
     <div class="fb-crm-header">
@@ -1980,10 +2010,10 @@ async function renderPanelContent() {
       ${choiceGroupsHtml(conv, store)}
 
       ${panelFields.length > 0 ? `
-        <div class="fb-crm-section-title">Details</div>
-        <div class="fb-crm-fields">
+        ${sectionTitleRow('details', 'Details')}
+        ${collapsedSections.has('details') ? '' : `<div class="fb-crm-fields">
           ${panelFields.map(fieldRowHtml).join('')}
-        </div>` : ''}
+        </div>`}` : ''}
 
       ${tagSectionHtml({
         title: 'Tags on this conversation',
@@ -1991,6 +2021,7 @@ async function renderPanelContent() {
         groups: store.tagGroups,
         grouped: tagsGrouped,
         toggleKey: 'tagsGrouped',
+        section: 'tagsOn',
         emptyHtml: '<div class="fb-crm-chips"><span class="fb-crm-muted">No tags yet</span></div>',
         chip: (t) =>
           `<span class="${chipClass(t)}" style="${chipStyle(t)}" title="${chipTitle(t)}">${chipHiddenMark(t)}${escapeHtml(t.name)}<button class="fb-crm-chip-x" data-remove="${t.id}" aria-label="Remove tag ${escapeHtml(t.name)}">✕</button></span>`,
@@ -2002,16 +2033,17 @@ async function renderPanelContent() {
         groups: store.tagGroups,
         grouped: addTagGrouped,
         toggleKey: 'addTagGrouped',
+        section: 'addExisting',
         chip: (t) =>
           `<button class="${chipClass(t)} fb-crm-chip-add" style="${chipStyle(t)}" title="${chipTitle(t)}" data-add="${t.id}">${chipHiddenMark(t)}+ ${escapeHtml(t.name)}</button>`,
       }) : ''}
 
-      <div class="fb-crm-section-title">Create new tag</div>
-      <div class="fb-crm-new">
+      ${sectionTitleRow('createTag', 'Create new tag')}
+      ${collapsedSections.has('createTag') ? '' : `<div class="fb-crm-new">
         <input type="text" id="fb-crm-new-name" placeholder="Tag name..." value="${escapeHtml(newTagDraft.name)}" />
         <input type="color" id="fb-crm-new-color" value="${newTagDraft.color}" />
         <button id="fb-crm-create">Add</button>
-      </div>
+      </div>`}
 
       <div class="fb-crm-footer">
         ${deleteArmed ? `
@@ -2361,6 +2393,18 @@ function wireClose() {
 function wirePanelActions(threadId: string) {
   if (!panelEl) return;
 
+  // Collapse / expand a section for every contact (stored in the CRM settings).
+  panelEl.querySelectorAll<HTMLElement>('[data-section-toggle]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const section = btn.dataset.sectionToggle as PanelSection;
+      const collapsed = btn.getAttribute('aria-expanded') === 'true';
+      void panelAction(async () => {
+        await mutate([{ op: 'setPanelSectionCollapsed', section, collapsed }]);
+        await renderPanel();
+      });
+    });
+  });
+
   panelEl.querySelectorAll<HTMLElement>('[data-group-toggle]').forEach(btn => {
     btn.addEventListener('click', async () => {
       const key = btn.dataset.groupToggle!;
@@ -2375,7 +2419,7 @@ function wirePanelActions(threadId: string) {
   // couldn't — and the background applies them under its usual lock.
   const applyPreset = (presetId: string) => panelAction(async () => {
     const store = await getStore();
-    const preset = readPresetActions(store).find((p) => p.id === presetId);
+    const preset = readActionButtons(store).find((p) => p.id === presetId);
     const conv = store.conversations[threadId];
     if (!preset || !conv) return;
 
@@ -2423,7 +2467,7 @@ function wirePanelActions(threadId: string) {
     btn.addEventListener('click', async () => {
       const id = btn.dataset.preset!;
       const store = await getStore();
-      const preset = readPresetActions(store).find((p) => p.id === id);
+      const preset = readActionButtons(store).find((p) => p.id === id);
       if (preset && needsConfirm(preset)) {
         presetArmed = id;
         presetNotice = null;

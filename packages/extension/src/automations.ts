@@ -44,21 +44,47 @@ import type { Store, Conversation } from './storage';
 import type { Mutation } from './mutations';
 import type { AutomationChange } from './history';
 import { buildThreadIndex } from './contacts';
-import { normalizeSteps, stepsFor, describePreset, type PresetStep } from './presets';
+import {
+  normalizeSteps, stepsFor, describePreset, readPresetActions, writePresetActions,
+  type PresetStep, type PresetAction,
+} from './presets';
 import { filterByQuery, normalizeQuery, type SavedSearch } from './search';
 import { writeCollection, type SettingsBag, type SettingsCollection } from './settingsMerge';
 import type { SendAsMode } from './campaigns';
 import { resolveMessage, templateName } from './templates';
 
 /**
- * Where the contacts come from. 'tagUnread' = unread conversations; 'search' =
- * a saved search; 'tagChange' = whoever just had a tag added or removed (it
- * runs on that contact the moment it happens, not on a schedule).
+ * Where a SCHEDULED run (and "Run now") takes its contacts from: 'tagUnread' =
+ * unread conversations, 'search' = a saved search. The other triggers bring
+ * their own contacts — a button press acts on whoever it was pressed for, a tag
+ * trigger on whoever the tag changed on — so this only matters with a schedule.
+ *
+ * Stored records from the first tag-trigger build may say 'tagChange'; those
+ * are read as 'search' plus one entry in `tagTriggers` (normalizeAutomation).
  */
-export type AutomationKind = 'tagUnread' | 'search' | 'tagChange';
+export type AutomationKind = 'tagUnread' | 'search';
 
-/** Which edit a 'tagChange' automation reacts to. */
+/** Which edit a tag trigger reacts to. */
 export type TagTriggerOn = 'added' | 'removed';
+
+/** "Run when <tag> is added to / removed from a contact". An action can have several. */
+export interface TagTrigger {
+  tagId: string;
+  on: TagTriggerOn;
+}
+
+/**
+ * The "button" trigger: the action shows as a button in the Messenger panel
+ * and in the contacts screen's bulk pane, and runs on the contact(s) it was
+ * pressed for. This is what a quick action used to be.
+ */
+export interface ActionButton {
+  /** Button text. Falls back to the action's name. */
+  label: string;
+  color?: string;
+  /** Tooltip. */
+  description?: string;
+}
 
 /**
  * "Send a message" as an automation action: each run queues ONE campaign to
@@ -90,12 +116,27 @@ export interface AutomationMessage {
 export const MESSAGE_CAP_OPTIONS = [10, 25, 50, 100, 250] as const;
 export const DEFAULT_MESSAGE_CAP = 25;
 
+/**
+ * One ACTION: what to do to a contact (steps, optional message) and what
+ * starts it. Triggers, any number of them at once:
+ *   * button      — `button` set; pressed in the Messenger panel or bulk pane
+ *   * schedule    — `everyMinutes` > 0, on the `kind` source
+ *   * tag change  — each entry in `tagTriggers`
+ *   * webhook     — an incoming-webhook token naming this action's id (inbound.ts)
+ *   * by hand     — "Run now" / "Run on…" on the Actions page
+ * Quick actions were merged into this record (readActions converts the old
+ * ones as it reads them); the type keeps its old name to keep the diff small.
+ */
 export interface Automation {
   id: string;
   name: string;
   kind: AutomationKind;
-  /** Whether the schedule runs it. "Run now" works either way. */
+  /** Whether the schedule and tag triggers run it. Buttons and "Run now" work either way. */
   enabled: boolean;
+  /** Show as a button in the Messenger panel and bulk pane. */
+  button?: ActionButton;
+  /** Run on a contact when one of these tags is added to / removed from them. */
+  tagTriggers: TagTrigger[];
   /** The actions, applied to each contact - the same steps as a quick action. */
   steps: PresetStep[];
   /** Optional: also message the contacts. */
@@ -108,10 +149,6 @@ export interface Automation {
   tagIds: string[];
   /** 'search' source: the saved search whose matches are acted on. */
   savedSearchId?: string;
-  /** 'tagChange' source: the tag whose adding (or removing) starts a run for that contact. */
-  triggerTagId?: string;
-  /** 'tagChange' source: react to the tag being added (default) or removed. */
-  triggerOn?: TagTriggerOn;
   /** 'tagUnread' source: also add people who aren't in the CRM yet, instead of skipping them. */
   createContacts: boolean;
   /** 'tagUnread' source: how many of the most recent conversations to look through. */
@@ -131,7 +168,7 @@ export interface Automation {
 
 export const AUTOMATIONS_KEY = 'automations';
 export const AUTOMATIONS_DELETED_KEY = 'automationsDeleted';
-export const MAX_AUTOMATIONS = 20;
+export const MAX_AUTOMATIONS = 50;
 
 /** Choices offered for `depth`. The list is newest-first, so unread threads cluster near the top. */
 export const DEPTH_OPTIONS = [50, 100, 250, 500] as const;
@@ -188,11 +225,18 @@ export function normalizeAutomation(raw: unknown): Automation | null {
   const o = raw as Record<string, unknown>;
   if (typeof o.id !== 'string' || !o.id) return null;
   if (o.kind !== 'tagUnread' && o.kind !== 'search' && o.kind !== 'tagChange') return null;
+  // The first tag-trigger build stored one trigger as its own kind.
+  const legacyTag = o.kind === 'tagChange';
+  const kind: AutomationKind = o.kind === 'tagUnread' ? 'tagUnread' : 'search';
+  const tagTriggers = normalizeTagTriggers(o.tagTriggers);
+  if (legacyTag && typeof o.triggerTagId === 'string' && o.triggerTagId && !tagTriggers.some((t) => t.tagId === o.triggerTagId)) {
+    tagTriggers.push({ tagId: o.triggerTagId, on: o.triggerOn === 'removed' ? 'removed' : 'added' });
+  }
+  const button = normalizeButton(o.button);
   const depth = typeof o.depth === 'number' && Number.isFinite(o.depth) && o.depth > 0
     ? Math.min(Math.round(o.depth), DEPTH_OPTIONS[DEPTH_OPTIONS.length - 1])
     : DEFAULT_DEPTH;
-  // A tag trigger runs when the tag changes, never on a schedule.
-  const every = o.kind !== 'tagChange' && typeof o.everyMinutes === 'number' && Number.isFinite(o.everyMinutes) && o.everyMinutes > 0
+  const every = !legacyTag && typeof o.everyMinutes === 'number' && Number.isFinite(o.everyMinutes) && o.everyMinutes > 0
     ? Math.max(MIN_EVERY_MINUTES, Math.round(o.everyMinutes))
     : 0;
   const tagIds = Array.isArray(o.tagIds) ? o.tagIds.filter((t): t is string => typeof t === 'string' && !!t) : [];
@@ -203,15 +247,15 @@ export function normalizeAutomation(raw: unknown): Automation | null {
   const message = normalizeMessage(o.message);
   return {
     id: o.id,
-    name: typeof o.name === 'string' ? o.name : 'Untitled automation',
-    kind: o.kind,
+    name: typeof o.name === 'string' ? o.name : 'Untitled action',
+    kind,
     enabled: o.enabled !== false,
+    ...(button ? { button } : {}),
+    tagTriggers,
     steps,
     ...(message ? { message } : {}),
     tagIds: legacyTagIds(steps),
-    ...(o.kind === 'search' && typeof o.savedSearchId === 'string' && o.savedSearchId ? { savedSearchId: o.savedSearchId } : {}),
-    ...(o.kind === 'tagChange' && typeof o.triggerTagId === 'string' && o.triggerTagId ? { triggerTagId: o.triggerTagId } : {}),
-    ...(o.kind === 'tagChange' ? { triggerOn: o.triggerOn === 'removed' ? 'removed' as const : 'added' as const } : {}),
+    ...(kind === 'search' && typeof o.savedSearchId === 'string' && o.savedSearchId ? { savedSearchId: o.savedSearchId } : {}),
     createContacts: o.createContacts === true,
     depth,
     everyMinutes: every,
@@ -219,6 +263,30 @@ export function normalizeAutomation(raw: unknown): Automation | null {
     createdAt: typeof o.createdAt === 'number' ? o.createdAt : 0,
     ...(typeof o.updatedAt === 'number' ? { updatedAt: o.updatedAt } : {}),
     ...(typeof o.runOn === 'string' && o.runOn.includes('@') ? { runOn: o.runOn.trim().toLowerCase() } : {}),
+  };
+}
+
+function normalizeTagTriggers(raw: unknown): TagTrigger[] {
+  if (!Array.isArray(raw)) return [];
+  const out: TagTrigger[] = [];
+  for (const t of raw) {
+    if (!t || typeof t !== 'object') continue;
+    const r = t as Record<string, unknown>;
+    if (typeof r.tagId !== 'string' || !r.tagId) continue;
+    const on: TagTriggerOn = r.on === 'removed' ? 'removed' : 'added';
+    if (out.some((x) => x.tagId === r.tagId && x.on === on)) continue;
+    out.push({ tagId: r.tagId, on });
+  }
+  return out;
+}
+
+function normalizeButton(raw: unknown): ActionButton | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const o = raw as Record<string, unknown>;
+  return {
+    label: typeof o.label === 'string' ? o.label : '',
+    ...(typeof o.color === 'string' && o.color ? { color: o.color } : {}),
+    ...(typeof o.description === 'string' && o.description ? { description: o.description } : {}),
   };
 }
 
@@ -277,6 +345,7 @@ export function newTagUnreadAutomation(order: number, now = Date.now()): Automat
     name: 'Tag unread conversations',
     kind: 'tagUnread',
     enabled: true,
+    tagTriggers: [],
     steps: [],
     tagIds: [],
     createContacts: false,
@@ -301,9 +370,126 @@ export function newTagTriggerAutomation(order: number, triggerTagId: string | un
   return {
     ...newTagUnreadAutomation(order, now),
     name: 'When a tag is added',
-    kind: 'tagChange',
-    triggerOn: 'added',
-    ...(triggerTagId ? { triggerTagId } : {}),
+    kind: 'search',
+    tagTriggers: triggerTagId ? [{ tagId: triggerTagId, on: 'added' }] : [],
+  };
+}
+
+/** A blank action for the Actions page: no triggers yet but a button, since that's the most common start. */
+export function newAction(order: number, now = Date.now()): Automation {
+  return {
+    ...newTagUnreadAutomation(order, now),
+    id: `au_${now.toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+    name: '',
+    kind: 'search',
+    button: { label: '' },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Quick actions → actions
+// ---------------------------------------------------------------------------
+//
+// Quick actions (presets.ts) were merged into actions. They are converted as
+// they are READ, keeping their ids, so nothing has to be written for the merge
+// to show: readActions is every stored action plus every quick action that
+// hasn't been saved as one yet. The first save on the Actions page writes the
+// whole list as actions and empties the old quick-action list (writeActions),
+// which completes the move on every machine as it syncs. Same ids throughout,
+// so two machines converting at once merge into one record, not two.
+
+/** One old quick action as an action with a button trigger. */
+export function presetToAction(p: PresetAction): Automation {
+  // The first "add to campaign" step becomes the action's message. A button
+  // press sends it to whoever was pressed for, so the once-per-contact rule
+  // (which only applies to scheduled and tag runs) starts off.
+  const first = p.steps.findIndex((s) => s.kind === 'addToCampaign');
+  const camp = first >= 0 ? p.steps[first] : null;
+  const steps = first >= 0 ? p.steps.filter((_, i) => i !== first) : p.steps;
+  const message: AutomationMessage | undefined = camp && camp.kind === 'addToCampaign'
+    ? {
+      template: camp.template,
+      ...(camp.templateId ? { templateId: camp.templateId } : {}),
+      skipIfUnread: !!camp.skipIfUnread,
+      dryRun: !!camp.dryRun,
+      oncePerContact: false,
+      maxPerRun: DEFAULT_MESSAGE_CAP,
+      sendAs: camp.sendAs === 'page' ? 'page' : 'profile',
+      ...(camp.sendAs === 'page' && camp.sendAsPageId ? { sendAsPageId: camp.sendAsPageId } : {}),
+    }
+    : undefined;
+  return {
+    id: p.id,
+    name: p.label,
+    kind: 'search',
+    enabled: true,
+    button: {
+      label: p.label,
+      ...(p.color ? { color: p.color } : {}),
+      ...(p.description ? { description: p.description } : {}),
+    },
+    tagTriggers: [],
+    steps,
+    ...(message ? { message } : {}),
+    tagIds: legacyTagIds(steps),
+    createContacts: false,
+    depth: DEFAULT_DEPTH,
+    everyMinutes: 0,
+    // After the existing actions, in their old button order.
+    order: MAX_AUTOMATIONS + p.order,
+    createdAt: p.createdAt,
+    ...(p.updatedAt ? { updatedAt: p.updatedAt } : {}),
+  };
+}
+
+/** Every action: stored ones, plus quick actions not yet saved as actions. */
+export function readActions(store: Pick<Store, 'settings'>): Automation[] {
+  const stored = readAutomations(store);
+  const have = new Set(stored.map((a) => a.id));
+  const converted = readPresetActions(store).filter((p) => !have.has(p.id)).map(presetToAction);
+  return [...stored, ...converted].sort(compareAutomations);
+}
+
+/**
+ * Save the full action list. Also clears the old quick-action list: `next`
+ * came from readActions, so every quick action is already in it as an action.
+ */
+export function writeActions(settings: SettingsBag | undefined, next: Automation[], now = Date.now()): SettingsBag {
+  const withActions = writeAutomations(settings, next.map(withLegacyFields), now);
+  return readPresetActions({ settings: withActions }).length ? writePresetActions(withActions, [], now) : withActions;
+}
+
+/**
+ * The actions that have a button, shaped as the old quick actions so the
+ * panel and the bulk pane run them with the same code (stepsFor,
+ * campaignSendsFor, webhookSendsFor, needsConfirm): the message becomes an
+ * "add to campaign" step at the end.
+ */
+export function readActionButtons(store: Pick<Store, 'settings'>): PresetAction[] {
+  return readActions(store).filter((a) => a.button).map(actionAsButton);
+}
+
+export function actionAsButton(a: Automation): PresetAction {
+  const m = a.message;
+  const send: PresetStep[] = m && (m.template.trim() || m.templateId)
+    ? [{
+      kind: 'addToCampaign',
+      template: m.template,
+      ...(m.templateId ? { templateId: m.templateId } : {}),
+      ...(m.skipIfUnread ? { skipIfUnread: true } : {}),
+      ...(m.dryRun ? { dryRun: true } : {}),
+      ...(m.sendAs === 'page' ? { sendAs: 'page' as const, ...(m.sendAsPageId ? { sendAsPageId: m.sendAsPageId } : {}) } : {}),
+    }]
+    : [];
+  return {
+    id: a.id,
+    label: a.button?.label.trim() || a.name || 'Untitled',
+    ...(a.button?.color ? { color: a.button.color } : {}),
+    ...(a.button?.description ? { description: a.button.description } : {}),
+    order: a.order,
+    steps: [...a.steps, ...send],
+    createdAt: a.createdAt,
+    ...(a.updatedAt ? { updatedAt: a.updatedAt } : {}),
   };
 }
 
@@ -327,13 +513,19 @@ export function liveTagIds(automation: Automation, store: Pick<Store, 'tags'>): 
   return legacyTagIds(automation.steps).filter((id) => !!store.tags[id]);
 }
 
+/** Does it have a source "Run now" / a schedule can take contacts from? */
+export function hasRunnableSource(automation: Automation, store: Pick<Store, 'savedSearches'>): boolean {
+  return automation.kind === 'tagUnread' || !!(automation.savedSearchId && store.savedSearches?.[automation.savedSearchId]);
+}
+
 /** Why an automation can't run yet, or null when it can. */
 export function whyNotRunnable(automation: Automation, store: Pick<Store, 'tags' | 'savedSearches'>): string | null {
-  if (automation.kind === 'search' && !(automation.savedSearchId && store.savedSearches?.[automation.savedSearchId])) {
-    return 'Choose the saved search whose contacts it should act on.';
+  // Only a schedule needs a source: the other triggers bring their own contacts.
+  if (automation.everyMinutes > 0 && !hasRunnableSource(automation, store)) {
+    return 'Choose the saved search the schedule should act on.';
   }
-  if (automation.kind === 'tagChange' && !(automation.triggerTagId && store.tags?.[automation.triggerTagId])) {
-    return 'Choose the tag that starts it.';
+  if (automation.tagTriggers.some((t) => !store.tags?.[t.tagId])) {
+    return 'A tag that starts it no longer exists. Choose another, or remove that trigger.';
   }
   const hasMessage = !!automation.message?.template.trim() || !!automation.message?.templateId;
   if (automation.message && !hasMessage) return 'Write the message, or remove the \u201csend a message\u201d action.';
@@ -366,6 +558,8 @@ export function describeActions(automation: Automation, store: Store): string {
 export interface TagTriggerHit {
   automationId: string;
   ids: string[];
+  /** The triggers that fired, for the run's history label. */
+  fired: TagTrigger[];
 }
 
 /**
@@ -375,31 +569,53 @@ export interface TagTriggerHit {
  * (there's no one left to act on). Paused automations never fire.
  */
 export function tagTriggerHits(prev: Store, next: Store, automations: Automation[]): TagTriggerHit[] {
-  const triggers = automations.filter((a) => a.kind === 'tagChange' && a.enabled && a.triggerTagId);
-  if (!triggers.length) return [];
-  const byId = new Map<string, Set<string>>();
+  const triggered = automations.filter((a) => a.enabled && a.tagTriggers.length);
+  if (!triggered.length) return [];
+  const byId = new Map<string, { ids: Set<string>; fired: TagTrigger[] }>();
   for (const [id, conv] of Object.entries(next.conversations)) {
     const before = prev.conversations[id]?.tags;
     const after = conv.tags;
     if (before === after) continue;
     const had = new Set(before || []);
     const has = new Set(after);
-    for (const a of triggers) {
-      const tag = a.triggerTagId!;
-      const fired = a.triggerOn === 'removed' ? had.has(tag) && !has.has(tag) : !had.has(tag) && has.has(tag);
-      if (!fired) continue;
-      let s = byId.get(a.id);
-      if (!s) byId.set(a.id, (s = new Set()));
-      s.add(id);
+    for (const a of triggered) {
+      for (const t of a.tagTriggers) {
+        const fired = t.on === 'removed' ? had.has(t.tagId) && !has.has(t.tagId) : !had.has(t.tagId) && has.has(t.tagId);
+        if (!fired) continue;
+        let hit = byId.get(a.id);
+        if (!hit) byId.set(a.id, (hit = { ids: new Set(), fired: [] }));
+        hit.ids.add(id);
+        if (!hit.fired.some((x) => x.tagId === t.tagId && x.on === t.on)) hit.fired.push(t);
+      }
     }
   }
-  return [...byId].map(([automationId, ids]) => ({ automationId, ids: [...ids] }));
+  return [...byId].map(([automationId, h]) => ({ automationId, ids: [...h.ids], fired: h.fired }));
 }
 
-/** "When Lead is added" — for the card and the run's history entry. */
-export function describeTagTrigger(a: Pick<Automation, 'triggerTagId' | 'triggerOn'>, store: Pick<Store, 'tags'>): string {
-  const name = a.triggerTagId ? store.tags[a.triggerTagId]?.name : undefined;
-  return `When ${name ? `“${name}”` : 'a deleted tag'} is ${a.triggerOn === 'removed' ? 'removed from' : 'added to'} a contact`;
+/** "“Lead” added" — short, for a chip or a history entry. */
+export function shortTagTrigger(t: TagTrigger, store: Pick<Store, 'tags'>): string {
+  const name = store.tags[t.tagId]?.name;
+  return `${name ? `“${name}”` : 'a deleted tag'} ${t.on === 'removed' ? 'removed' : 'added'}`;
+}
+
+/** "When “Lead” is added to a contact". */
+export function describeTagTrigger(t: TagTrigger, store: Pick<Store, 'tags'>): string {
+  const name = store.tags[t.tagId]?.name;
+  return `When ${name ? `“${name}”` : 'a deleted tag'} is ${t.on === 'removed' ? 'removed from' : 'added to'} a contact`;
+}
+
+/** One short label per trigger, for the action's card. Paused triggers say so. */
+export function describeTriggers(a: Automation, store: Pick<Store, 'tags' | 'savedSearches'>): string[] {
+  const out: string[] = [];
+  if (a.button) out.push('Button');
+  if (a.everyMinutes > 0) {
+    const src = a.kind === 'tagUnread'
+      ? 'unread conversations'
+      : (a.savedSearchId && store.savedSearches[a.savedSearchId] ? `“${store.savedSearches[a.savedSearchId].name}”` : 'a deleted search');
+    out.push(`${describeSchedule(a.everyMinutes)} on ${src}${a.enabled ? '' : ' (paused)'}`);
+  }
+  for (const t of a.tagTriggers) out.push(`${shortTagTrigger(t, store)}${a.enabled ? '' : ' (paused)'}`);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +632,7 @@ export function describeTagTrigger(a: Pick<Automation, 'triggerTagId' | 'trigger
  * fires a few seconds early.
  */
 export function isDue(automation: Automation, lastRunAt: number | undefined, now: number): boolean {
-  if (!automation.enabled || automation.everyMinutes <= 0 || automation.kind === 'tagChange') return false;
+  if (!automation.enabled || automation.everyMinutes <= 0) return false;
   if (!lastRunAt) return true;
   return now - lastRunAt >= automation.everyMinutes * 60_000 - 60_000;
 }

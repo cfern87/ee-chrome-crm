@@ -502,6 +502,25 @@
 }
 .fb-crm-group-toggle:hover { text-decoration: underline; }
 
+/* A collapsible section title: the whole title is the button. */
+.fb-crm-section-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+.fb-crm-section-toggle .fb-crm-section-title { margin: 0; }
+.fb-crm-section-caret { font-size: 10px; color: #8a8d91; width: 10px; flex-shrink: 0; }
+.fb-crm-section-toggle:hover .fb-crm-section-title { text-decoration: underline; }
+
 .fb-crm-tag-group-label {
   display: flex;
   align-items: center;

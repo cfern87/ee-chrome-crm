@@ -7,7 +7,7 @@
 
 import React, { useCallback, useEffect, useState } from 'react';
 import type { Store, SaveResult } from '../storage';
-import { readAutomations, describeRun, type AutomationRun } from '../automations';
+import { readActions, describeRun, type AutomationRun } from '../automations';
 import { readInboundSettings, writeInboundSettings, type InboundSettings, type InboundStatus } from '../inbound';
 import { TOKEN_HISTORY_LIMIT, type InboundCommandDetail, type InboundToken } from '../inboundClient';
 import { Banner, Button, Card, Input, Stack, Text, Toggle, Field as FormField, color, radius, space } from '../ui/primitives';
@@ -145,7 +145,7 @@ export function InboundWebhookSettings({ store, updateStore }: {
   updateStore: (s: Store) => Promise<SaveResult>;
 }) {
   const settings = readInboundSettings(store);
-  const automations = readAutomations(store);
+  const automations = readActions(store);
   const [endpoint, setEndpoint] = useState('');
   const [status, setStatus] = useState<InboundStatus | null>(null);
   const [tokens, setTokens] = useState<InboundToken[]>([]);

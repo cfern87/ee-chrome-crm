@@ -41,7 +41,6 @@ import {
   SubNav, CopyButton,
 } from './shared';
 import { OnlineDot } from './Campaigns';
-import { PresetActionsSettings } from './PresetActionsSettings';
 import { WebhookSettings } from './WebhookSettings';
 import { InboundWebhookSettings } from './InboundWebhookSettings';
 import { DailyReportSettings } from './DailyReportSettings';
@@ -248,7 +247,15 @@ export function SettingsPanel({ store, updateStore, conversations, tags, syncUsa
         </Text>
       </Card>
 
-      <PresetActionsSettings store={store} updateStore={updateStore} />
+      {/* Quick actions moved: they are Actions with a button now. */}
+      <Card>
+        <Text as="h3" size="strong" weight="bold" style={{ margin: 0 }}>Quick actions</Text>
+        <Text as="p" size="small" tone="muted" leading="relaxed" style={{ margin: `${space.xs}px 0 0` }}>
+          Quick actions are now <strong>Actions</strong> with a button — open <strong>Actions</strong> in the left menu.
+          Your existing quick actions are already there, with the same buttons in Messenger. An action can also run on a
+          schedule or when a tag is added or removed.
+        </Text>
+      </Card>
 
       <SendingPaceSettings store={store} updateStore={updateStore} />
       </>
