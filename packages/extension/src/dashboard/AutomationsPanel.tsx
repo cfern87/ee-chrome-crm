@@ -17,6 +17,7 @@ import {
   readActions, writeActions, newAction, hasRunnableSource,
   whyNotRunnable, describeSchedule, describeRun, describeActions, describeTriggers, matchSavedSearch,
   AUTOMATION_RUNS_KEY, DEPTH_OPTIONS, SCHEDULE_OPTIONS, MAX_AUTOMATIONS, MESSAGE_CAP_OPTIONS, DEFAULT_MESSAGE_CAP,
+  DAILY_MINUTES, formatHour,
   type Automation, type AutomationRuns, type AutomationRun, type AutomationMessage, type TagTrigger,
 } from '../automations';
 import { isDestructive } from '../presets';
@@ -693,7 +694,19 @@ function ActionEditor({ initial, store, team, isNew, onSave, onCancel, onOpenTag
                 <Stack direction="row" gap="md" wrap align="flex-end">
                   <FormField label="How often" hint="Runs on the computer that sends your campaigns, while its browser is open.">
                     {(fp) => (
-                      <Select {...fp} value={String(draft.everyMinutes)} onChange={(e) => set({ everyMinutes: Number(e.target.value) })} style={{ width: 200 }}>
+                      <Select
+                        {...fp}
+                        value={String(draft.everyMinutes)}
+                        onChange={(e) => {
+                          const everyMinutes = Number(e.target.value);
+                          // A time of day only means something once a day.
+                          setDraft((d) => {
+                            const { runAtHour: _h, ...rest } = d;
+                            return { ...(everyMinutes === DAILY_MINUTES ? d : rest), everyMinutes };
+                          });
+                        }}
+                        style={{ width: 200 }}
+                      >
                         {!SCHEDULE_OPTIONS.some((o) => o.minutes === draft.everyMinutes) && (
                           <option value={draft.everyMinutes}>{describeSchedule(draft.everyMinutes)}</option>
                         )}
@@ -701,6 +714,30 @@ function ActionEditor({ initial, store, team, isNew, onSave, onCancel, onOpenTag
                       </Select>
                     )}
                   </FormField>
+                  {draft.everyMinutes === DAILY_MINUTES && (
+                    <FormField
+                      label="At about"
+                      hint="Approximate: it runs at the first check after this time (checks are every 5 minutes), and only while the sending computer is on with its browser open — if it isn't, it runs when it next is that day."
+                    >
+                      {(fp) => (
+                        <Select
+                          {...fp}
+                          value={draft.runAtHour === undefined ? '' : String(draft.runAtHour)}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            setDraft((d) => {
+                              const { runAtHour: _h, ...rest } = d;
+                              return v === '' ? rest : { ...rest, runAtHour: Number(v) };
+                            });
+                          }}
+                          style={{ width: 160 }}
+                        >
+                          <option value="">Any time</option>
+                          {Array.from({ length: 24 }, (_, h) => <option key={h} value={h}>{formatHour(h)}</option>)}
+                        </Select>
+                      )}
+                    </FormField>
+                  )}
                   <FormField label="On">
                     {(fp) => (
                       <Select

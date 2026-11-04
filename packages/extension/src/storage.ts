@@ -22,6 +22,7 @@
 //     person costs a single write.
 
 import { recordHistory, actorKey, ACTOR_SETTING_PREFIX } from './history';
+import { memberChatUrl } from './contacts';
 import { readStore as driveReadStore, writeStore as driveWriteStore, mergeStores } from './drive';
 import { mergeSettingsWithBase, reconcileCollections, type SettingsBag } from './settingsMerge';
 import { getEntitlement, isSignedIn, getStoredSession, FREE_CONTACT_LIMIT } from './license';
@@ -366,6 +367,19 @@ export interface Conversation {
   // group's "hidden by default" setting doesn't re-hide them. hiddenFunnels
   // wins if a group is somehow in both (e.g. after merging duplicates).
   shownFunnels?: string[];
+  // Team workspaces: each member's own chat with this person, by member
+  // (history.actorKey of their email). A Messenger chat link is per pair of
+  // people — the one a teammate captured doesn't open for anyone else — so
+  // every member who talks to the contact gets their own entry, and each of
+  // them is shown their own (contacts.memberChatUrl). `chatUrl` above stays as
+  // the first one captured, the fallback for older records.
+  memberChats?: Record<string, MemberChat>;
+}
+
+/** One team member's chat with a contact (Conversation.memberChats). */
+export interface MemberChat {
+  threadId: string;
+  chatUrl?: string;
 }
 
 export interface Store {
@@ -1382,9 +1396,44 @@ const teamIdbKey = (teamId: string) => teamCacheKey(IDB_KEY, teamId);
 const teamBaseIdbKey = (teamId: string) => `base@team:${teamId}`;
 
 async function loadStoreTeam(teamId: string): Promise<Store> {
-  return (await chromeLocalGet(teamCacheKey(STORAGE_KEY, teamId))) ||
+  const s = (await chromeLocalGet(teamCacheKey(STORAGE_KEY, teamId))) ||
     (await idbGet(teamIdbKey(teamId))) ||
     clone(EMPTY_STORE);
+  return withMemberChatUrls(s, await myActorKey());
+}
+
+/** The signed-in member's history/chat key (history.actorKey), or undefined when signed out. */
+export async function myActorKey(): Promise<string | undefined> {
+  const email = (await getStoredSession().catch(() => null))?.email?.trim().toLowerCase();
+  return email ? actorKey(email) : undefined;
+}
+
+/**
+ * A team store as THIS member should see it: each contact's `chatUrl` is the
+ * member's own chat (contacts.memberChatUrl). Every reader — the dashboard's
+ * Open chat, the popup, campaign sends — then just reads `chatUrl`.
+ * saveStoreTeam undoes it, so the shared link is never overwritten by a view.
+ */
+function withMemberChatUrls(store: Store, me: string | undefined): Store {
+  if (!me) return store;
+  let conversations: Record<string, Conversation> | null = null;
+  for (const [id, conv] of Object.entries(store.conversations || {})) {
+    const url = memberChatUrl(conv, me);
+    if (url && url !== conv.chatUrl) (conversations ??= { ...store.conversations })[id] = { ...conv, chatUrl: url };
+  }
+  return conversations ? { ...store, conversations } : store;
+}
+
+/** Put back the shared `chatUrl` wherever a save carries only this member's view of it. */
+function withSharedChatUrls(input: Store, previous: Store | null, me: string | undefined): Store {
+  if (!me || !previous) return input;
+  let conversations: Record<string, Conversation> | null = null;
+  for (const [id, conv] of Object.entries(input.conversations)) {
+    const prev = previous.conversations[id];
+    if (!prev || conv.chatUrl === prev.chatUrl) continue;
+    if (conv.chatUrl === memberChatUrl(prev, me)) (conversations ??= { ...input.conversations })[id] = { ...conv, chatUrl: prev.chatUrl };
+  }
+  return conversations ? { ...input, conversations } : input;
 }
 
 /** The personal workspace's local cache, whichever workspace is active. */
@@ -1479,13 +1528,14 @@ async function saveStoreTeam(input: Store, teamId: string, isActive = true): Pro
   // then the same tombstone/history/diagnostics handling as a personal save.
   // No contact cap: a team runs on its owner's plan, checked by the server.
   const arrivals = (await localGet<Arrivals>(teamArrivalsKey(teamId))) || {};
-  const guarded = previous
-    ? guardStaleWrite(previous, normalize(input), arrivals, input.workspaceReadAt || 0)
-    : normalize(input);
   // Who is saving: every new history event is stamped with them, so teammates
   // can see who did what (history.ts, "who did it").
   const email = (await getStoredSession().catch(() => null))?.email?.trim().toLowerCase();
   const actor = email ? actorKey(email) : undefined;
+  const shared = withSharedChatUrls(normalize(input), previous, actor);
+  const guarded = previous
+    ? guardStaleWrite(previous, shared, arrivals, input.workspaceReadAt || 0)
+    : shared;
   const withActorDir = actor && guarded.settings?.[ACTOR_SETTING_PREFIX + actor] !== email
     ? { ...guarded, settings: { ...guarded.settings, [ACTOR_SETTING_PREFIX + actor]: email } }
     : guarded;
@@ -1496,7 +1546,7 @@ async function saveStoreTeam(input: Store, teamId: string, isActive = true): Pro
   await Promise.all([chromeLocalSet(store, key), idbSet(store, teamIdbKey(teamId))]);
   // Only the open workspace is this context's cached view.
   if (isActive) {
-    loadedStore = { ...store, workspace: teamId, workspaceReadAt: Date.now() };
+    loadedStore = { ...withMemberChatUrls(store, actor), workspace: teamId, workspaceReadAt: Date.now() };
     loadedAt = Date.now();
   }
   await setTeamDirty(teamId, true);

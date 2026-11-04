@@ -32,7 +32,7 @@ import {
 import { PRODUCT_NAME, WORKER_NOT_LOADED } from './product';
 import { readableFill, chipOutline, ON_DARK } from './ui/contrast';
 import { eyeOffSvgMarkup } from './ui/icons';
-import type { Mutation } from './mutations';
+import type { Mutation, ThreadProfile } from './mutations';
 import { PLATFORM_URL, SESSION_KEY } from './license';
 
 import { profileKey, normalizeProfileUrl, extractThreadFromProfileUrl, RESERVED_FB_PATHS } from './csv';
@@ -59,7 +59,7 @@ import type { SendFailureKind } from './campaigns';
 import { isE2eeThreadUrl, threadChatUrl } from './threadUrl';
 import {
   getActiveWorkspaceId, getCachedWorkspaces, localGet, localSet,
-  NEW_CONTACT_TARGET_KEY, WORKSPACE_NOTICE_KEY, type WorkspaceNotice,
+  WORKSPACE_NOTICE_KEY, type WorkspaceNotice,
 } from './team';
 import { isPlaceholderThreadText, profileOwnerIdFromHtml, staysPlaceholder } from './profileOwner';
 import { checkSender, detectSenderIdentity, type SenderIdentity, type SenderRequirement } from './senderIdentity';
@@ -330,6 +330,8 @@ const elsewhereCache = new Map<string, { at: number; list: SavedTo[] }>();
 const ELSEWHERE_TTL_MS = 30_000;
 // The workspace the panel last rendered, to notice a switch.
 let panelWorkspace: string | undefined;
+// The thread whose contact this panel just created, for "Saved to X · Move to…".
+let justCreatedThread: string | null = null;
 
 // ---- Panel busy state ----
 //
@@ -380,7 +382,10 @@ window.addEventListener('beforeunload', (e) => {
   e.returnValue = '';
 });
 
-async function mutate(mutations: Mutation[], opts: { here?: boolean } = {}): Promise<Store> {
+/** `target`: save a NEW contact into this workspace instead of the open one. */
+interface MutateOpts { here?: boolean; target?: string }
+
+async function mutate(mutations: Mutation[], opts: MutateOpts = {}): Promise<Store> {
   lastSavedTo = null;
   if (!mutations.length) return getStore();
 
@@ -402,7 +407,10 @@ async function mutate(mutations: Mutation[], opts: { here?: boolean } = {}): Pro
   invalidateThreadIndex();
 
   const send = (timeoutMs: number) =>
-    sendBg<MutateResponse>({ type: 'MUTATE_STORE', payload: { mutations, ...(opts.here ? { here: true } : {}) } }, timeoutMs);
+    sendBg<MutateResponse>({
+      type: 'MUTATE_STORE',
+      payload: { mutations, ...(opts.here ? { here: true } : {}), ...(opts.target ? { target: opts.target } : {}) },
+    }, timeoutMs);
 
   // A null response means the worker didn't answer in time — it was asleep, or
   // busy with a campaign send. Give it one more, longer go before giving up:
@@ -637,7 +645,48 @@ function nameCandidates(threadId: string | null, link?: HTMLAnchorElement): Reco
   return out;
 }
 
-async function ensureConversation(threadId: string, link?: HTMLAnchorElement, opts: { here?: boolean } = {}): Promise<Conversation | null> {
+// Path segments that are Facebook pages, not people's profiles.
+const NOT_PROFILE_PATHS = new Set([
+  'messages', 't', 'e2ee', 'groups', 'events', 'watch', 'marketplace', 'gaming', 'photo', 'photos', 'stories',
+  'hashtag', 'notifications', 'settings', 'help', 'friends', 'pages', 'reel', 'reels', 'search', 'bookmarks',
+  'saved', 'policies', 'privacy', 'login', 'me', 'home.php', 'ads', 'business', 'fundraisers', 'memories',
+  'permalink.php', 'story.php', 'share', 'l.php', 'sharer', 'dialog', 'video', 'videos', 'live',
+]);
+
+/**
+ * Who the OPEN conversation is with, from the profile link in its header (the
+ * name/avatar at the top of the chat). A Messenger chat id is per pair of
+ * people, but the profile is the person — the same for every team member.
+ *
+ * Only links in the header strip count: the messages below can contain links
+ * to other people's profiles and pages. Not verified against every layout —
+ * null when nothing qualifies, and nothing else depends on it being found.
+ */
+function openThreadProfile(): ThreadProfile | null {
+  const main = document.querySelector<HTMLElement>('[role="main"]');
+  if (!main) return null;
+  const top = main.getBoundingClientRect().top;
+  for (const a of Array.from(main.querySelectorAll<HTMLAnchorElement>('a[href]'))) {
+    const r = a.getBoundingClientRect();
+    if (!r.width || r.top - top > 140) continue; // header strip only
+    let u: URL;
+    try { u = new URL(a.href, location.href); } catch { continue; }
+    if (!/(^|\.)facebook\.com$/i.test(u.hostname)) continue;
+    const seg = u.pathname.split('/').filter(Boolean);
+    if (seg[0] === 'profile.php') {
+      const id = u.searchParams.get('id');
+      if (id && /^\d+$/.test(id)) return { fbUserId: id, profileUrl: `https://www.facebook.com/profile.php?id=${id}` };
+      continue;
+    }
+    if (seg.length !== 1 || NOT_PROFILE_PATHS.has(seg[0].toLowerCase()) || !/^[A-Za-z0-9.]+$/.test(seg[0])) continue;
+    return /^\d+$/.test(seg[0])
+      ? { fbUserId: seg[0], profileUrl: `https://www.facebook.com/profile.php?id=${seg[0]}` }
+      : { fbUsername: seg[0], profileUrl: `https://www.facebook.com/${seg[0]}` };
+  }
+  return null;
+}
+
+async function ensureConversation(threadId: string, link?: HTMLAnchorElement, opts: MutateOpts = {}): Promise<Conversation | null> {
   // Only assembled when this could be a FIRST capture — an already-saved
   // contact re-asserting its chat URL on the sidebar's 2s pass is the common
   // case by a wide margin, and building a diagnostic for it every time would
@@ -656,6 +705,8 @@ async function ensureConversation(threadId: string, link?: HTMLAnchorElement, op
       // rule lives in the mutation so it runs against the real store.
       name: offered,
       allowCreate: true,
+      // The person's profile, when this is the conversation on screen.
+      ...(threadId === getActiveThreadId() ? (() => { const p = openThreadProfile(); return p ? { profile: p } : {}; })() : {}),
       ...(known ? {} : {
         diag: {
           at: Date.now(),
@@ -674,12 +725,15 @@ async function ensureConversation(threadId: string, link?: HTMLAnchorElement, op
     },
   ], opts);
   if (lastSavedTo) {
-    // Saved into the workspace new contacts go to, not the open one.
+    // Saved into the workspace picked for it, not the open one.
     routedThreads.set(threadId.toLowerCase(), lastSavedTo);
     lastSavedTo = null;
     return null;
   }
-  return findConversationForThread(next, threadId);
+  const found = findConversationForThread(next, threadId);
+  // Just created here: the panel offers "Move to…" another workspace for it.
+  if (!known && found) justCreatedThread = threadId.toLowerCase();
+  return found;
 }
 
 // Find an already-saved contact that matches a profile page, by profile URL
@@ -713,7 +767,7 @@ function findConversationForProfile(store: Store, profileUrl: string): Conversat
 // Create a new contact directly from a profile page (no Messenger thread
 // required yet). Mirrors the CSV-import identity resolution so the contact
 // lines up with any Messenger-captured or imported copy of the same person.
-async function addProfileContact(profileUrl: string, name: string, opts: { here?: boolean } = {}): Promise<Conversation | null> {
+async function addProfileContact(profileUrl: string, name: string, opts: MutateOpts = {}): Promise<Conversation | null> {
   const norm = normalizeProfileUrl(profileUrl) || profileUrl;
   const thread = extractThreadFromProfileUrl(profileUrl);
   // The numeric fbid read off the page. This is the id the Messenger sidebar
@@ -1345,6 +1399,20 @@ const PANEL_PREF_PREFIX = 'fb_crm_panel_';
 // Collapsed panel sections, account-wide (panelSections.ts). Read from the
 // store at the top of each contact render; the section helpers below look here.
 let collapsedSections = new Set<PanelSection>();
+// Toggles clicked but not yet seen in the store. The panel redraws at once
+// from these and the save runs in the background; a click used to wait for the
+// save (a Drive round trip) behind the busy overlay. Dropped once the store
+// agrees.
+const sectionToggles = new Map<PanelSection, boolean>();
+
+function applySectionToggles(fromStore: Set<PanelSection>): Set<PanelSection> {
+  const out = new Set(fromStore);
+  for (const [section, collapsed] of sectionToggles) {
+    if (fromStore.has(section) === collapsed) { sectionToggles.delete(section); continue; }
+    if (collapsed) out.add(section); else out.delete(section);
+  }
+  return out;
+}
 
 /**
  * A section's title row with a ▾/▸ toggle that collapses it for every contact.
@@ -1844,15 +1912,13 @@ async function togglePanel() {
 interface StripData {
   active: string;
   teams: Array<{ id: string; name: string; writable: boolean }>;
-  target: string;
   notice: WorkspaceNotice | null;
   elsewhere: SavedTo[];
 }
 
 async function workspaceStripData(threadId: string | null): Promise<StripData | null> {
-  const [cache, active, target, notice] = await Promise.all([
-    getCachedWorkspaces(), getActiveWorkspaceId(),
-    localGet<string>(NEW_CONTACT_TARGET_KEY), localGet<WorkspaceNotice>(WORKSPACE_NOTICE_KEY),
+  const [cache, active, notice] = await Promise.all([
+    getCachedWorkspaces(), getActiveWorkspaceId(), localGet<WorkspaceNotice>(WORKSPACE_NOTICE_KEY),
   ]);
   const teams = cache.list.filter((w) => w.status === 'active').map((w) => ({ id: w.id, name: w.name, writable: w.active }));
   if (!teams.length && !notice) return null;
@@ -1867,9 +1933,18 @@ async function workspaceStripData(threadId: string | null): Promise<StripData | 
       elsewhereCache.set(key, { at: Date.now(), list: elsewhere });
     }
   }
-  return { active, teams, target: target || '', notice: notice?.text ? notice : null, elsewhere };
+  return { active, teams, notice: notice?.text ? notice : null, elsewhere };
 }
 
+/** The open workspace's name, for the strip label. */
+function workspaceName(d: StripData): string {
+  return d.active === 'personal' ? 'Personal' : (d.teams.find((w) => w.id === d.active)?.name || 'Team');
+}
+
+/**
+ * Notice, a quiet "<name> workspace" label (switching lives in the toolbar
+ * popup), and "Also in …" when the person exists in another workspace.
+ */
 function workspaceStripHtml(d: StripData | null): string {
   if (!d) return '';
   const notice = d.notice
@@ -1877,26 +1952,49 @@ function workspaceStripHtml(d: StripData | null): string {
          <button class="fb-crm-ws-notice-x" data-ws-notice-dismiss="1" aria-label="Dismiss">✕</button></div>`
     : '';
   if (!d.teams.length) return notice;
-  const all = [{ id: 'personal', name: 'Personal', writable: true }, ...d.teams];
-  const options = all.map((w) =>
-    `<option value="${escapeHtml(w.id)}"${w.id === d.active ? ' selected' : ''}>${escapeHtml(w.name)}${w.writable ? '' : ' (read-only)'}</option>`).join('');
-  const targetValid = !d.target || all.some((w) => w.id === d.target && w.writable);
-  const targets = `<option value="">The open workspace</option>` + all.filter((w) => w.writable).map((w) =>
-    `<option value="${escapeHtml(w.id)}"${targetValid && w.id === d.target ? ' selected' : ''}>${escapeHtml(w.name)}</option>`).join('');
-  const elsewhere = d.elsewhere.length
-    ? `<div class="fb-crm-ws-elsewhere">Also in ${d.elsewhere.map((w) =>
-        `<button class="fb-crm-ws-link" data-ws-switch="${escapeHtml(w.workspaceId)}" title="Switch to ${escapeHtml(w.name)}">${escapeHtml(w.name)}</button>`).join(', ')}</div>`
+  const also = d.elsewhere.length
+    ? ` · also in ${d.elsewhere.map((w) =>
+        `<button class="fb-crm-ws-link" data-ws-switch="${escapeHtml(w.workspaceId)}" title="Switch to ${escapeHtml(w.name)}">${escapeHtml(w.name)}</button>`).join(', ')}`
     : '';
   return `${notice}
-    <div class="fb-crm-ws" role="group" aria-label="Workspace">
-      <label class="fb-crm-ws-field">Workspace
-        <select id="fb-crm-ws-select" aria-label="Open workspace">${options}</select>
-      </label>
-      <label class="fb-crm-ws-field" title="Where a contact goes the first time it's saved from Messenger or a profile page">New contacts to
-        <select id="fb-crm-ws-target" aria-label="Save new contacts to">${targets}</select>
-      </label>
-    </div>
-    ${elsewhere}`;
+    <div class="fb-crm-ws-label" title="Switch workspace from the extension's toolbar icon"><strong>${escapeHtml(workspaceName(d))}</strong> workspace${also}</div>`;
+}
+
+/** The workspaces a new contact can be saved into: the open one first (the default). */
+function saveTargets(d: StripData | null): Array<{ id: string; name: string }> {
+  if (!d?.teams.length) return [];
+  const all = [{ id: 'personal', name: 'Personal', writable: true }, ...d.teams].filter((w) => w.writable);
+  const open = all.find((w) => w.id === d.active);
+  return [...(open ? [open] : []), ...all.filter((w) => w.id !== d.active)];
+}
+
+/** "Save to [workspace ▾]" for the new-contact screens. Empty with no teams. */
+function saveTargetHtml(d: StripData | null): string {
+  const targets = saveTargets(d);
+  if (targets.length < 2) return '';
+  return `<label class="fb-crm-ws-save">Save to
+      <select id="fb-crm-save-target" aria-label="Workspace to save this contact in">
+        ${targets.map((w, i) => `<option value="${escapeHtml(w.id)}">${escapeHtml(w.name)}${i === 0 ? ' (open)' : ''}</option>`).join('')}
+      </select>
+    </label>`;
+}
+
+/** The chosen "Save to" workspace, or undefined for the open one. */
+function chosenSaveTarget(d: StripData | null): string | undefined {
+  const v = panelEl?.querySelector<HTMLSelectElement>('#fb-crm-save-target')?.value;
+  return v && v !== d?.active ? v : undefined;
+}
+
+/** "Saved to Acme · Move to [▾]" under a contact this panel just created. */
+function justCreatedHtml(d: StripData | null): string {
+  const targets = saveTargets(d).slice(1);
+  if (!d || !targets.length) return '';
+  return `<div class="fb-crm-ws-save" role="status">Saved to <strong>${escapeHtml(workspaceName(d))}</strong> ·
+      <select id="fb-crm-move-target" aria-label="Move this contact to another workspace">
+        <option value="">Move to…</option>
+        ${targets.map((w) => `<option value="${escapeHtml(w.id)}">${escapeHtml(w.name)}</option>`).join('')}
+      </select>
+    </div>`;
 }
 
 function wireWorkspaceStrip(): void {
@@ -1908,18 +2006,8 @@ function wireWorkspaceStrip(): void {
     await renderPanel();
     await injectSidebarTags();
   });
-  panelEl.querySelector<HTMLSelectElement>('#fb-crm-ws-select')?.addEventListener('change', (e) => {
-    switchTo((e.target as HTMLSelectElement).value);
-  });
   panelEl.querySelectorAll<HTMLElement>('[data-ws-switch]').forEach((b) => {
     b.addEventListener('click', () => switchTo(b.dataset.wsSwitch!));
-  });
-  panelEl.querySelector<HTMLSelectElement>('#fb-crm-ws-target')?.addEventListener('change', (e) => {
-    const v = (e.target as HTMLSelectElement).value;
-    void (async () => {
-      await localSet(NEW_CONTACT_TARGET_KEY, v || null);
-      await renderPanel();
-    })();
   });
   panelEl.querySelector('[data-ws-notice-dismiss]')?.addEventListener('click', () => {
     void (async () => { await localSet(WORKSPACE_NOTICE_KEY, null); await renderPanel(); })();
@@ -1994,6 +2082,7 @@ async function renderPanelContent() {
     lastRenderedThread = null;
     routedThreads.clear();
     elsewhereCache.clear();
+    justCreatedThread = null;
   }
   panelWorkspace = wsNow;
 
@@ -2052,17 +2141,21 @@ async function renderPanelContent() {
         });
         return;
       }
+      const profileStrip = await workspaceStripData(null);
       panelEl.innerHTML = `
         <div class="fb-crm-header">
           <span>${PRODUCT_NAME}</span>
           <button class="fb-crm-close">✕</button>
         </div>
         <div class="fb-crm-body">
+          ${workspaceStripHtml(profileStrip)}
           <div class="fb-crm-name-row"><div class="fb-crm-name">${escapeHtml(guessName)}</div></div>
           <div class="fb-crm-muted" style="margin:6px 0 12px">Not in your CRM yet.</div>
+          ${saveTargetHtml(profileStrip)}
           <button class="fb-crm-pick-btn" id="fb-crm-add-profile">➕ Add to CRM</button>
         </div>`;
       wireClose();
+      wireWorkspaceStrip();
       panelEl.querySelector('#fb-crm-add-profile')?.addEventListener('click', () => void panelAction(async () => {
         // Save the name the panel is SHOWING. It came from getProfilePageName,
         // so establishProfileName below returns that same remembered read
@@ -2080,8 +2173,9 @@ async function renderPanelContent() {
           btn.disabled = true;
           if (!isUsableProfileName(guessName)) btn.textContent = '⏳ Reading name…';
         }
+        const target = chosenSaveTarget(profileStrip);
         const name = await establishProfileName();
-        const conv = await addProfileContact(profileUrl, name || 'Unknown');
+        const conv = await addProfileContact(profileUrl, name || 'Unknown', target ? { target } : {});
         // A null result means the write couldn't reach the background. Re-render
         // either way: the panel then reflects whatever actually got saved rather
         // than claiming success.
@@ -2113,7 +2207,8 @@ async function renderPanelContent() {
   const preStore = await getStore();
   const autoCapture = (preStore.settings as Record<string, unknown>)?.autoCapture !== false;
   const wasRemoved = removedThreads.has(threadId);
-  const strip = workspaceStripHtml(await workspaceStripData(threadId));
+  const stripData = await workspaceStripData(threadId);
+  const strip = workspaceStripHtml(stripData);
   const routed = routedThreads.get(threadId.toLowerCase());
   if (routed && !findConversationForThread(preStore, threadId)) {
     const tid = threadId;
@@ -2138,13 +2233,15 @@ async function renderPanelContent() {
         ${strip}
         <div class="fb-crm-name-row"><div class="fb-crm-name">${escapeHtml(guessName)}</div></div>
         <div class="fb-crm-muted" style="margin:6px 0 12px">${wasRemoved ? 'Removed from your CRM.' : 'Not saved yet · auto-capture is off.'}</div>
+        ${saveTargetHtml(stripData)}
         <button class="fb-crm-pick-btn" id="fb-crm-save-contact">➕ ${wasRemoved ? 'Add back to CRM' : 'Save this contact'}</button>
       </div>`;
     wireClose();
     wireWorkspaceStrip();
     panelEl.querySelector('#fb-crm-save-contact')?.addEventListener('click', () => void panelAction(async () => {
       removedThreads.delete(threadId);
-      await ensureConversation(threadId);
+      const target = chosenSaveTarget(stripData);
+      await ensureConversation(threadId, undefined, target ? { target } : {});
       await renderPanel();
       await injectSidebarTags();
     }));
@@ -2194,7 +2291,7 @@ async function renderPanelContent() {
   ]);
 
   const presets = readActionButtons(store);
-  collapsedSections = readCollapsedSections(store);
+  collapsedSections = applySectionToggles(readCollapsedSections(store));
 
   panelEl.innerHTML = `
     <div class="fb-crm-header">
@@ -2203,6 +2300,7 @@ async function renderPanelContent() {
     </div>
     <div class="fb-crm-body">
       ${strip}
+      ${justCreatedThread === threadId.toLowerCase() ? justCreatedHtml(stripData) : ''}
       ${nameRowHtml(conv.participantName, !isProfilePage())}
       <div class="fb-crm-meta">📨 Last contacted: <strong>${formatRelative(conv.lastContactedAt)}</strong></div>
 
@@ -2276,6 +2374,25 @@ async function renderPanelContent() {
   wirePanelFields(conv.id, conv, panelFields);
   wirePanelTasks(conv);
   wireWorkspaceStrip();
+  panelEl.querySelector<HTMLSelectElement>('#fb-crm-move-target')?.addEventListener('change', (e) => {
+    const to = (e.target as HTMLSelectElement).value;
+    if (!to) return;
+    const convId = conv.id;
+    const tid = threadId;
+    void panelAction(async () => {
+      const res = await sendBg<{ ok?: boolean; error?: string; savedTo?: SavedTo }>(
+        { type: 'MOVE_CONTACT', payload: { conversationId: convId, to } }, 60_000);
+      if (res?.ok && res.savedTo) {
+        justCreatedThread = null;
+        routedThreads.set(tid.toLowerCase(), res.savedTo);
+        storeCache = null;
+      } else {
+        presetNotice = { text: res?.error || 'Could not move this contact.', error: true };
+      }
+      await renderPanel();
+      await injectSidebarTags();
+    });
+  });
 
   // If the user was typing a tag name when a re-render happened, restore focus
   // and place the caret at the end so their typing isn't interrupted.
@@ -2604,10 +2721,10 @@ function wirePanelActions(threadId: string) {
     btn.addEventListener('click', () => {
       const section = btn.dataset.sectionToggle as PanelSection;
       const collapsed = btn.getAttribute('aria-expanded') === 'true';
-      void panelAction(async () => {
-        await mutate([{ op: 'setPanelSectionCollapsed', section, collapsed }]);
-        await renderPanel();
-      });
+      sectionToggles.set(section, collapsed);
+      void renderPanel();
+      // Saved in the background — not awaited, no busy overlay.
+      void mutate([{ op: 'setPanelSectionCollapsed', section, collapsed }]).catch(() => { sectionToggles.delete(section); });
     });
   });
 

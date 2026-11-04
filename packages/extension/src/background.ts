@@ -25,7 +25,7 @@
 // periodic watchdog alarm self-heals any stall (e.g. if the worker was killed
 // mid-step).
 
-import { loadStore, saveStore, flushDriveIfDirty, syncDriveNow, isDriveEnabled, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, removeTagsFrom, isStoreChangeKey, loadStoreIn, saveStoreIn, readPersonalCache, readTeamCache } from './storage';
+import { loadStore, saveStore, flushDriveIfDirty, syncDriveNow, isDriveEnabled, DRIVE_SYNC_ALARM, DRIVE_SYNC_PERIOD_MINUTES, removeTagsFrom, isStoreChangeKey, loadStoreIn, saveStoreIn, readPersonalCache, readTeamCache, myActorKey } from './storage';
 import type { Store, SaveResult, Conversation } from './storage';
 import { applyMutations } from './mutations';
 import type { Mutation } from './mutations';
@@ -53,8 +53,8 @@ import {
 } from './dailyReport';
 import { makeInboundClient, inboundEndpointUrl } from './inboundClient';
 import {
-  makeTeamClient, getActiveWorkspaceId, getCachedWorkspaces, getWorkspaceInfo, isTeamWorkspace, localGet,
-  NEW_CONTACT_TARGET_KEY, PERSONAL_WORKSPACE, TEAM_SYNC_ALARM, TEAM_SYNC_PERIOD_MINUTES,
+  makeTeamClient, getActiveWorkspaceId, getCachedWorkspaces, getWorkspaceInfo, isTeamWorkspace,
+  PERSONAL_WORKSPACE, TEAM_SYNC_ALARM, TEAM_SYNC_PERIOD_MINUTES,
 } from './team';
 import { makeTeamService } from './teamService';
 import { parseTeamSeed } from './workspaceTransfer';
@@ -231,7 +231,21 @@ interface MutateResponse {
  * sidebar re-asserts a contact's chat URL on every repaint and almost never has
  * anything new to say.
  */
-async function mutateStore(mutations: Mutation[], opts: { triggerDepth?: number } = {}): Promise<MutateResponse> {
+/**
+ * Stamp the signed-in member on the edits that record a chat link, so in a
+ * team workspace each member's chat is kept under them (Conversation.memberChats).
+ * The ops ignore it outside a team.
+ */
+async function withMember(mutations: Mutation[]): Promise<Mutation[]> {
+  if (!mutations.some((m) => m.op === 'upsertContact' || m.op === 'setChatUrl' || m.op === 'setResolvedThread')) return mutations;
+  const me = await myActorKey();
+  if (!me) return mutations;
+  return mutations.map((m) =>
+    (m.op === 'upsertContact' || m.op === 'setChatUrl' || m.op === 'setResolvedThread') && !m.member ? { ...m, member: me } : m);
+}
+
+async function mutateStore(input: Mutation[], opts: { triggerDepth?: number } = {}): Promise<MutateResponse> {
+  const mutations = await withMember(input);
   return withStoreLock(async () => {
     const store = await loadStore();
     const { store: next, changed, conversationId } = applyMutations(store, mutations);
@@ -246,31 +260,30 @@ async function mutateStore(mutations: Mutation[], opts: { triggerDepth?: number 
   });
 }
 
-// ---- edits from Messenger / profile pages: where new contacts go ----
+// ---- edits from Messenger / profile pages: saving a new contact elsewhere ----
 //
-// Someone in a team may want contacts they meet on Messenger to land in a
-// particular workspace (Personal, or one team) whichever one is open in the
-// switcher (NEW_CONTACT_TARGET_KEY; absent = the open one). Only a write that
-// would CREATE a contact is redirected — edits to someone already in the open
-// workspace stay there. The answer says where it went, so the panel can say so.
+// The panel's new-contact screens offer "Save to [workspace]" (the open one by
+// default). A page edit carrying `target` that would CREATE a contact is saved
+// into that workspace instead; edits to someone already in the open workspace
+// stay there. The answer says where it went, so the panel can say so.
 
 interface SavedTo { workspaceId: string; name: string }
 
-async function newContactTarget(active: string): Promise<SavedTo | null> {
-  const pref = await localGet<string>(NEW_CONTACT_TARGET_KEY);
-  if (!pref || pref === active) return null;
-  if (pref === PERSONAL_WORKSPACE) return { workspaceId: pref, name: 'Personal' };
-  const info = await getWorkspaceInfo(pref);
+/** A workspace a contact may be written into, other than the open one. Null = use the open one. */
+async function writableTarget(id: string | undefined, active: string): Promise<SavedTo | null> {
+  if (!id || id === active) return null;
+  if (id === PERSONAL_WORKSPACE) return { workspaceId: id, name: 'Personal' };
+  const info = await getWorkspaceInfo(id);
   // A team we've left, or one that's read-only: fall back to the open workspace.
   if (!info || info.status !== 'active' || !info.active) return null;
-  return { workspaceId: pref, name: info.name };
+  return { workspaceId: id, name: info.name };
 }
 
-async function mutateFromPage(mutations: Mutation[]): Promise<MutateResponse & { savedTo?: SavedTo }> {
+async function mutateFromPage(mutations: Mutation[], targetId?: string): Promise<MutateResponse & { savedTo?: SavedTo }> {
   const creates = mutations.length === 1 && (
     (mutations[0].op === 'upsertContact' && mutations[0].allowCreate) || mutations[0].op === 'addProfileContact');
   if (!creates) return mutateStore(mutations);
-  const target = await newContactTarget(await getActiveWorkspaceId());
+  const target = await writableTarget(targetId, await getActiveWorkspaceId());
   if (!target) return mutateStore(mutations);
   // Would this create someone in the open workspace? If not it's an update
   // to a contact that already lives here, and stays here.
@@ -278,14 +291,49 @@ async function mutateFromPage(mutations: Mutation[]): Promise<MutateResponse & {
   const trial = applyMutations(current, mutations);
   if (!Object.keys(trial.store.conversations).some((id) => !current.conversations[id])) return mutateStore(mutations);
 
+  const stamped = await withMember(mutations);
   const result = await withStoreLock(async () => {
     const other = await loadStoreIn(target.workspaceId);
-    const { store: next, changed } = applyMutations(other, mutations);
+    const { store: next, changed } = applyMutations(other, stamped);
     return changed ? saveStoreIn(target.workspaceId, next) : { ok: true, pending: 0, itemLimitReached: false } as SaveResult;
   });
   if (isTeamWorkspace(target.workspaceId)) void teamService.syncTeam(target.workspaceId);
   const saved = result.ok || result.pending > 0;
   return { success: saved, changed: false, store: current, result, ...(saved ? { savedTo: target } : { error: result.reason }) };
+}
+
+/**
+ * Move a contact from the open workspace into another one: copied there (with
+ * its history; tags the target doesn't have are dropped, since tag ids are per
+ * workspace), then deleted here. Used right after a contact was captured into
+ * the wrong workspace.
+ */
+async function moveContact(conversationId: string, toId: string): Promise<{ ok: boolean; error?: string; savedTo?: SavedTo }> {
+  const target = await writableTarget(toId, await getActiveWorkspaceId());
+  if (!target) return { ok: false, error: "That workspace can't take contacts (it's read-only, or you're not in it)." };
+  const current = await loadStore();
+  const conv = current.conversations[conversationId];
+  if (!conv) return { ok: false, error: 'That contact is no longer here.' };
+  const saved = await withStoreLock(async () => {
+    const other = await loadStoreIn(target.workspaceId);
+    if (other.conversations[conv.id] || buildThreadIndex(other).has(conv.id.toLowerCase())) {
+      return { ok: true, pending: 0, itemLimitReached: false } as SaveResult; // already there
+    }
+    const tags = conv.tags.filter((t) => !!other.tags[t]);
+    const deleted = { ...(other.deleted || {}) };
+    delete deleted[conv.id];
+    const next: Store = {
+      ...other,
+      conversations: { ...other.conversations, [conv.id]: { ...conv, tags, updatedAt: Date.now() } },
+      history: { ...(other.history || {}), ...(current.history?.[conv.id] ? { [conv.id]: current.history[conv.id] } : {}) },
+      deleted,
+    };
+    return saveStoreIn(target.workspaceId, next);
+  });
+  if (!saved.ok && saved.pending === 0) return { ok: false, error: saved.reason || 'Could not save it there.' };
+  if (isTeamWorkspace(target.workspaceId)) void teamService.syncTeam(target.workspaceId);
+  await mutateStore([{ op: 'deleteContact', conversationId }]);
+  return { ok: true, savedTo: target };
 }
 
 /** Which OTHER workspaces this computer has a copy of `threadId` in (from their local copies). */
@@ -3095,7 +3143,14 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           }
           // `here`: the user asked to save in the open workspace regardless.
           const pageMutations = (request.payload?.mutations || []) as Mutation[];
-          sendResponse(request.payload?.here ? await mutateStore(pageMutations) : await mutateFromPage(pageMutations));
+          sendResponse(request.payload?.here
+            ? await mutateStore(pageMutations)
+            : await mutateFromPage(pageMutations, typeof request.payload?.target === 'string' ? request.payload.target : undefined));
+          break;
+        }
+        case 'MOVE_CONTACT': {
+          if (!(await isSignedIn())) { sendResponse({ ok: false, error: 'Signed out' }); break; }
+          sendResponse(await moveContact(String(request.payload?.conversationId || ''), String(request.payload?.to || '')));
           break;
         }
         case 'CONTACT_ELSEWHERE': {

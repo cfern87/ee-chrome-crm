@@ -38,6 +38,13 @@ import {
   type FollowUpTask, type TaskPatch,
 } from './tasks';
 
+/** A Facebook profile read off a Messenger conversation's header. */
+export interface ThreadProfile {
+  profileUrl?: string;
+  fbUserId?: string;
+  fbUsername?: string;
+}
+
 export type Mutation =
   // Create-or-update the contact for a Messenger sidebar thread. `allowCreate`
   // is false when auto-capture is off or the user removed this person.
@@ -51,6 +58,13 @@ export type Mutation =
       // contact — see NameDiag. Ignored on an update, where the interesting
       // moment has already passed.
       diag?: NameDiag;
+      // Who the open chat is with, read off the conversation header. Saved on
+      // the contact, and used to recognise a contact another team member
+      // already captured under their own (different) chat id.
+      profile?: ThreadProfile;
+      // Team workspaces: the member doing this (stamped by the background).
+      // Their chat goes into memberChats rather than over the shared link.
+      member?: string;
     }
   // Attach a legacy/vanity-keyed contact to the real Messenger thread id.
   | { op: 'bindThread'; conversationId: string; threadId: string; chatUrl?: string }
@@ -106,11 +120,11 @@ export type Mutation =
       run: Omit<AutomationRunInfo, 'changes'>;
       entries: Array<{ conversationId: string; changes: AutomationChange[] }>;
     }
-  | { op: 'setResolvedThread'; conversationId: string; threadId: string; chatUrl?: string }
+  | { op: 'setResolvedThread'; conversationId: string; threadId: string; chatUrl?: string; member?: string }
   // Point a contact at a chat URL that has just been proven to work, without
   // touching its thread ids — the e2ee repair, where the id was right all along
   // and only the route was wrong (see threadUrl.ts).
-  | { op: 'setChatUrl'; conversationId: string; chatUrl: string }
+  | { op: 'setChatUrl'; conversationId: string; chatUrl: string; member?: string }
   // Record what Messenger last showed about OUR last message in one or more
   // threads. Batched because the sweep that produces these reports everything
   // it can see in one pass, and one mutation is one store lock rather than
@@ -209,24 +223,72 @@ function findByProfile(store: Store, profileUrl: string, pageThreadId?: string |
   return null;
 }
 
+/** Whether a store is a team workspace's (its load stamp says so). Member chats only apply there. */
+function inTeam(store: Store): boolean {
+  return !!store.workspace && store.workspace !== 'personal';
+}
+
+/** The contact a header profile points at: by account id, username, or profile URL. */
+function findByThreadProfile(store: Store, p: ThreadProfile | undefined): string | null {
+  if (!p) return null;
+  for (const id of [p.fbUserId, p.fbUsername]) {
+    if (!id) continue;
+    const hit = ownerIdFor(store, id);
+    if (hit) return hit;
+  }
+  if (p.profileUrl) {
+    const pk = profileKey(p.profileUrl);
+    if (pk) for (const c of Object.values(store.conversations)) if (profileKey(c.profileUrl) === pk) return c.id;
+  }
+  return null;
+}
+
+/** Fill in the profile fields a contact is missing. Returns whether anything changed. */
+function backfillProfile(conv: Conversation, p: ThreadProfile | undefined): boolean {
+  if (!p) return false;
+  let changed = false;
+  if (p.fbUserId && !conv.fbUserId) { conv.fbUserId = p.fbUserId; changed = true; }
+  if (p.fbUsername && !conv.fbUsername) { conv.fbUsername = p.fbUsername; changed = true; }
+  if (p.profileUrl && !conv.profileUrl) { conv.profileUrl = p.profileUrl; changed = true; }
+  return changed;
+}
+
+/** Record `member`'s own chat on a contact. Returns whether anything changed. */
+function setMemberChat(conv: Conversation, member: string, threadId: string, chatUrl: string | undefined): boolean {
+  const cur = conv.memberChats?.[member];
+  if (cur && cur.threadId === threadId && (!chatUrl || cur.chatUrl === chatUrl)) return false;
+  conv.memberChats = { ...(conv.memberChats || {}), [member]: { threadId, ...(chatUrl || cur?.chatUrl ? { chatUrl: chatUrl || cur?.chatUrl } : {}) } };
+  return true;
+}
+
 function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
   switch (m.op) {
     case 'upsertContact': {
-      const ownerId = ownerIdFor(store, m.threadId);
+      // A chat id we don't know may still be someone we have — a teammate's
+      // capture of the same person, under THEIR chat id — so match the
+      // conversation header's profile before creating anyone.
+      const ownerId = ownerIdFor(store, m.threadId) || findByThreadProfile(store, m.profile);
+      const memberMode = !!m.member && inTeam(store);
 
       if (ownerId) {
         const conv = { ...store.conversations[ownerId] };
-        let changed = false;
-        // Adopt this sidebar thread id onto the existing record rather than
-        // making a second copy of the same person.
-        if (ownerId !== m.threadId && conv.resolvedThreadId !== m.threadId) {
-          conv.resolvedThreadId = m.threadId;
-          conv.participantId = m.threadId;
-          changed = true;
-        }
-        if (m.chatUrl && m.chatUrl !== conv.chatUrl) {
-          conv.chatUrl = m.chatUrl;
-          changed = true;
+        let changed = backfillProfile(conv, m.profile);
+        if (memberMode) {
+          // In a team this member's chat is theirs alone: recorded under them,
+          // never over the shared link or another member's thread id.
+          if (setMemberChat(conv, m.member!, m.threadId, m.chatUrl)) changed = true;
+        } else {
+          // Adopt this sidebar thread id onto the existing record rather than
+          // making a second copy of the same person.
+          if (ownerId !== m.threadId && conv.resolvedThreadId !== m.threadId) {
+            conv.resolvedThreadId = m.threadId;
+            conv.participantId = m.threadId;
+            changed = true;
+          }
+          if (m.chatUrl && m.chatUrl !== conv.chatUrl) {
+            conv.chatUrl = m.chatUrl;
+            changed = true;
+          }
         }
         // Names. A hand-set name always wins. Beyond that the rule depends on
         // how we found this record:
@@ -269,6 +331,10 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
         updatedAt: now,
         chatUrl: m.chatUrl,
         ...(m.diag ? { nameDiag: m.diag } : {}),
+        ...(m.profile?.fbUserId ? { fbUserId: m.profile.fbUserId } : {}),
+        ...(m.profile?.fbUsername ? { fbUsername: m.profile.fbUsername } : {}),
+        ...(m.profile?.profileUrl ? { profileUrl: m.profile.profileUrl } : {}),
+        ...(memberMode ? { memberChats: { [m.member!]: { threadId: m.threadId, ...(m.chatUrl ? { chatUrl: m.chatUrl } : {}) } } } : {}),
       };
       // Re-adding someone clears their tombstone, so the merge can't undo it.
       delete next.deleted[m.threadId];
@@ -295,6 +361,15 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
     case 'setResolvedThread': {
       const conv = store.conversations[m.conversationId];
       if (!conv) return { store, changed: false };
+      if (m.member && inTeam(store)) {
+        const c = { ...conv };
+        if (!setMemberChat(c, m.member, m.threadId, m.chatUrl ?? `https://www.facebook.com/messages/t/${m.threadId}/`)) {
+          return { store, changed: false, conversationId: m.conversationId };
+        }
+        const next = copy(store);
+        next.conversations[m.conversationId] = { ...c, updatedAt: now };
+        return { store: next, changed: true, conversationId: m.conversationId };
+      }
       if (conv.resolvedThreadId === m.threadId && (!m.chatUrl || conv.chatUrl === m.chatUrl)) {
         return { store, changed: false, conversationId: m.conversationId };
       }
@@ -312,6 +387,14 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
     case 'setChatUrl': {
       const conv = store.conversations[m.conversationId];
       if (!conv) return { store, changed: false };
+      if (m.member && inTeam(store)) {
+        const c = { ...conv };
+        const threadId = c.memberChats?.[m.member]?.threadId || (m.chatUrl.match(/\/t\/([^/?#]+)/)?.[1] ?? c.id);
+        if (!setMemberChat(c, m.member, threadId, m.chatUrl)) return { store, changed: false, conversationId: m.conversationId };
+        const next = copy(store);
+        next.conversations[m.conversationId] = { ...c, updatedAt: now };
+        return { store: next, changed: true, conversationId: m.conversationId };
+      }
       if (conv.chatUrl === m.chatUrl) return { store, changed: false, conversationId: m.conversationId };
       const next = copy(store);
       next.conversations[m.conversationId] = { ...conv, chatUrl: m.chatUrl, updatedAt: now };

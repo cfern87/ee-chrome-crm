@@ -155,6 +155,11 @@ export interface Automation {
   depth: number;
   /** Run automatically this often, in minutes. 0 = only when run by hand. */
   everyMinutes: number;
+  /**
+   * Once-a-day schedules only: the hour (0–23, this computer's local time) it
+   * should run at, roughly. Absent = any time, a day after the last run.
+   */
+  runAtHour?: number;
   order: number;
   createdAt: number;
   updatedAt?: number;
@@ -259,6 +264,8 @@ export function normalizeAutomation(raw: unknown): Automation | null {
     createContacts: o.createContacts === true,
     depth,
     everyMinutes: every,
+    ...(every === DAILY_MINUTES && typeof o.runAtHour === 'number' && Number.isInteger(o.runAtHour) && o.runAtHour >= 0 && o.runAtHour <= 23
+      ? { runAtHour: o.runAtHour } : {}),
     order: typeof o.order === 'number' ? o.order : 0,
     createdAt: typeof o.createdAt === 'number' ? o.createdAt : 0,
     ...(typeof o.updatedAt === 'number' ? { updatedAt: o.updatedAt } : {}),
@@ -612,7 +619,7 @@ export function describeTriggers(a: Automation, store: Pick<Store, 'tags' | 'sav
     const src = a.kind === 'tagUnread'
       ? 'unread conversations'
       : (a.savedSearchId && store.savedSearches[a.savedSearchId] ? `“${store.savedSearches[a.savedSearchId].name}”` : 'a deleted search');
-    out.push(`${describeSchedule(a.everyMinutes)} on ${src}${a.enabled ? '' : ' (paused)'}`);
+    out.push(`${describeSchedule(a.everyMinutes, a.runAtHour)} on ${src}${a.enabled ? '' : ' (paused)'}`);
   }
   for (const t of a.tagTriggers) out.push(`${shortTagTrigger(t, store)}${a.enabled ? '' : ' (paused)'}`);
   return out;
@@ -633,12 +640,30 @@ export function describeTriggers(a: Automation, store: Pick<Store, 'tags' | 'sav
  */
 export function isDue(automation: Automation, lastRunAt: number | undefined, now: number): boolean {
   if (!automation.enabled || automation.everyMinutes <= 0) return false;
+  if (automation.everyMinutes === DAILY_MINUTES && automation.runAtHour !== undefined) {
+    // Once a day at about this hour: due from that hour today, if it hasn't
+    // run since. Before the hour, wait — even on a first run.
+    const at = new Date(now);
+    at.setHours(automation.runAtHour, 0, 0, 0);
+    if (now < at.getTime()) return false;
+    return !lastRunAt || lastRunAt < at.getTime();
+  }
   if (!lastRunAt) return true;
   return now - lastRunAt >= automation.everyMinutes * 60_000 - 60_000;
 }
 
-/** "Every hour", or a fallback for a value typed in elsewhere. */
-export function describeSchedule(everyMinutes: number): string {
+/** Minutes in a day — the "Once a day" schedule, the only one with a time of day. */
+export const DAILY_MINUTES = 1440;
+
+/** "9 AM" / "12 PM" for an hour 0–23. */
+export function formatHour(h: number): string {
+  const d = new Date(2000, 0, 1, h);
+  return d.toLocaleTimeString(undefined, { hour: 'numeric' });
+}
+
+/** "Every hour", or a fallback for a value typed in elsewhere. With `runAtHour`, "Once a day, around 9 AM". */
+export function describeSchedule(everyMinutes: number, runAtHour?: number): string {
+  if (everyMinutes === DAILY_MINUTES && runAtHour !== undefined) return `Once a day, around ${formatHour(runAtHour)}`;
   const hit = SCHEDULE_OPTIONS.find((o) => o.minutes === everyMinutes);
   if (hit) return hit.label;
   return everyMinutes >= 60 && everyMinutes % 60 === 0

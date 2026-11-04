@@ -8,6 +8,21 @@ import { profileKey, extractThreadFromProfileUrl } from './csv';
 import { cleanName, looksLikeName, nameKey } from './names';
 import { tasksOf, pruneDoneTasks, type FollowUpTask } from './tasks';
 
+/**
+ * The chat link to show `member` (actorKey) for this contact in a team: their
+ * own chat if they have one; otherwise — when another member's chat is all
+ * there is, which won't open for them — a link by the person's account id,
+ * which works for anyone; otherwise whatever is stored.
+ */
+export function memberChatUrl(conv: Conversation, member: string | undefined): string | undefined {
+  if (!member) return conv.chatUrl;
+  const own = conv.memberChats?.[member];
+  if (own) return own.chatUrl || `https://www.facebook.com/messages/t/${own.threadId}/`;
+  const others = conv.memberChats && Object.keys(conv.memberChats).length > 0;
+  if (others && conv.fbUserId) return `https://www.facebook.com/messages/t/${conv.fbUserId}/`;
+  return conv.chatUrl;
+}
+
 /** Thread id embedded in a Messenger chat URL, if any. */
 function chatUrlThread(url: string | undefined): string | null {
   const m = (url || '').match(/\/t\/([^/?#]+)/);
@@ -44,6 +59,10 @@ export function threadAliases(conv: Conversation): string[] {
   ];
   const fromChat = chatUrlThread(conv.chatUrl);
   if (fromChat) out.push(fromChat);
+  // Every team member's own chat with them is one of their ids too.
+  for (const mc of Object.values(conv.memberChats || {})) {
+    if (mc?.threadId) out.push(mc.threadId);
+  }
   const fromProfile = extractThreadFromProfileUrl(conv.profileUrl);
   if (fromProfile) out.push(fromProfile.threadId);
   return out.filter((s): s is string => !!s).map((s) => s.toLowerCase());

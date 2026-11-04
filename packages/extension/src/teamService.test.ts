@@ -266,6 +266,26 @@ describe('saving into a workspace that is not open', () => {
   });
 });
 
+describe('chat links per member', () => {
+  it('each member sees their own chat link; saving their view keeps the shared one', async () => {
+    const fake = makeServer();
+    expect((await service(fake.client).createTeam('Acme', 'empty')).ok).toBe(true);
+    const H = await import('./history');
+    const me = H.actorKey('me@x.y');
+    const loaded = await S.loadStore({ maxAgeMs: 0 });
+    const c = { ...conv('p1'), chatUrl: 'https://www.facebook.com/messages/t/OTHER/', memberChats: { [me]: { threadId: 'MINE', chatUrl: 'https://www.facebook.com/messages/t/MINE/' } } };
+    expect((await S.saveStore({ ...loaded, conversations: { p1: c } })).ok).toBe(true);
+    S.invalidateLoadCache();
+    const view = await S.loadStore({ maxAgeMs: 0 });
+    expect(view.conversations.p1.chatUrl).toBe('https://www.facebook.com/messages/t/MINE/');
+    // Save the member's view straight back: the stored shared link is unchanged.
+    expect((await S.saveStore({ ...view, conversations: { ...view.conversations, p1: { ...view.conversations.p1, tags: ['x'] } } })).ok).toBe(true);
+    const stored = (await S.readTeamCache('t1'))!;
+    expect(stored.conversations.p1.chatUrl).toBe('https://www.facebook.com/messages/t/OTHER/');
+    expect(stored.conversations.p1.tags).toEqual(['x']);
+  });
+});
+
 describe('delete a team after merging it', () => {
   async function teamWith(ids: string[], jobIds: string[]) {
     const fake = makeServer();

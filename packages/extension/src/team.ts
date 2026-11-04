@@ -64,13 +64,6 @@ export const SETUP_GONE_MS = 30 * 60_000;
  */
 export const WORKSPACE_NOTICE_KEY = 'crm_workspace_notice';
 
-/**
- * chrome.storage.local key: which workspace contacts first saved from
- * Messenger or a profile page go to. Absent / '' = whichever is open (the
- * default). Per browser — it's how this person works on this computer.
- */
-export const NEW_CONTACT_TARGET_KEY = 'crm_new_contact_workspace';
-
 export interface WorkspaceNotice {
   at: number;
   text: string;
