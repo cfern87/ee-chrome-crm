@@ -26,6 +26,10 @@ export const TEAM_SETUP_PENDING_MESSAGE =
   'The server side of team workspaces is not set up yet (the Supabase tables/functions are missing).';
 
 export type TeamRole = 'owner' | 'member';
+export type SeatPurchasePolicy = 'owner' | 'members';
+
+/** Pricing line used wherever teams are described. */
+export const TEAM_PRICING_COPY = 'Teams include 2 seats (you included). Extra seats are $20/seat per month.';
 
 export interface WorkspaceInfo {
   /** Team id (uuid). */
@@ -35,8 +39,20 @@ export interface WorkspaceInfo {
   /** 'invited' = waiting for this user to accept. */
   status: 'invited' | 'active';
   ownerEmail: string;
+  /** Members plus pending invites — both take a seat. */
   memberCount: number;
+  /** Seats the team can fill right now (included + paid, capped at maxSeats). */
   seatLimit: number;
+  /** Included seats (2, or an admin's override). */
+  freeSeats: number;
+  /** Seats currently paid for. */
+  paidSeats: number;
+  /** Hard maximum for the team. */
+  maxSeats: number;
+  /** Who may buy seats: the owner only, or any active member. */
+  seatPurchasePolicy: SeatPurchasePolicy;
+  /** How many more seats the signed-in user can buy for this team (0 = can't). */
+  seatsBuyable: number;
   /** False when the owner's Pro plan has lapsed: the workspace is read-only. */
   active: boolean;
 }
@@ -205,6 +221,9 @@ function firstRow(data: unknown): Record<string, unknown> | null {
 }
 
 function toWorkspace(r: Record<string, unknown>): WorkspaceInfo {
+  const num = (v: unknown, fallback: number) =>
+    (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? fallback : Number(v));
+  const seatLimit = num(r.seat_limit, 0);
   return {
     id: String(r.team_id ?? ''),
     name: String(r.name ?? 'Team'),
@@ -212,7 +231,13 @@ function toWorkspace(r: Record<string, unknown>): WorkspaceInfo {
     status: r.status === 'invited' ? 'invited' : 'active',
     ownerEmail: String(r.owner_email ?? ''),
     memberCount: Number(r.member_count ?? 0) || 0,
-    seatLimit: Number(r.seat_limit ?? 0) || 0,
+    seatLimit,
+    // Older servers send only seat_limit: treat it all as included, none buyable.
+    freeSeats: num(r.free_seats, seatLimit),
+    paidSeats: num(r.paid_seats, 0),
+    maxSeats: num(r.max_seats, seatLimit),
+    seatPurchasePolicy: r.seat_purchase_policy === 'members' ? 'members' : 'owner',
+    seatsBuyable: num(r.seats_buyable, 0),
     active: r.active !== false,
   };
 }
@@ -266,6 +291,11 @@ export function makeTeamClient(deps: TeamClientDeps) {
       return failed(r) ? r : { ok: true };
     },
 
+    async setSeatPurchasePolicy(teamId: string, policy: SeatPurchasePolicy): Promise<{ ok: true } | Fail> {
+      const r = await rpc('crm_team_set_seat_purchase_policy', { p_team: teamId, p_policy: policy });
+      return failed(r) ? r : { ok: true };
+    },
+
     async remove(teamId: string, email: string): Promise<{ ok: true } | Fail> {
       const r = await rpc('crm_remove_member', { p_team: teamId, p_email: email });
       return failed(r) ? r : { ok: true };
@@ -310,4 +340,30 @@ export type TeamClient = ReturnType<typeof makeTeamClient>;
 /** True when an error means this user is no longer in the team. */
 export function isNotMemberError(error: string | undefined): boolean {
   return !!error && /not a member/i.test(error);
+}
+
+// ---- seats (the backend does the math; these only word it) ----
+
+/** crm_invite_member's error when the team has no free seat. */
+export function isTeamFullError(error: string | undefined): boolean {
+  return !!error && /^This team is full/i.test(error.trim());
+}
+
+/** Where seats are bought: the website, with this team's card highlighted. */
+export function addSeatsUrl(teamId: string): string {
+  return `https://notanothersocialcrm.com/account/teams?team=${encodeURIComponent(teamId)}`;
+}
+
+/** "2 included + 1 paid · max 10". */
+export function seatBreakdown(w: WorkspaceInfo): string {
+  return `${w.freeSeats} included${w.paidSeats > 0 ? ` + ${w.paidSeats} paid` : ''} · max ${w.maxSeats}`;
+}
+
+/** Why this user can't add seats to the team, or null when they can (or no reason applies). */
+export function addSeatsBlockedReason(w: WorkspaceInfo): string | null {
+  if (w.seatsBuyable > 0) return null;
+  if (!w.active) return 'The team owner needs an active Pro plan before seats can be added.';
+  if (w.role !== 'owner' && w.seatPurchasePolicy === 'owner') return 'Only the team owner can add seats.';
+  if (w.seatLimit >= w.maxSeats) return `This team has the maximum of ${w.maxSeats} seats.`;
+  return null;
 }

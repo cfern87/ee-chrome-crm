@@ -64,7 +64,8 @@ function makeServer(me = 'me@x.y') {
   const teams = new Map<string, FakeTeam>();
   const state = { failPut: false, failGet: false, deleted: [] as string[] };
   const info = (id: string, name: string, over: Partial<WorkspaceInfo> = {}): WorkspaceInfo => ({
-    id, name, role: 'owner', status: 'active', ownerEmail: me, memberCount: 1, seatLimit: 5, active: true, ...over,
+    id, name, role: 'owner', status: 'active', ownerEmail: me, memberCount: 1, seatLimit: 5, active: true,
+    freeSeats: 2, paidSeats: 3, maxSeats: 10, seatPurchasePolicy: 'owner', seatsBuyable: 5, ...over,
   });
   const client = {
     async myWorkspaces() { return { ok: true as const, list: [...teams.values()].map((t) => t.info) }; },

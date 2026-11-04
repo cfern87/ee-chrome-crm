@@ -3450,6 +3450,11 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           sendResponse(await teamService.invite(String(request.payload?.teamId || ''), String(request.payload?.email || '')));
           break;
         }
+        case 'TEAM_SET_SEAT_POLICY': {
+          const policy = request.payload?.policy === 'members' ? 'members' : 'owner';
+          sendResponse(await teamService.setSeatPurchasePolicy(String(request.payload?.teamId || ''), policy));
+          break;
+        }
         case 'TEAM_REMOVE_MEMBER': {
           sendResponse(await teamService.removeMember(String(request.payload?.teamId || ''), String(request.payload?.email || '')));
           break;

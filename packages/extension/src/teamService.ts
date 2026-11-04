@@ -12,9 +12,9 @@ import {
 import { normalizeStoreShape } from './drive';
 import {
   PERSONAL_WORKSPACE, WORKSPACES_CACHE_KEY, getActiveWorkspaceId, getCachedWorkspaces,
-  isNotMemberError, isTeamWorkspace, localSet, patchTeamSyncMeta, getTeamSyncMeta,
+  isNotMemberError, isTeamFullError, isTeamWorkspace, localSet, patchTeamSyncMeta, getTeamSyncMeta,
   SETUP_GONE_MS, WORKSPACE_NOTICE_KEY, type WorkspaceNotice,
-  type TeamClient, type TeamSyncMeta, type WorkspaceInfo, type WorkspacesCache,
+  type SeatPurchasePolicy, type TeamClient, type TeamSyncMeta, type WorkspaceInfo, type WorkspacesCache,
 } from './team';
 import { syncTeamOnce, type TeamSyncResult } from './teamSync';
 import { foldWorkspaceInto, personalAfterMove, teamSeedFrom, type TeamSeed } from './workspaceTransfer';
@@ -293,7 +293,15 @@ export function makeTeamService(deps: TeamServiceDeps) {
 
   async function invite(teamId: string, email: string): Promise<Ok | Err> {
     const r = await client.invite(teamId, email.trim());
-    if (r.ok) await refreshWorkspaces();
+    // A "team is full" answer means our seat numbers are stale: refresh them too.
+    if (r.ok || isTeamFullError((r as Err).error)) await refreshWorkspaces();
+    return r as Ok | Err;
+  }
+
+  /** Owner only: whether any active member may buy seats, or just the owner. */
+  async function setSeatPurchasePolicy(teamId: string, policy: SeatPurchasePolicy): Promise<Ok | Err> {
+    const r = await client.setSeatPurchasePolicy(teamId, policy);
+    await refreshWorkspaces();
     return r as Ok | Err;
   }
 
@@ -370,7 +378,7 @@ export function makeTeamService(deps: TeamServiceDeps) {
 
   return {
     getWorkspaces, refreshWorkspaces, syncActiveTeam, onStoreChanged, onAlarm, switchTo,
-    createTeam, invite, removeMember, accept, leave, deleteTeam, mayRunScheduledAutomations, mergeTargets,
+    createTeam, invite, setSeatPurchasePolicy, removeMember, accept, leave, deleteTeam, mayRunScheduledAutomations, mergeTargets,
     members: (teamId: string) => client.members(teamId),
     /** Push/pull one team now, open or not (after a write into a team that isn't open). */
     syncTeam: (teamId: string) => syncOnce(teamId),

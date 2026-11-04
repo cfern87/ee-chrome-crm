@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { makeTeamClient, TEAM_SETUP_PENDING_MESSAGE, isNotMemberError, isTeamWorkspace, PERSONAL_WORKSPACE } from './team';
+import {
+  makeTeamClient, TEAM_SETUP_PENDING_MESSAGE, isNotMemberError, isTeamWorkspace, PERSONAL_WORKSPACE,
+  addSeatsBlockedReason, addSeatsUrl, isTeamFullError, seatBreakdown, type WorkspaceInfo,
+} from './team';
 
 function client(reply: (url: string, body: unknown) => { status?: number; json: unknown }, token: string | null = 'jwt') {
   const calls: { url: string; body: unknown; headers: Record<string, string> }[] = [];
@@ -32,12 +35,33 @@ describe('team client', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('maps workspace rows', async () => {
+  it('maps workspace rows, including seats', async () => {
     const { c } = client(() => ({
-      json: [{ team_id: 't1', name: 'Acme', role: 'owner', status: 'active', owner_email: 'a@x', member_count: 3, seat_limit: 10, active: false }],
+      json: [{
+        team_id: 't1', name: 'Acme', role: 'owner', status: 'active', owner_email: 'a@x', member_count: 3, seat_limit: 3, active: false,
+        free_seats: 2, paid_seats: 1, max_seats: 10, seat_purchase_policy: 'members', seats_buyable: 7,
+      }],
     }));
     const r = await c.myWorkspaces();
-    expect(r).toEqual({ ok: true, list: [{ id: 't1', name: 'Acme', role: 'owner', status: 'active', ownerEmail: 'a@x', memberCount: 3, seatLimit: 10, active: false }] });
+    expect(r).toEqual({ ok: true, list: [{
+      id: 't1', name: 'Acme', role: 'owner', status: 'active', ownerEmail: 'a@x', memberCount: 3, seatLimit: 3, active: false,
+      freeSeats: 2, paidSeats: 1, maxSeats: 10, seatPurchasePolicy: 'members', seatsBuyable: 7,
+    }] });
+  });
+
+  it('reads rows from a server without seat columns', async () => {
+    const { c } = client(() => ({
+      json: [{ team_id: 't1', name: 'Acme', role: 'member', status: 'active', owner_email: 'a@x', member_count: 3, seat_limit: 10, active: true }],
+    }));
+    const r = await c.myWorkspaces();
+    expect(r).toMatchObject({ ok: true, list: [{ seatLimit: 10, freeSeats: 10, paidSeats: 0, maxSeats: 10, seatPurchasePolicy: 'owner', seatsBuyable: 0 }] });
+  });
+
+  it('sets the seat purchase policy', async () => {
+    const { c, calls } = client(() => ({ json: null }));
+    expect(await c.setSeatPurchasePolicy('t1', 'members')).toEqual({ ok: true });
+    expect(calls[0].url).toBe('https://sb.example/rest/v1/rpc/crm_team_set_seat_purchase_policy');
+    expect(calls[0].body).toEqual({ p_team: 't1', p_policy: 'members' });
   });
 
   it('recognises a server without the team functions', async () => {
@@ -74,5 +98,34 @@ describe('helpers', () => {
     expect(isTeamWorkspace('abc')).toBe(true);
     expect(isNotMemberError('not a member of this team')).toBe(true);
     expect(isNotMemberError('network down')).toBe(false);
+  });
+});
+
+describe('seats', () => {
+  const team = (over: Partial<WorkspaceInfo> = {}): WorkspaceInfo => ({
+    id: 't1', name: 'Acme', role: 'owner', status: 'active', ownerEmail: 'a@x', memberCount: 2, seatLimit: 2, active: true,
+    freeSeats: 2, paidSeats: 0, maxSeats: 10, seatPurchasePolicy: 'owner', seatsBuyable: 8, ...over,
+  });
+
+  it('words the breakdown', () => {
+    expect(seatBreakdown(team())).toBe('2 included · max 10');
+    expect(seatBreakdown(team({ paidSeats: 1 }))).toBe('2 included + 1 paid · max 10');
+    expect(seatBreakdown(team({ freeSeats: 5 }))).toBe('5 included · max 10');
+  });
+
+  it('explains why seats cannot be added', () => {
+    expect(addSeatsBlockedReason(team())).toBeNull();
+    expect(addSeatsBlockedReason(team({ seatsBuyable: 0, active: false }))).toMatch(/active Pro plan/);
+    expect(addSeatsBlockedReason(team({ seatsBuyable: 0, role: 'member' }))).toBe('Only the team owner can add seats.');
+    expect(addSeatsBlockedReason(team({ seatsBuyable: 0, seatLimit: 10 }))).toBe('This team has the maximum of 10 seats.');
+    // Members may buy, but the team is at max.
+    expect(addSeatsBlockedReason(team({ seatsBuyable: 0, role: 'member', seatPurchasePolicy: 'members', seatLimit: 10 }))).toMatch(/maximum/);
+  });
+
+  it('recognises the "team is full" errors and links to the website', () => {
+    expect(isTeamFullError('This team is full (2 seats). Add seats at notanothersocialcrm.com/account/teams')).toBe(true);
+    expect(isTeamFullError('This team is full (10 seats, the maximum).')).toBe(true);
+    expect(isTeamFullError('Only the team owner can invite.')).toBe(false);
+    expect(addSeatsUrl('abc')).toBe('https://notanothersocialcrm.com/account/teams?team=abc');
   });
 });

@@ -5,12 +5,13 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { PLATFORM_URL } from '../license';
 import {
-  ACTIVE_WORKSPACE_KEY, PERSONAL_WORKSPACE, WORKSPACES_CACHE_KEY, WORKSPACE_NOTICE_KEY, isTeamWorkspace,
-  localGet, localSet, type TeamMember, type WorkspaceInfo, type WorkspaceNotice,
+  ACTIVE_WORKSPACE_KEY, PERSONAL_WORKSPACE, TEAM_PRICING_COPY, WORKSPACES_CACHE_KEY, WORKSPACE_NOTICE_KEY,
+  addSeatsBlockedReason, addSeatsUrl, isTeamFullError, isTeamWorkspace, localGet, localSet, seatBreakdown,
+  type TeamMember, type WorkspaceInfo, type WorkspaceNotice,
 } from '../team';
 import type { WorkspacesView } from '../teamService';
 import type { TeamSeed } from '../workspaceTransfer';
-import { Banner, Button, Card, Input, Select, Stack, Text, color, space } from '../ui/primitives';
+import { Banner, Button, ButtonLink, Card, Input, Select, Stack, Text, Toggle, color, space } from '../ui/primitives';
 import { sendBg, formatRelativeTime } from './shared';
 
 type Result = { ok: boolean; error?: string; warning?: string };
@@ -116,14 +117,31 @@ export function TeamPanel() {
   const [status, setStatus] = useState<{ tone: 'success' | 'warning' | 'danger' | 'info'; msg: string } | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const run = async (message: unknown, success: string, timeout = 30_000) => {
+  // Seats are bought on the website; refetch when the user comes back so new
+  // seats show up. Throttled: focus and visibility often fire together.
+  useEffect(() => {
+    let last = 0;
+    const onBack = () => {
+      if (document.visibilityState !== 'visible' || Date.now() - last < 3000) return;
+      last = Date.now();
+      void reload(true);
+    };
+    window.addEventListener('focus', onBack);
+    document.addEventListener('visibilitychange', onBack);
+    return () => {
+      window.removeEventListener('focus', onBack);
+      document.removeEventListener('visibilitychange', onBack);
+    };
+  }, [reload]);
+
+  const run: Run = async (message, success, timeout = 30_000, onError) => {
     setBusy(true);
     setStatus(null);
     const r = await sendBg<Result>(message, timeout);
     setBusy(false);
     if (r?.ok && r.warning) setStatus({ tone: 'warning', msg: r.warning });
     else if (r?.ok) setStatus({ tone: 'success', msg: success });
-    else setStatus({ tone: 'danger', msg: r?.error || 'No answer from the extension. Try again.' });
+    else if (!(r?.error && onError?.(r.error))) setStatus({ tone: 'danger', msg: r?.error || 'No answer from the extension. Try again.' });
     await reload();
     return !!r?.ok;
   };
@@ -149,7 +167,8 @@ export function TeamPanel() {
       </Stack>
       <Text as="p" size="small" tone="muted" leading="relaxed" style={{ margin: `${space.xs}px 0 ${space.md}px` }}>
         Share one set of contacts with your team. Everyone you invite gets a workspace switcher and can read and
-        edit the shared contacts; your personal workspace stays private. Billing stays on your account.
+        edit the shared contacts; your personal workspace stays private. Billing stays on your account.{' '}
+        {TEAM_PRICING_COPY}
       </Text>
 
       {setupPending && <Banner tone="warning">{view.error}</Banner>}
@@ -197,7 +216,7 @@ function ProGate() {
     <div style={{ padding: space.md, background: color.surface.sunken, borderRadius: 8 }}>
       <Text as="p" size="small" style={{ margin: `0 0 ${space.sm}px` }}>
         <strong>Team workspaces are part of Pro.</strong> Upgrade to invite teammates to a shared set of contacts.
-        Invited teammates don't need their own subscription.
+        Invited teammates don't need their own subscription. {TEAM_PRICING_COPY}
       </Text>
       <a href={`${PLATFORM_URL}/account/billing`} target="_blank" rel="noopener noreferrer"
         style={{ display: 'inline-block', background: color.special.base, color: color.surface.raised, textDecoration: 'none', padding: '8px 14px', borderRadius: 6, fontWeight: 600, fontSize: 13 }}>
@@ -207,7 +226,8 @@ function ProGate() {
   );
 }
 
-type Run = (message: unknown, success: string, timeout?: number) => Promise<boolean>;
+/** `onError` may claim an error (return true) to show it its own way instead of in the status line. */
+type Run = (message: unknown, success: string, timeout?: number, onError?: (error: string) => boolean) => Promise<boolean>;
 
 const SEED_CHOICES: { id: TeamSeed; label: string; hint: string }[] = [
   {
@@ -293,6 +313,59 @@ function CreateTeam({ busy, run }: { busy: boolean; run: Run }) {
   );
 }
 
+/** Opens the website's seat checkout for this team in a new tab. */
+function AddSeatsButton({ team }: { team: WorkspaceInfo }) {
+  return (
+    <ButtonLink variant="secondary" size="sm" href={addSeatsUrl(team.id)} target="_blank" rel="noopener noreferrer">
+      Add seats
+    </ButtonLink>
+  );
+}
+
+/**
+ * "3 of 4 seats used", the included/paid/max breakdown, and either the
+ * "Add seats" button or why there isn't one. All numbers come from the server.
+ */
+function SeatInfo({ team }: { team: WorkspaceInfo }) {
+  const reason = addSeatsBlockedReason(team);
+  return (
+    <Stack gap="xs">
+      <Stack direction="row" align="center" justify="space-between" gap="sm" wrap>
+        <div>
+          <Text as="div" size="small">{team.memberCount} of {team.seatLimit} seats used</Text>
+          <Text as="div" size="micro" tone="muted">{seatBreakdown(team)}</Text>
+        </div>
+        {team.seatsBuyable > 0 && <AddSeatsButton team={team} />}
+      </Stack>
+      {team.memberCount > team.seatLimit && (
+        <Text as="div" size="micro" tone="warning">
+          This team has more people than seats. Everyone stays, but no one new can be invited until seats are added.
+        </Text>
+      )}
+      {reason && <Text as="div" size="micro" tone="muted">{reason}</Text>}
+    </Stack>
+  );
+}
+
+/** Owner only: "Let members buy seats". */
+function SeatPolicyToggle({ team, busy, run }: { team: WorkspaceInfo; busy: boolean; run: Run }) {
+  const on = team.seatPurchasePolicy === 'members';
+  return (
+    <div>
+      <Toggle
+        label="Let members buy seats"
+        checked={on}
+        disabled={busy}
+        onChange={(e) => void run(
+          { type: 'TEAM_SET_SEAT_POLICY', payload: { teamId: team.id, policy: e.target.checked ? 'members' : 'owner' } },
+          e.target.checked ? 'Members can now add seats to this team.' : 'Only you can add seats to this team now.',
+        )}
+      />
+      <Text as="div" size="micro" tone="muted">When off, only you can add seats to this team.</Text>
+    </div>
+  );
+}
+
 function MemberOfRow({ w, busy, active, onLeave }: { w: WorkspaceInfo; busy: boolean; active: boolean; onLeave: () => void }) {
   const [confirm, setConfirm] = useState(false);
   return (
@@ -303,6 +376,7 @@ function MemberOfRow({ w, busy, active, onLeave }: { w: WorkspaceInfo; busy: boo
       {!w.active && (
         <Text as="div" size="micro" tone="warning">Read-only: the owner's Pro plan isn't active.</Text>
       )}
+      <div style={{ marginTop: space.sm }}><SeatInfo team={w} /></div>
       <div style={{ marginTop: space.sm }}>
         {confirm ? (
           <Stack direction="row" gap="sm" align="center">
@@ -321,7 +395,12 @@ function MemberOfRow({ w, busy, active, onLeave }: { w: WorkspaceInfo; busy: boo
 function OwnerTeam({ team, view, busy, run }: { team: WorkspaceInfo; view: WorkspacesView; busy: boolean; run: Run }) {
   const [members, setMembers] = useState<TeamMember[] | null>(null);
   const [email, setEmail] = useState('');
+  // The server's "This team is full…" answer, shown with the Add seats button.
+  const [fullError, setFullError] = useState('');
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const full = team.memberCount >= team.seatLimit;
+  // Seats bought (or freed) since the "full" answer: drop it.
+  useEffect(() => { setFullError(''); }, [team.seatLimit, team.memberCount]);
   // Where the team's data goes before it's deleted ('' = nowhere).
   const [mergeInto, setMergeInto] = useState<string>(PERSONAL_WORKSPACE);
   const mergeTargets = joined(view.list).filter((w) => w.id !== team.id && w.active);
@@ -332,8 +411,8 @@ function OwnerTeam({ team, view, busy, run }: { team: WorkspaceInfo; view: Works
   }, [team.id]);
   useEffect(() => { void loadMembers(); }, [loadMembers, team.memberCount]);
 
-  const act: Run = async (message, success, timeout) => {
-    const ok = await run(message, success, timeout);
+  const act: Run = async (message, success, timeout, onError) => {
+    const ok = await run(message, success, timeout, onError);
     await loadMembers();
     return ok;
   };
@@ -344,7 +423,7 @@ function OwnerTeam({ team, view, busy, run }: { team: WorkspaceInfo; view: Works
   return (
     <Stack gap="sm">
       <Text as="div" size="small">
-        You own <strong>{team.name}</strong> · {team.memberCount} of {team.seatLimit} seats used
+        You own <strong>{team.name}</strong>
         {!team.active && <Text size="small" tone="warning"> · read-only until your Pro plan is active again</Text>}
       </Text>
       {sync && (
@@ -375,20 +454,36 @@ function OwnerTeam({ team, view, busy, run }: { team: WorkspaceInfo; view: Works
         {members === null && <div style={{ padding: space.md }}><Text size="small" tone="muted">Loading members…</Text></div>}
       </div>
 
+      <SeatInfo team={team} />
+
       <form
         onSubmit={(e) => {
           e.preventDefault();
           const to = email.trim();
-          if (!to) return;
+          if (!to || full) return;
+          setFullError('');
           void act({ type: 'TEAM_INVITE', payload: { teamId: team.id, email: to } },
-            `Invited ${to}. They'll see the invite under Settings → Account & plan after signing in to the extension with that email.`)
+            `Invited ${to}. They'll see the invite under Settings → Account & plan after signing in to the extension with that email.`,
+            undefined,
+            (error) => { if (!isTeamFullError(error)) return false; setFullError(error); return true; })
             .then((ok) => { if (ok) setEmail(''); });
         }}
         style={{ display: 'flex', gap: space.sm }}
       >
-        <Input type="email" placeholder="teammate@company.com" value={email} onChange={(e) => setEmail(e.target.value)} style={{ flex: 1 }} />
-        <Button type="submit" variant="primary" disabled={busy || !email.trim() || !team.active}>Invite</Button>
+        <Input type="email" placeholder={full ? 'All seats are taken' : 'teammate@company.com'} value={email}
+          disabled={full || !team.active} onChange={(e) => setEmail(e.target.value)} style={{ flex: 1 }} />
+        <Button type="submit" variant="primary" disabled={busy || full || !email.trim() || !team.active}>Invite</Button>
       </form>
+      {fullError && (
+        <Banner tone="warning" live>
+          <Stack direction="row" align="center" justify="space-between" gap="sm" wrap>
+            <span>{fullError}</span>
+            {team.seatsBuyable > 0 && <AddSeatsButton team={team} />}
+          </Stack>
+        </Banner>
+      )}
+
+      <SeatPolicyToggle team={team} busy={busy} run={run} />
 
       <Stack direction="row" gap="sm" align="center">
         {!inThisTeam && (
