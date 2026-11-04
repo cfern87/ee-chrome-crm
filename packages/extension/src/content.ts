@@ -668,7 +668,12 @@ function openThreadProfile(): ThreadProfile | null {
   const top = main.getBoundingClientRect().top;
   for (const a of Array.from(main.querySelectorAll<HTMLAnchorElement>('a[href]'))) {
     const r = a.getBoundingClientRect();
-    if (!r.width || r.top - top > 140) continue; // header strip only
+    // Header strip only: from the pane's top edge down ~140px. Messages
+    // scrolled up out of view sit ABOVE the top (negative offset) and can hold
+    // links to other people's profiles, so those don't count either.
+    // Measured 2026-11-03: the name/avatar links sit ~22px and ~110px down.
+    const dy = r.top - top;
+    if (!r.width || dy < -4 || dy > 140) continue;
     let u: URL;
     try { u = new URL(a.href, location.href); } catch { continue; }
     if (!/(^|\.)facebook\.com$/i.test(u.hostname)) continue;
