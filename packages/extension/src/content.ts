@@ -1785,12 +1785,13 @@ function tasksSectionHtml(conv: Conversation): string {
     .map((c) => `<option value="${c.value}"${c.value === taskDraft.due ? ' selected' : ''}>${c.label}</option>`)
     .join('');
 
-  // The date field only exists while "Pick a date…" is chosen. It sits on its
+  // The date field shows only while "Pick a date…" is chosen. It sits on its
   // own line: the add row is already three controls wide in a 320px panel.
-  const datePicker = taskDraft.due === PANEL_DUE_CUSTOM
-    ? `<input type="date" id="fb-crm-task-date" class="fb-crm-task-date" aria-label="Due date"
-         min="${dateInputValue(Date.now())}" max="${dateInputValue(Date.now() + 5 * 366 * 86_400_000)}" value="${escapeAttr(taskDraft.date)}" />`
-    : '';
+  // Always rendered (hidden otherwise) so choosing it in the select only
+  // toggles visibility: redrawing the panel to add it replaced the element
+  // under the open calendar, which left the calendar frozen.
+  const datePicker = `<input type="date" id="fb-crm-task-date" class="fb-crm-task-date" aria-label="Due date"
+         min="${dateInputValue(Date.now())}" max="${dateInputValue(Date.now() + 5 * 366 * 86_400_000)}" value="${escapeAttr(taskDraft.date)}"${taskDraft.due === PANEL_DUE_CUSTOM ? '' : ' style="display:none"'} />`;
 
   const count = open.length ? `<span class="fb-crm-task-count${overdue ? ' fb-crm-task-count--overdue' : ''}">${open.length} open${overdue ? ` · ${overdue} overdue` : ''}</span>` : '';
   if (collapsedSections.has('followUps')) {
@@ -2041,7 +2042,35 @@ function renderSavedElsewhere(name: string, to: SavedTo, strip: string, saveHere
   panelEl.querySelector('#fb-crm-save-here')?.addEventListener('click', () => void panelAction(saveHere));
 }
 
+// While the follow-up calendar is open, a redraw (a message arriving is a
+// store write, and every write redraws) would replace the date field under it
+// and leave the calendar frozen. Redraws wait until it closes. The browser
+// says nothing when the calendar is dismissed by clicking away, so the hold
+// also ends on any click in the page (capture phase, so the clicked control's
+// own handler still runs before the deferred redraw) and after a minute.
+let datePickerOpenedAt = 0;
+let renderDeferred = false;
+const DATE_PICKER_HOLD_MS = 60_000;
+
+function datePickerHolding(): boolean {
+  return datePickerOpenedAt > 0 && Date.now() - datePickerOpenedAt < DATE_PICKER_HOLD_MS;
+}
+
+function closeDatePicker(): void {
+  if (!datePickerOpenedAt) return;
+  datePickerOpenedAt = 0;
+  if (renderDeferred) {
+    renderDeferred = false;
+    // After the change/blur handlers have finished with the old element.
+    setTimeout(() => { if (panelEl && panelEl.style.display !== 'none') void renderPanel(); }, 0);
+  }
+}
+
+document.addEventListener('click', () => closeDatePicker(), true);
+
 async function renderPanel(): Promise<void> {
+  if (datePickerHolding()) { renderDeferred = true; return; }
+  datePickerOpenedAt = 0;
   await renderPanelContent();
   restorePanelScroll();
   if (panelAnchor) positionPanelAt(panelAnchor);
@@ -2652,19 +2681,29 @@ function wirePanelTasks(conv: Conversation) {
   titleEl.addEventListener('focus', () => { taskTitleFocused = true; });
   titleEl.addEventListener('blur', () => { taskTitleFocused = false; });
   titleEl.addEventListener('keydown', e => { if (e.key === 'Enter') addEl.click(); });
-  dueEl.addEventListener('change', async () => {
+  // Calendar only: typed digits in the year segment run on to six places
+  // ("20266") and produce dates nobody meant. Every key but Tab/Escape is
+  // swallowed, and the calendar opens on click or focus instead.
+  const openCalendar = () => {
+    if (!dateEl) return;
+    try {
+      dateEl.showPicker();
+      datePickerOpenedAt = Date.now();
+    } catch { /* needs a user gesture */ }
+  };
+  dueEl.addEventListener('change', () => {
     taskDraft.due = dueEl.value;
-    // Choosing (or leaving) "Pick a date…" adds or removes the date field, so
-    // the section has to be redrawn. Every other choice needs no repaint.
-    if (taskDraft.due === PANEL_DUE_CUSTOM || dateEl) await renderPanel();
+    // Only the date field's visibility changes — no redraw, so the calendar
+    // opens on the element that stays in the page.
+    if (!dateEl) return;
+    const custom = taskDraft.due === PANEL_DUE_CUSTOM;
+    dateEl.style.display = custom ? '' : 'none';
+    if (custom && !taskDraft.date) openCalendar();
+    else if (!custom) closeDatePicker();
   });
   if (dateEl) {
-    // Calendar only: typed digits in the year segment run on to six places
-    // ("20266") and produce dates nobody meant. Every key but Tab/Escape is
-    // swallowed, and the calendar opens on click or focus instead.
-    const openCalendar = () => { try { dateEl.showPicker(); } catch { /* needs a user gesture */ } };
     dateEl.addEventListener('keydown', e => {
-      if (e.key === 'Tab' || e.key === 'Escape') return;
+      if (e.key === 'Tab' || e.key === 'Escape') { closeDatePicker(); return; }
       e.preventDefault();
       if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown') openCalendar();
     });
@@ -2674,9 +2713,8 @@ function wirePanelTasks(conv: Conversation) {
       // Backstop for a value that got in anyway: outside min..max means a bad year.
       if (dateEl.value && (dateEl.value < dateEl.min || dateEl.value > dateEl.max)) dateEl.value = '';
       taskDraft.date = dateEl.value;
+      closeDatePicker();
     });
-    // Just chosen from the select: show the calendar straight away.
-    if (!taskDraft.date) openCalendar();
   }
 
   addEl.addEventListener('click', async () => {
