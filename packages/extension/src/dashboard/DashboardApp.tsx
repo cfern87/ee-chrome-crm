@@ -2161,6 +2161,19 @@ export default function DashboardApp() {
                 )}
               </div>
 
+              {/* The saved search in use, by name, so it reads without opening
+                  Advanced search. */}
+              {activePresetId && store.savedSearches[activePresetId] && (
+                <Text
+                  size="micro"
+                  weight="bold"
+                  title={store.savedSearches[activePresetId].name}
+                  style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                >
+                  Saved search: {store.savedSearches[activePresetId].name}{presetDirty && ' (edited)'}
+                </Text>
+              )}
+
               {!isQueryEmpty(query) && !showBuilder && (
                 <Text size="micro" tone="muted" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {describeQuery(query, queryCtx)}

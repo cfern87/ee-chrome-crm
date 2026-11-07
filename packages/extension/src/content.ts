@@ -1325,6 +1325,11 @@ function resetPanelPosition(): void {
 const newTagDraft: { name: string; color: string } = { name: '', color: randomColor() };
 let newTagNameFocused = false;
 
+// The "Add existing tag" search box. Module scope for the same reason: a
+// redraw mid-typing must keep the query (and focus). Cleared per contact.
+let tagSearchQuery = '';
+let tagSearchFocused = false;
+
 // In-progress custom-field edits, keyed by field id, for the same reason as
 // newTagDraft: any storage change rebuilds the panel, and without this a
 // half-typed value would be replaced by the stored one mid-keystroke. An entry
@@ -1481,8 +1486,10 @@ function tagSectionHtml(opts: {
   emptyHtml?: string;
   /** Collapsible (account-wide) under this id. */
   section?: PanelSection;
+  /** A search box above the chips that filters them by name (wirePanelTagSearch). */
+  searchable?: boolean;
 }): string {
-  const { title, tags, groups, grouped, toggleKey, chip, emptyHtml, section } = opts;
+  const { title, tags, groups, grouped, toggleKey, chip, emptyHtml, section, searchable } = opts;
   if (section && collapsedSections.has(section)) return sectionTitleRow(section, title);
   // The toggle is only worth showing when it would actually change anything.
   // That's true the moment ANY tag here belongs to a real group — even just
@@ -1517,6 +1524,13 @@ function tagSectionHtml(opts: {
       <div class="fb-crm-section-title">${title}</div>
       ${toggle}
     </div>`;
+  if (searchable && tags.length > 0) {
+    return `${head}
+    <input type="search" id="fb-crm-tag-search" class="fb-crm-tag-search" placeholder="Search tags…"
+      aria-label="Search tags" autocomplete="off" value="${escapeAttr(tagSearchQuery)}" />
+    <div class="fb-crm-tag-filter-body">${body}</div>
+    <div class="fb-crm-muted fb-crm-tag-search-empty" style="display:none">No tags match</div>`;
+  }
   return `${head}
     ${body}`;
 }
@@ -2156,6 +2170,8 @@ async function renderPanelContent() {
     expandedFunnels.clear();
     taskDraft.title = '';
     taskTitleFocused = false;
+    tagSearchQuery = '';
+    tagSearchFocused = false;
   }
   currentPanelThreadId = threadId;
   lastRenderedThread = threadId;
@@ -2371,8 +2387,9 @@ async function renderPanelContent() {
         grouped: addTagGrouped,
         toggleKey: 'addTagGrouped',
         section: 'addExisting',
+        searchable: true,
         chip: (t) =>
-          `<button class="${chipClass(t)} fb-crm-chip-add" style="${chipStyle(t)}" title="${chipTitle(t)}" data-add="${t.id}">${chipHiddenMark(t)}+ ${escapeHtml(t.name)}</button>`,
+          `<button class="${chipClass(t)} fb-crm-chip-add" style="${chipStyle(t)}" title="${chipTitle(t)}" data-add="${t.id}" data-tag-name="${escapeAttr(t.name.toLowerCase())}">${chipHiddenMark(t)}+ ${escapeHtml(t.name)}</button>`,
       }) : ''}
 
       ${sectionTitleRow('createTag', 'Create new tag')}
@@ -2407,6 +2424,7 @@ async function renderPanelContent() {
   wirePanelActions(conv.id);
   wirePanelFields(conv.id, conv, panelFields);
   wirePanelTasks(conv);
+  wirePanelTagSearch();
   wireWorkspaceStrip();
   panelEl.querySelector<HTMLSelectElement>('#fb-crm-move-target')?.addEventListener('change', (e) => {
     const to = (e.target as HTMLSelectElement).value;
@@ -2438,6 +2456,61 @@ async function renderPanelContent() {
       const v = el.value;
       try { el.setSelectionRange(v.length, v.length); } catch { /* ignore */ }
     }
+  }
+}
+
+/**
+ * The "Add existing tag" search box. Filters the chips in place (no redraw):
+ * a chip shows when its name contains the query, and a group heading goes
+ * with its row once that row has nothing left. Enter adds the first match,
+ * Escape clears the query.
+ */
+function wirePanelTagSearch(): void {
+  const input = panelEl?.querySelector<HTMLInputElement>('#fb-crm-tag-search');
+  const body = panelEl?.querySelector<HTMLElement>('.fb-crm-tag-filter-body');
+  const empty = panelEl?.querySelector<HTMLElement>('.fb-crm-tag-search-empty');
+  if (!input || !body) return;
+
+  const apply = () => {
+    const q = tagSearchQuery.trim().toLowerCase();
+    let anyShown = false;
+    body.querySelectorAll<HTMLElement>('.fb-crm-chips').forEach((row) => {
+      let rowShown = false;
+      row.querySelectorAll<HTMLElement>('[data-add]').forEach((chip) => {
+        const show = !q || (chip.dataset.tagName || '').includes(q);
+        chip.style.display = show ? '' : 'none';
+        if (show) rowShown = true;
+      });
+      row.style.display = rowShown ? '' : 'none';
+      const label = row.previousElementSibling as HTMLElement | null;
+      if (label?.classList.contains('fb-crm-tag-group-label')) label.style.display = rowShown ? '' : 'none';
+      if (rowShown) anyShown = true;
+    });
+    if (empty) empty.style.display = anyShown ? 'none' : '';
+  };
+
+  input.addEventListener('input', () => { tagSearchQuery = input.value; apply(); });
+  input.addEventListener('focus', () => { tagSearchFocused = true; });
+  input.addEventListener('blur', () => { tagSearchFocused = false; });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (!tagSearchQuery.trim()) return;
+      const first = Array.from(body.querySelectorAll<HTMLElement>('[data-add]')).find((c) => c.style.display !== 'none');
+      first?.click();
+    } else if (e.key === 'Escape' && input.value) {
+      e.preventDefault();
+      e.stopPropagation();
+      input.value = '';
+      tagSearchQuery = '';
+      apply();
+    }
+  });
+  apply();
+
+  if (tagSearchFocused) {
+    input.focus({ preventScroll: true });
+    try { input.setSelectionRange(input.value.length, input.value.length); } catch { /* ignore */ }
   }
 }
 

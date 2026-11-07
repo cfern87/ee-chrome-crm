@@ -593,6 +593,24 @@
 .fb-crm-chips + .fb-crm-tag-group-label { margin-top: 8px; }
 .fb-crm-section-title-row + .fb-crm-tag-group-label { margin-top: 0; }
 
+/* "Add existing tag" search box: a small field between the title and chips. */
+.fb-crm-tag-search {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 0 6px;
+  padding: 4px 8px;
+  border: 1px solid #ccd0d5;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: inherit;
+  background: #fff;
+  color: #1c1e21;
+  outline: none;
+}
+.fb-crm-tag-search:focus { border-color: #065fd4; }
+.fb-crm-tag-filter-body > .fb-crm-tag-group-label:first-child { margin-top: 0; }
+.fb-crm-tag-search-empty { font-size: 12px; margin: 2px 0 4px; }
+
 .fb-crm-tag-group-dot {
   width: 7px;
   height: 7px;
