@@ -165,15 +165,15 @@ export function AutomationsPanel({ store, updateStore, onOpenTags, onOpenSearch 
   };
 
   return (
-    <Stack gap="lg">
-      <Card>
+    <Stack gap="sm">
+      <Card padding="lg">
         <Stack direction="row" gap="md" align="flex-start" justify="space-between" wrap>
           <div style={{ flex: 1, minWidth: 260 }}>
             <Text as="h2" size="strong" weight="bold" style={{ margin: 0 }}>Actions</Text>
             <Text as="p" size="small" tone="muted" leading="relaxed" style={{ margin: `${space.xs}px 0 0` }}>
               Things to do to a contact — tags, funnel stages, fields, follow-ups, a message — and what starts them:
-              a button in Messenger and the contacts screen, a schedule, a tag being added or removed, or an incoming
-              webhook. Quick actions and automations are both actions now. You can also run any action from here.
+              a button, a schedule, a tag change, a message being sent, or an incoming webhook. Click ▸ on an action
+              for its details.
             </Text>
           </div>
           <Button variant="primary" onClick={startNew} disabled={!!draftNew || actions.length >= MAX_AUTOMATIONS}>
@@ -257,6 +257,7 @@ function TriggerChip({ children, tone = 'default' }: { children: React.ReactNode
     <span
       style={{
         display: 'inline-flex', alignItems: 'center', padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 600,
+        whiteSpace: 'nowrap', flex: '0 0 auto',
         background: tone === 'muted' ? color.surface.sunken : color.surface.selected,
         color: tone === 'muted' ? color.text.muted : color.accent.base,
         border: `1px solid ${tone === 'muted' ? color.border.subtle : '#b3d9f2'}`,
@@ -302,17 +303,42 @@ function ActionCard({
   const shownRun = run && stopping ? { ...run, stopping: true } : run;
   const triggers = describeTriggers(a, store);
   const [runningOn, setRunningOn] = useState(false);
+  // Collapsed by default: one summary row per action, so a long list fits on
+  // screen. The details and the less-used controls (reorder, delete, run the
+  // schedule) are one click away, the same ▸/▾ disclosure the delivery logs use.
+  const [open, setOpen] = useState(false);
+  const name = a.name || a.button?.label || 'Untitled action';
+  const lastRun = !isRunning && run
+    ? interrupted
+      ? `Last run ${formatRelativeTime(run.startedAt)} was interrupted before it finished.`
+      : `Last run ${formatRelativeTime(run.finishedAt || run.startedAt)}${run.trigger === 'schedule' ? ' (scheduled)' : run.trigger === 'webhook' ? ' (webhook)' : run.trigger === 'tag' ? ' (tag change)' : run.trigger === 'message' ? ' (message sent)' : run.trigger === 'action' ? ' (run by another action)' : ''}: ${describeRun(run)}`
+    : null;
+  const lastRunBad = !!run && (!!run.error || interrupted);
+  const does = describeActions(a, store);
+  const oneLine: React.CSSProperties = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 };
+  // The button preview already says "it has a button", so its chip is left out of the summary row.
+  const rowChips = a.button ? triggers.filter((t) => t !== 'Button') : triggers;
+  const MAX_ROW_CHIPS = 2;
 
   return (
-    <Card>
-      <Stack gap="sm">
-        <Stack direction="row" gap="sm" align="center" wrap>
-          <Text size="body" weight="semibold" style={{ flex: 1, minWidth: 180 }}>{a.name || a.button?.label || 'Untitled action'}</Text>
+    <Card padding="md">
+      <Stack gap="xs">
+        {/* Summary row: what it is and what starts it, and the two things you do most. */}
+        <Stack direction="row" gap="sm" align="center">
+          <button
+            onClick={() => setOpen(!open)}
+            aria-expanded={open}
+            title={open ? 'Hide details' : 'Show details'}
+            style={{ all: 'unset', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: space.xs, flex: '0 1 auto', ...oneLine }}
+          >
+            <span aria-hidden style={{ fontSize: 11, color: color.text.muted, width: 10 }}>{open ? '▾' : '▸'}</span>
+            <Text size="body" weight="semibold" style={oneLine}>{name}</Text>
+          </button>
           {a.button && (
             <span
               title="How the button looks in Messenger and the contacts screen"
               style={{
-                padding: '3px 10px', borderRadius: 6, fontSize: 12, fontWeight: 600,
+                padding: '1px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600, flex: '0 0 auto', maxWidth: 140, ...oneLine,
                 background: a.button.color || color.surface.raised,
                 color: a.button.color ? onColor(a.button.color) : color.text.primary,
                 border: `1px solid ${a.button.color || color.border.control}`,
@@ -321,35 +347,57 @@ function ActionCard({
               {a.button.label.trim() || a.name || 'Untitled'}
             </span>
           )}
+          {!open && (
+            <div style={{ display: 'flex', gap: space.xs, flex: '1 1 auto', overflow: 'hidden', minWidth: 0 }}>
+              {rowChips.slice(0, MAX_ROW_CHIPS).map((t) => <TriggerChip key={t}>{t}</TriggerChip>)}
+              {rowChips.length > MAX_ROW_CHIPS && (
+                <span title={rowChips.slice(MAX_ROW_CHIPS).join('\n')}><TriggerChip tone="muted">+{rowChips.length - MAX_ROW_CHIPS}</TriggerChip></span>
+              )}
+              {!triggers.length && <TriggerChip tone="muted">Only when run from here</TriggerChip>}
+            </div>
+          )}
+          {open && <div style={{ flex: '1 1 auto' }} />}
           {automatic && (
             <Toggle
-              label={<span style={{ fontSize: 12 }}>{a.enabled ? 'Automatic on' : 'Automatic paused'}</span>}
+              label={<span style={{ fontSize: 12 }}>{a.enabled ? 'On' : 'Paused'}</span>}
+              labelFirst={false}
               checked={a.enabled}
-              title="Turns the schedule, tag and message-sent triggers on or off. The button and running it from here still work."
+              title="Automatic: turns the schedule, tag and message-sent triggers on or off. The button and running it from here still work."
               onChange={(e) => onToggleEnabled(e.target.checked)}
             />
           )}
+          {!runningOn && (
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={() => setRunningOn(true)}
+              disabled={isRunning || !!blocked}
+              title="Choose who to run it on — a saved search — and run it now"
+            >
+              Run on…
+            </Button>
+          )}
+          <Button size="sm" variant="secondary" onClick={onEdit} disabled={isRunning}>Edit</Button>
         </Stack>
 
-        <Stack direction="row" gap="xs" wrap align="center">
-          <Text size="small" tone="secondary"><strong>Starts:</strong></Text>
-          {triggers.length
-            ? triggers.map((t) => <TriggerChip key={t}>{t}</TriggerChip>)
-            : <TriggerChip tone="muted">Only when run from here</TriggerChip>}
-          {scheduled && team && <Text size="small" tone="muted">· schedule runs on {describeRunner(a.runOn, team)}</Text>}
-        </Stack>
-        <Text size="small" tone="secondary"><strong>Does:</strong> {describeActions(a, store)}</Text>
-        {search && (
-          <Text size="small" tone="muted">
-            The schedule’s search matches {matchSavedSearch(search, store).length} now ·{' '}
-            <Button size="sm" variant="link" onClick={() => onOpenSearch(search)}>show them</Button>
+        {/* One muted line: what it does, and how the last run went. Full text on hover and when open. */}
+        {!open && (
+          <Text
+            as="div"
+            size="small"
+            tone={lastRunBad ? 'danger' : 'muted'}
+            title={[`Does: ${does}`, lastRun].filter(Boolean).join('\n')}
+            style={{ ...oneLine, paddingLeft: 14 }}
+          >
+            {does}{lastRun ? ` · ${lastRun}` : ''}
           </Text>
         )}
 
+        {/* Always visible, open or not: things that need attention right now. */}
         {blocked && <Banner tone="warning">{blocked} Edit this action to fix it.</Banner>}
 
         {isRunning && shownRun && (
-          <div role="status" style={{ background: color.surface.selected, borderRadius: radius.sm, padding: `${space.sm}px ${space.md}px` }}>
+          <div role="status" style={{ background: color.surface.selected, borderRadius: radius.sm, padding: `${space.xs}px ${space.md}px` }}>
             <Stack direction="row" gap="sm" align="center" justify="space-between">
               <Text size="small" weight="semibold" tone="accent">
                 {describeRun(shownRun)}
@@ -364,14 +412,6 @@ function ActionCard({
           </div>
         )}
 
-        {!isRunning && run && (
-          <Text size="small" tone={run.error || interrupted ? 'danger' : 'muted'}>
-            {interrupted
-              ? `Last run ${formatRelativeTime(run.startedAt)} was interrupted before it finished.`
-              : `Last run ${formatRelativeTime(run.finishedAt || run.startedAt)}${run.trigger === 'schedule' ? ' (scheduled)' : run.trigger === 'webhook' ? ' (webhook)' : run.trigger === 'tag' ? ' (tag change)' : run.trigger === 'message' ? ' (message sent)' : run.trigger === 'action' ? ' (run by another action)' : ''}: ${describeRun(run)}`}
-          </Text>
-        )}
-
         {runningOn && (
           <RunOnPicker
             action={a}
@@ -381,43 +421,51 @@ function ActionCard({
           />
         )}
 
-        <Stack direction="row" gap="sm" align="center" wrap>
-          {!runningOn && (
-            <Button
-              size="sm"
-              variant="primary"
-              onClick={() => setRunningOn(true)}
-              disabled={isRunning || !!blocked}
-              title="Choose who to run it on — a saved search — and run it now"
-            >
-              Run on…
-            </Button>
-          )}
-          {scheduled && hasRunnableSource(a, store) && (
-            <Button
-              size="sm"
-              variant="secondary"
-              onClick={() => onRun()}
-              disabled={isRunning || scanBusy || !!blocked}
-              title={scanBusy ? 'Another unread scan is using the Facebook window' : 'Run the scheduled job now, on its own contacts'}
-            >
-              Run schedule now
-            </Button>
-          )}
-          <Button size="sm" variant="secondary" onClick={onEdit} disabled={isRunning}>Edit</Button>
-          <Button size="sm" variant="ghost" onClick={() => onMove(-1)} disabled={first} title="Move up (also moves its button)">↑</Button>
-          <Button size="sm" variant="ghost" onClick={() => onMove(1)} disabled={last} title="Move down (also moves its button)">↓</Button>
-          <div style={{ marginLeft: 'auto', display: 'flex', gap: space.xs }}>
-            {confirmingDelete ? (
-              <>
-                <Button size="sm" variant="danger-solid" onClick={onConfirmDelete}>Delete?</Button>
-                <Button size="sm" variant="ghost" onClick={onCancelDelete}>No</Button>
-              </>
-            ) : (
-              <Button size="sm" variant="danger" onClick={onAskDelete} disabled={isRunning}>Delete</Button>
+        {open && (
+          <Stack gap="xs" style={{ paddingLeft: 14, paddingTop: space.xs }}>
+            <Stack direction="row" gap="xs" wrap align="center">
+              <Text size="small" tone="secondary"><strong>Starts:</strong></Text>
+              {triggers.length
+                ? triggers.map((t) => <TriggerChip key={t}>{t}</TriggerChip>)
+                : <TriggerChip tone="muted">Only when run from here</TriggerChip>}
+              {scheduled && team && <Text size="small" tone="muted">· schedule runs on {describeRunner(a.runOn, team)}</Text>}
+            </Stack>
+            <Text size="small" tone="secondary"><strong>Does:</strong> {does}</Text>
+            {search && (
+              <Text size="small" tone="muted">
+                The schedule’s search matches {matchSavedSearch(search, store).length} now ·{' '}
+                <Button size="sm" variant="link" onClick={() => onOpenSearch(search)}>show them</Button>
+              </Text>
             )}
-          </div>
-        </Stack>
+            {lastRun && <Text size="small" tone={lastRunBad ? 'danger' : 'muted'}>{lastRun}</Text>}
+
+            <Stack direction="row" gap="sm" align="center" wrap style={{ paddingTop: space.xs }}>
+              {scheduled && hasRunnableSource(a, store) && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => onRun()}
+                  disabled={isRunning || scanBusy || !!blocked}
+                  title={scanBusy ? 'Another unread scan is using the Facebook window' : 'Run the scheduled job now, on its own contacts'}
+                >
+                  Run schedule now
+                </Button>
+              )}
+              <Button size="sm" variant="ghost" onClick={() => onMove(-1)} disabled={first} title="Move up (also moves its button)">↑</Button>
+              <Button size="sm" variant="ghost" onClick={() => onMove(1)} disabled={last} title="Move down (also moves its button)">↓</Button>
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: space.xs }}>
+                {confirmingDelete ? (
+                  <>
+                    <Button size="sm" variant="danger-solid" onClick={onConfirmDelete}>Delete?</Button>
+                    <Button size="sm" variant="ghost" onClick={onCancelDelete}>No</Button>
+                  </>
+                ) : (
+                  <Button size="sm" variant="danger" onClick={onAskDelete} disabled={isRunning}>Delete</Button>
+                )}
+              </div>
+            </Stack>
+          </Stack>
+        )}
       </Stack>
     </Card>
   );
