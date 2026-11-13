@@ -1079,6 +1079,14 @@ export default function DashboardApp() {
 
   // Check/uncheck exactly the contacts on the current page, leaving any
   // selection made on other pages alone.
+  // The selection banner is one toggle: anywhere on it (checkbox included)
+  // selects this page when nothing is selected, and clears the WHOLE selection
+  // when anything is — so undoing a selection is as easy as making it.
+  const handleSelectionBanner = () => {
+    if (selectedIds.size > 0) clearBulkSelection();
+    else handleSelectPage();
+  };
+
   const handleSelectPage = () => {
     const next = new Set(selectedIds);
     if (pageIds.length > 0 && pageSelectedCount === pageIds.length) {
@@ -2231,21 +2239,25 @@ export default function DashboardApp() {
                   too narrow for them. Sticky, so it stays in reach. */}
               {filtered.length > 0 && (
                 <div
+                  onClick={handleSelectionBanner}
+                  title={selectedIds.size > 0 ? 'Click to clear the selection' : undefined}
                   style={{
                     position: 'sticky', top: 0, zIndex: layer.sticky, display: 'flex', alignItems: 'center', gap: 8,
-                    padding: '6px 10px', minHeight: 40, boxSizing: 'border-box',
+                    padding: '6px 10px', minHeight: 40, boxSizing: 'border-box', cursor: 'pointer', userSelect: 'none',
                     background: selectedIds.size > 0 ? color.surface.selected : color.surface.sunken,
                     border: `1px solid ${selectedIds.size > 0 ? '#b3d9f2' : 'transparent'}`, borderRadius: 6, marginBottom: 6, fontSize: 12,
                   }}
                 >
                   <input
                     type="checkbox"
-                    aria-label={pageCount > 1 ? 'Select this page' : 'Select all'}
+                    aria-label={selectedIds.size > 0 ? 'Clear selection' : pageCount > 1 ? 'Select this page' : 'Select all'}
                     ref={(el) => {
                       if (el) el.indeterminate = pageSelectedCount > 0 && pageSelectedCount < pageIds.length;
                     }}
                     checked={pageIds.length > 0 && pageSelectedCount === pageIds.length}
-                    onChange={handleSelectPage}
+                    // The banner's click does the work; this only stops the
+                    // browser toggling the box on its own in between.
+                    onChange={() => {}}
                     style={{ cursor: 'pointer' }}
                   />
                   {selectedIds.size > 0 ? (
@@ -2255,13 +2267,13 @@ export default function DashboardApp() {
                       <span style={{ fontWeight: 500, color: color.text.secondary }}> · actions on the right</span>
                     </span>
                   ) : (
-                    <label style={{ flex: 1, cursor: 'pointer', fontWeight: 500, color: color.text.secondary }} onClick={handleSelectPage}>
+                    <label style={{ flex: 1, cursor: 'pointer', fontWeight: 500, color: color.text.secondary }}>
                       {pageCount > 1 ? `Select this page (${pageIds.length})` : 'Select all'}
                     </label>
                   )}
                   {pageCount > 1 && selectedIds.size < filtered.length && (
                     <button
-                      onClick={handleSelectAllMatching}
+                      onClick={(e) => { e.stopPropagation(); handleSelectAllMatching(); }}
                       title="Select every contact matching the current filters, across all pages"
                       style={{ background: 'none', border: 'none', color: color.accent.base, fontSize: 11, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', padding: 0, whiteSpace: 'nowrap' }}
                     >
@@ -2270,7 +2282,7 @@ export default function DashboardApp() {
                   )}
                   {selectedIds.size > 0 && (
                     <button
-                      onClick={clearBulkSelection}
+                      onClick={(e) => { e.stopPropagation(); clearBulkSelection(); }}
                       style={{ background: 'none', color: color.text.secondary, border: 'none', fontSize: 12, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', padding: 0 }}
                     >
                       Clear
