@@ -724,6 +724,23 @@ function CampaignStepEditor({ step, store, onChange }: {
  * never a link to the campaign. Shared by quick actions' "Add to campaign"
  * and automations' "Also send them a message".
  */
+const RECENT_SNIPPET = 70;
+
+/**
+ * One dropdown row: the message itself first — that is what you are choosing —
+ * then the campaign's name when it says something the text doesn't (an
+ * auto-name that is just the opening words would only repeat it), then the date.
+ */
+export function recentCampaignLabel(c: Pick<Campaign, 'name' | 'template' | 'createdAt'>): string {
+  const text = c.template.replace(/\s+/g, ' ').trim();
+  const snippet = text.length > RECENT_SNIPPET ? `${text.slice(0, RECENT_SNIPPET - 1).trimEnd()}…` : text;
+  const name = (c.name || '').trim();
+  const norm = (s: string) => s.toLowerCase().replace(/[…\s.]+$/g, '').replace(/\s+/g, ' ');
+  const nameAddsInfo = !!name && !norm(text).startsWith(norm(name));
+  const date = new Date(c.createdAt).toLocaleDateString();
+  return nameAddsInfo ? `“${snippet}” — ${name} · ${date}` : `“${snippet}” · ${date}`;
+}
+
 export function RecentCampaignPicker({ onPick }: { onPick: (template: string) => void }) {
   const [recent, setRecent] = useState<Campaign[] | null>(null);
 
@@ -756,14 +773,14 @@ export function RecentCampaignPicker({ onPick }: { onPick: (template: string) =>
           if (c) onPick(c.template);
           e.target.value = '';
         }}
-        style={{ width: 300 }}
+        style={{ width: '100%', maxWidth: 520 }}
       >
         <option value="">
           {recent === null ? 'Loading recent campaigns…' : recent.length ? 'Use a recent campaign’s message…' : 'No recent campaigns'}
         </option>
         {(recent || []).map((c) => (
-          <option key={c.id} value={c.id}>
-            {c.name} · {new Date(c.createdAt).toLocaleDateString()}
+          <option key={c.id} value={c.id} title={c.template}>
+            {recentCampaignLabel(c)}
           </option>
         ))}
       </Select>

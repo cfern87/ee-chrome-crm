@@ -163,3 +163,32 @@ describe('malformed input', () => {
     expect(hooks(driveRound(bag, {}, 2_000)).map((h) => h.id)).toEqual(['w1']);
   });
 });
+
+describe('pinned (★) contacts across machines', () => {
+  const K = 'pinnedContacts';
+  const AT = 'pinnedContactsAt';
+
+  it('takes the newer star list in Drive mode, whichever side is local', () => {
+    const laptop = { [K]: ['c1', 'c2'], [AT]: 2_000 };
+    const desktop = { [K]: ['c1'], [AT]: 1_000 };
+    expect(driveRound(laptop, desktop)[K]).toEqual(['c1', 'c2']);
+    expect(driveRound(desktop, laptop)[K]).toEqual(['c1', 'c2']);
+  });
+
+  it('carries an unstar (empty list) to the other machine', () => {
+    const laptop = { [K]: [], [AT]: 3_000 };
+    const desktop = { [K]: ['c1'], [AT]: 1_000 };
+    expect(driveRound(laptop, desktop)[K]).toEqual([]);
+  });
+
+  it('a stamped list beats an unstamped one from an older build', () => {
+    const laptop = { [K]: ['c2'], [AT]: 1 };
+    const oldBuild = { [K]: ['c9'] };
+    expect(driveRound(laptop, oldBuild)[K]).toEqual(['c2']);
+    expect(syncRound(oldBuild, oldBuild, laptop)[K]).toEqual(['c2']);
+  });
+
+  it('leaves an unstamped list to the scalar rules', () => {
+    expect(driveRound({ [K]: ['a'] }, { [K]: ['b'] })[K]).toEqual(['b']);
+  });
+});

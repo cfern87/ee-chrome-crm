@@ -44,6 +44,7 @@ import { DASHBOARD_TILE_ORDER_KEY } from './dashboardTiles';
 import { RATIO_TILE_COLLECTION } from './ratioTiles';
 import { TEMPLATE_COLLECTION } from './templates';
 import { DAILY_REPORT_KEY, DAILY_REPORT_LOG_KEY } from './dailyReport';
+import { PINNED_CONTACTS_KEY } from './storage';
 
 /** The `settings` bag. Untyped by design — it holds every feature's keys. */
 export type SettingsBag = Record<string, unknown>;
@@ -128,6 +129,37 @@ function monotonicKeys(): string[] {
  */
 function stampedKeys(): string[] {
   return [DASHBOARD_TILE_ORDER_KEY, DAILY_REPORT_KEY, DAILY_REPORT_LOG_KEY];
+}
+
+/**
+ * Keys whose value keeps its existing shape (so plain readers like popup.js
+ * need no change) but carries its write time in a SIDECAR key, `${key}At`.
+ * Same newest-wins rule as stampedKeys, applied to the pair together.
+ *
+ * The pinned (★) contact list is the case: as a plain scalar, Drive mode's
+ * mergeSettings always kept the local machine's list, so a star added on the
+ * laptop never reached the desktop and the desktop kept uploading its own.
+ */
+function sidecarStampedKeys(): string[] {
+  return [PINNED_CONTACTS_KEY];
+}
+
+export const sidecarStampKey = (key: string) => `${key}At`;
+
+function overlaySidecarStamped(out: SettingsBag, a: SettingsBag | undefined, b: SettingsBag | undefined): SettingsBag {
+  for (const key of sidecarStampedKeys()) {
+    const at = sidecarStampKey(key);
+    const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+    const sa = num(a?.[at]);
+    const sb = num(b?.[at]);
+    // Neither side has ever stamped it: leave whatever the scalar pass chose.
+    if (sa === undefined && sb === undefined) continue;
+    const src = sb !== undefined && (sa === undefined || sb >= sa) ? b! : a!;
+    if (src[key] === undefined) delete out[key];
+    else out[key] = src[key];
+    out[at] = src[at];
+  }
+  return out;
 }
 
 function stampOf(v: unknown): number | undefined {
@@ -291,7 +323,7 @@ function overlayCollections(
   now: number,
 ): SettingsBag {
   for (const spec of collections()) Object.assign(out, mergeCollection(spec, a, b, now));
-  return overlayStamped(overlayMonotonic(out, a, b), a, b);
+  return overlaySidecarStamped(overlayStamped(overlayMonotonic(out, a, b), a, b), a, b);
 }
 
 /**

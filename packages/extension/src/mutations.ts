@@ -31,6 +31,7 @@ import {
   readPinnedContacts, PINNED_CONTACTS_KEY, MAX_PINNED_CONTACTS,
 } from './storage';
 import { buildThreadIndex } from './contacts';
+import { sidecarStampKey } from './settingsMerge';
 import { looksLikeName, isDamagedName } from './names';
 import { profileKey } from './csv';
 import {
@@ -675,7 +676,9 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
         return { store, changed: false, conversationId: m.conversationId };
       }
       const out = copy(store);
-      out.settings = { ...out.settings, [PINNED_CONTACTS_KEY]: next };
+      // The sidecar stamp is what lets the newest star list win across
+      // machines (settingsMerge.ts sidecarStampedKeys).
+      out.settings = { ...out.settings, [PINNED_CONTACTS_KEY]: next, [sidecarStampKey(PINNED_CONTACTS_KEY)]: now };
       return { store: out, changed: true, conversationId: m.conversationId };
     }
 
