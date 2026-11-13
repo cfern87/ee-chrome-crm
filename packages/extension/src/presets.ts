@@ -105,6 +105,12 @@ type PresetStepBody =
   | { kind: 'sendWebhook'; url: string; batch?: boolean }
   | { kind: 'archive' }
   | { kind: 'unarchive' }
+  // Run another action on this contact, as if its trigger had fired. Emitted
+  // as a no-op `runAction` mutation that the background queues once the write
+  // lands (background.ts queueTriggeredRun), so it works the same from a
+  // button, a bulk press or an automation run, under the same depth limit as
+  // tag triggers. That action's own "only run if" condition still applies.
+  | { kind: 'runAction'; actionId: string }
   | { kind: 'deleteContact' };
 
 export type PresetStepKind = PresetStepBody['kind'];
@@ -278,6 +284,8 @@ function normalizeStepBody(raw: unknown): PresetStepBody | null {
     case 'unarchive':
     case 'deleteContact':
       return { kind: o.kind };
+    case 'runAction':
+      return typeof o.actionId === 'string' && o.actionId ? { kind: 'runAction', actionId: o.actionId } : null;
     default:
       return null;
   }
@@ -528,6 +536,13 @@ export function stepsFor(preset: PresetAction, conv: Conversation, store: Store,
         deletes = true;
         break;
 
+      case 'runAction':
+        // An action that runs itself would only loop until the depth limit.
+        if (step.actionId === preset.id) break;
+        flushTags();
+        out.push({ op: 'runAction', conversationId: id, automationId: step.actionId });
+        break;
+
       case 'addToCampaign':
       case 'sendWebhook':
         // Not store edits — see campaignSendsFor and webhookSendsFor.
@@ -671,6 +686,7 @@ export function describePreset(preset: PresetAction, store: Store): string {
       case 'archive': return 'archive';
       case 'unarchive': return 'unarchive';
       case 'deleteContact': return 'DELETE contact';
+      case 'runAction': return `run “${actionName(store, s.actionId)}”`;
       case 'addToCampaign': {
         const linked = templateName(store, s.templateId);
         if (linked) return `add to campaign (template "${linked}")${s.dryRun ? ' (dry run)' : ''}`;
@@ -685,6 +701,25 @@ export function describePreset(preset: PresetAction, store: Store): string {
       }
     }
   }
+}
+
+/**
+ * An action's name for display, read straight from settings — presets.ts sits
+ * below automations.ts in the import graph, so it can't call readActions.
+ */
+export function actionName(store: Pick<Store, 'settings'>, id: string): string {
+  const bag = (store.settings || {}) as Record<string, unknown>;
+  for (const key of ['automations', 'presetActions']) {
+    const list = bag[key];
+    if (!Array.isArray(list)) continue;
+    const hit = list.find((a) => a && typeof a === 'object' && (a as { id?: unknown }).id === id) as
+      { name?: unknown; label?: unknown; button?: { label?: unknown } } | undefined;
+    if (hit) {
+      const n = [hit.name, hit.button?.label, hit.label].find((x) => typeof x === 'string' && x.trim());
+      return (n as string | undefined)?.trim() || 'Untitled action';
+    }
+  }
+  return 'deleted action';
 }
 
 /** " due in 3 days at 14:00", " due today", or "" for an undated task. */

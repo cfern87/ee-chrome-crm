@@ -121,7 +121,7 @@ import {
 import { MAX_READ_STATE_WRITES } from './mutations';
 import { e2eeVariantOf } from './threadUrl';
 import {
-  readActions, shortTagTrigger, resolveUnread, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable, automationChangesOf,
+  readActions, shortTagTrigger, resolveUnread, contactsPassingCondition, messageSentTargets, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable, automationChangesOf,
   tagTriggerHits, withResolvedMessage,
   AUTOMATION_RUNS_KEY,
   type Automation, type AutomationRun, type AutomationRuns, type UnreadScanReport,
@@ -249,6 +249,7 @@ async function mutateStore(input: Mutation[], opts: { triggerDepth?: number } = 
   return withStoreLock(async () => {
     const store = await loadStore();
     const { store: next, changed, conversationId } = applyMutations(store, mutations);
+    fireRunActionSteps(mutations, next, opts.triggerDepth ?? 0);
     if (!changed) return { success: true, changed: false, store, conversationId };
     const result = await saveStore(next);
     // After the save, and deliberately not awaited: a webhook endpoint that
@@ -365,9 +366,26 @@ async function contactElsewhere(threadId: string): Promise<SavedTo[]> {
 // An automation's own edits can set off another tag trigger (that's how they
 // chain), but only MAX_TAG_TRIGGER_DEPTH deep, so two automations that add and
 // remove each other's tags can't loop forever.
+//
+// The same queue carries the other contact-level triggers: "a message was sent
+// to them" (fireMessageSentTriggers) and "another action ran this one" (a
+// `runAction` step, fireRunActionSteps). Queued per action AND trigger, so a
+// run's history says what actually started it.
 const MAX_TAG_TRIGGER_DEPTH = 3;
-const tagTriggerQueue = new Map<string, { ids: Set<string>; depth: number; source: string }>();
+type QueuedTrigger = 'tag' | 'message' | 'action';
+const tagTriggerQueue = new Map<string, { id: string; trigger: QueuedTrigger; ids: Set<string>; depth: number; source: string }>();
 const tagTriggerDraining = new Set<string>();
+
+/** Queue a contact-level run of action `automationId` on `ids`, `depth` triggers deep. */
+function queueTriggeredRun(automationId: string, trigger: QueuedTrigger, ids: Iterable<string>, depth: number, source: string): void {
+  if (depth > MAX_TAG_TRIGGER_DEPTH) return;
+  const key = `${trigger}|${automationId}`;
+  const q = tagTriggerQueue.get(key) || { id: automationId, trigger, ids: new Set<string>(), depth, source };
+  for (const id of ids) q.ids.add(id);
+  q.depth = Math.max(q.depth, depth);
+  tagTriggerQueue.set(key, q);
+  void drainTagTriggers(key);
+}
 
 function fireTagTriggers(prev: Store, next: Store, depth: number): void {
   try {
@@ -375,11 +393,7 @@ function fireTagTriggers(prev: Store, next: Store, depth: number): void {
     const automations = readActions(next);
     for (const hit of tagTriggerHits(prev, next, automations)) {
       const source = hit.fired.map((t) => shortTagTrigger(t, next)).join(', ');
-      const q = tagTriggerQueue.get(hit.automationId) || { ids: new Set<string>(), depth: depth + 1, source };
-      hit.ids.forEach((id) => q.ids.add(id));
-      q.depth = Math.max(q.depth, depth + 1);
-      tagTriggerQueue.set(hit.automationId, q);
-      void drainTagTriggers(hit.automationId);
+      queueTriggeredRun(hit.automationId, 'tag', hit.ids, depth + 1, source);
     }
   } catch (e) {
     console.warn('[CRM] tag trigger check failed', e);
@@ -387,26 +401,76 @@ function fireTagTriggers(prev: Store, next: Store, depth: number): void {
 }
 
 /**
- * Run one tag-triggered automation on everyone queued for it, one run at a
- * time. A bulk edit tags people in chunks, so contacts that arrive while a
- * run is going wait and go in the next run rather than being dropped.
+ * "Run another action" steps in a write: each names an action to run on one
+ * contact. Read from the mutations rather than the store diff, because the
+ * step changes nothing - so it fires even when the rest of the write was a
+ * no-op.
  */
-async function drainTagTriggers(id: string): Promise<void> {
-  if (tagTriggerDraining.has(id)) return;
-  tagTriggerDraining.add(id);
+function fireRunActionSteps(mutations: Mutation[], store: Store, depth: number): void {
+  try {
+    if (depth >= MAX_TAG_TRIGGER_DEPTH) return;
+    const byTarget = new Map<string, Set<string>>();
+    for (const m of mutations) {
+      if (m.op !== 'runAction') continue;
+      let set = byTarget.get(m.automationId);
+      if (!set) byTarget.set(m.automationId, (set = new Set()));
+      set.add(m.conversationId);
+    }
+    if (!byTarget.size) return;
+    const actions = new Set(readActions(store).map((a) => a.id));
+    for (const [target, ids] of byTarget) {
+      if (!actions.has(target)) continue; // deleted since the step was set up
+      queueTriggeredRun(target, 'action', ids, depth + 1, 'another action');
+    }
+  } catch (e) {
+    console.warn('[CRM] run-action step failed', e);
+  }
+}
+
+/**
+ * A confirmed send to a contact: run every action with the "message sent"
+ * trigger on them. `queuedBy` is the action whose message this was. It never
+ * triggers itself, and a send queued by an action that ITSELF has this
+ * trigger sets nothing else off, so two such actions that each send a message
+ * can't message someone back and forth forever.
+ */
+async function fireMessageSentTriggers(threadId: string, queuedBy: string | undefined): Promise<void> {
+  try {
+    const store = await loadStore();
+    const actions = readActions(store);
+    if (queuedBy && actions.find((a) => a.id === queuedBy)?.onMessageSent) return;
+    const targets = messageSentTargets(actions, queuedBy);
+    if (!targets.length) return;
+    const id = store.conversations[threadId] ? threadId : buildThreadIndex(store).get(threadId.toLowerCase())?.id;
+    if (!id) return;
+    for (const a of targets) queueTriggeredRun(a.id, 'message', [id], 1, 'message sent');
+  } catch (e) {
+    console.warn('[CRM] message-sent trigger check failed', e);
+  }
+}
+
+/**
+ * Run one triggered action on everyone queued for it, one run at a time. A
+ * bulk edit tags people in chunks, so contacts that arrive while a run is
+ * going wait and go in the next run rather than being dropped.
+ */
+async function drainTagTriggers(key: string): Promise<void> {
+  if (tagTriggerDraining.has(key)) return;
+  tagTriggerDraining.add(key);
   try {
     let busyRetries = 0;
-    while (tagTriggerQueue.has(id)) {
+    while (tagTriggerQueue.has(key)) {
+      const id = tagTriggerQueue.get(key)!.id;
       // Already running (Run now, or a run from before): wait for it.
       if (runningSearchIds.has(id)) {
         if (++busyRetries > 200) break;
         await new Promise((r) => setTimeout(r, 1500));
         continue;
       }
-      const q = tagTriggerQueue.get(id)!;
-      tagTriggerQueue.delete(id);
+      const q = tagTriggerQueue.get(key)!;
+      tagTriggerQueue.delete(key);
       await new Promise<void>((resolve) => {
-        void startAutomation(id, 'tag', {
+        void startAutomation(id, q.trigger, {
           ids: [...q.ids],
           triggerDepth: q.depth,
           source: q.source,
@@ -420,7 +484,7 @@ async function drainTagTriggers(id: string): Promise<void> {
       });
     }
   } finally {
-    tagTriggerDraining.delete(id);
+    tagTriggerDraining.delete(key);
   }
 }
 
@@ -1745,7 +1809,9 @@ async function noteAutomationMessaged(automationId: string, threadIds: string[])
  * the message against the store AFTER the steps, so a step that deletes or
  * archives someone is respected.
  */
-async function applyAutomationActions(automation: Automation, ids: string[], ctx: RunLogContext): Promise<Partial<AutomationRun>> {
+async function applyAutomationActions(automation: Automation, allIds: string[], ctx: RunLogContext): Promise<Partial<AutomationRun>> {
+  // "Only run if...": everyone else is left out of the steps AND the message.
+  const ids = automation.when ? contactsPassingCondition(automation, allIds, await loadStore()) : allIds;
   // Who this run touched, and the changes history has no event of its own for.
   // Written to each of them as one 'a' event at the end — in `finally`, so a
   // run that fails half-way still shows on the contacts it did reach.
@@ -2365,6 +2431,7 @@ async function processTick(): Promise<void> {
             message: fr.renderedMessage,
             dryRun: fc.dryRun,
           });
+          if (!fc.dryRun) void fireMessageSentTriggers(fr.threadId, fc.automationId);
         } else {
           fr.status = 'error';
           fr.error = verdict === 'failed'
@@ -2507,6 +2574,8 @@ async function processTick(): Promise<void> {
           message: rr.renderedMessage,
           dryRun: after.dryRun,
         });
+        // A dry run typed but never sent: nothing to react to.
+        if (!after.dryRun) void fireMessageSentTriggers(rr.threadId, after.automationId);
       } else {
         rr.status = 'error';
         rr.error = result.error;

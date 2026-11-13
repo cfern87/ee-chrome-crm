@@ -97,6 +97,9 @@ export type Mutation =
   // the popup's snapshot of the store is up to 5s stale (it polls) — writing
   // that back wholesale is exactly the clobber mutations.ts exists to stop.
   | { op: 'setPinned'; conversationId: string; pinned: boolean }
+  // "Run another action" step (presets.ts). Changes nothing in the store: the
+  // background reads it out of the batch and queues that action's run.
+  | { op: 'runAction'; conversationId: string; automationId: string }
   // Collapse or expand one Messenger-panel section for the whole account (panelSections.ts).
   | { op: 'setPanelSectionCollapsed'; section: PanelSection; collapsed: boolean }
   // Hide or show one funnel bar in this contact's panel (Conversation.hiddenFunnels).
@@ -662,6 +665,9 @@ function applyOne(store: Store, m: Mutation, now: number): MutationOutcome {
       out.settings = { ...out.settings, [PANEL_COLLAPSED_KEY]: withSectionCollapsed(store, m.section, m.collapsed) };
       return { store: out, changed: true };
     }
+
+    case 'runAction':
+      return { store, changed: false };
 
     case 'setPinned': {
       if (m.pinned && !store.conversations[m.conversationId]) return { store, changed: false };

@@ -84,12 +84,13 @@ export function actorEmail(settings: Record<string, unknown> | undefined, key: s
 // fields URI-encoded (that encodes '|' and ','). Old builds don't know 'a' and
 // skip it when reading, but still carry it through merges.
 
-export type AutomationTrigger = 'manual' | 'schedule' | 'webhook' | 'tag';
+/** 'message' = a message was sent to the contact; 'action' = another action ran it (a "run action" step). */
+export type AutomationTrigger = 'manual' | 'schedule' | 'webhook' | 'tag' | 'message' | 'action';
 
 /** Changes made by an automation that history has no event of its own for. */
 export type AutomationChange = 'field' | 'task' | 'tasksDone' | 'archived' | 'unarchived' | 'renamed';
 
-const TRIGGER_CODE: Record<AutomationTrigger, string> = { manual: 'm', schedule: 's', webhook: 'h', tag: 'g' };
+const TRIGGER_CODE: Record<AutomationTrigger, string> = { manual: 'm', schedule: 's', webhook: 'h', tag: 'g', message: 'x', action: 'c' };
 const CHANGE_CODE: Record<AutomationChange, string> = {
   field: 'f', task: 'k', tasksDone: 't', archived: 'r', unarchived: 'u', renamed: 'n',
 };

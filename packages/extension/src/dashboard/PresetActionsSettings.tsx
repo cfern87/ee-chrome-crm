@@ -25,6 +25,7 @@ import type { TaskPriority } from '../tasks';
 import type { Campaign } from '../campaigns';
 import { funnelStages } from '../funnel';
 import { emptyQuery, newCondition, type QueryGroup } from '../search';
+import { readActions } from '../automations';
 import { DraftInput, sendBg } from './shared';
 import { isValidWebhookUrl } from '../webhooks';
 import { ensureHostPermission, TEST_PERMISSION_NOTE } from './WebhookSettings';
@@ -48,12 +49,13 @@ const STEP_LABELS: Record<PresetStepKind, string> = {
   completeTasks: 'Complete open tasks',
   archive: 'Archive contact',
   unarchive: 'Unarchive contact',
+  runAction: 'Run another action',
   deleteContact: 'Delete contact',
 };
 
 const STEP_ORDER: PresetStepKind[] = [
   'addTag', 'removeTag', 'setFunnelStage', 'advanceFunnel', 'removeFromFunnel', 'appendName', 'prependName', 'setField', 'addTask', 'completeTasks',
-  'addToCampaign', 'sendWebhook', 'archive', 'unarchive', 'deleteContact',
+  'addToCampaign', 'sendWebhook', 'runAction', 'archive', 'unarchive', 'deleteContact',
 ];
 
 /** How many past campaigns "Use a recent campaign's message" offers. */
@@ -124,6 +126,8 @@ function blankStep(kind: PresetStepKind, store: Store): PresetStep {
       return { kind, template: '' };
     case 'sendWebhook':
       return { kind, url: '' };
+    case 'runAction':
+      return { kind, actionId: '' };
     default:
       return { kind } as PresetStep;
   }
@@ -323,7 +327,7 @@ export function PresetActionsSettings({ store, updateStore }: {
  * action, and the actions of an automation (AutomationsPanel), which run the
  * same steps.
  */
-export function StepListEditor({ steps, store, onChange, emptyText, title = 'Actions, applied in this order', hideKinds = [] }: {
+export function StepListEditor({ steps, store, onChange, emptyText, title = 'Actions, applied in this order', hideKinds = [], selfId }: {
   steps: PresetStep[];
   store: Store;
   onChange: (next: PresetStep[]) => void;
@@ -335,6 +339,8 @@ export function StepListEditor({ steps, store, onChange, emptyText, title = 'Act
    * per-run cap and once-per-contact a scheduled job needs.
    */
   hideKinds?: PresetStepKind[];
+  /** The action these steps belong to, left out of "Run another action". */
+  selfId?: string;
 }) {
   const kinds = STEP_ORDER.filter((k) => !hideKinds.includes(k));
   const tags = Object.values(store.tags).sort((a, b) => a.name.localeCompare(b.name));
@@ -356,6 +362,7 @@ export function StepListEditor({ steps, store, onChange, emptyText, title = 'Act
             kinds={kinds}
             tags={tags}
             fields={fields}
+            selfId={selfId}
             onChange={(next) => onChange(steps.map((s, k) => (k === si ? next : s)))}
             onRemove={() => onChange(steps.filter((_, k) => k !== si))}
             onMove={(delta) => {
@@ -396,7 +403,8 @@ export function StepListEditor({ steps, store, onChange, emptyText, title = 'Act
 }
 
 /** One step of a preset: its kind, and the operand that kind needs. */
-function StepRow({ step, store, kinds, tags, fields, onChange, onRemove, onMove }: {
+function StepRow({ step, store, kinds, tags, fields, onChange, onRemove, onMove, selfId }: {
+  selfId?: string;
   step: PresetStep;
   store: Store;
   kinds: PresetStepKind[];
@@ -611,6 +619,26 @@ function StepRow({ step, store, kinds, tags, fields, onChange, onRemove, onMove 
       )}
 
       {step.kind === 'sendWebhook' && <WebhookStepFields step={step} onChange={onChange} />}
+
+      {step.kind === 'runAction' && (() => {
+        const others = readActions(store).filter((a) => a.id !== selfId);
+        return (
+          <Select
+            value={step.actionId}
+            aria-label="Action to run"
+            title="Runs that action on this contact too, as if its trigger had fired. Its own “Only run if” still applies. Chains stop after 3 levels."
+            onChange={(e) => onChange({ ...step, actionId: e.target.value })}
+            style={{ width: 240 }}
+          >
+            {!others.some((a) => a.id === step.actionId) && (
+              <option value={step.actionId}>{others.length ? 'Choose an action…' : 'No other actions yet'}</option>
+            )}
+            {others.map((a) => (
+              <option key={a.id} value={a.id}>{a.name || a.button?.label || 'Untitled action'}</option>
+            ))}
+          </Select>
+        );
+      })()}
 
       <div style={{ marginLeft: 'auto', display: 'flex', gap: space.xxs }}>
         {!step.when && (
@@ -903,8 +931,10 @@ const CONDITION_SAVE_MS = 600;
  * store write and a sync. The latest onChange is read through a ref so a save
  * that lands after another edit to the preset doesn't write back a stale copy.
  */
-function StepCondition({ when, store, onChange, onRemove }: {
+export function StepCondition({ when, store, onChange, onRemove, title = 'Only if', hint = 'checked against the contact as it was when the button was pressed' }: {
   when: QueryGroup;
+  title?: string;
+  hint?: string;
   store: Store;
   onChange: (next: QueryGroup) => void;
   onRemove: () => void;
@@ -931,9 +961,9 @@ function StepCondition({ when, store, onChange, onRemove }: {
   return (
     <div style={{ marginTop: space.xs, paddingLeft: space.sm, borderLeft: `2px solid ${color.border.subtle}` }}>
       <Stack direction="row" gap="xs" align="center" style={{ marginBottom: space.xs }}>
-        <Text size="micro" weight="semibold" tone="secondary">Only if</Text>
+        <Text size="micro" weight="semibold" tone="secondary">{title}</Text>
         <Text size="micro" tone="muted" style={{ flex: 1 }}>
-          checked against the contact as it was when the button was pressed
+          {hint}
         </Text>
         <Button size="sm" variant="link" onClick={() => { pending.current = null; flush(); onRemove(); }}>
           Remove condition

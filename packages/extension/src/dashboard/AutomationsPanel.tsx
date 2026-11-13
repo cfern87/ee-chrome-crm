@@ -21,7 +21,7 @@ import {
   type Automation, type AutomationRuns, type AutomationRun, type AutomationMessage, type TagTrigger,
 } from '../automations';
 import { isDestructive } from '../presets';
-import { sortSavedSearches, type SavedSearch, type QueryContext } from '../search';
+import { sortSavedSearches, emptyQuery, newCondition, type SavedSearch, type QueryContext } from '../search';
 import { SavedSearchPreview } from './SearchBuilder';
 import {
   Banner, Button, Card, ColorInput, EmptyState, Input, Select, Stack, Text, Textarea, Toggle,
@@ -30,7 +30,7 @@ import {
 import { onColor } from '../ui/contrast';
 import { sendBg, formatRelativeTime } from './shared';
 import { SendAsPicker, sendAsInvalid } from './SendAsPicker';
-import { StepListEditor, RecentCampaignPicker } from './PresetActionsSettings';
+import { StepListEditor, RecentCampaignPicker, StepCondition } from './PresetActionsSettings';
 import { LinkedTemplateSelect } from './MessageTemplates';
 import { useWorkspaces } from './TeamSettings';
 import { isTeamWorkspace } from '../team';
@@ -296,7 +296,7 @@ function ActionCard({
   const blocked = whyNotRunnable(a, store);
   const interrupted = !!run?.running && !isRunning;
   const scheduled = a.everyMinutes > 0;
-  const automatic = scheduled || a.tagTriggers.length > 0;
+  const automatic = scheduled || a.tagTriggers.length > 0 || !!a.onMessageSent;
   const search = scheduled && a.kind === 'search' && a.savedSearchId ? store.savedSearches[a.savedSearchId] : undefined;
   const stopping = stoppingLocal || !!run?.stopping;
   const shownRun = run && stopping ? { ...run, stopping: true } : run;
@@ -325,7 +325,7 @@ function ActionCard({
             <Toggle
               label={<span style={{ fontSize: 12 }}>{a.enabled ? 'Automatic on' : 'Automatic paused'}</span>}
               checked={a.enabled}
-              title="Turns the schedule and tag triggers on or off. The button and running it from here still work."
+              title="Turns the schedule, tag and message-sent triggers on or off. The button and running it from here still work."
               onChange={(e) => onToggleEnabled(e.target.checked)}
             />
           )}
@@ -368,7 +368,7 @@ function ActionCard({
           <Text size="small" tone={run.error || interrupted ? 'danger' : 'muted'}>
             {interrupted
               ? `Last run ${formatRelativeTime(run.startedAt)} was interrupted before it finished.`
-              : `Last run ${formatRelativeTime(run.finishedAt || run.startedAt)}${run.trigger === 'schedule' ? ' (scheduled)' : run.trigger === 'webhook' ? ' (webhook)' : run.trigger === 'tag' ? ' (tag change)' : ''}: ${describeRun(run)}`}
+              : `Last run ${formatRelativeTime(run.finishedAt || run.startedAt)}${run.trigger === 'schedule' ? ' (scheduled)' : run.trigger === 'webhook' ? ' (webhook)' : run.trigger === 'tag' ? ' (tag change)' : run.trigger === 'message' ? ' (message sent)' : run.trigger === 'action' ? ' (run by another action)' : ''}: ${describeRun(run)}`}
           </Text>
         )}
 
@@ -559,6 +559,7 @@ function ActionEditor({ initial, store, team, isNew, onSave, onCancel, onOpenTag
               // The message below is the way to send one. An old quick action
               // with a second "add to campaign" step keeps showing it.
               hideKinds={draft.steps.some((s) => s.kind === 'addToCampaign') ? [] : ['addToCampaign']}
+              selfId={draft.id}
             />
             <Button size="sm" variant="link" onClick={onOpenTags} style={{ alignSelf: 'flex-start' }}>Manage tags</Button>
 
@@ -882,10 +883,55 @@ function ActionEditor({ initial, store, team, isNew, onSave, onCancel, onOpenTag
               </Stack>
             )}
 
+            {/* Message sent */}
+            <Toggle
+              labelFirst={false}
+              label="When a message is sent to a contact"
+              checked={!!draft.onMessageSent}
+              onChange={(e) => {
+                const { onMessageSent: _m, ...rest } = draft;
+                setDraft(e.target.checked ? { ...rest, onMessageSent: true, enabled: true } : rest);
+              }}
+            />
+            {draft.onMessageSent && (
+              <Text size="small" tone="muted" style={{ paddingLeft: space.md, borderLeft: `2px solid ${color.border.subtle}` }}>
+                Runs on that contact each time the send queue confirms a message to them — any campaign, any action’s
+                message, a button press. Dry runs don’t count, and neither does this action’s own message. Fires on the
+                computer that sent it.
+              </Text>
+            )}
+
             <Text size="small" tone="muted">
-              Every action can also be run from this page (“Run on…”), and by an incoming webhook (Settings → Incoming
-              webhooks).
+              Every action can also be run from this page (“Run on…”), by an incoming webhook (Settings → Incoming
+              webhooks), and by another action’s “Run another action” step.
             </Text>
+          </Section>
+
+          {/* 3. Conditions */}
+          <Section title="3. Only run if… (optional)">
+            {draft.when ? (
+              <StepCondition
+                key={draft.when.id}
+                when={draft.when}
+                store={store}
+                title="Only contacts where"
+                hint="checked whatever starts it, against the contact as they are when it runs. Everyone else is skipped, message included."
+                onChange={(when) => setDraft((d) => ({ ...d, when }))}
+                onRemove={() => setDraft((d) => {
+                  const { when: _w, ...rest } = d;
+                  return rest;
+                })}
+              />
+            ) : (
+              <Stack direction="row" gap="sm" align="center" wrap>
+                <Button size="sm" variant="secondary" onClick={() => set({ when: { ...emptyQuery(), children: [newCondition()] } })}>
+                  Add a condition
+                </Button>
+                <Text size="small" tone="muted">
+                  e.g. only contacts tagged Lead, or not contacted in 7 days. Each action above can also have its own “If…”.
+                </Text>
+              </Stack>
+            )}
           </Section>
 
           <Stack direction="row" gap="sm" align="center">

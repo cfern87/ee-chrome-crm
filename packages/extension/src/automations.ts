@@ -42,13 +42,13 @@
 
 import type { Store, Conversation } from './storage';
 import type { Mutation } from './mutations';
-import type { AutomationChange } from './history';
+import type { AutomationChange, AutomationTrigger } from './history';
 import { buildThreadIndex } from './contacts';
 import {
   normalizeSteps, stepsFor, describePreset, readPresetActions, writePresetActions,
   type PresetStep, type PresetAction,
 } from './presets';
-import { filterByQuery, normalizeQuery, type SavedSearch } from './search';
+import { filterByQuery, normalizeQuery, isQueryEmpty, matchesQuery, type QueryGroup, type QueryContext, type SavedSearch } from './search';
 import { writeCollection, type SettingsBag, type SettingsCollection } from './settingsMerge';
 import type { SendAsMode } from './campaigns';
 import { resolveMessage, templateName } from './templates';
@@ -137,6 +137,19 @@ export interface Automation {
   button?: ActionButton;
   /** Run on a contact when one of these tags is added to / removed from them. */
   tagTriggers: TagTrigger[];
+  /**
+   * Run on a contact whenever the send queue confirms a message to them (any
+   * campaign, any action's message — dry runs excluded). Fires on the machine
+   * that sent it. Sends queued by THIS action never re-trigger it.
+   */
+  onMessageSent?: boolean;
+  /**
+   * Only run on contacts matching this advanced-search query, whatever started
+   * it — button, schedule, tag, message, webhook, another action, "Run now".
+   * Checked against the contact as it is when the run starts. Absent = everyone.
+   * Each step can still have its own "If…" on top.
+   */
+  when?: QueryGroup;
   /** The actions, applied to each contact - the same steps as a quick action. */
   steps: PresetStep[];
   /** Optional: also message the contacts. */
@@ -250,6 +263,9 @@ export function normalizeAutomation(raw: unknown): Automation | null {
     ? normalizeSteps(o.steps)
     : tagIds.map((tagId): PresetStep => ({ kind: 'addTag', tagId }));
   const message = normalizeMessage(o.message);
+  const rawWhen = o.when && typeof o.when === 'object' ? normalizeQuery(o.when) : null;
+  // An empty condition matches everyone, so it is the same as none.
+  const when = rawWhen && !isQueryEmpty(rawWhen) ? rawWhen : undefined;
   return {
     id: o.id,
     name: typeof o.name === 'string' ? o.name : 'Untitled action',
@@ -257,6 +273,8 @@ export function normalizeAutomation(raw: unknown): Automation | null {
     enabled: o.enabled !== false,
     ...(button ? { button } : {}),
     tagTriggers,
+    ...(o.onMessageSent === true ? { onMessageSent: true } : {}),
+    ...(when ? { when } : {}),
     steps,
     ...(message ? { message } : {}),
     tagIds: legacyTagIds(steps),
@@ -476,6 +494,28 @@ export function readActionButtons(store: Pick<Store, 'settings'>): PresetAction[
   return readActions(store).filter((a) => a.button).map(actionAsButton);
 }
 
+/** `step` gated by `cond` as well as by its own "If…". */
+function withCondition(step: PresetStep, cond: QueryGroup | undefined): PresetStep {
+  if (!cond) return step;
+  if (!step.when) return { ...step, when: cond };
+  return { ...step, when: { type: 'group', id: `${cond.id}+${step.when.id}`, combinator: 'and', children: [cond, step.when] } };
+}
+
+/** Of these contacts, the ones the action's "Only run if…" lets through (all of them when it has none). */
+export function contactsPassingCondition(a: Pick<Automation, 'when'>, ids: string[], store: Store, now = Date.now()): string[] {
+  if (!a.when) return ids;
+  const ctx: QueryContext = { now, tags: store.tags, tagGroups: store.tagGroups, fieldDefs: store.fieldDefs, history: store.history };
+  return ids.filter((id) => {
+    const conv = store.conversations[id];
+    return !!conv && matchesQuery(conv, a.when!, ctx);
+  });
+}
+
+/** The actions a confirmed send to a contact sets off. `queuedBy` = the action whose message it was, if any. */
+export function messageSentTargets(automations: Automation[], queuedBy?: string): Automation[] {
+  return automations.filter((a) => a.enabled && a.onMessageSent && a.id !== queuedBy);
+}
+
 export function actionAsButton(a: Automation): PresetAction {
   const m = a.message;
   const send: PresetStep[] = m && (m.template.trim() || m.templateId)
@@ -494,7 +534,9 @@ export function actionAsButton(a: Automation): PresetAction {
     ...(a.button?.color ? { color: a.button.color } : {}),
     ...(a.button?.description ? { description: a.button.description } : {}),
     order: a.order,
-    steps: [...a.steps, ...send],
+    // The action-wide condition gates every step, so the panel, the bulk pane
+    // and everything that reads a button's steps honour it without knowing.
+    steps: [...a.steps, ...send].map((s) => withCondition(s, a.when)),
     createdAt: a.createdAt,
     ...(a.updatedAt ? { updatedAt: a.updatedAt } : {}),
   };
@@ -622,6 +664,7 @@ export function describeTriggers(a: Automation, store: Pick<Store, 'tags' | 'sav
     out.push(`${describeSchedule(a.everyMinutes, a.runAtHour)} on ${src}${a.enabled ? '' : ' (paused)'}`);
   }
   for (const t of a.tagTriggers) out.push(`${shortTagTrigger(t, store)}${a.enabled ? '' : ' (paused)'}`);
+  if (a.onMessageSent) out.push(`Message sent${a.enabled ? '' : ' (paused)'}`);
   return out;
 }
 
@@ -863,7 +906,7 @@ export interface AutomationRun {
   /** Stop was pressed; the scan is winding down and will keep what it found. */
   stopping?: boolean;
   /** 'webhook' = started by an incoming webhook (inbound.ts); 'tag' = a tag was added or removed. */
-  trigger: 'manual' | 'schedule' | 'webhook' | 'tag';
+  trigger: AutomationTrigger;
   startedAt: number;
   finishedAt?: number;
   rowsSeen: number;
@@ -902,7 +945,7 @@ export function describeRun(run: AutomationRun): string {
       : `Looking through conversations — ${run.rowsSeen} checked`;
   }
   if (run.error) return `Stopped: ${run.error}`;
-  const parts = run.trigger === 'tag'
+  const parts = run.trigger === 'tag' || run.trigger === 'message' || run.trigger === 'action'
     ? [`ran on ${run.matched ?? 0} contact${run.matched === 1 ? '' : 's'}`]
     : run.matched !== undefined
       ? [`${run.matched} matched the search`]

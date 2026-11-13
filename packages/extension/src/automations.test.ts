@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   resolveUnread, planActions, planMessage, messageSkipped, matchSavedSearch, withLegacyFields,
   readAutomations, writeAutomations, normalizeAutomation, isDue, whyNotRunnable,
-  newTagUnreadAutomation, describeRun, type Automation, type AutomationMessage,
+  newTagUnreadAutomation, describeRun, actionAsButton, contactsPassingCondition, messageSentTargets, describeTriggers,
+  type Automation, type AutomationMessage,
 } from './automations';
 import type { SavedSearch } from './search';
 import { applyMutations } from './mutations';
@@ -205,5 +206,50 @@ describe('automation webhook actions', () => {
     });
     expect(line).toContain('2 sent to webhook');
     expect(line).toContain('1 webhook failed');
+  });
+});
+
+describe('message-sent trigger, run-action step, action-wide condition', () => {
+  const hotOnly = {
+    type: 'group' as const, id: 'w', combinator: 'and' as const,
+    children: [{ type: 'condition' as const, id: 'c', field: 'tags', op: 'hasAny', values: ['hot'] }],
+  };
+
+  it('round-trips onMessageSent and the condition, and drops an empty condition', () => {
+    const a = normalizeAutomation({ ...automation(), onMessageSent: true, when: hotOnly })!;
+    expect(a.onMessageSent).toBe(true);
+    expect(a.when?.children).toHaveLength(1);
+    const empty = normalizeAutomation({ ...automation(), when: { ...hotOnly, children: [] } })!;
+    expect(empty.when).toBeUndefined();
+    expect(describeTriggers({ ...a, button: undefined }, storeWith([]))).toContain('Message sent');
+  });
+
+  it('only lets matching contacts through the condition', () => {
+    const store = storeWith([conv('1', { tags: ['hot'] }), conv('2')]);
+    expect(contactsPassingCondition(automation({ when: hotOnly as never }), ['1', '2', 'gone'], store)).toEqual(['1']);
+    expect(contactsPassingCondition(automation(), ['1', '2'], store)).toEqual(['1', '2']);
+  });
+
+  it('gates every button step by the condition, ANDed with its own If', () => {
+    const store = storeWith([conv('1', { tags: ['hot'] }), conv('2')]);
+    const btn = actionAsButton(automation({ when: hotOnly as never, button: { label: 'Go' } }));
+    expect(planActions({ ...automation(), steps: btn.steps }, ['1', '2'], store).groupIds).toEqual(['1']);
+  });
+
+  it('message-sent targets skip paused actions and the action that queued the send', () => {
+    const a = automation({ id: 'a', onMessageSent: true });
+    const b = automation({ id: 'b', onMessageSent: true, enabled: false });
+    const c = automation({ id: 'c' });
+    const d = automation({ id: 'd', onMessageSent: true });
+    expect(messageSentTargets([a, b, c, d], 'd').map((x) => x.id)).toEqual(['a']);
+  });
+
+  it('a run-action step emits a no-op runAction mutation, never one that runs itself', () => {
+    const store = storeWith([conv('1')]);
+    const a = automation({ id: 'a', steps: [{ kind: 'runAction', actionId: 'b' }, { kind: 'runAction', actionId: 'a' }] });
+    const muts = planActions(a, ['1'], store).groups.flat();
+    expect(muts).toEqual([{ op: 'runAction', conversationId: '1', automationId: 'b' }]);
+    expect(applyMutations(store, muts).changed).toBe(false);
+    expect(normalizeAutomation(a)!.steps).toHaveLength(2);
   });
 });
