@@ -2985,8 +2985,9 @@ function BulkPane(p: {
 
         <div style={heading}>Message & replies</div>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-          <button onClick={p.onMessage} style={btn({ background: color.success.base, color: color.surface.raised, border: `1px solid ${color.success.base}` })}>
-            💬 Message {p.count}
+          {/* The everyday action gets the prominent slot; messaging is in More. */}
+          <button onClick={p.onOpenAll} style={btn({ background: color.success.base, color: color.surface.raised, border: `1px solid ${color.success.base}` })}>
+            Open all in Messenger
           </button>
           <button
             onClick={p.onCheckReplies}
@@ -3071,7 +3072,7 @@ function BulkPane(p: {
 
         <div style={heading}>More</div>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-          <button onClick={p.onOpenAll} style={btn()}>Open all in Messenger</button>
+          <button onClick={p.onMessage} style={btn()}>💬 Message {p.count}</button>
           {p.count >= 2 && (
             <button onClick={p.onMerge} title="Combine the selected contacts into one (unions tags, keeps the best identity/thread id)" style={btn()}>
               Merge {p.count} into one
