@@ -881,6 +881,7 @@ function describeRunHeader(run: AutomationRunInfo, names: Map<string, string>): 
     : run.trigger === 'tag' ? (run.source ? `tag ${run.source}` : 'tag change')
     : run.trigger === 'message' ? 'message sent'
     : run.trigger === 'read' ? 'message read'
+    : run.trigger === 'replied' ? 'they replied'
     : run.trigger === 'action' ? (run.source ? `run by ${run.source}` : 'run by another action')
     : run.trigger === 'schedule' ? 'on its schedule' : 'run by hand';
   return (

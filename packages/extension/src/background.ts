@@ -121,7 +121,7 @@ import {
 import { MAX_READ_STATE_WRITES } from './mutations';
 import { e2eeVariantOf } from './threadUrl';
 import {
-  readActions, shortTagTrigger, resolveUnread, contactsPassingCondition, messageSentTargets, messageReadHits, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable, automationChangesOf,
+  readActions, shortTagTrigger, resolveUnread, contactsPassingCondition, messageSentTargets, messageReadHits, repliedHits, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable, automationChangesOf,
   tagTriggerHits, withResolvedMessage,
   AUTOMATION_RUNS_KEY,
   type Automation, type AutomationRun, type AutomationRuns, type UnreadScanReport,
@@ -374,7 +374,7 @@ async function contactElsewhere(threadId: string): Promise<SavedTo[]> {
 // `runAction` step, fireRunActionSteps). Queued per action AND trigger, so a
 // run's history says what actually started it.
 const MAX_TAG_TRIGGER_DEPTH = 3;
-type QueuedTrigger = 'tag' | 'message' | 'action' | 'read';
+type QueuedTrigger = 'tag' | 'message' | 'action' | 'read' | 'replied';
 const tagTriggerQueue = new Map<string, { id: string; trigger: QueuedTrigger; ids: Set<string>; depth: number; source: string }>();
 const tagTriggerDraining = new Set<string>();
 
@@ -467,11 +467,14 @@ function fireManualSendTriggers(mutations: Mutation[]): void {
   }
 }
 
-/** Your last message changed from unread to read on these contacts: run "message read" actions. */
+/** Read-state changes: "message read" (unread → read) and "they replied" (→ responded) actions. */
 function fireMessageReadTriggers(prev: Store, next: Store): void {
   try {
-    const hit = messageReadHits(prev, next, readActions(next));
-    for (const id of hit.automationIds) queueTriggeredRun(id, 'read', hit.ids, 1, 'message read');
+    const actions = readActions(next);
+    const read = messageReadHits(prev, next, actions);
+    for (const id of read.automationIds) queueTriggeredRun(id, 'read', read.ids, 1, 'message read');
+    const replied = repliedHits(prev, next, actions);
+    for (const id of replied.automationIds) queueTriggeredRun(id, 'replied', replied.ids, 1, 'they replied');
   } catch (e) {
     console.warn('[CRM] message-read trigger check failed', e);
   }

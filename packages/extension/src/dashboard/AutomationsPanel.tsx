@@ -297,7 +297,7 @@ function ActionCard({
   const blocked = whyNotRunnable(a, store);
   const interrupted = !!run?.running && !isRunning;
   const scheduled = a.everyMinutes > 0;
-  const automatic = scheduled || a.tagTriggers.length > 0 || !!a.onMessageSent || !!a.onMessageRead;
+  const automatic = scheduled || a.tagTriggers.length > 0 || !!a.onMessageSent || !!a.onMessageRead || !!a.onReplied;
   const search = scheduled && a.kind === 'search' && a.savedSearchId ? store.savedSearches[a.savedSearchId] : undefined;
   const stopping = stoppingLocal || !!run?.stopping;
   const shownRun = run && stopping ? { ...run, stopping: true } : run;
@@ -311,7 +311,7 @@ function ActionCard({
   const lastRun = !isRunning && run
     ? interrupted
       ? `Last run ${formatRelativeTime(run.startedAt)} was interrupted before it finished.`
-      : `Last run ${formatRelativeTime(run.finishedAt || run.startedAt)}${run.trigger === 'schedule' ? ' (scheduled)' : run.trigger === 'webhook' ? ' (webhook)' : run.trigger === 'tag' ? ' (tag change)' : run.trigger === 'message' ? ' (message sent)' : run.trigger === 'read' ? ' (message read)' : run.trigger === 'action' ? ' (run by another action)' : ''}: ${describeRun(run)}`
+      : `Last run ${formatRelativeTime(run.finishedAt || run.startedAt)}${run.trigger === 'schedule' ? ' (scheduled)' : run.trigger === 'webhook' ? ' (webhook)' : run.trigger === 'tag' ? ' (tag change)' : run.trigger === 'message' ? ' (message sent)' : run.trigger === 'read' ? ' (message read)' : run.trigger === 'replied' ? ' (they replied)' : run.trigger === 'action' ? ' (run by another action)' : ''}: ${describeRun(run)}`
     : null;
   const lastRunBad = !!run && (!!run.error || interrupted);
   const does = describeActions(a, store);
@@ -964,6 +964,25 @@ function ActionEditor({ initial, store, team, isNew, onSave, onCancel, onOpenTag
                 Runs when the CRM sees your last message change from unread to read — which happens when that
                 conversation is on screen in Messenger (Facebook only shows read receipts inside an open chat). A thread
                 already read the first time it’s seen doesn’t count, since there’s no telling when they read it.
+              </Text>
+            )}
+
+            {/* Replied */}
+            <Toggle
+              labelFirst={false}
+              label="When a contact replies"
+              checked={!!draft.onReplied}
+              onChange={(e) => {
+                const { onReplied: _y, ...rest } = draft;
+                setDraft(e.target.checked ? { ...rest, onReplied: true, enabled: true } : rest);
+              }}
+            />
+            {draft.onReplied && (
+              <Text size="small" tone="muted" style={{ paddingLeft: space.md, borderLeft: `2px solid ${color.border.subtle}` }}>
+                Runs when the CRM sees a reply from someone it knew was waiting on them (your last message to them was
+                unread or read) — in an open chat, or as an unread conversation in Messenger’s list, which needs nothing
+                opened. Uses the same reply detection as “Check for replies”. A conversation first seen with a reply
+                already in it doesn’t count.
               </Text>
             )}
 

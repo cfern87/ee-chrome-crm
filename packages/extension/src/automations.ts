@@ -151,6 +151,12 @@ export interface Automation {
    */
   onMessageRead?: boolean;
   /**
+   * Run on a contact when they reply: Conversation.readState changes to
+   * 'responded' from 'unread' or 'read' (it was waiting on them). Same rule as
+   * onMessageRead — a thread first seen with a reply in it doesn't fire.
+   */
+  onReplied?: boolean;
+  /**
    * Only run on contacts matching this advanced-search query, whatever started
    * it — button, schedule, tag, message, webhook, another action, "Run now".
    * Checked against the contact as it is when the run starts. Absent = everyone.
@@ -282,6 +288,7 @@ export function normalizeAutomation(raw: unknown): Automation | null {
     tagTriggers,
     ...(o.onMessageSent === true ? { onMessageSent: true } : {}),
     ...(o.onMessageRead === true ? { onMessageRead: true } : {}),
+    ...(o.onReplied === true ? { onReplied: true } : {}),
     ...(when ? { when } : {}),
     steps,
     ...(message ? { message } : {}),
@@ -530,11 +537,26 @@ export function messageSentTargets(automations: Automation[], queuedBy?: string)
  * state was unknown before, don't count (see Automation.onMessageRead).
  */
 export function messageReadHits(prev: Pick<Store, 'conversations'>, next: Pick<Store, 'conversations'>, automations: Automation[]): { automationIds: string[]; ids: string[] } {
-  const targets = automations.filter((a) => a.enabled && a.onMessageRead);
+  return readStateHits(prev, next, automations.filter((a) => a.enabled && a.onMessageRead), 'read', ['unread']);
+}
+
+/**
+ * Contacts who replied in this write (readState became 'responded' while we
+ * were waiting on them), and the "they replied" actions to run on them.
+ */
+export function repliedHits(prev: Pick<Store, 'conversations'>, next: Pick<Store, 'conversations'>, automations: Automation[]): { automationIds: string[]; ids: string[] } {
+  return readStateHits(prev, next, automations.filter((a) => a.enabled && a.onReplied), 'responded', ['unread', 'read']);
+}
+
+function readStateHits(
+  prev: Pick<Store, 'conversations'>, next: Pick<Store, 'conversations'>, targets: Automation[],
+  to: NonNullable<Conversation['readState']>, from: Array<Conversation['readState']>,
+): { automationIds: string[]; ids: string[] } {
   if (!targets.length) return { automationIds: [], ids: [] };
   const ids: string[] = [];
   for (const [id, conv] of Object.entries(next.conversations)) {
-    if (conv.readState === 'read' && prev.conversations[id]?.readState === 'unread') ids.push(id);
+    const before = prev.conversations[id]?.readState;
+    if (conv.readState === to && before !== undefined && from.includes(before)) ids.push(id);
   }
   return { automationIds: ids.length ? targets.map((a) => a.id) : [], ids };
 }
@@ -689,6 +711,7 @@ export function describeTriggers(a: Automation, store: Pick<Store, 'tags' | 'sav
   for (const t of a.tagTriggers) out.push(`${shortTagTrigger(t, store)}${a.enabled ? '' : ' (paused)'}`);
   if (a.onMessageSent) out.push(`Message sent${a.enabled ? '' : ' (paused)'}`);
   if (a.onMessageRead) out.push(`Message read${a.enabled ? '' : ' (paused)'}`);
+  if (a.onReplied) out.push(`They replied${a.enabled ? '' : ' (paused)'}`);
   return out;
 }
 
@@ -969,7 +992,7 @@ export function describeRun(run: AutomationRun): string {
       : `Looking through conversations — ${run.rowsSeen} checked`;
   }
   if (run.error) return `Stopped: ${run.error}`;
-  const parts = run.trigger === 'tag' || run.trigger === 'message' || run.trigger === 'action' || run.trigger === 'read'
+  const parts = run.trigger === 'tag' || run.trigger === 'message' || run.trigger === 'action' || run.trigger === 'read' || run.trigger === 'replied'
     ? [`ran on ${run.matched ?? 0} contact${run.matched === 1 ? '' : 's'}`]
     : run.matched !== undefined
       ? [`${run.matched} matched the search`]

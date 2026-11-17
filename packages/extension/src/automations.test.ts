@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   resolveUnread, planActions, planMessage, messageSkipped, matchSavedSearch, withLegacyFields,
   readAutomations, writeAutomations, normalizeAutomation, isDue, whyNotRunnable,
-  newTagUnreadAutomation, describeRun, actionAsButton, contactsPassingCondition, messageSentTargets, describeTriggers, messageReadHits,
+  newTagUnreadAutomation, describeRun, actionAsButton, contactsPassingCondition, messageSentTargets, describeTriggers, messageReadHits, repliedHits,
   type Automation, type AutomationMessage,
 } from './automations';
 import type { SavedSearch } from './search';
@@ -281,5 +281,25 @@ describe('message-read trigger', () => {
     const a = applyMutations(store, [{ op: 'markContacted', conversationId: '1', manual: true }], 10_000).store;
     const b = applyMutations(store, [{ op: 'markContacted', conversationId: '1' }], 10_000).store;
     expect(a.conversations['1'].lastContactedAt).toBe(b.conversations['1'].lastContactedAt);
+  });
+});
+
+describe('they-replied trigger', () => {
+  const onReply = automation({ id: 'y', onReplied: true });
+  it('round-trips and shows as a trigger', () => {
+    const a = normalizeAutomation({ ...onReply })!;
+    expect(a.onReplied).toBe(true);
+    expect(describeTriggers(a, storeWith([]))).toContain('They replied');
+  });
+  it('fires when a contact waiting on them replies, not on first sighting', () => {
+    const prev = storeWith([conv('1', { readState: 'unread' }), conv('2', { readState: 'read' }), conv('3'), conv('4', { readState: 'responded' })]);
+    const next = storeWith([
+      conv('1', { readState: 'responded' }),
+      conv('2', { readState: 'responded' }),
+      conv('3', { readState: 'responded' }),
+      conv('4', { readState: 'responded' }),
+    ]);
+    expect(repliedHits(prev, next, [onReply])).toEqual({ automationIds: ['y'], ids: ['1', '2'] });
+    expect(repliedHits(prev, next, [{ ...onReply, enabled: false }]).ids).toEqual([]);
   });
 });
