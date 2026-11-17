@@ -297,7 +297,7 @@ function ActionCard({
   const blocked = whyNotRunnable(a, store);
   const interrupted = !!run?.running && !isRunning;
   const scheduled = a.everyMinutes > 0;
-  const automatic = scheduled || a.tagTriggers.length > 0 || !!a.onMessageSent;
+  const automatic = scheduled || a.tagTriggers.length > 0 || !!a.onMessageSent || !!a.onMessageRead;
   const search = scheduled && a.kind === 'search' && a.savedSearchId ? store.savedSearches[a.savedSearchId] : undefined;
   const stopping = stoppingLocal || !!run?.stopping;
   const shownRun = run && stopping ? { ...run, stopping: true } : run;
@@ -311,7 +311,7 @@ function ActionCard({
   const lastRun = !isRunning && run
     ? interrupted
       ? `Last run ${formatRelativeTime(run.startedAt)} was interrupted before it finished.`
-      : `Last run ${formatRelativeTime(run.finishedAt || run.startedAt)}${run.trigger === 'schedule' ? ' (scheduled)' : run.trigger === 'webhook' ? ' (webhook)' : run.trigger === 'tag' ? ' (tag change)' : run.trigger === 'message' ? ' (message sent)' : run.trigger === 'action' ? ' (run by another action)' : ''}: ${describeRun(run)}`
+      : `Last run ${formatRelativeTime(run.finishedAt || run.startedAt)}${run.trigger === 'schedule' ? ' (scheduled)' : run.trigger === 'webhook' ? ' (webhook)' : run.trigger === 'tag' ? ' (tag change)' : run.trigger === 'message' ? ' (message sent)' : run.trigger === 'read' ? ' (message read)' : run.trigger === 'action' ? ' (run by another action)' : ''}: ${describeRun(run)}`
     : null;
   const lastRunBad = !!run && (!!run.error || interrupted);
   const does = describeActions(a, store);
@@ -362,7 +362,7 @@ function ActionCard({
               label={<span style={{ fontSize: 12 }}>{a.enabled ? 'On' : 'Paused'}</span>}
               labelFirst={false}
               checked={a.enabled}
-              title="Automatic: turns the schedule, tag and message-sent triggers on or off. The button and running it from here still work."
+              title="Automatic: turns the schedule, tag and message triggers on or off. The button and running it from here still work."
               onChange={(e) => onToggleEnabled(e.target.checked)}
             />
           )}
@@ -943,9 +943,27 @@ function ActionEditor({ initial, store, team, isNew, onSave, onCancel, onOpenTag
             />
             {draft.onMessageSent && (
               <Text size="small" tone="muted" style={{ paddingLeft: space.md, borderLeft: `2px solid ${color.border.subtle}` }}>
-                Runs on that contact each time the send queue confirms a message to them — any campaign, any action’s
-                message, a button press. Dry runs don’t count, and neither does this action’s own message. Fires on the
-                computer that sent it.
+                Runs on that contact each time a message goes to them: one you type and send in Messenger yourself, or
+                one the send queue confirms (any campaign, any action’s message, a button press). Dry runs don’t count,
+                and neither does this action’s own message. Fires on the computer that sent it.
+              </Text>
+            )}
+
+            {/* Message read */}
+            <Toggle
+              labelFirst={false}
+              label="When a contact reads your last message"
+              checked={!!draft.onMessageRead}
+              onChange={(e) => {
+                const { onMessageRead: _r, ...rest } = draft;
+                setDraft(e.target.checked ? { ...rest, onMessageRead: true, enabled: true } : rest);
+              }}
+            />
+            {draft.onMessageRead && (
+              <Text size="small" tone="muted" style={{ paddingLeft: space.md, borderLeft: `2px solid ${color.border.subtle}` }}>
+                Runs when the CRM sees your last message change from unread to read — which happens when that
+                conversation is on screen in Messenger (Facebook only shows read receipts inside an open chat). A thread
+                already read the first time it’s seen doesn’t count, since there’s no telling when they read it.
               </Text>
             )}
 

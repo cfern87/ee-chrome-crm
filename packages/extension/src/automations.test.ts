@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   resolveUnread, planActions, planMessage, messageSkipped, matchSavedSearch, withLegacyFields,
   readAutomations, writeAutomations, normalizeAutomation, isDue, whyNotRunnable,
-  newTagUnreadAutomation, describeRun, actionAsButton, contactsPassingCondition, messageSentTargets, describeTriggers,
+  newTagUnreadAutomation, describeRun, actionAsButton, contactsPassingCondition, messageSentTargets, describeTriggers, messageReadHits,
   type Automation, type AutomationMessage,
 } from './automations';
 import type { SavedSearch } from './search';
@@ -251,5 +251,35 @@ describe('message-sent trigger, run-action step, action-wide condition', () => {
     expect(muts).toEqual([{ op: 'runAction', conversationId: '1', automationId: 'b' }]);
     expect(applyMutations(store, muts).changed).toBe(false);
     expect(normalizeAutomation(a)!.steps).toHaveLength(2);
+  });
+});
+
+describe('message-read trigger', () => {
+  const reader = automation({ id: 'r', onMessageRead: true });
+
+  it('round-trips and shows as a trigger', () => {
+    const a = normalizeAutomation({ ...reader })!;
+    expect(a.onMessageRead).toBe(true);
+    expect(describeTriggers(a, storeWith([]))).toContain('Message read');
+  });
+
+  it('fires only on a change from unread to read', () => {
+    const prev = storeWith([conv('1', { readState: 'unread' }), conv('2'), conv('3', { readState: 'responded' }), conv('4', { readState: 'unread' })]);
+    const next = storeWith([
+      conv('1', { readState: 'read' }), // unread → read: fires
+      conv('2', { readState: 'read' }), // unknown → read: an old read, not a change we saw
+      conv('3', { readState: 'read' }), // they replied before; not "read our last message" news
+      conv('4', { readState: 'unread' }),
+      conv('5', { readState: 'read' }), // new contact
+    ]);
+    expect(messageReadHits(prev, next, [reader, automation({ id: 'x' })])).toEqual({ automationIds: ['r'], ids: ['1'] });
+    expect(messageReadHits(prev, next, [{ ...reader, enabled: false }]).ids).toEqual([]);
+  });
+
+  it('a manual send flag rides on markContacted without changing what it records', () => {
+    const store = storeWith([conv('1')]);
+    const a = applyMutations(store, [{ op: 'markContacted', conversationId: '1', manual: true }], 10_000).store;
+    const b = applyMutations(store, [{ op: 'markContacted', conversationId: '1' }], 10_000).store;
+    expect(a.conversations['1'].lastContactedAt).toBe(b.conversations['1'].lastContactedAt);
   });
 });

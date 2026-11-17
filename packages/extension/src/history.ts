@@ -85,12 +85,12 @@ export function actorEmail(settings: Record<string, unknown> | undefined, key: s
 // skip it when reading, but still carry it through merges.
 
 /** 'message' = a message was sent to the contact; 'action' = another action ran it (a "run action" step). */
-export type AutomationTrigger = 'manual' | 'schedule' | 'webhook' | 'tag' | 'message' | 'action';
+export type AutomationTrigger = 'manual' | 'schedule' | 'webhook' | 'tag' | 'message' | 'action' | 'read';
 
 /** Changes made by an automation that history has no event of its own for. */
 export type AutomationChange = 'field' | 'task' | 'tasksDone' | 'archived' | 'unarchived' | 'renamed';
 
-const TRIGGER_CODE: Record<AutomationTrigger, string> = { manual: 'm', schedule: 's', webhook: 'h', tag: 'g', message: 'x', action: 'c' };
+const TRIGGER_CODE: Record<AutomationTrigger, string> = { manual: 'm', schedule: 's', webhook: 'h', tag: 'g', message: 'x', action: 'c', read: 'r' };
 const CHANGE_CODE: Record<AutomationChange, string> = {
   field: 'f', task: 'k', tasksDone: 't', archived: 'r', unarchived: 'u', renamed: 'n',
 };

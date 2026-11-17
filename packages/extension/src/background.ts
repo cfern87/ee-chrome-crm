@@ -121,7 +121,7 @@ import {
 import { MAX_READ_STATE_WRITES } from './mutations';
 import { e2eeVariantOf } from './threadUrl';
 import {
-  readActions, shortTagTrigger, resolveUnread, contactsPassingCondition, messageSentTargets, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable, automationChangesOf,
+  readActions, shortTagTrigger, resolveUnread, contactsPassingCondition, messageSentTargets, messageReadHits, matchSavedSearch, planActions, planMessage, messageSkipped, isDue, whyNotRunnable, automationChangesOf,
   tagTriggerHits, withResolvedMessage,
   AUTOMATION_RUNS_KEY,
   type Automation, type AutomationRun, type AutomationRuns, type UnreadScanReport,
@@ -250,6 +250,7 @@ async function mutateStore(input: Mutation[], opts: { triggerDepth?: number } = 
     const store = await loadStore();
     const { store: next, changed, conversationId } = applyMutations(store, mutations);
     fireRunActionSteps(mutations, next, opts.triggerDepth ?? 0);
+    fireManualSendTriggers(mutations);
     if (!changed) return { success: true, changed: false, store, conversationId };
     const result = await saveStore(next);
     // After the save, and deliberately not awaited: a webhook endpoint that
@@ -257,6 +258,7 @@ async function mutateStore(input: Mutation[], opts: { triggerDepth?: number } = 
     // — every other tab's edits would queue behind it.
     void fireContactWebhooks(store, next);
     fireTagTriggers(store, next, opts.triggerDepth ?? 0);
+    fireMessageReadTriggers(store, next);
     return { success: true, changed: true, store: next, conversationId, result };
   });
 }
@@ -372,7 +374,7 @@ async function contactElsewhere(threadId: string): Promise<SavedTo[]> {
 // `runAction` step, fireRunActionSteps). Queued per action AND trigger, so a
 // run's history says what actually started it.
 const MAX_TAG_TRIGGER_DEPTH = 3;
-type QueuedTrigger = 'tag' | 'message' | 'action';
+type QueuedTrigger = 'tag' | 'message' | 'action' | 'read';
 const tagTriggerQueue = new Map<string, { id: string; trigger: QueuedTrigger; ids: Set<string>; depth: number; source: string }>();
 const tagTriggerDraining = new Set<string>();
 
@@ -446,6 +448,32 @@ async function fireMessageSentTriggers(threadId: string, queuedBy: string | unde
     for (const a of targets) queueTriggeredRun(a.id, 'message', [id], 1, 'message sent');
   } catch (e) {
     console.warn('[CRM] message-sent trigger check failed', e);
+  }
+}
+
+// A double Enter, or Enter and the send button together, reports one send
+// twice. One trigger per contact within this window.
+const MANUAL_SEND_DEDUPE_MS = 3000;
+const lastManualSendAt = new Map<string, number>();
+
+/** Messages the user typed and sent themselves in Messenger (markContacted with `manual`). */
+function fireManualSendTriggers(mutations: Mutation[]): void {
+  const now = Date.now();
+  for (const m of mutations) {
+    if (m.op !== 'markContacted' || !m.manual || m.dryRun) continue;
+    if (now - (lastManualSendAt.get(m.conversationId) ?? 0) < MANUAL_SEND_DEDUPE_MS) continue;
+    lastManualSendAt.set(m.conversationId, now);
+    void fireMessageSentTriggers(m.conversationId, undefined);
+  }
+}
+
+/** Your last message changed from unread to read on these contacts: run "message read" actions. */
+function fireMessageReadTriggers(prev: Store, next: Store): void {
+  try {
+    const hit = messageReadHits(prev, next, readActions(next));
+    for (const id of hit.automationIds) queueTriggeredRun(id, 'read', hit.ids, 1, 'message read');
+  } catch (e) {
+    console.warn('[CRM] message-read trigger check failed', e);
   }
 }
 

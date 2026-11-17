@@ -3238,7 +3238,7 @@ function resolveSendThreadId(composer: Element): string | null {
 
 // Stamp lastContactedAt — but only for an already-saved contact. A campaign
 // send passes the text it sent, which goes into the contact's history.
-async function markContacted(threadId: string, sent?: { message: string; dryRun: boolean }): Promise<void> {
+async function markContacted(threadId: string, sent?: { message: string; dryRun: boolean }, manual = false): Promise<void> {
   const store = await getStore();
   // Saved contacts only — never auto-create one just because a message went
   // out. Resolve through aliases so a profile-added contact still counts.
@@ -3246,7 +3246,7 @@ async function markContacted(threadId: string, sent?: { message: string; dryRun:
   if (!conv) return;
   // The coalescing window for rapid repeat sends lives in the mutation, so it
   // applies whichever tab the send came from.
-  await mutate([{ op: 'markContacted', conversationId: conv.id, ...(sent ? { message: sent.message, dryRun: sent.dryRun } : {}) }]);
+  await mutate([{ op: 'markContacted', conversationId: conv.id, ...(sent ? { message: sent.message, dryRun: sent.dryRun } : {}), ...(manual ? { manual: true } : {}) }]);
   console.log('[CRM] Recorded lastContacted for', conv.participantName || threadId);
   if (panelEl && panelEl.style.display !== 'none') renderPanel();
 }
@@ -3254,13 +3254,18 @@ async function markContacted(threadId: string, sent?: { message: string; dryRun:
 // Given a send originating from `composer`, record contact if everything checks
 // out. Guards: composer is the real composer, it has text, and the thread is a
 // confidently-resolved saved contact.
-function handleSendFrom(composer: Element | null): void {
+//
+// `trusted` is the event's isTrusted: a real key press or click by the user.
+// The send queue types with dispatched (untrusted) events that land here too,
+// and those sends already fire their own "message sent" triggers from the
+// queue, so only a trusted send is reported as a manual one.
+function handleSendFrom(composer: Element | null, trusted = false): void {
   if (!isMessageComposer(composer)) return;
   const text = (composer as HTMLElement).textContent?.trim() || '';
   if (text.length === 0) return; // empty composer doesn't send a message
   const threadId = resolveSendThreadId(composer);
   if (!threadId) return;
-  markContacted(threadId).catch(() => { /* storage hiccup — ignore */ });
+  markContacted(threadId, undefined, trusted).catch(() => { /* storage hiccup — ignore */ });
   // A message we just sent has not been read. Said here rather than left to the
   // next sweep so the CRM doesn't keep showing the PREVIOUS message's receipt
   // as though it belonged to this one.
@@ -3274,7 +3279,7 @@ function watchOutgoingMessages() {
     'keydown',
     (e: KeyboardEvent) => {
       if (e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
-      handleSendFrom(e.target as Element);
+      handleSendFrom(e.target as Element, e.isTrusted);
     },
     true
   );
@@ -3294,7 +3299,7 @@ function watchOutgoingMessages() {
       let container: Element | null = btn;
       for (let i = 0; i < 12 && container; i++) {
         const composer = container.querySelector<HTMLElement>('[contenteditable="true"][role="textbox"], [contenteditable="true"]');
-        if (composer && isMessageComposer(composer)) { handleSendFrom(composer); return; }
+        if (composer && isMessageComposer(composer)) { handleSendFrom(composer, e.isTrusted); return; }
         container = container.parentElement;
       }
     },

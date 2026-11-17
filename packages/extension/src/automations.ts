@@ -144,6 +144,13 @@ export interface Automation {
    */
   onMessageSent?: boolean;
   /**
+   * Run on a contact when your last message to them changes from unread to
+   * read, as observed in Messenger on this computer (Conversation.readState).
+   * Only a change counts: a thread first seen already read says nothing about
+   * when they read it, so it doesn't fire.
+   */
+  onMessageRead?: boolean;
+  /**
    * Only run on contacts matching this advanced-search query, whatever started
    * it — button, schedule, tag, message, webhook, another action, "Run now".
    * Checked against the contact as it is when the run starts. Absent = everyone.
@@ -274,6 +281,7 @@ export function normalizeAutomation(raw: unknown): Automation | null {
     ...(button ? { button } : {}),
     tagTriggers,
     ...(o.onMessageSent === true ? { onMessageSent: true } : {}),
+    ...(o.onMessageRead === true ? { onMessageRead: true } : {}),
     ...(when ? { when } : {}),
     steps,
     ...(message ? { message } : {}),
@@ -516,6 +524,21 @@ export function messageSentTargets(automations: Automation[], queuedBy?: string)
   return automations.filter((a) => a.enabled && a.onMessageSent && a.id !== queuedBy);
 }
 
+/**
+ * Contacts whose last message from us went from unread to read in this write,
+ * and the actions that should run on them. Contacts that are new, or whose
+ * state was unknown before, don't count (see Automation.onMessageRead).
+ */
+export function messageReadHits(prev: Pick<Store, 'conversations'>, next: Pick<Store, 'conversations'>, automations: Automation[]): { automationIds: string[]; ids: string[] } {
+  const targets = automations.filter((a) => a.enabled && a.onMessageRead);
+  if (!targets.length) return { automationIds: [], ids: [] };
+  const ids: string[] = [];
+  for (const [id, conv] of Object.entries(next.conversations)) {
+    if (conv.readState === 'read' && prev.conversations[id]?.readState === 'unread') ids.push(id);
+  }
+  return { automationIds: ids.length ? targets.map((a) => a.id) : [], ids };
+}
+
 export function actionAsButton(a: Automation): PresetAction {
   const m = a.message;
   const send: PresetStep[] = m && (m.template.trim() || m.templateId)
@@ -665,6 +688,7 @@ export function describeTriggers(a: Automation, store: Pick<Store, 'tags' | 'sav
   }
   for (const t of a.tagTriggers) out.push(`${shortTagTrigger(t, store)}${a.enabled ? '' : ' (paused)'}`);
   if (a.onMessageSent) out.push(`Message sent${a.enabled ? '' : ' (paused)'}`);
+  if (a.onMessageRead) out.push(`Message read${a.enabled ? '' : ' (paused)'}`);
   return out;
 }
 
@@ -945,7 +969,7 @@ export function describeRun(run: AutomationRun): string {
       : `Looking through conversations — ${run.rowsSeen} checked`;
   }
   if (run.error) return `Stopped: ${run.error}`;
-  const parts = run.trigger === 'tag' || run.trigger === 'message' || run.trigger === 'action'
+  const parts = run.trigger === 'tag' || run.trigger === 'message' || run.trigger === 'action' || run.trigger === 'read'
     ? [`ran on ${run.matched ?? 0} contact${run.matched === 1 ? '' : 's'}`]
     : run.matched !== undefined
       ? [`${run.matched} matched the search`]

@@ -110,7 +110,9 @@ export type Mutation =
   | { op: 'deleteContact'; conversationId: string }
   // `message` is the exact text a campaign sent, logged with the history event;
   // manual sends leave it out.
-  | { op: 'markContacted'; conversationId: string; message?: string; dryRun?: boolean }
+  // `manual`: the user sent it themselves from Messenger (a real key press or
+  // click), which fires "message sent" action triggers (background.ts).
+  | { op: 'markContacted'; conversationId: string; message?: string; dryRun?: boolean; manual?: boolean }
   // A campaign was queued: log each recipient's exact (already rendered)
   // message in their history, before anything is sent.
   | { op: 'logQueued'; entries: Array<{ conversationId: string; message: string }>; dryRun?: boolean; at: number }
