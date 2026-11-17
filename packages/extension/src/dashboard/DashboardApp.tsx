@@ -943,11 +943,23 @@ export default function DashboardApp() {
   const [filtersClosed, setFiltersClosed] = useState(false);
   const filtersVisible = !filtersClosed && !listScrolled;
 
+  const listHeaderRef = useRef<HTMLDivElement>(null);
+
   const onListScroll = (e: React.UIEvent<HTMLDivElement>) => {
-    const top = e.currentTarget.scrollTop;
+    const el = e.currentTarget;
+    const top = el.scrollTop;
+    // Hiding the filters makes the list taller by the header's height. If the
+    // rows only just overflowed, they'd then fit (or nearly), the browser
+    // would clamp scrollTop back toward 0, the filters would reopen, and the
+    // list would shrink again: the scroll never gets anywhere, and the sticky
+    // selection row snaps back each time. So only collapse when the list will
+    // still be scrolled past the reopen threshold with the whole header gone
+    // (an over-estimate: the search row stays). Lists near that size just
+    // scroll with the filters open.
+    const spareAfterCollapse = el.scrollHeight - el.clientHeight - (listHeaderRef.current?.offsetHeight ?? 0);
     // Different thresholds each way, or a header that changes height would
     // change the scroll position and flap against its own boundary.
-    setListScrolled((was) => (was ? top > 8 : top > 48));
+    setListScrolled((was) => (was ? top > 8 : top > 48 && spareAfterCollapse > 48));
   };
 
   const toggleFilters = () => {
@@ -2073,7 +2085,7 @@ export default function DashboardApp() {
                 costs three or four contacts on every screen. The toggle
                 button below is always present so filters are reachable
                 without scrolling to the top. */}
-            <div style={{ flex: '0 0 auto', padding: space.md, borderBottom: `1px solid ${color.border.subtle}`, display: 'flex', flexDirection: 'column', gap: space.sm }}>
+            <div ref={listHeaderRef} style={{ flex: '0 0 auto', padding: space.md, borderBottom: `1px solid ${color.border.subtle}`, display: 'flex', flexDirection: 'column', gap: space.sm }}>
               <div style={{ display: 'flex', gap: space.xs, alignItems: 'center' }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <FormField label="Search contacts" hideLabel>
